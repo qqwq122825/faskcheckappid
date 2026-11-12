@@ -1,0 +1,46 @@
+{
+  "scope": "Five distinct persistent identities; live provisioning and metadata refresh only; no account submitted",
+  "initial_preparation_seconds_displayed": 53.11,
+  "initial_per_device_seconds_displayed": [
+    9.34,
+    8.13,
+    8.04,
+    5.44,
+    6.82
+  ],
+  "new_device_gap_seconds": 3,
+  "warm_prepare_ms": 2.55,
+  "refresh_samples": [
+    {
+      "slot": 1,
+      "load_ms": 0.17,
+      "refresh_ms": 3065.2,
+      "status": "ready"
+    },
+    {
+      "slot": 2,
+      "load_ms": 0.23,
+      "refresh_ms": 1045.4,
+      "status": "ready"
+    },
+    {
+      "slot": 3,
+      "load_ms": 0.15,
+      "refresh_ms": 1101.9,
+      "status": "ready"
+    },
+    {
+      "slot": 4,
+      "load_ms": 0.17,
+      "refresh_ms": 1074.37,
+      "status": "ready"
+    },
+    {
+      "slot": 5,
+      "load_ms": 0.11,
+      "refresh_ms": 2208.66,
+      "status": "ready"
+    }
+  ],
+  "offline_tests_passed": 21
+}

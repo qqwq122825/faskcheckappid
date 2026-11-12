@@ -1,0 +1,41 @@
+{
+  "measured_at": "2026-11-12 Asia/Shanghai",
+  "provider": "https://new.ani.sidestore.io/",
+  "scope": "reused persistent identity; device metadata only; no account authentication",
+  "import_and_local_check_ms": 100.59,
+  "samples": [
+    {
+      "sample": 1,
+      "ms": 1454.99,
+      "status": "ready"
+    },
+    {
+      "sample": 2,
+      "ms": 2110.15,
+      "status": "ready"
+    },
+    {
+      "sample": 3,
+      "ms": 1639.3,
+      "status": "ready"
+    }
+  ],
+  "per_attempt_refresh_samples": [
+    {
+      "sample": 1,
+      "ms": 1094.73,
+      "status": "ready"
+    },
+    {
+      "sample": 2,
+      "ms": 1173.43,
+      "status": "ready"
+    },
+    {
+      "sample": 3,
+      "ms": 1645.18,
+      "status": "ready"
+    }
+  ],
+  "refresh_scope": "Persistent identity and matching cached client_info; get_headers only; no account authentication"
+}

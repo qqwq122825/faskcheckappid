@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+config/
+logs/
+data/
+dist/
+accounts.txt
+账号.txt
+
+.DS_Store

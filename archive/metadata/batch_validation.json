@@ -1,0 +1,37 @@
+{
+  "tests_passed": 34,
+  "live_proxy_api_tested": true,
+  "live_batch_accounts_submitted": true,
+  "verified": [
+    "auth concurrency <= 2",
+    "start after 2 ready devices",
+    "account 3 reuses device while only 2 ready",
+    "same identity and valid proxy across bounded retry",
+    "new process/session per attempt",
+    "expired leases rejected",
+    "child terminated and joined before retry",
+    "429 stops batch",
+    "debug events exclude credentials",
+    "verified TLS through loopback HTTP CONNECT proxy",
+    "real synthetic SRP M1/M2 with debug enabled"
+  ],
+  "offline_demo": "logs/offline-demo-20261112-224909/verification.json",
+  "entrypoint": "GSA批量测试.command",
+  "configuration": {
+    "concurrency": 2,
+    "proxy_ttl_seconds": 60,
+    "proxy_inventory_target": 10,
+    "device_capacity": 10,
+    "startup_devices": 2,
+    "max_attempts": 2
+  },
+  "live_verification": "logs/batch-20261112-225827-3620/analysis.json",
+  "latest_live_outcome": {
+    "queued": 20,
+    "started": 5,
+    "not_started": 15,
+    "devices_registered": 3,
+    "init_20970_responses": 7,
+    "stop_reason": "provider_circuit_open"
+  }
+}

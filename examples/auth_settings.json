@@ -1,0 +1,21 @@
+{
+  "processes": 2,
+  "threads": 10,
+  "device_capacity": 10,
+  "device_parallelism": 0,
+  "device_selection": "prefer_new",
+  "warmup_devices": 2,
+  "device_rest_after": 20,
+  "device_rest_seconds": 30,
+  "device_rest_slots": 1,
+  "proxy_target": 0,
+  "proxy_ttl": 1800,
+  "timeout": 8,
+  "prepare_timeout": 12,
+  "attempt_budget": 40,
+  "registration_budget": 40,
+  "resource_timeout": 120,
+  "max_attempts": 1,
+  "debug": false,
+  "proxy_scheme": "http"
+}

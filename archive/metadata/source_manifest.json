@@ -1,0 +1,89 @@
+{
+  "source_root": "/Users/xxx/Downloads/core",
+  "files": [
+    {
+      "source": "/Users/xxx/Downloads/core/gsa_status.py",
+      "extracted": "gsa_status.py",
+      "sha256": "2e694fe9db9206ac7752c90f1d3b89d2254d75255451e89a78c34068f4a5b1a3",
+      "source_sha256": "b8bfb901721fbd324d67db708bdcb8759e68eb05a56a4e55dc9c02b39a52cbf8",
+      "local_modifications": [
+        "Preserve per-attempt HTTP outcome separately from Apple business code using thread-local metadata"
+      ]
+    },
+    {
+      "source": "/Users/xxx/Downloads/core/srp_auth.py",
+      "extracted": "srp_auth.py",
+      "sha256": "8e1365729f1d298060d32b971a207df43adedd38d095fe4c5ae3d31c70d3e011",
+      "source_sha256": "8e1365729f1d298060d32b971a207df43adedd38d095fe4c5ae3d31c70d3e011"
+    },
+    {
+      "source": "/Users/xxx/Downloads/core/anisette_v3.py",
+      "extracted": "anisette_v3.py",
+      "sha256": "762c9f2bc98c5bb3b9a9b1f0f8e3999a09cbdde632f6fc2911326649673206ee",
+      "source_sha256": "3a002ad4cf042d0a5c7b842b32967c515372ded16619fd56a5cd29db0a600f93",
+      "local_modifications": [
+        "Explicit HTTP/WebSocket routing for Apple versus Anisette provider",
+        "Optional allowlisted timing hooks"
+      ]
+    },
+    {
+      "source": "/Users/xxx/Downloads/core/apple_trust.py",
+      "extracted": "apple_trust.py",
+      "sha256": "e85cc6a0c836bdf9536f0d6d63b806ef7dc1844bf51068162161ad6d6f47f09f",
+      "source_sha256": "e85cc6a0c836bdf9536f0d6d63b806ef7dc1844bf51068162161ad6d6f47f09f"
+    },
+    {
+      "source": "/Users/xxx/Downloads/core/timing.py",
+      "extracted": "timing.py",
+      "sha256": "115d36c86790c706399ece79487c4154b16bd2db94326c36ddc637f53d588848",
+      "source_sha256": "115d36c86790c706399ece79487c4154b16bd2db94326c36ddc637f53d588848"
+    },
+    {
+      "source": "/Users/xxx/Downloads/core/network_timing.py",
+      "extracted": "network_timing.py",
+      "sha256": "daaf3e5b913a25a7321c053a6135a0f515eb2461a9a051277b12a3ba5488b414",
+      "source_sha256": "2a3034121899e25276f235d730f3d67f11e172a83eb0ada315451760cb3ea2a4",
+      "local_modifications": [
+        "Correct HTTP proxy target DNS mode annotation"
+      ]
+    },
+    {
+      "source": "/Users/xxx/Downloads/core/tls.py",
+      "extracted": "tls.py",
+      "sha256": "fc5c2d350740fbaf973e2f533c46bb6fa21326803ec8225b0fb24df6ab796c06",
+      "source_sha256": "fc5c2d350740fbaf973e2f533c46bb6fa21326803ec8225b0fb24df6ab796c06"
+    },
+    {
+      "source": "/Users/xxx/Downloads/core/gsa_dns.py",
+      "extracted": "gsa_dns.py",
+      "sha256": "c98e7d613204c49f13c224f2a47fdbde2efa64452932af67c085698f6d2a0e9e",
+      "source_sha256": "c98e7d613204c49f13c224f2a47fdbde2efa64452932af67c085698f6d2a0e9e"
+    },
+    {
+      "source": "/Users/xxx/Downloads/core/gsa_runtime.py",
+      "extracted": "reference/gsa_runtime.py",
+      "sha256": "168ce409e6749a88a71cd3a13f921a69cc2f05c701b5d6587938be17c07be311",
+      "source_sha256": "168ce409e6749a88a71cd3a13f921a69cc2f05c701b5d6587938be17c07be311"
+    },
+    {
+      "source": "/Users/xxx/Downloads/core/proxy_api.py",
+      "extracted": "proxy_api.py",
+      "source_sha256": "91dfda75b25901567d3d77b624a14b8bd303cc6190ddde956c9c3367c73aae6b",
+      "sha256": "91dfda75b25901567d3d77b624a14b8bd303cc6190ddde956c9c3367c73aae6b"
+    },
+    {
+      "source": "/Users/xxx/Downloads/core/idmsa.py",
+      "extracted": "idmsa.py",
+      "source_sha256": "31e5d89333a5eac102abb4f4d99685379c6363c48f0e301e539a05b7218d97d8",
+      "sha256": "31e5d89333a5eac102abb4f4d99685379c6363c48f0e301e539a05b7218d97d8"
+    }
+  ],
+  "missing_protocol_dependencies": [],
+  "missing_device_dependencies": [],
+  "verification": "Live 20-task queue tested with concurrency 2. Three devices registered; seven observed init/-20970 responses triggered the configured provider circuit. Raw logs and reconciled accounting retained.",
+  "certificate": {
+    "source": "/www/wwwroot/fastapi/assets/certificates/apple-root-ca.pem",
+    "local": "assets/certificates/apple-root-ca.pem",
+    "sha256_der_expected": "b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024"
+  }
+}
