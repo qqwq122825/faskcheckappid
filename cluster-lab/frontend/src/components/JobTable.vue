@@ -6,7 +6,7 @@ import { api, fmt, percent, date, refresh } from '../composables/useCluster'
 import StatusBadge from './StatusBadge.vue'
 defineProps<{ jobs: any[] }>()
 const router = useRouter()
-const removable = ['completed', 'failed', 'stopped']
+const removable = ['completed', 'failed', 'stopped', 'paused']
 
 async function remove(job: any) {
   try {
@@ -28,7 +28,7 @@ async function remove(job: any) {
     <el-table-column label="任务进度" min-width="220"><template #default="{ row }"><div class="progress-label">{{ fmt(row.confirmed) }} / {{ fmt(row.rows) }} 条</div><el-progress :percentage="Number(percent(row).toFixed(1))" :stroke-width="7" /></template></el-table-column>
     <el-table-column label="操作" width="210" fixed="right"><template #default="{ row }">
       <el-button plain @click="router.push('/jobs/' + row.id)">查看详情</el-button>
-      <el-tooltip :disabled="removable.includes(row.status)" content="任务仍在运行或排队，先停止再删除" placement="top">
+      <el-tooltip :disabled="removable.includes(row.status)" content="任务正在执行，先停止再删除" placement="top">
         <span><el-button :icon="Delete" :disabled="!removable.includes(row.status)" @click="remove(row)" /></span>
       </el-tooltip>
     </template></el-table-column>

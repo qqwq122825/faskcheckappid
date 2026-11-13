@@ -772,8 +772,14 @@ class Controller:
             job = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
             if not job:
                 raise ValueError('任务不存在')
-            if job['status'] in ('running', 'paused', 'queued', 'preparing'):
+            if job['status'] in ('running', 'queued', 'preparing'):
                 raise Conflict('任务仍在运行或排队，请先停止')
+            if job['status'] == 'paused':
+                # 暂停的任务可以删，但节点上还有包在跑时要等它回传完
+                active = db.execute("SELECT COUNT(*) FROM units WHERE job_id=? "
+                                    "AND status IN ('leased','running')", (job_id,)).fetchone()[0]
+                if active:
+                    raise Conflict(f'仍有 {active} 个工作包在节点上执行，稍候再删除')
             db.execute('DELETE FROM units WHERE job_id=?', (job_id,))
             db.execute('DELETE FROM jobs WHERE id=?', (job_id,))
             event(db, 'job_deleted', f'任务已删除：{job["name"]}', job_id=None)
