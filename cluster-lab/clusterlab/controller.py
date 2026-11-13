@@ -66,6 +66,10 @@ class Controller:
         self.results = private_dir(self.root / 'results')
         self.db = Database(self.root / 'controller.sqlite3', SCHEMA)
         with self.db.transaction() as db:
+            job_columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
+            if 'queued_at' not in job_columns:
+                db.execute('ALTER TABLE jobs ADD COLUMN queued_at REAL')
+                db.execute("UPDATE jobs SET queued_at=created WHERE status IN ('running','paused')")
             columns = {row['name'] for row in db.execute('PRAGMA table_info(nodes)')}
             for name, definition in {'telemetry_json': "TEXT NOT NULL DEFAULT '{}'",
                                      'stop_version': 'INTEGER NOT NULL DEFAULT 0',
@@ -79,8 +83,13 @@ class Controller:
         self.dispatch_times = deque()
         self.preparer = ThreadPoolExecutor(max_workers=1, thread_name_prefix='file-preparation')
         self.closing = threading.Event()
-        with self.db.connect() as db:
-            preparing = [r['id'] for r in db.execute("SELECT id FROM jobs WHERE status='preparing'")]
+        with self.db.transaction() as db:
+            # Retain the oldest active task when upgrading an older installation.
+            running = list(db.execute("SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id"))
+            for row in running[1:]:
+                db.execute("UPDATE jobs SET status='queued',queued_at=COALESCE(queued_at,created) WHERE id=?", (row['id'],))
+            self._advance_queue(db)
+            preparing = [r['id'] for r in db.execute("SELECT id FROM jobs WHERE status='preparing' ORDER BY created,id")]
         for job_id in preparing:
             self.preparer.submit(self.prepare, job_id)
 
@@ -126,8 +135,10 @@ class Controller:
                        (processes, threads, int(data['enabled']), node_id))
             event(db, 'node_config', '节点执行配置已更新，下一次心跳下发；在途工作包保持原配置', node_id=node_id)
 
-    def create_job(self, name, stream, unit_rows=500, mode='digest'):
+    def create_job(self, name, stream, unit_rows=500, mode='digest', enqueue=False):
         integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
+        if type(enqueue) is not bool:
+            raise ValueError('加入队列选项无效')
         if mode not in ('digest', 'simulate'):
             raise ValueError('仅支持离线摘要或模拟任务')
         job_id = uuid.uuid4().hex
@@ -140,9 +151,9 @@ class Controller:
             raise ValueError('文件为空')
         now = time.time()
         with self.db.transaction() as db:
-            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode) VALUES(?,?,?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
                        (job_id, str(name).strip()[:120] or '未命名任务', 'preparing', now, now,
-                        str(target), target.stat().st_size, unit_rows, mode))
+                        str(target), target.stat().st_size, unit_rows, mode, now if enqueue else None))
             event(db, 'job_uploaded', '输入文件已保存，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
@@ -219,13 +230,26 @@ class Controller:
                 if buffer:
                     self._save_unit(job_id, seq + 1, first_row, buffer, directory, rows)
             with self.db.transaction() as db:
-                db.execute("UPDATE jobs SET status='ready',rows=?,updated=? WHERE id=?", (rows, time.time(), job_id))
+                db.execute("UPDATE jobs SET status=CASE WHEN queued_at IS NOT NULL THEN 'queued' ELSE 'ready' END,rows=?,updated=? WHERE id=?", (rows, time.time(), job_id))
                 event(db, 'job_ready', f'文件准备完成，共 {rows:,} 条记录', job_id=job_id)
+                self._advance_queue(db)
         except Exception as exc:
             message = str(exc) if isinstance(exc, (ValueError, UnicodeError)) else type(exc).__name__
             with self.db.transaction() as db:
-                db.execute("UPDATE jobs SET status='failed',error=?,updated=? WHERE id=?", (message, time.time(), job_id))
+                db.execute("UPDATE jobs SET status='failed',queued_at=NULL,error=?,updated=? WHERE id=?", (message, time.time(), job_id))
                 event(db, 'prepare_failed', message, job_id=job_id)
+                self._advance_queue(db)
+
+    def _advance_queue(self, db):
+        if db.execute("SELECT 1 FROM jobs WHERE status IN ('running','paused') LIMIT 1").fetchone():
+            return
+        # Older versions could have leased work belonging to another task.
+        if db.execute("SELECT 1 FROM units WHERE status IN ('leased','running') LIMIT 1").fetchone():
+            return
+        head = db.execute("SELECT id,status FROM jobs WHERE status='queued' OR (status='preparing' AND queued_at IS NOT NULL) ORDER BY queued_at,id LIMIT 1").fetchone()
+        if head and head['status'] == 'queued':
+            db.execute("UPDATE jobs SET status='running',updated=? WHERE id=?", (time.time(), head['id']))
+            event(db, 'job_started', '轮到本任务，自动开始派发', job_id=head['id'])
 
     def _save_unit(self, job_id, seq, first_row, lines, directory, rows):
         path = directory / f'{seq:08d}.part'
@@ -244,9 +268,19 @@ class Controller:
             job = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
             if not job:
                 raise ValueError('任务不存在')
-            if action == 'start' and job['status'] in ('ready', 'paused'):
+            if action == 'start' and job['status'] == 'ready':
+                db.execute("UPDATE jobs SET status='queued',queued_at=?,updated=? WHERE id=?", (time.time(), time.time(), job_id))
+                event(db, 'job_queued', '任务已加入执行队列', job_id=job_id)
+                self._advance_queue(db)
+            elif action == 'start' and job['status'] == 'paused':
                 db.execute("UPDATE jobs SET status='running',updated=? WHERE id=?", (time.time(), job_id))
-                event(db, 'job_started', '任务开始派发', job_id=job_id)
+                event(db, 'job_started', '继续当前任务，恢复派发', job_id=job_id)
+            elif action == 'start' and job['status'] in ('queued', 'running'):
+                pass
+            elif action == 'dequeue' and (job['status'] == 'queued' or job['status'] == 'preparing' and job['queued_at'] is not None):
+                db.execute("UPDATE jobs SET status=CASE WHEN status='queued' THEN 'ready' ELSE status END,queued_at=NULL,updated=? WHERE id=?", (time.time(), job_id))
+                event(db, 'job_dequeued', '任务已移出队列，可稍后重新加入', job_id=job_id)
+                self._advance_queue(db)
             elif action == 'pause' and job['status'] == 'running':
                 db.execute("UPDATE jobs SET status='paused',updated=? WHERE id=?", (time.time(), job_id))
                 event(db, 'job_paused', '已暂停派发，在途工作包继续完成', job_id=job_id)
@@ -352,7 +386,7 @@ class Controller:
             active = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? AND status IN ('leased','running')", (node_id,)).fetchone()[0]
             if not node['enabled'] or active >= min(node['desired_processes'], node['max_processes'] or 1):
                 return None
-            unit = db.execute("SELECT u.*,j.mode FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.status='running' ORDER BY j.created,u.seq LIMIT 1").fetchone()
+            unit = db.execute("SELECT u.*,j.mode FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
             if not unit:
                 return None
             token = secrets.token_urlsafe(24)
@@ -429,6 +463,7 @@ class Controller:
                 if not unfinished:
                     db.execute("UPDATE jobs SET status='completed',updated=? WHERE id=?", (time.time(), unit['job_id']))
                     event(db, 'job_completed', '全部工作包已确认，任务完成', unit['job_id'])
+                    self._advance_queue(db)
                 return {'accepted': True, 'duplicate': False}
         finally:
             temporary.unlink(missing_ok=True)
@@ -438,8 +473,16 @@ class Controller:
         with self.db.transaction() as db:
             self._expire(db)
             jobs = []
-            for row in db.execute('SELECT * FROM jobs ORDER BY created DESC LIMIT 50'):
-                value = {k: row[k] for k in ('id', 'name', 'status', 'created', 'updated', 'bytes', 'rows', 'unit_rows', 'mode', 'error')}
+            queue_filter = "(status='queued' OR (status='preparing' AND queued_at IS NOT NULL))"
+            waiting_count = db.execute(f'SELECT COUNT(*) FROM jobs WHERE {queue_filter}').fetchone()[0]
+            queue = [dict(row) for row in db.execute(f'SELECT id,name,status,rows FROM jobs WHERE {queue_filter} ORDER BY queued_at,id LIMIT 10')]
+            for position, entry in enumerate(queue, 1):
+                entry['position'] = position
+            current = db.execute("SELECT id FROM jobs WHERE status IN ('running','paused') ORDER BY queued_at,created,id LIMIT 1").fetchone()
+            for row in db.execute("SELECT * FROM jobs ORDER BY CASE WHEN status IN ('running','paused') THEN 0 WHEN status='queued' OR (status='preparing' AND queued_at IS NOT NULL) THEN 1 ELSE 2 END,CASE WHEN status IN ('queued','running','paused') OR (status='preparing' AND queued_at IS NOT NULL) THEN queued_at END,created DESC,id LIMIT 50"):
+                value = {k: row[k] for k in ('id', 'name', 'status', 'created', 'updated', 'bytes', 'rows', 'unit_rows', 'mode', 'error', 'queued_at')}
+                value['queue_position'] = (db.execute(f'SELECT COUNT(*) FROM jobs WHERE {queue_filter} AND (queued_at<? OR (queued_at=? AND id<=?))', (row['queued_at'], row['queued_at'], row['id'])).fetchone()[0]
+                                           if row['status'] in ('queued', 'preparing') and row['queued_at'] is not None else None)
                 groups = db.execute('SELECT status,COUNT(*) AS n,SUM(rows) AS rows FROM units WHERE job_id=? GROUP BY status', (row['id'],)).fetchall()
                 counts = {r['status']: r['n'] for r in groups}
                 row_counts = {r['status']: r['rows'] for r in groups}
@@ -465,11 +508,13 @@ class Controller:
             counts = db.execute("SELECT COALESCE(SUM(CASE WHEN status='completed' THEN rows ELSE 0 END),0),COALESCE(SUM(CASE WHEN status IN ('running','leased','completed') THEN processed ELSE 0 END),0) FROM units").fetchone()
             maximum = db.execute("SELECT value FROM controller_settings WHERE key='max_unit_rows'").fetchone()[0]
             return {'jobs': jobs, 'nodes': nodes, 'events': events, 'server_time': now,
+                    'current_job_id': current['id'] if current else None, 'queue': queue,
                     'settings': {'max_unit_rows': maximum, 'default_unit_rows': min(1000, maximum),
                                  'unit_byte_limit': 4 * 1024 * 1024},
                     'totals': {'rows': aggregate[0], 'jobs': aggregate[1], 'confirmed': counts[0],
                                'processed': counts[1], 'online': sum(n['status'] != 'offline' for n in nodes),
-                               'nodes': len(nodes), 'rate': round(sum(n['rate'] for n in nodes), 1)}}
+                               'nodes': len(nodes), 'busy': sum(n['status'] != 'offline' and n['active'] > 0 for n in nodes),
+                               'queued': waiting_count, 'rate': round(sum(n['rate'] for n in nodes), 1)}}
 
     def result_paths(self, job_id):
         with self.db.connect() as db:

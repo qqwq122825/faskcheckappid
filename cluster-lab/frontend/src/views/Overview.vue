@@ -1,41 +1,33 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref } from 'vue'
+import { computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { Plus, ArrowRight, VideoPlay, VideoPause, RefreshRight } from '@element-plus/icons-vue'
-import { state, isNode, fmt, createTaskOpen, jobRates, date } from '../composables/useCluster'
-import { DEMO_TOTAL, simulatedCounts } from '../lib/simulation.js'
+import { ArrowRight } from '@element-plus/icons-vue'
+import { state, isNode, fmt, percent, date } from '../composables/useCluster'
 import ConnectPanel from '../components/ConnectPanel.vue'
-import TaskActions from '../components/TaskActions.vue'
-import TaskFeedback from '../components/TaskFeedback.vue'
+import MetricCard from '../components/MetricCard.vue'
+import StatusBadge from '../components/StatusBadge.vue'
 const router = useRouter()
 const jobs = computed<any[]>(() => state.value?.jobs || [])
-const job = computed(() => jobs.value.find(j => j.status === 'running') || jobs.value[0])
-const inFlight = computed(() => (job.value?.row_counts?.leased || 0) + (job.value?.row_counts?.running || 0))
-const unconfirmed = computed(() => (job.value?.row_counts?.unknown || 0) + Math.max(0, (job.value?.processed || 0) - (job.value?.confirmed || 0)))
-const preview = ref(false), playing = ref(false), done = ref(0)
-const categories = computed(() => simulatedCounts(done.value))
-const demoStatus = computed(() => done.value === DEMO_TOTAL ? 'completed' : playing.value ? 'running' : 'paused')
-let timer: ReturnType<typeof setInterval> | undefined
-function pauseDemo() { playing.value = false; clearInterval(timer) }
-function playDemo() {
-  if (done.value === DEMO_TOTAL) done.value = 0
-  pauseDemo(); playing.value = true
-  timer = setInterval(() => {
-    done.value = Math.min(DEMO_TOTAL, done.value + 250)
-    if (done.value === DEMO_TOTAL) pauseDemo()
-  }, 500)
-}
-function openDemo() { preview.value = true; done.value = 0; playDemo() }
-function closeDemo() { pauseDemo(); preview.value = false }
-onUnmounted(pauseDemo)
+const job = computed(() => jobs.value.find(j => j.id === state.value?.current_job_id) || jobs.value[0])
+const totals = computed(() => state.value?.totals || {})
+const queue = computed<any[]>(() => state.value?.queue || [])
 </script>
 <template>
   <ConnectPanel v-if="isNode" />
   <template v-else-if="state">
-    <div class="home-task-toolbar"><div><span class="current-task-label">当前任务</span></div><div class="actions"><el-button v-if="!preview" @click="openDemo">查看统计演示</el-button><el-button v-else @click="closeDemo">返回当前任务</el-button><el-button :icon="Plus" type="primary" @click="createTaskOpen = true">上传 TXT 创建任务</el-button></div></div>
-    <template v-if="preview"><el-alert title="界面演示：以下数字由浏览器本地生成，不会修改任务，也不向节点下发工作。" type="warning" :closable="false" show-icon /><div class="home-task-heading"><div><h2>离线统计演示 · 10,000 条合成记录</h2><p>模拟成功、失败、超时和跳过的结果反馈。</p></div><div class="actions"><el-button v-if="playing" :icon="VideoPause" @click="pauseDemo">暂停演示</el-button><el-button v-else-if="done < DEMO_TOTAL" type="primary" :icon="VideoPlay" @click="playDemo">继续演示</el-button><el-button :icon="RefreshRight" @click="openDemo">重新演示</el-button></div></div><TaskFeedback :total="DEMO_TOTAL" :completed="done" :active="playing ? Math.min(250, DEMO_TOTAL - done) : 0" :success="categories.success" :failed="categories.failed" :timeout="categories.timeout" :skipped="categories.skipped" :unconfirmed="0" :pending="Math.max(0, DEMO_TOTAL - done - (playing ? 250 : 0))" :rate="playing ? 500 : 0" :status="demoStatus" preview /></template>
-    <template v-else-if="job"><div class="home-task-heading"><div><h2>{{ job.name }}</h2><p>{{ date(job.created) }} 创建 · {{ job.mode === 'simulate' ? '离线合成任务' : '文件摘要任务' }}</p></div><TaskActions :job="job" /></div><el-alert v-if="job.error || job.unit_counts.unknown || job.status === 'preparing' || job.status === 'paused'" :title="job.error || (job.unit_counts.unknown ? '存在待确认工作包，请核对后再决定是否重新排队。' : job.status === 'preparing' ? '正在解析文件，当前总数为已解析数量，准备完成后可开始。' : '已暂停派发新工作包，在途工作继续执行。')" :type="job.error ? 'error' : 'info'" :closable="false" show-icon /><TaskFeedback :total="job.rows" :completed="job.confirmed" :active="inFlight" :success="job.confirmed" :failed="null" :timeout="null" :unconfirmed="unconfirmed" :pending="job.row_counts?.pending || 0" :rate="jobRates[job.id] || 0" :status="job.status" /><div class="home-task-bottom"><span>本次任务 · {{ job.unit_counts.completed || 0 }} / {{ job.units }} 个工作包已确认</span><el-button :icon="ArrowRight" @click="router.push('/jobs/' + job.id)">查看任务详情</el-button></div></template>
-    <el-card v-else shadow="never"><el-empty description="创建任务后，这里直接展示本次进度与结果。"><el-button type="primary" @click="createTaskOpen = true">创建第一个任务</el-button></el-empty></el-card>
-    <div class="home-shortcuts"><el-button link @click="router.push('/jobs')">全部任务</el-button><el-button link @click="router.push('/nodes')">节点配置</el-button><el-button link @click="router.push('/events')">运行日志</el-button></div>
+    <div class="metrics-grid cluster-overview">
+      <MetricCard label="节点总数" :value="fmt(totals.nodes)" unit="台" note="已登记的执行节点" />
+      <MetricCard label="在线节点" :value="fmt(totals.online)" unit="台" note="心跳连接正常" accent />
+      <MetricCard label="工作节点" :value="fmt(totals.busy)" unit="台" note="当前有在途分片" />
+      <MetricCard label="排队任务" :value="fmt(totals.queued)" unit="个" note="包含已入队且正在准备文件的任务" />
+    </div>
+    <div class="home-task-toolbar"><span class="current-task-label">{{ state.current_job_id ? '当前任务' : job?.status === 'queued' || job?.status === 'preparing' ? '等待执行' : '最近任务' }}</span><el-button :icon="ArrowRight" @click="router.push('/jobs')">任务管理</el-button></div>
+    <el-card v-if="job" shadow="never" class="section-card">
+      <div class="section-heading"><div><div class="task-name"><h2>{{ job.name }}</h2><StatusBadge :status="job.status" /></div><p>{{ date(job.created) }} 创建 · {{ fmt(job.confirmed) }} / {{ fmt(job.rows) }} 条已确认</p></div><el-button type="primary" :icon="ArrowRight" @click="router.push('/jobs/' + job.id)">查看任务详情</el-button></div>
+      <el-progress class="summary-progress" :percentage="Number(percent(job).toFixed(1))" :stroke-width="10" />
+      <p v-if="job.status === 'paused'" class="muted">当前任务暂停中，后续任务保留排队顺序。</p>
+    </el-card>
+    <el-card v-else shadow="never" class="section-card"><el-empty description="暂无任务，请到任务管理上传 TXT 并加入队列。"><el-button type="primary" @click="router.push('/jobs')">前往任务管理</el-button></el-empty></el-card>
+    <el-card shadow="never" class="section-card"><template #header><div class="section-heading"><div><h2>等待队列 <span class="muted">{{ fmt(totals.queued) }} 个任务</span></h2><p>按加入顺序执行，当前任务全部确认后自动接续。显示接下来的 10 个任务。</p></div><el-button link @click="router.push('/jobs')">查看全部任务</el-button></div></template><el-table :data="queue" empty-text="暂无排队任务"><el-table-column prop="position" label="顺序" width="85" /><el-table-column label="任务名称" min-width="240"><template #default="{ row }"><el-button link class="job-link" @click="router.push('/jobs/' + row.id)">{{ row.name }}</el-button></template></el-table-column><el-table-column label="记录数" width="150"><template #default="{ row }">{{ fmt(row.rows) }}</template></el-table-column><el-table-column label="状态" width="155"><template #default="{ row }"><StatusBadge :status="row.status" /></template></el-table-column></el-table></el-card>
   </template>
 </template>

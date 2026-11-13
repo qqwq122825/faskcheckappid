@@ -42,6 +42,87 @@ class ControllerTests(unittest.TestCase):
                          for n in range(unit['first_row'], unit['first_row'] + unit['rows']))
         return value, hashlib.sha256(value).hexdigest()
 
+    def queued_job(self, count=10000, unit_rows=1000):
+        job = self.service.create_job('queued test', io.BytesIO(b'hello\n' * count), unit_rows, enqueue=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = next(j for j in self.service.snapshot()['jobs'] if j['id'] == job)
+            if state['status'] != 'preparing':
+                return job
+            time.sleep(.01)
+        self.fail('queued preparation did not finish')
+
+    def confirm(self, unit):
+        payload, checksum = self.output(unit)
+        return self.service.accept_result(self.node['id'], unit['id'], unit['token'], io.BytesIO(payload), checksum)
+
+    def test_fifo_starts_second_task_only_after_final_ack_of_first(self):
+        first, second = self.queued_job(10001), self.queued_job(10000)
+        snapshot = self.service.snapshot()
+        self.assertEqual(snapshot['current_job_id'], first)
+        self.assertEqual(snapshot['queue'][0]['id'], second)
+        self.assertEqual(snapshot['totals']['queued'], 1)
+        units = []
+        for _ in range(11):
+            unit = self.service.lease(self.node['id'], 'test-session')
+            self.assertEqual(unit['job_id'], first)
+            units.append(unit)
+            self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
+            self.assertEqual(self.service.snapshot()['current_job_id'], first)
+            self.confirm(unit)
+        self.assertEqual(sum(unit['rows'] for unit in units), 10001)
+        self.assertEqual(self.service.snapshot()['current_job_id'], second)
+        self.assertTrue(self.confirm(units[-1])['duplicate'])
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual(unit['job_id'], second)
+
+    def test_pause_reserves_queue_position_across_controller_restart(self):
+        first, second = self.queued_job(100, 50), self.queued_job(50, 50)
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.service.job_action(first, 'pause')
+        self.confirm(unit)
+        self.service.close()
+        self.service = Controller(self.temp.name)
+        self.assertEqual(self.service.snapshot()['current_job_id'], first)
+        self.assertEqual(self.service.snapshot()['queue'][0]['id'], second)
+        self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
+        self.service.job_action(first, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.confirm(unit)
+        self.assertEqual(self.service.snapshot()['current_job_id'], second)
+
+    def test_preparing_head_cannot_be_overtaken_and_can_leave_queue(self):
+        from unittest.mock import patch
+        with patch.object(self.service.preparer, 'submit'):
+            first = self.service.create_job('first', io.BytesIO(b'hello\n' * 50), 50, enqueue=True)
+            second = self.service.create_job('second', io.BytesIO(b'hello\n' * 50), 50, enqueue=True)
+        self.service.prepare(second)
+        self.assertIsNone(self.service.snapshot()['current_job_id'])
+        self.assertEqual([j['id'] for j in self.service.snapshot()['queue']], [first, second])
+        self.service.job_action(first, 'dequeue')
+        self.assertEqual(self.service.snapshot()['current_job_id'], second)
+        self.service.prepare(first)
+        self.assertEqual(next(j['status'] for j in self.service.snapshot()['jobs'] if j['id'] == first), 'ready')
+        self.service.job_action(first, 'start')
+        self.assertEqual(self.service.snapshot()['queue'][0]['id'], first)
+
+    def test_failed_preparation_advances_queue_and_simultaneous_starts_serialize(self):
+        from unittest.mock import patch
+        from concurrent.futures import ThreadPoolExecutor
+        with patch.object(self.service.preparer, 'submit'):
+            failed = self.service.create_job('bad', io.BytesIO(b'\xff\n'), 50, enqueue=True)
+            queued = self.service.create_job('next', io.BytesIO(b'hello\n' * 50), 50, enqueue=True)
+        self.service.prepare(queued)
+        self.service.prepare(failed)
+        self.assertEqual(self.service.snapshot()['current_job_id'], queued)
+        self.confirm(self.service.lease(self.node['id'], 'test-session'))
+        jobs = [self.job(50) for _ in range(3)]
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            list(pool.map(lambda job: self.service.job_action(job, 'start'), jobs))
+        snapshot = self.service.snapshot()
+        self.assertEqual(sum(j['status'] == 'running' for j in snapshot['jobs']), 1)
+        self.assertEqual(snapshot['totals']['queued'], 2)
+
     def test_lease_requires_started_job_and_respects_node_capacity(self):
         job = self.job()
         self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))

@@ -4,7 +4,7 @@ export const router = createRouter({
   history: createWebHashHistory(),
   scrollBehavior: () => ({ top: 0 }),
   routes: [
-    { path: '/', component: () => import('./views/Overview.vue'), meta: { title: '首页', description: '直接查看当前任务的进度、结果与处理速度。' } },
+    { path: '/', component: () => import('./views/Overview.vue'), meta: { title: '首页', description: '节点概况、当前任务进度与等待队列。' } },
     { path: '/jobs', component: () => import('./views/Jobs.vue'), meta: { title: '任务管理', description: '创建任务、查看进度，按任务下载结果。' } },
     { path: '/jobs/:id', component: () => import('./views/JobDetail.vue'), meta: { title: '任务详情', description: '本页统计仅属于当前任务。' } },
     { path: '/nodes', component: () => import('./views/Nodes.vue'), meta: { title: '节点配置', description: '集中查看节点状态，调整后续工作包的执行配置。' } },

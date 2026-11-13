@@ -127,7 +127,10 @@ def create_app(role, service, password=None):
             if not uploaded:
                 raise ValueError('请选择 UTF-8 文本文件')
             unit_rows = int(request.form.get('unit_rows', str(service.settings()['default_unit_rows'])))
-            job_id = service.create_job(request.form.get('name') or uploaded.filename, uploaded.stream, unit_rows, 'digest')
+            enqueue = request.form.get('enqueue', 'false')
+            if enqueue not in ('true', 'false'):
+                raise ValueError('加入队列选项无效')
+            job_id = service.create_job(request.form.get('name') or uploaded.filename, uploaded.stream, unit_rows, 'digest', enqueue == 'true')
             return jsonify(id=job_id), 202
 
         @app.post('/api/demo')
