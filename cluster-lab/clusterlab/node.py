@@ -157,10 +157,13 @@ class Node:
                     self.active.pop(unit_id, None)
 
     def apply_config(self, config):
-        """总控下发的出口配置；只在内存里保存，不落盘。"""
+        """总控下发的出口配置；只在内存里保存，不落盘。
+
+        兼容两种键名：proxy_for_node 返回的是 api/scheme，老版本是 proxy_api。
+        """
         if isinstance(config, dict):
-            self.proxy_api = str(config.get('proxy_api') or '')
-            self.proxy_scheme = str(config.get('proxy_scheme') or 'socks5h')
+            self.proxy_api = str(config.get('api') or config.get('proxy_api') or '')
+            self.proxy_scheme = str(config.get('scheme') or config.get('proxy_scheme') or 'socks5h')
             self.origin = str(config.get('origin') or self.origin)
 
     def _heartbeat(self):
@@ -199,8 +202,9 @@ class Node:
             if requested and not self.builder.state['running']:
                 try:
                     self.builder.start(int(requested))
-                except (RuntimeError, ValueError):
-                    pass
+                except (RuntimeError, ValueError) as exc:
+                    # 不能静默吞：面板上看不到原因会以为节点没响应
+                    self.builder._update(message=str(exc))
             # 运行中轮换：用够次数的设备删身份重注册，池子始终是新的
             limit = int(value.get('device_rotate_after') or 0)
             if limit and not self.builder.state['running']:
