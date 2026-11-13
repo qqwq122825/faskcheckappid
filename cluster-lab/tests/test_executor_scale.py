@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import _execute_auth_unit, execute_unit_group
+from clusterlab.executor import _execute_auth_unit, atomic_json, execute_unit_group
 
 
 class FakePool:
@@ -80,6 +80,28 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(done['checksum'], hashlib.sha256(payload).hexdigest())
             self.assertEqual(usage_calls, [{1: 250, 2: 250}])
             self.assertEqual(len(payload.splitlines()), 500)
+
+    def test_auth_progress_is_time_based_instead_of_waiting_for_ten_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text('account----password\n', encoding='utf-8')
+            descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool, lambda *_args, **_kwargs: {'status': 'wrong_password'},
+                    lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'), \
+                 patch('clusterlab.executor.time.monotonic', side_effect=[10.0, 10.3]), \
+                 patch('clusterlab.executor.atomic_json', wraps=atomic_json) as writes:
+                _execute_auth_unit(root, descriptor, threading.Event())
+
+            progress = [call.args[1] for call in writes.call_args_list
+                        if call.args[0].name == 'progress.json']
+            self.assertEqual([item['processed'] for item in progress], [1, 1])
+            self.assertEqual(progress[0]['counts'], {'wrong_password': 1})
 
 
 if __name__ == '__main__':

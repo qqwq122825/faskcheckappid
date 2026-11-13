@@ -361,6 +361,7 @@ def _execute_auth_unit(directory, descriptor, stop):
     workers = max(1, int(descriptor.get('threads') or 1))
     counters = Counter()
     processed = 0
+    last_progress = time.monotonic()
 
     pool = DevicePool(device_root, origin, max_devices=capacity)
     from fastcheck.workers import device_profile
@@ -463,10 +464,12 @@ def _execute_auth_unit(directory, descriptor, stop):
                 output.write(encoded)
                 output_digest.update(encoded)
                 usage_counts[device] += 1
-                if processed % 10 == 0:
+                now = time.monotonic()
+                if now - last_progress >= 0.25:
                     atomic_json(directory / 'progress.json',
                                 {'processed': processed, 'started': started,
                                  'counts': dict(counters)})
+                    last_progress = now
 
     if processed != int(descriptor.get('rows') or 0):
         raise ValueError('输入条数和工作包描述不一致')

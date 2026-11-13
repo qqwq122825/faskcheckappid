@@ -26,7 +26,7 @@ Command: cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python -m unitt
 Input: modified working tree, including live category, retry, node-limit and migration tests.
 Literal output/result:
 ----------------------------------------------------------------------
-Ran 38 tests in 3.931s
+Ran 39 tests in 3.734s
 
 OK
 MODIFIED_TEST_EXIT=0
@@ -61,7 +61,7 @@ Command: cd /Users/xxx/Documents/并发 && .venv/bin/python -m unittest discover
 Input: complete modified working tree; no runtime input.
 Literal output/result:
 ----------------------------------------------------------------------
-Ran 114 tests in 34.910s
+Ran 114 tests in 34.118s
 
 OK
 ROOT_TEST_EXIT=0
@@ -120,14 +120,14 @@ Exit status: 0
 Report: /Users/xxx/Documents/并发/cluster-lab/runtime/live-feedback-036/report.json
 
 ROLLBACK
-Command: /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/rollback-test && diff -qr /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/rollback-original /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/rollback-test && cd /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/rollback-test/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Command: /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/rollback-test-v2 && diff -qr /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/rollback-original-v2 /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/rollback-test-v2 && cd /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/rollback-test-v2/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
 Input: a second clean copy of baseline commit with DIFF_FILE applied, then reversed by executable ROLLBACK.sh.
 Literal output/result:
 ROLLBACK_RESULT=restored pre-change source, built UI, version, retry UI, node limits, and final-only category behavior
 ROLLBACK_DIFF_EXIT=0
 ...................................
 ----------------------------------------------------------------------
-Ran 35 tests in 3.782s
+Ran 35 tests in 3.874s
 
 OK
 ROLLBACK_TEST_EXIT=0
@@ -138,7 +138,7 @@ OBSERVED MODIFIED BEHAVIOR
 - The task form exposes timeout retry count 0..5 and leases preserve the selected value (observed: retries=4).
 - Node configuration defaults to 10 processes x 100 threads, offers “use machine maximum,” and the next lease uses the saved values (observed: 10x100).
 - A legacy node stuck at 32 threads is migrated once to 100 when it reports that capacity.
-- processed and category counts update from the 1-second heartbeat before package completion.
+- Auth progress is persisted by elapsed time (every 0.25 seconds when results arrive), not after each ten rows; processed and category counts reach the controller on the 1-second heartbeat before package completion.
 - Final result counters replace live counters atomically; the observed final values were not doubled.
 
 ORIGINAL SHA256

@@ -221,7 +221,7 @@ index 4c22ae1..72cb74f 100644
                  jobs.append(value)
              nodes = []
 diff --git a/cluster-lab/clusterlab/executor.py b/cluster-lab/clusterlab/executor.py
-index 60eb32e..8348ac9 100644
+index 60eb32e..a45f78b 100644
 --- a/cluster-lab/clusterlab/executor.py
 +++ b/cluster-lab/clusterlab/executor.py
 @@ -61,16 +61,23 @@ def execute_unit(directory, descriptor, stop):
@@ -310,13 +310,26 @@ index 60eb32e..8348ac9 100644
          atomic_json(directory / 'done.json',
                      {'ok': False, 'processed': processed,
                       'error': f'{type(exc).__name__}: {exc}'[:300]})
-@@ -447,12 +465,15 @@ def _execute_auth_unit(directory, descriptor, stop):
+@@ -343,6 +361,7 @@ def _execute_auth_unit(directory, descriptor, stop):
+     workers = max(1, int(descriptor.get('threads') or 1))
+     counters = Counter()
+     processed = 0
++    last_progress = time.monotonic()
+ 
+     pool = DevicePool(device_root, origin, max_devices=capacity)
+     from fastcheck.workers import device_profile
+@@ -445,14 +464,19 @@ def _execute_auth_unit(directory, descriptor, stop):
+                 output.write(encoded)
+                 output_digest.update(encoded)
                  usage_counts[device] += 1
-                 if processed % 10 == 0:
+-                if processed % 10 == 0:
++                now = time.monotonic()
++                if now - last_progress >= 0.25:
                      atomic_json(directory / 'progress.json',
 -                                {'processed': processed, 'started': started})
 +                                {'processed': processed, 'started': started,
 +                                 'counts': dict(counters)})
++                    last_progress = now
  
      if processed != int(descriptor.get('rows') or 0):
          raise ValueError('输入条数和工作包描述不一致')
@@ -742,9 +755,18 @@ index f521001..7d348a8 100644
          job = self.job(101)
          snapshot = self.service.snapshot()['jobs'][0]
 diff --git a/cluster-lab/tests/test_executor_scale.py b/cluster-lab/tests/test_executor_scale.py
-index 8c25af7..db720c2 100644
+index 8c25af7..121493a 100644
 --- a/cluster-lab/tests/test_executor_scale.py
 +++ b/cluster-lab/tests/test_executor_scale.py
+@@ -10,7 +10,7 @@ from unittest.mock import patch
+ 
+ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+ 
+-from clusterlab.executor import _execute_auth_unit, execute_unit_group
++from clusterlab.executor import _execute_auth_unit, atomic_json, execute_unit_group
+ 
+ 
+ class FakePool:
 @@ -44,6 +44,7 @@ class ExecutorScaleTests(unittest.TestCase):
              self.assertTrue(done['ok'], done)
              self.assertEqual(done['workers'], 4)
@@ -753,7 +775,7 @@ index 8c25af7..db720c2 100644
              self.assertEqual([record['row'] for record in records], list(range(7001, 7124)))
              self.assertEqual([record['account'] for record in records], lines)
              self.assertEqual(done['checksum'], hashlib.sha256(
-@@ -74,6 +75,8 @@ class ExecutorScaleTests(unittest.TestCase):
+@@ -74,10 +75,34 @@ class ExecutorScaleTests(unittest.TestCase):
              done = json.loads((root / 'done.json').read_text('utf-8'))
              payload = (root / 'results.jsonl').read_bytes()
              self.assertEqual(done['processed'], 500)
@@ -762,6 +784,32 @@ index 8c25af7..db720c2 100644
              self.assertEqual(done['checksum'], hashlib.sha256(payload).hexdigest())
              self.assertEqual(usage_calls, [{1: 250, 2: 250}])
              self.assertEqual(len(payload.splitlines()), 500)
+ 
++    def test_auth_progress_is_time_based_instead_of_waiting_for_ten_results(self):
++        with tempfile.TemporaryDirectory() as temporary:
++            root = Path(temporary)
++            (root / 'input.part').write_text('account----password\n', encoding='utf-8')
++            descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
++                          'device_capacity': 1, 'device_root': str(root / 'devices'),
++                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
++            with patch('clusterlab.executor._load_fastcheck', return_value=(
++                    FakePool, lambda *_args, **_kwargs: {'status': 'wrong_password'},
++                    lambda result: result['status'])), \
++                 patch('fastcheck.workers.device_profile',
++                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
++                 patch('clusterlab.executor._bump_usage'), \
++                 patch('clusterlab.executor.time.monotonic', side_effect=[10.0, 10.3]), \
++                 patch('clusterlab.executor.atomic_json', wraps=atomic_json) as writes:
++                _execute_auth_unit(root, descriptor, threading.Event())
++
++            progress = [call.args[1] for call in writes.call_args_list
++                        if call.args[0].name == 'progress.json']
++            self.assertEqual([item['processed'] for item in progress], [1, 1])
++            self.assertEqual(progress[0]['counts'], {'wrong_password': 1})
++
+ 
+ if __name__ == '__main__':
+     unittest.main()
 diff --git a/cluster-lab/tests/test_node.py b/cluster-lab/tests/test_node.py
 index 2578739..77a2697 100644
 --- a/cluster-lab/tests/test_node.py
