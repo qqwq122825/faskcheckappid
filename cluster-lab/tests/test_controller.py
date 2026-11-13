@@ -76,20 +76,28 @@ class ControllerTests(unittest.TestCase):
         unit = self.service.lease(self.node['id'], 'test-session')
         self.assertEqual(unit['job_id'], second)
 
-    def test_pause_reserves_queue_position_across_controller_restart(self):
+    def test_pause_releases_slot_and_rejoins_queue_on_resume(self):
+        """暂停 = 让出执行位：下一个任务立刻开始，恢复时按原排队时间回到队列。"""
         first, second = self.queued_job(100, 50), self.queued_job(50, 50)
         unit = self.service.lease(self.node['id'], 'test-session')
         self.service.job_action(first, 'pause')
-        self.confirm(unit)
-        self.service.close()
-        self.service = Controller(self.temp.name)
-        self.assertEqual(self.service.snapshot()['current_job_id'], first)
-        self.assertEqual(self.service.snapshot()['queue'][0]['id'], second)
-        self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
-        self.service.job_action(first, 'start')
-        unit = self.service.lease(self.node['id'], 'test-session')
+        # 在途工作包仍可确认，确认后队列立刻推进到第二个任务
         self.confirm(unit)
         self.assertEqual(self.service.snapshot()['current_job_id'], second)
+        # 暂停的任务不占队列位，只以 paused 状态留在任务列表里
+        self.assertEqual(self.service.snapshot()['queue'], [])
+        paused = next(j for j in self.service.snapshot()['jobs'] if j['id'] == first)
+        self.assertEqual(paused['status'], 'paused')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual(unit['job_id'], second)
+        # 总控重启后状态保持
+        self.service.close()
+        self.service = Controller(self.temp.name)
+        self.assertEqual(self.service.snapshot()['current_job_id'], second)
+        self.assertEqual(self.service.snapshot()['queue'], [])
+        # 恢复时回到队列，不会抢占正在跑的任务
+        self.service.job_action(first, 'start')
+        self.assertEqual([j['id'] for j in self.service.snapshot()['queue']], [first])
 
     def test_preparing_head_cannot_be_overtaken_and_can_leave_queue(self):
         from unittest.mock import patch

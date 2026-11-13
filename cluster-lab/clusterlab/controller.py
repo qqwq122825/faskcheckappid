@@ -373,7 +373,9 @@ class Controller:
                 self._advance_queue(db)
 
     def _advance_queue(self, db):
-        if db.execute("SELECT 1 FROM jobs WHERE status IN ('running','paused') LIMIT 1").fetchone():
+        # paused 不挡队列：暂停等于让出执行位，下一个任务立刻开始；
+        # 恢复时按原来记录的排队时间回到队列，位置不会丢。
+        if db.execute("SELECT 1 FROM jobs WHERE status='running' LIMIT 1").fetchone():
             return
         # Older versions could have leased work belonging to another task.
         if db.execute("SELECT 1 FROM units WHERE status IN ('leased','running') LIMIT 1").fetchone():
@@ -405,8 +407,10 @@ class Controller:
                 event(db, 'job_queued', '任务已加入执行队列', job_id=job_id)
                 self._advance_queue(db)
             elif action == 'start' and job['status'] == 'paused':
-                db.execute("UPDATE jobs SET status='running',updated=? WHERE id=?", (time.time(), job_id))
-                event(db, 'job_started', '继续当前任务，恢复派发', job_id=job_id)
+                db.execute("UPDATE jobs SET status='queued',queued_at=COALESCE(queued_at,?),updated=? WHERE id=?",
+                           (time.time(), time.time(), job_id))
+                event(db, 'job_queued', '任务恢复，按原排队顺序回到队列', job_id=job_id)
+                self._advance_queue(db)
             elif action == 'start' and job['status'] in ('queued', 'running'):
                 pass
             elif action == 'dequeue' and (job['status'] == 'queued' or job['status'] == 'preparing' and job['queued_at'] is not None):
@@ -414,8 +418,10 @@ class Controller:
                 event(db, 'job_dequeued', '任务已移出队列，可稍后重新加入', job_id=job_id)
                 self._advance_queue(db)
             elif action == 'pause' and job['status'] == 'running':
-                db.execute("UPDATE jobs SET status='paused',updated=? WHERE id=?", (time.time(), job_id))
-                event(db, 'job_paused', '已暂停派发，在途工作包继续完成', job_id=job_id)
+                db.execute("UPDATE jobs SET status='paused',queued_at=COALESCE(queued_at,?),updated=? WHERE id=?",
+                           (job['created'], time.time(), job_id))
+                event(db, 'job_paused', '已暂停派发，在途工作包继续完成；下一个排队任务开始', job_id=job_id)
+                self._advance_queue(db)
             elif action == 'stop' and job['status'] in ('queued', 'running', 'paused', 'ready'):
                 db.execute("UPDATE jobs SET status='stopped',queued_at=NULL,updated=? WHERE id=?",
                            (time.time(), job_id))
@@ -642,7 +648,8 @@ class Controller:
                 if not unfinished:
                     db.execute("UPDATE jobs SET status='completed',updated=? WHERE id=?", (time.time(), unit['job_id']))
                     event(db, 'job_completed', '全部工作包已确认，任务完成', unit['job_id'])
-                    self._advance_queue(db)
+                # 在途包一确认就要推进队列：暂停/完成的任务可能正卡着下一个
+                self._advance_queue(db)
                 return {'accepted': True, 'duplicate': False}
         finally:
             temporary.unlink(missing_ok=True)
@@ -657,7 +664,10 @@ class Controller:
             queue = [dict(row) for row in db.execute(f'SELECT id,name,status,rows FROM jobs WHERE {queue_filter} ORDER BY queued_at,id LIMIT 10')]
             for position, entry in enumerate(queue, 1):
                 entry['position'] = position
-            current = db.execute("SELECT id FROM jobs WHERE status IN ('running','paused') ORDER BY queued_at,created,id LIMIT 1").fetchone()
+            # running 优先：暂停的任务已经让出执行位，不该再占据"当前任务"位置
+            current = db.execute(
+                "SELECT id FROM jobs WHERE status IN ('running','paused') "
+                "ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END, queued_at, created, id LIMIT 1").fetchone()
             for row in db.execute("SELECT * FROM jobs ORDER BY CASE WHEN status IN ('running','paused') THEN 0 WHEN status='queued' OR (status='preparing' AND queued_at IS NOT NULL) THEN 1 ELSE 2 END,CASE WHEN status IN ('queued','running','paused') OR (status='preparing' AND queued_at IS NOT NULL) THEN queued_at END,created DESC,id LIMIT 50"):
                 value = {k: row[k] for k in ('id', 'name', 'status', 'created', 'updated', 'bytes', 'rows', 'unit_rows', 'mode', 'error', 'queued_at')}
                 value['queue_position'] = (db.execute(f'SELECT COUNT(*) FROM jobs WHERE {queue_filter} AND (queued_at<? OR (queued_at=? AND id<=?))', (row['queued_at'], row['queued_at'], row['id'])).fetchone()[0]
