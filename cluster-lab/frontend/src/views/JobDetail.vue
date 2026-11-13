@@ -8,7 +8,19 @@ import StatusBadge from '../components/StatusBadge.vue'
 import TaskActions from '../components/TaskActions.vue'
 import { jobIssueMessage } from '../lib/jobStatus.js'
 const route = useRoute(), router = useRouter(), expanded = ref<string[]>([])
-const exportCategory = ref('all')
+const exportOptions = [
+  { label: '全部结果', value: 'all' },
+  { label: '密正', value: 'valid' },
+  { label: '密码错误', value: 'wrong_password' },
+  { label: '双重验证', value: 'need_2fa' },
+  { label: '锁定', value: 'locked' },
+  { label: '超时', value: 'timeout' },
+  { label: '未判断', value: 'undetermined' },
+]
+function download(category: string) {
+  if (!job.value) return
+  location.href = `/api/jobs/${job.value.id}/results?category=${category}`
+}
 const job = computed(() => state.value?.jobs?.find((j: any) => j.id === route.params.id))
 const issueMessage = computed(() => jobIssueMessage(job.value))
 const count = (key: string) => job.value?.row_counts?.[key] || 0
@@ -60,19 +72,17 @@ const events = computed(() => state.value?.events?.filter((e: any) => e.job_id =
                   :rate="hourlyRate" :elapsed="elapsedSeconds" :capacity="capacityText"
                   :categorized="job.categorized" :status="job.status">
       <template #actions>
-        <el-select v-model="exportCategory" style="width:170px" :disabled="job.status !== 'completed'">
-          <el-option label="全部结果" value="all" />
-          <el-option label="密正" value="valid" />
-          <el-option label="密码错误" value="wrong_password" />
-          <el-option label="双重验证" value="need_2fa" />
-          <el-option label="锁定" value="locked" />
-          <el-option label="超时" value="timeout" />
-          <el-option label="未判断" value="undetermined" />
-        </el-select>
-        <el-button v-if="job.status === 'completed'" tag="a"
-                   :href="`/api/jobs/${job.id}/results?category=${exportCategory}`"
-                   :icon="Download" type="primary">导出账号</el-button>
-        <el-button v-else disabled :icon="Download">等待全部确认</el-button>
+        <el-dropdown v-if="job.status === 'completed'" trigger="click" @command="download">
+          <el-button type="primary" :icon="Download">导出账号</el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item v-for="item in exportOptions" :key="item.value" :command="item.value">
+                {{ item.label }}
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+        <el-button v-else disabled :icon="Download">等待全部确认后可导出</el-button>
       </template>
     </TaskFeedback>
 
