@@ -40,10 +40,12 @@ CREATE TABLE IF NOT EXISTS units (
  checksum TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', node_id TEXT,
  lease_token TEXT, lease_until REAL, attempt INTEGER NOT NULL DEFAULT 0,
  processed INTEGER NOT NULL DEFAULT 0, result_path TEXT, result_checksum TEXT,
+ result_counts TEXT,
  updated REAL NOT NULL, UNIQUE(job_id,seq)
 );
 CREATE INDEX IF NOT EXISTS units_queue ON units(status,job_id,seq);
 CREATE INDEX IF NOT EXISTS units_node ON units(node_id,status);
+CREATE INDEX IF NOT EXISTS units_rows ON units(job_id,status,first_row);
 CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, code TEXT NOT NULL,
  message TEXT NOT NULL, job_id TEXT, node_id TEXT
@@ -116,6 +118,9 @@ class Controller:
                                      'ack_stop_version': 'INTEGER NOT NULL DEFAULT 0'}.items():
                 if name not in columns:
                     db.execute(f'ALTER TABLE nodes ADD COLUMN {name} {definition}')
+            unit_columns = {row['name'] for row in db.execute('PRAGMA table_info(units)')}
+            if 'result_counts' not in unit_columns:
+                db.execute('ALTER TABLE units ADD COLUMN result_counts TEXT')
         self.lease_seconds, self.offline_seconds = lease_seconds, offline_seconds
         # 全局派发闸门：整个集群每秒最多放多少个新工作包。0 表示不限。
         self.dispatch_per_second = max(0, int(dispatch_per_second or 0))
@@ -413,10 +418,8 @@ class Controller:
                     if len(line) > 65536:
                         raise ValueError('单行超过 64 KiB；请将超长记录拆分后重试')
                     line.decode('utf-8-sig' if rows == 0 else 'utf-8')
-                    # 纯空白行不切进分片：否则会生成"只有空行"的包，
-                    # 执行器拿不到账号会判定 EmptyInput 并让任务卡在待确认。
-                    if not line.strip():
-                        continue
+                    # 每一行都是输入文件中的一条记录，空白行也必须保留。
+                    # 这样文件末尾的剩余记录仍会形成正常的小包，不会被静默丢弃。
                     # 不补换行：分包内容与上传文件逐字节一致，导出才能原样还原
                     if buffer and buffered_bytes + len(line) > byte_limit:
                         seq += 1
@@ -718,8 +721,10 @@ class Controller:
                          buckets['undetermined'] + buckets['unknown'], time.time(), unit['job_id']))
                 else:
                     db.execute("UPDATE jobs SET updated=? WHERE id=?", (time.time(), unit['job_id']))
-                db.execute("UPDATE units SET status='completed',processed=rows,result_path=?,result_checksum=?,lease_until=NULL,updated=? WHERE id=?",
-                           (str(final), expected_digest, time.time(), unit_id))
+                db.execute("UPDATE units SET status='completed',processed=rows,result_path=?,result_checksum=?,"
+                           "result_counts=?,lease_until=NULL,updated=? WHERE id=?",
+                           (str(final), expected_digest,
+                            json.dumps(dict(buckets), separators=(',', ':')), time.time(), unit_id))
                 event(db, 'result_confirmed', f'工作包 #{unit["seq"]} 结果已确认（{count:,} 条）', unit['job_id'], node_id)
                 unfinished = db.execute("SELECT COUNT(*) FROM units WHERE job_id=? AND status!='completed'", (unit['job_id'],)).fetchone()[0]
                 if not unfinished:
@@ -789,45 +794,81 @@ class Controller:
     def read_rows(self, job_id, offset=0, limit=100, category='all'):
         """按行号窗口读取结果，供页面表格分页。
 
-        只读已确认分片的结果文件，不加载整个任务；单个分片 10 万行读一遍约 100 ms，
-        1 亿条任务翻页也不会随规模变慢。
+        全部结果按 first_row 直接定位覆盖页面的分片；分类结果利用每片
+        result_counts 跳过不需要的整片。100,000,000 条任务的高位页不再从第 1 条扫描。
         """
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
+        categories = ('all', 'valid', 'wrong_password', 'need_2fa', 'locked',
+                      'timeout', 'undetermined', 'unknown')
+        if category not in categories:
+            raise ValueError('结果分类无效')
         with self.db.connect() as db:
             job = db.execute('SELECT rows,rows AS total FROM jobs WHERE id=?', (job_id,)).fetchone()
             if not job:
                 raise ValueError('任务不存在')
-            units = list(db.execute(
-                "SELECT seq,first_row,rows,result_path FROM units WHERE job_id=? AND status='completed' "
-                "ORDER BY seq", (job_id,)))
-        rows, skipped = [], 0
-        for unit in units:
-            span_start, span_end = unit['first_row'], unit['first_row'] + unit['rows']
-            path = unit['result_path']
-            if not path or not Path(path).exists():
-                continue
-            try:
-                with Path(path).open('r', encoding='utf-8') as stream:
-                    for line in stream:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            record = json.loads(line)
-                        except ValueError:
-                            continue
-                        if category != 'all' and record.get('status') != category:
-                            continue
-                        if skipped < offset:
-                            skipped += 1
-                            continue
-                        rows.append(record)
-                        if len(rows) >= limit:
-                            return {'rows': rows, 'total': job['total'], 'offset': offset}
-            except OSError:
-                continue
-        return {'rows': rows, 'total': job['total'], 'offset': offset}
+            if category == 'all':
+                # offset 是全局零基行号，利用分片的连续行号范围直接定位。
+                first, last = offset + 1, offset + limit
+                units = list(db.execute(
+                    "SELECT seq,first_row,rows,result_path,result_counts FROM units "
+                    "WHERE job_id=? AND status='completed' AND first_row<=? "
+                    "AND first_row+rows>? ORDER BY seq", (job_id, last, first)))
+            else:
+                # 分类偏移不能由全局行号推导，但可用分片计数跳过整个结果文件。
+                units = list(db.execute(
+                    "SELECT seq,first_row,rows,result_path,result_counts FROM units "
+                    "WHERE job_id=? AND status='completed' ORDER BY seq", (job_id,)))
+
+            rows, skipped, total = [], 0, 0
+            for unit in units:
+                counts = None
+                if unit['result_counts']:
+                    try:
+                        counts = json.loads(unit['result_counts'])
+                    except (TypeError, ValueError):
+                        counts = None
+                if category != 'all' and counts is not None:
+                    count = int(counts.get(category, 0) or 0)
+                    total += count
+                    if skipped + count <= offset:
+                        skipped += count
+                        continue
+                    if len(rows) >= limit:
+                        continue
+
+                path = unit['result_path']
+                if not path or not Path(path).exists():
+                    continue
+                try:
+                    with Path(path).open('r', encoding='utf-8') as stream:
+                        local_index = 0
+                        for line in stream:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                record = json.loads(line)
+                            except ValueError:
+                                continue
+                            if category != 'all' and (record.get('status') or 'valid') != category:
+                                continue
+                            if category == 'all':
+                                absolute = unit['first_row'] + local_index
+                                local_index += 1
+                                if absolute <= offset:
+                                    continue
+                            elif counts is None:
+                                total += 1
+                            if category != 'all' and skipped < offset:
+                                skipped += 1
+                                continue
+                            if len(rows) < limit:
+                                rows.append(record)
+                except OSError:
+                    continue
+            return {'rows': rows, 'total': job['total'] if category == 'all' else total,
+                    'offset': offset}
 
     def delete_job(self, job_id):
         """删除任务及其工作包；源文件被其他任务复用时保留。"""

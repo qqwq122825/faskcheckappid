@@ -2,17 +2,18 @@
 import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { UploadFilled } from '@element-plus/icons-vue'
-import { api, busy, createTaskOpen, refresh, state } from '../composables/useCluster'
+import { api, busy, createTaskOpen, refresh, session, state } from '../composables/useCluster'
 const router = useRouter()
 const name = ref(''), unitRows = ref(1000), file = ref<File>(), error = ref(''), advanced = ref<string[]>([])
 const files = ref<any[]>([]), chosen = ref(''), mode = ref<'new' | 'reuse'>('new')
 const timeout = ref(20), retries = ref(0)
+const uploadPercent = ref<number | null>(null)
 const maxUnitRows = computed(() => state.value?.settings?.max_unit_rows || 10000)
 watch(createTaskOpen, open => {
   if (open) {
     error.value = ''; file.value = undefined; name.value = ''
     unitRows.value = Math.min(10000, maxUnitRows.value); advanced.value = ['advanced']
-    timeout.value = 20; retries.value = 0
+    timeout.value = 20; retries.value = 0; uploadPercent.value = null
     chosen.value = ''; mode.value = 'new'
     loadFiles()
   }
@@ -32,6 +33,28 @@ function sizeText(bytes: number) {
   if (!bytes) return '—'
   const mb = bytes / 1024 / 1024
   return mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB' : mb >= 1 ? mb.toFixed(1) + ' MB' : (bytes / 1024).toFixed(0) + ' KB'
+}
+function uploadStream(selected: File): Promise<any> {
+  const query = new URLSearchParams({ name: name.value.trim() || selected.name,
+    unit_rows: String(unitRows.value), mode: 'auth', timeout: String(timeout.value),
+    retries: String(retries.value), enqueue: 'true' })
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `/api/jobs/stream?${query}`)
+    xhr.setRequestHeader('X-CSRF-Token', session.value?.csrf || '')
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+    xhr.upload.onprogress = event => {
+      if (event.lengthComputable) uploadPercent.value = Math.min(100, Math.round(event.loaded / event.total * 100))
+    }
+    xhr.onerror = () => reject(new Error('上传连接中断'))
+    xhr.onload = () => {
+      let result: any = {}
+      try { result = JSON.parse(xhr.responseText || '{}') } catch { /* use status below */ }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(result)
+      else reject(new Error(result.error || `上传失败（${xhr.status}）`))
+    }
+    xhr.send(selected)
+  })
 }
 async function submit() {
   error.value = ''
@@ -58,20 +81,13 @@ async function submit() {
   }
   busy.value = true
   try {
-    const data = new FormData()
-    data.append('file', file.value)
-    data.append('name', name.value.trim() || file.value.name)
-    data.append('unit_rows', String(unitRows.value))
-    data.append('mode', 'auth')
-    data.append('timeout', String(timeout.value))
-    data.append('retries', String(retries.value))
-    data.append('enqueue', 'true')
-    await api('/api/jobs', data)
+    uploadPercent.value = 0
+    await uploadStream(file.value)
     createTaskOpen.value = false
     await refresh()
     await router.push('/jobs')
   } catch (e) { error.value = (e as Error).message }
-  finally { busy.value = false }
+  finally { busy.value = false; uploadPercent.value = null }
 }
 </script>
 <template>
@@ -94,7 +110,7 @@ async function submit() {
       <el-form-item v-if="mode === 'new'" label="TXT 文件">
         <el-upload drag :auto-upload="false" :limit="1" :disabled="busy" accept=".txt" :on-change="chooseFile" :on-remove="() => file = undefined" :on-exceed="() => error = '一次选择一个 TXT 文件，请先移除已选文件'">
           <el-icon class="el-icon--upload"><UploadFilled /></el-icon><div>点击选择或拖入 TXT 文件</div>
-          <template #tip><div class="el-upload__tip">UTF-8 编码，每行一条记录，最大 2 GiB。</div></template>
+          <template #tip><div class="el-upload__tip">UTF-8 编码，每行一条记录，最大 8 GiB；大文件以原始字节流上传，不生成 multipart 临时副本。</div></template>
         </el-upload>
       </el-form-item>
       <el-form-item label="任务名称（可选）"><el-input v-model="name" placeholder="不填写则使用上传的文件名；重名会自动加 -2、-3" maxlength="120" :disabled="busy" /></el-form-item>
@@ -115,6 +131,6 @@ async function submit() {
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
       <p class="muted">创建后自动加入执行队列；前一个任务全部确认后，轮到本任务自动开始。</p>
     </el-form>
-    <template #footer><el-button :disabled="busy" @click="createTaskOpen = false">取消</el-button><el-button type="primary" :loading="busy" @click="submit">{{ busy ? '正在上传并创建…' : '创建并加入队列' }}</el-button></template>
+    <template #footer><el-button :disabled="busy" @click="createTaskOpen = false">取消</el-button><el-button type="primary" :loading="busy" @click="submit">{{ busy ? `正在上传${uploadPercent == null ? '' : ` ${uploadPercent}%`}` : '创建并加入队列' }}</el-button></template>
   </el-dialog>
 </template>

@@ -101,20 +101,25 @@ def _split_account(line):
     return line.strip(), ''
 
 
-def _bump_usage(device_root, slot):
-    """记录每台设备被用过多少次；同一个 usage.json 由多个进程共享。"""
-    if not device_root or not slot:
+def _bump_usage(device_root, counts):
+    """每个工作包合并写一次设备计数，并用进程锁防止覆盖。"""
+    if not device_root or not counts:
         return
+    import portalocker
     path = Path(device_root) / 'usage.json'
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock = path.with_suffix('.lock')
     try:
-        data = json.loads(path.read_text('utf-8')) if path.exists() else {}
-    except (OSError, ValueError):
-        data = {}
-    key = str(int(slot))
-    data[key] = int(data.get(key) or 0) + 1
-    try:
-        path.write_text(json.dumps(data), 'utf-8')
-    except OSError:
+        with portalocker.Lock(str(lock), mode='a+', timeout=10):
+            try:
+                data = json.loads(path.read_text('utf-8')) if path.exists() else {}
+            except (OSError, ValueError):
+                data = {}
+            for slot, count in counts.items():
+                key = str(int(slot))
+                data[key] = int(data.get(key) or 0) + int(count)
+            atomic_json(path, data)
+    except (OSError, portalocker.exceptions.LockException):
         pass
 
 
@@ -165,20 +170,6 @@ def _execute_auth_unit(directory, descriptor, stop):
     counters = Counter()
     processed = 0
 
-    accounts = []
-    with (directory / 'input.part').open('r', encoding='utf-8', errors='replace') as source:
-        for line in source:
-            if stop.is_set():
-                break
-            line = line.rstrip('\r\n')
-            if line.strip():
-                accounts.append(line)
-    if not accounts:
-        # 空包不算失败：分包与校验都已通过，只是没有可执行记录。
-        (directory / 'results.jsonl').write_bytes(b'')
-        atomic_json(directory / 'done.json', {'ok': True, 'processed': 0, 'counts': {}})
-        return
-
     pool = DevicePool(device_root, origin, max_devices=capacity)
     from fastcheck.workers import device_profile
 
@@ -210,6 +201,11 @@ def _execute_auth_unit(directory, descriptor, stop):
         account, password = _split_account(line)
         account_started = time.time()
         slot_id = 1 + (index % capacity)
+        # 空白行仍是输入文件中的一条记录，但不应触发真实认证请求。
+        # 作为未判断结果落盘，保证小包按描述的 rows 正常完成。
+        if not line.strip():
+            return row, line, {'status': 'undetermined', 'kind': 'blank_record',
+                               'slot': slot_id, 'elapsed': 0}
         account_proxy = proxy_for(index)
         identity = identities.get(slot_id)
         try:
@@ -232,15 +228,31 @@ def _execute_auth_unit(directory, descriptor, stop):
         return row, line, result
 
     stop_flag = stop
-    with output_path.open('wb') as output:
+    output_digest = hashlib.sha256()
+    usage_counts = Counter()
+    with (directory / 'input.part').open('r', encoding='utf-8', errors='replace') as source, output_path.open('wb') as output:
         output_path.chmod(0o600)
         first_row = int(descriptor.get('first_row') or 1)
         with ThreadPoolExecutor(max_workers=workers) as workers_pool:
-            futures = [workers_pool.submit(one, first_row + index, index, line)
-                       for index, line in enumerate(accounts)]
-            for future in futures:
+            # 只保留 2×线程数的在途 Future；分片上限调到 10 万时也不会
+            # 同时构造 10 万个 Future 和 10 万份账号对象。
+            pending = deque()
+            index = 0
+            exhausted = False
+            while not exhausted or pending:
                 if stop_flag.is_set():
-                    break
+                    raise InterruptedError('租约失效或节点关闭')
+                while not exhausted and len(pending) < workers * 2:
+                    line = source.readline()
+                    if line == '':
+                        exhausted = True
+                        break
+                    line = line.rstrip('\r\n')
+                    pending.append(workers_pool.submit(one, first_row + index, index, line))
+                    index += 1
+                if not pending:
+                    continue
+                future = pending.popleft()
                 row, line, result = future.result()
                 status = result_bucket(result)
                 counters[status] += 1
@@ -248,20 +260,26 @@ def _execute_auth_unit(directory, descriptor, stop):
                 # sha256/bytes 是总控的必需字段（结果完整性校验），认证模式同样补齐
                 raw_line = line.encode('utf-8')
                 account, password = _split_account(line)
+                device = result.get('slot') or 1 + ((row - first_row) % capacity)
                 record = {'row': row, 'account': account, 'password': password, 'status': status,
                           'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
                           'stage': result.get('stage') or '', 'http': result.get('http'),
                           'code': (result.get('detail') or result.get('kind') or '')[:180],
-                          'device': result.get('slot') or slot_id,
+                          'device': device,
                           'elapsed': result.get('elapsed'), 'attempts': 0}
-                output.write((json.dumps(record, separators=(',', ':')) + '\n').encode())
-                _bump_usage(device_root, record['device'])
+                encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
+                output.write(encoded)
+                output_digest.update(encoded)
+                usage_counts[device] += 1
                 if processed % 10 == 0:
                     atomic_json(directory / 'progress.json',
                                 {'processed': processed, 'started': started})
 
+    if processed != int(descriptor.get('rows') or 0):
+        raise ValueError('输入条数和工作包描述不一致')
+    _bump_usage(device_root, usage_counts)
     atomic_json(directory / 'progress.json', {'processed': processed, 'started': started})
     atomic_json(directory / 'done.json',
                 {'ok': True, 'processed': processed, 'counts': dict(counters),
-                 'checksum': hashlib.sha256(output_path.read_bytes()).hexdigest(),
+                 'checksum': output_digest.hexdigest(),
                  'elapsed': time.time() - started})

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import secrets
 import tempfile
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from flask import Flask, Response, jsonify, request, send_file, session
@@ -230,8 +231,9 @@ def create_app(role, service, password=None):
             date = datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d')
             rows = service.export_results(job_id, category)
             name = f'{date}_{labels[category]}.txt'
+            encoded_name = quote(name, safe='')
             return Response(rows, mimetype='text/plain; charset=utf-8',
-                            headers={'Content-Disposition': f'attachment; filename*=UTF-8\'\'{name}',
+                            headers={'Content-Disposition': f"attachment; filename*=UTF-8''{encoded_name}",
                                      'Cache-Control': 'no-store'})
 
         @app.post('/agent/heartbeat')

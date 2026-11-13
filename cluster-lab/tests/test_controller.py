@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from clusterlab.controller import Conflict, Controller
 from clusterlab.web import create_app
@@ -355,6 +356,8 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, 'text/plain')
         from urllib.parse import unquote
+        response.headers['Content-Disposition'].encode('latin-1')
+        self.assertNotIn('全部结果', response.headers['Content-Disposition'])
         disposition = unquote(response.headers['Content-Disposition'])
         self.assertRegex(disposition, r'\d{4}-\d{2}-\d{2}_全部结果\.txt')
         self.assertEqual(response.data, source)
@@ -399,6 +402,90 @@ class ControllerTests(unittest.TestCase):
         payload, checksum = self.output(unit)
         with self.assertRaises(Conflict):
             self.service.accept_result(self.node['id'], unit['id'], unit['token'], io.BytesIO(payload), checksum)
+
+    def test_10002_records_keep_the_final_two_record_package(self):
+        source = b''.join(f'account-{index:05d}\n'.encode() for index in range(10000)) + b'\n\n'
+        job = self.service.create_job('10002 records', io.BytesIO(source), 10000)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = next(item for item in self.service.snapshot()['jobs'] if item['id'] == job)
+            if state['status'] != 'preparing':
+                break
+            time.sleep(.01)
+        self.assertEqual(state['status'], 'ready')
+        self.assertEqual((state['rows'], state['units']), (10002, 2))
+        with self.service.db.connect() as db:
+            units = list(db.execute('SELECT first_row,rows,path FROM units WHERE job_id=? ORDER BY seq', (job,)))
+        self.assertEqual([(unit['first_row'], unit['rows']) for unit in units], [(1, 10000), (10001, 2)])
+        self.assertEqual(Path(units[1]['path']).read_bytes(), b'\n\n')
+
+        self.service.job_action(job, 'start')
+        first = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual(first['rows'], 10000)
+        self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
+        self.confirm(first)
+        second = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual((second['first_row'], second['rows']), (10001, 2))
+        self.confirm(second)
+        self.assertEqual(self.service.snapshot()['jobs'][0]['status'], 'completed')
+
+    def test_one_hundred_million_row_high_offset_opens_only_target_shard(self):
+        """1 亿条任务翻到末页时，不扫前 9,999 个分片。"""
+        job = self.job(50)
+        result = Path(self.temp.name) / 'last-10000.jsonl'
+        first = 100_000_000 - 10_000 + 1
+        with result.open('w', encoding='utf-8') as stream:
+            for row in range(first, 100_000_001):
+                stream.write(json.dumps({'row': row, 'status': 'valid'}) + '\n')
+        now = time.time()
+        units = []
+        for seq in range(1, 10_001):
+            start = (seq - 1) * 10_000 + 1
+            units.append((f'u{seq:05d}', job, seq, start, 10_000, str(result), '0' * 64,
+                          'completed', 10_000, str(result), '0' * 64,
+                          '{"valid":10000}', now))
+        with self.service.db.transaction() as db:
+            db.execute('DELETE FROM units WHERE job_id=?', (job,))
+            db.executemany(
+                'INSERT INTO units(id,job_id,seq,first_row,rows,path,checksum,status,processed,'
+                'result_path,result_checksum,result_counts,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                units)
+            db.execute("UPDATE jobs SET rows=100000000,status='completed' WHERE id=?", (job,))
+
+        opened = []
+        original_open = Path.open
+        def counting_open(path, *args, **kwargs):
+            if path == result:
+                opened.append(path)
+            return original_open(path, *args, **kwargs)
+        with patch.object(Path, 'open', counting_open):
+            page = self.service.read_rows(job, 99_999_950, 50)
+        self.assertEqual([row['row'] for row in page['rows']], list(range(99_999_951, 100_000_001)))
+        self.assertEqual(page['total'], 100_000_000)
+        self.assertEqual(len(opened), 1)
+
+    def test_category_page_uses_persisted_shard_counts(self):
+        job = self.job(100)
+        self.service.job_action(job, 'start')
+        while unit := self.service.lease(self.node['id'], 'test-session'):
+            self.confirm(unit)
+        page = self.service.read_rows(job, 50, 1, 'valid')
+        self.assertEqual(page['total'], 100)
+        self.assertEqual(page['rows'][0]['row'], 51)
+        with self.service.db.connect() as db:
+            counts = [json.loads(row['result_counts']) for row in
+                      db.execute('SELECT result_counts FROM units WHERE job_id=? ORDER BY seq', (job,))]
+        self.assertEqual(counts, [{'valid': 50}, {'valid': 50}])
+
+    def test_raw_stream_upload_avoids_multipart_copy(self):
+        client = create_app('controller', self.service).test_client()
+        csrf = client.get('/api/session').json['csrf']
+        response = client.post('/api/jobs/stream?name=large.txt&unit_rows=50&mode=digest&enqueue=true',
+                               data=b'hello\n' * 50,
+                               content_type='application/octet-stream',
+                               headers={'X-CSRF-Token': csrf, 'Content-Length': '300'})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json['bytes'], 300)
 
     def test_host_metrics_are_finite_and_do_not_accept_arbitrary_fields(self):
         value = self.service.clean_telemetry({'cpu_percent':25.2,'memory_percent':float('nan'),
