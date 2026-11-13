@@ -4,6 +4,7 @@ import { ElMessage } from 'element-plus'
 import { api, fmt, state } from '../composables/useCluster'
 
 const visible = ref(false), nodeId = ref(''), capacity = ref(2), error = ref('')
+const autoRotate = ref(false), savingAuto = ref(false), rotateAfter = ref(20)
 // 每次刷新都从全局状态里取最新节点，设备池进度才会跟着心跳走
 const node = computed(() => state.value?.nodes?.find((n: any) => n.id === nodeId.value))
 const busy = ref(false), timer = 0 as any
@@ -33,6 +34,8 @@ const rows = computed(() => {
 
 function show(value: any) {
   nodeId.value = value?.id || ''
+  autoRotate.value = Boolean(value?.telemetry?.device_auto_rotate ?? false)
+  rotateAfter.value = Number(value?.telemetry?.device_rotate_after ?? 20) || 20
   capacity.value = Math.max(1, Number(value?.telemetry?.device_pool?.capacity) || 2)
   error.value = ''
   visible.value = true
@@ -53,6 +56,17 @@ async function initialize() {
     error.value = exc?.message || '请求失败'
   } finally { busy.value = false }
 }
+async function toggleAuto(next: boolean) {
+  savingAuto.value = true
+  try {
+    await api('/api/settings/rotation', { device_rotate_after: rotateAfter.value || 20,
+                                           device_auto_rotate: next }, 'POST')
+    ElMessage.success(next ? '已开启自动补充：任务运行中持续换新设备' : '已关闭自动补充')
+  } catch (exc: any) {
+    autoRotate.value = !next
+    error.value = exc?.message || '保存失败'
+  } finally { savingAuto.value = false }
+}
 async function cancelBuild() {
   try { await api(`/api/nodes/${node.value.id}/devices`, { capacity: 0 }, 'POST'); ElMessage.success('已请求停止') }
   catch (exc: any) { error.value = exc?.message || '请求失败' }
@@ -72,6 +86,14 @@ async function cancelBuild() {
         <el-form-item label="设备数量">
           <el-input-number v-model="capacity" :min="1" :max="200" :step="1" :precision="0" :disabled="building || busy" />
           <span class="field-note">设备在节点本地注册，每台约 6–8 秒；不占用任务隧道。</span>
+        </el-form-item>
+        <el-form-item label="自动补充">
+          <el-switch v-model="autoRotate" :loading="savingAuto" :disabled="savingAuto"
+                     @change="toggleAuto" active-text="任务运行时持续换新并补齐" />
+          <span class="field-note">
+            开启后，节点在任务执行期间淘汰用满次数的设备并自动注册新的，
+            池子始终保持目标数量；关闭时只保留手动初始化。
+          </span>
         </el-form-item>
         <div class="actions">
           <el-button type="primary" native-type="submit" :loading="busy" :disabled="building">初始化设备</el-button>

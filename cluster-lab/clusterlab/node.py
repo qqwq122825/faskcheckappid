@@ -214,12 +214,20 @@ class Node:
                 except (RuntimeError, ValueError) as exc:
                     # 不能静默吞：面板上看不到原因会以为节点没响应
                     self.builder._update(message=str(exc))
-            # 运行中轮换：用够次数的设备删身份重注册，池子始终是新的
+            # 自动补充：任务跑着也维护设备池——淘汰用满次数的，把空槽位补满
+            auto = bool(value.get('device_auto_rotate'))
             limit = int(value.get('device_rotate_after') or 0)
-            if limit and not self.builder.state['running']:
-                stale = self.builder.retirable(limit)
-                if stale:
-                    self.builder.retire(stale[:max(1, len(stale) // 2)])
+            if auto and not self.builder.state['running']:
+                if limit:
+                    stale = self.builder.retirable(limit)
+                    if stale:
+                        self.builder.retire(stale)
+                capacity = int(self.builder.state['capacity'] or 0)
+                if capacity:
+                    try:
+                        self.builder.start(capacity)   # 已就绪的槽位会跳过，只补空的
+                    except (RuntimeError, ValueError):
+                        pass
             for unit_id in value['rejected']:
                 if unit_id in self.active:
                     self.active[unit_id][1].set()

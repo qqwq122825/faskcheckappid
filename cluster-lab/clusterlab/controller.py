@@ -56,6 +56,7 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_api','');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_scheme','socks5h');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('origin','https://new.ani.sidestore.io');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_rotate_after','0');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_auto_rotate','0');
 '''
 
 
@@ -230,7 +231,9 @@ class Controller:
                 'proxy_api': mask_api(values.get('proxy_api', '')),
                 'proxy_configured': bool(values.get('proxy_api', '')),
                 'proxy_scheme': values.get('proxy_scheme', 'socks5h'),
-                'device_rotate_after': int(values.get('device_rotate_after', 0) or 0)}
+                'device_rotate_after': int(values.get('device_rotate_after', 0) or 0),
+                # column 声明是 INTEGER，存 '1' 会读回整数 1，比较时统一转字符串
+                'device_auto_rotate': str(values.get('device_auto_rotate', '0')) in ('1', 'True', 'true')}
 
     def proxy_for_node(self, node):
         """节点专属出口：按创建顺序把链接分给各节点，避免所有节点抢同一条配额。"""
@@ -259,10 +262,19 @@ class Controller:
 
     def configure_rotation(self, data):
         limit = integer(int(data.get('device_rotate_after') or 0), '设备轮换阈值', 0, 100000)
+        auto = '1' if data.get('device_auto_rotate') else '0'
         with self.db.transaction() as db:
-            db.execute("UPDATE controller_settings SET value=? WHERE key='device_rotate_after'", (limit,))
-            event(db, 'controller_config',
-                  f'设备轮换阈值设为 {limit} 条' if limit else '设备轮换已关闭')
+            for key_name, key_value in (('device_rotate_after', str(limit)),
+                                        ('device_auto_rotate', auto)):
+                db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           (key_name, key_value))
+            if auto == '1':
+                event(db, 'controller_config',
+                      f'设备自动补充已开启：每台用满 {limit or 20} 条后换新并补齐' if limit
+                      else '设备自动补充已开启（轮换阈值 0 时只补缺不换新）')
+            else:
+                event(db, 'controller_config', '设备自动补充已关闭')
         return self.settings()
 
     def configure_proxy(self, data):
@@ -563,6 +575,7 @@ class Controller:
                     'rejected': reject, 'confirmed': confirmed, 'interrupted_ack': interrupted_ack,
                     'device_request': node['device_request'],
                     'device_rotate_after': self.settings().get('device_rotate_after', 0),
+                    'device_auto_rotate': bool(self.settings().get('device_auto_rotate')),
                     'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds,
                     'server_time': now,
                     'config': {**self.proxy_for_node(node),
