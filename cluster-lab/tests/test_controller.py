@@ -356,7 +356,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(response.mimetype, 'text/plain')
         from urllib.parse import unquote
         disposition = unquote(response.headers['Content-Disposition'])
-        self.assertRegex(disposition, r'\d{4}-\d{2}-\d{2}_处理成功_10000条\.txt')
+        self.assertRegex(disposition, r'\d{4}-\d{2}-\d{2}_全部结果\.txt')
         self.assertEqual(response.data, source)
         self.assertEqual(len(response.data.splitlines()), 10000)
         response.close()

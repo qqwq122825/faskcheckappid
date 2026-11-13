@@ -8,8 +8,11 @@ const props = defineProps<{
   pending: number, rate: number, status: string, preview?: boolean, skipped?: number,
   elapsed?: number | null, categorized?: Record<string, number> | null,
   capacity?: string,
+  processed?: number, unitCounts?: Record<string, number>,
 }>()
 const percentage = computed(() => props.total ? Math.min(100, props.completed / props.total * 100) : 0)
+const reportedProcessed = computed(() => props.processed == null ? null : Math.max(props.completed, Math.min(props.total, props.processed)))
+const awaitingConfirmation = computed(() => reportedProcessed.value == null ? null : Math.max(0, reportedProcessed.value - props.completed))
 interface Cell { label: string; value: number | null | undefined; tone?: string; suffix?: string }
 const categories = computed(() => props.categorized || {})
 const cells = computed<Cell[]>(() => [
@@ -17,7 +20,7 @@ const cells = computed<Cell[]>(() => [
   { label: '完成', value: props.completed,
     tone: props.total && props.completed >= props.total ? 'success' : undefined },
   { label: '剩余', value: Math.max(0, props.total - props.completed) },
-  { label: '当前校验', value: props.active },
+  { label: '在途记录', value: props.active },
   { label: '密正', value: categories.value.valid ?? 0, tone: 'success' },
   { label: '密码错误', value: categories.value.wrong_password ?? 0 },
   { label: '双重验证', value: categories.value.need_2fa ?? 0 },
@@ -26,4 +29,25 @@ const cells = computed<Cell[]>(() => [
   { label: '未判断', value: categories.value.unknown ?? 0 },
 ])
 </script>
-<template><el-card shadow="never" class="task-feedback"><template #header><div class="section-heading"><h2>进度与结果</h2><div class="feedback-state"><el-tag v-if="preview" type="warning" effect="plain">合成演示</el-tag><el-tag v-if="preview" :type="status === 'completed' ? 'success' : status === 'paused' ? 'warning' : 'primary'" round>{{ status === 'completed' ? '已完成' : status === 'paused' ? '已暂停' : '运行中' }}</el-tag><StatusBadge v-else :status="status" /></div></div></template><div class="feedback-grid"><div v-for="cell in cells" :key="cell.label" class="feedback-cell" :class="cell.tone"><span>{{ cell.label }}</span><strong>{{ cell.value == null ? '—' : fmt(cell.value) }}<small v-if="cell.suffix">{{ cell.suffix }}</small></strong></div></div><div class="feedback-footer"><div class="feedback-progress-label"><span>{{ fmt(completed) }} / {{ fmt(total) }}</span><strong>{{ percentage.toFixed(1) }}%</strong></div><el-progress :percentage="Number(percentage.toFixed(1))" :show-text="false" :stroke-width="10" /><div class="feedback-meta"><span v-if="capacity">工作进程 {{ capacity }}</span><span>用时 {{ elapsed == null ? '—' : fmt(elapsed) }} 秒 · {{ fmt(rate) }} 条/小时</span></div><p>{{ preview ? '合成统计，不代表真实任务结果。' : '完成数以总控确认为准。' }}</p></div></el-card></template>
+<template>
+  <el-card shadow="never" class="task-feedback">
+    <template #header><div class="section-heading"><h2>进度与结果</h2><div class="feedback-state">
+      <el-tag v-if="preview" type="warning" effect="plain">合成演示</el-tag>
+      <el-tag v-if="preview" :type="status === 'completed' ? 'success' : status === 'paused' ? 'warning' : 'primary'" round>{{ status === 'completed' ? '已完成' : status === 'paused' ? '已暂停' : '运行中' }}</el-tag>
+      <StatusBadge v-else :status="status" :unit-counts="unitCounts" />
+    </div></div></template>
+    <div class="feedback-grid"><div v-for="cell in cells" :key="cell.label" class="feedback-cell" :class="cell.tone"><span>{{ cell.label }}</span><strong>{{ cell.value == null ? '—' : fmt(cell.value) }}<small v-if="cell.suffix">{{ cell.suffix }}</small></strong></div></div>
+    <div class="feedback-footer">
+      <div class="feedback-progress-label"><span>总控已确认 {{ fmt(completed) }} / {{ fmt(total) }}</span><strong>{{ percentage.toFixed(1) }}%</strong></div>
+      <el-progress :percentage="Number(percentage.toFixed(1))" :show-text="false" :stroke-width="10" />
+      <div v-if="!preview" class="feedback-meta" aria-label="任务进度口径">
+        <span>节点已处理 {{ reportedProcessed == null ? '尚未上报' : fmt(reportedProcessed) + ' 条' }}</span>
+        <span>总控已确认 {{ fmt(completed) }} 条</span>
+        <span>已处理待确认 {{ awaitingConfirmation == null ? '—' : fmt(awaitingConfirmation) + ' 条' }}</span>
+      </div>
+      <p v-if="!preview && active > 0 && !reportedProcessed">等待节点上报中间进度；在途记录数不代表同时执行数量。</p>
+      <div class="feedback-meta"><span v-if="capacity">工作进程 {{ capacity }}</span><span>用时 {{ elapsed == null ? '—' : fmt(elapsed) }} 秒 · {{ fmt(rate) }} 条/小时</span></div>
+      <p>{{ preview ? '合成统计，不代表真实任务结果。' : '进度条按总控已确认数量计算，工作包回传后可能批量更新；完成表示结果回传已确认，分类结果见上方统计。' }}</p>
+    </div>
+  </el-card>
+</template>

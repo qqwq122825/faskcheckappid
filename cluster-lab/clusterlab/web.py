@@ -7,7 +7,7 @@ import secrets
 import tempfile
 from zoneinfo import ZoneInfo
 
-from flask import Flask, jsonify, request, send_file, session
+from flask import Flask, Response, jsonify, request, send_file, session
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -215,10 +215,18 @@ def create_app(role, service, password=None):
 
         @app.get('/api/jobs/<job_id>/results')
         def download_results(job_id):
-            path, rows = service.text_export(job_id)
+            labels = {'all': '全部结果', 'valid': '密正', 'wrong_password': '密码错误',
+                      'need_2fa': '双重验证', 'locked': '锁定', 'timeout': '超时',
+                      'undetermined': '未判断'}
+            category = request.args.get('category', 'all')
+            if category not in labels:
+                raise ValueError('导出分类无效')
             date = datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d')
-            return send_file(path, mimetype='text/plain', as_attachment=True,
-                             download_name=f'{date}_处理成功_{rows}条.txt', conditional=False)
+            rows = service.export_results(job_id, category)
+            name = f'{date}_{labels[category]}.txt'
+            return Response(rows, mimetype='text/plain; charset=utf-8',
+                            headers={'Content-Disposition': f'attachment; filename*=UTF-8\'\'{name}',
+                                     'Cache-Control': 'no-store'})
 
         @app.post('/agent/heartbeat')
         def heartbeat():

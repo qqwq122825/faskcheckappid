@@ -361,7 +361,7 @@ class Controller:
                     if len(line) > 65536:
                         raise ValueError('单行超过 64 KiB；请将超长记录拆分后重试')
                     line.decode('utf-8-sig' if rows == 0 else 'utf-8')
-                    line = line if line.endswith(b'\n') else line + b'\n'
+                    # 不补换行：分包内容与上传文件逐字节一致，导出才能原样还原
                     if buffer and buffered_bytes + len(line) > byte_limit:
                         seq += 1
                         self._save_unit(job_id, seq, first_row, buffer, directory, rows)
@@ -794,6 +794,45 @@ class Controller:
         if source and remaining == 0 and source.exists() and source.parent == self.inputs:
             source.unlink(missing_ok=True)
         return {'deleted': job_id, 'source_kept': bool(remaining)}
+
+    def export_results(self, job_id, category='all'):
+        """按分类流式导出，内容保持上传时的原始记录（`账号----密码`）。
+
+        结果文件和输入分包行数一一对应，所以两个文件同步读取即可：
+        既能按 status 过滤，又不用把整包读进内存。
+        """
+        with self.db.connect() as db:
+            job = db.execute('SELECT id,status FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if not job:
+                raise ValueError('任务不存在')
+            if job['status'] != 'completed':
+                raise Conflict('全部工作包确认后才可导出')
+            units = list(db.execute(
+                "SELECT seq,path,result_path FROM units WHERE job_id=? AND status='completed' ORDER BY seq",
+                (job_id,)))
+
+        def rows():
+            for unit in units:
+                source, result = Path(unit['path']), unit['result_path']
+                if not result or not Path(result).exists() or not source.exists():
+                    continue
+                try:
+                    # 二进制模式：保留原始换行符（\r\n 不能被文本模式转成 \n）
+                    with source.open('rb') as src, Path(result).open('rb') as res:
+                        for original, line in zip(src, res):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            if category != 'all':
+                                try:
+                                    if json.loads(line).get('status') != category:
+                                        continue
+                                except ValueError:
+                                    continue
+                            yield original      # 严格保持原字节，包括末行没有换行的情况
+                except OSError:
+                    continue
+        return rows()
 
     def result_paths(self, job_id):
         with self.db.connect() as db:

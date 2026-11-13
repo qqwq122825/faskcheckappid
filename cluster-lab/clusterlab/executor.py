@@ -243,7 +243,8 @@ def _execute_auth_unit(directory, descriptor, stop):
                 processed += 1
                 # sha256/bytes 是总控的必需字段（结果完整性校验），认证模式同样补齐
                 raw_line = line.encode('utf-8')
-                record = {'row': row, 'account': _split_account(line)[0], 'status': status,
+                account, password = _split_account(line)
+                record = {'row': row, 'account': account, 'password': password, 'status': status,
                           'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
                           'stage': result.get('stage') or '', 'http': result.get('http'),
                           'code': (result.get('detail') or result.get('kind') or '')[:180],
