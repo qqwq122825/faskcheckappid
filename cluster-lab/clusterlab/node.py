@@ -67,11 +67,6 @@ class Node:
                 else:
                     db.execute("UPDATE tasks SET status='interrupted',error='节点重启，等待总控确认' WHERE id=?", (task['id'],))
 
-    def start(self):
-        self.thread = threading.Thread(target=self.loop, daemon=True, name='node-agent')
-        self.thread.start()
-        atexit.register(self.close)
-
     def close(self):
         if self.stop.is_set():
             return
@@ -278,19 +273,61 @@ class Node:
             self.active[unit_id] = (process, stop)
         return True
 
+    def start(self):
+        self.thread = threading.Thread(target=self.loop, daemon=True, name='node-agent')
+        self.thread.start()
+        # 心跳与上传各自独立：上传一个几十 MB 的结果文件会阻塞几十秒，
+        # 放在主循环里会让总控把节点判离线、把工作包标成待确认。
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True,
+                                                 name='node-heartbeat')
+        self.heartbeat_thread.start()
+        self.upload_thread = threading.Thread(target=self._upload_loop, daemon=True,
+                                              name='node-upload')
+        self.upload_thread.start()
+        atexit.register(self.close)
+
+    def _heartbeat_loop(self):
+        while not self.stop.is_set():
+            with self.lock:
+                configured = bool(self.config)
+            if configured:
+                try:
+                    self._heartbeat()
+                except Exception as exc:                          # noqa: BLE001
+                    message = str(exc) if isinstance(exc, (ConnectionError, ValueError)) else type(exc).__name__
+                    with self.lock:
+                        self.connected = False
+                        self.error = message[:240]
+            self.stop.wait(self.interval)
+
+    def _upload_loop(self):
+        while not self.stop.is_set():
+            with self.lock:
+                configured = bool(self.config)
+            if configured:
+                try:
+                    self._upload_one()
+                    self.stop.wait(0.2)
+                    continue
+                except Exception as exc:                          # noqa: BLE001
+                    message = str(exc) if isinstance(exc, (ConnectionError, ValueError)) else type(exc).__name__
+                    with self.lock:
+                        self.error = message[:240]
+            self.stop.wait(2.0)
+
     def loop(self):
+        """主循环只做进程回收与领取，心跳和上传在各自线程里跑。"""
         while not self.stop.is_set():
             self._poll_processes()
             self.telemetry.sample()
             with self.lock:
                 configured = bool(self.config)
                 generation = self.generation
+                settings = self.settings
             if not configured:
                 self.stop.wait(self.interval)
                 continue
             try:
-                settings = self._heartbeat()
-                self._upload_one()
                 if settings['enabled']:
                     with self.db.connect() as db:
                         backlog = db.execute("SELECT COUNT(*) FROM tasks WHERE status='outbox'").fetchone()[0]

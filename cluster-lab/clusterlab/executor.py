@@ -126,7 +126,8 @@ def execute_auth_unit(directory, descriptor, stop):
         scheme = descriptor.get('proxy_scheme') or 'socks5h'
         # 一次多提几条，包内按账号分摊：一条隧道只承担一个账号，
         # 比整包共用一条出口的失败率低得多。上限 1000 避免把配额一次抽干。
-        demand = min(1000, max(int(descriptor.get('rows') or 0), threads * 4, 20))
+        worker_count = max(1, int(descriptor.get('threads') or 1))
+        demand = min(1000, max(int(descriptor.get('rows') or 0), worker_count * 4, 20))
         try:
             proxies = fetch_proxies(descriptor['proxy_api'], demand,
                                     scheme=None if scheme == 'http' else scheme)
