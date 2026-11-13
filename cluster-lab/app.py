@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def main():
-    parser = argparse.ArgumentParser(description='苹果id校验集群系统 · 总控与节点')
+    parser = argparse.ArgumentParser(description='苹果集群系统 · 总控与节点')
     parser.add_argument('role', choices=('controller', 'node'))
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int)
@@ -32,7 +32,7 @@ def main():
     application = create_app(args.role, service, password)
     if args.role == 'node':
         service.start()
-    print(f'苹果id校验集群系统 {args.role} · http://{args.host}:{port}/', flush=True)
+    print(f'苹果集群系统 {args.role} · http://{args.host}:{port}/', flush=True)
     print(f'数据目录：{root.resolve()}', flush=True)
     try:
         # waitress 的 max_request_body_size 默认只有 1 GiB，Flask 那边的

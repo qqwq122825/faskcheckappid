@@ -1,0 +1,96 @@
+BRANCH/FIELD
+main / top brand=苹果集群系统; sidebar-bottom=苹果id校验集群系统; App footer removed; Settings tech-stack rows removed; built static UI / VERSION 0.3.10
+Original baseline commit: eb83d60e8d205c5793759495c32c9f19cccaed8e
+
+FOUR ARTIFACTS
+MODIFIED_FILE=/Users/xxx/Documents/并发/verification-artifacts/short-apple-cluster-name/MODIFIED_FILE
+DIFF_FILE=/Users/xxx/Documents/并发/verification-artifacts/short-apple-cluster-name/DIFF_FILE
+VERIFICATION.txt=/Users/xxx/Documents/并发/verification-artifacts/short-apple-cluster-name/VERIFICATION.txt
+ROLLBACK.sh=/Users/xxx/Documents/并发/verification-artifacts/short-apple-cluster-name/ROLLBACK.sh
+
+BASELINE
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/short-apple-cluster-name/baseline-check/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: baseline commit eb83d60e8d205c5793759495c32c9f19cccaed8e; no runtime input.
+Literal output/result:
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.700s
+
+OK
+BASELINE_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED BACKEND
+Command: cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python -m unittest discover -s tests
+Input: final short top brand, full sidebar-bottom brand, no tech-stack UI, rebuilt static UI.
+Literal output/result:
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.788s
+
+OK
+MODIFIED_TEST_EXIT=0
+Exit status: 0
+
+FRONTEND TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm test
+Input: top brand 苹果集群系统; sidebar-bottom 苹果id校验集群系统; no Vue/Python footer; VERSION 0.3.10.
+Literal output/result:
+ℹ tests 11
+ℹ suites 0
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 57.284
+FRONTEND_TEST_EXIT=0
+Exit status: 0
+
+FRONTEND BUILD
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm run build
+Input: final frontend source VERSION 0.3.10.
+Literal output/result:
+✓ 1652 modules transformed.
+✓ built in 2.10s
+FRONTEND_BUILD_EXIT=0
+Exit status: 0
+
+GLOBAL UI LABEL SCAN
+Command: search frontend source and legacy static UI for “离线任务平台”, “Vue + Python”, “Vue 3 + Element Plus”, and “Python + Flask”.
+Input: frontend/src, frontend/index.html and clusterlab/static, excluding rebuilt static/ui during source-only scan; the build test separately verifies output.
+Literal output/result:
+OFFLINE_LABEL_MATCHES=0
+TECH_STACK_LABEL_MATCHES=0
+SCAN_EXIT=0
+Exit status: 0
+Observed UI: top/login/browser title use 苹果集群系统; expanded sidebar bottom uses the full 苹果id校验集群系统; version-only bottom label and the page footer were removed.
+
+ROLLBACK
+Command: /Users/xxx/Documents/并发/verification-artifacts/short-apple-cluster-name/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/short-apple-cluster-name/rollback-test && diff -qr /Users/xxx/Documents/并发/verification-artifacts/short-apple-cluster-name/rollback-original /Users/xxx/Documents/并发/verification-artifacts/short-apple-cluster-name/rollback-test && cd /Users/xxx/Documents/并发/verification-artifacts/short-apple-cluster-name/rollback-test/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: second baseline copy with final DIFF_FILE applied, then reversed by executable ROLLBACK.sh.
+Literal output/result:
+ROLLBACK_RESULT=restored long Apple ID validation branding, 17px brand CSS, previous built UI and VERSION 0.3.9
+ROLLBACK_DIFF_EXIT=0
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.714s
+
+OK
+ROLLBACK_TEST_EXIT=0
+Exit status: 0
+Restored behavior/status: byte-for-byte comparison matched baseline; the long top brand, version-only sidebar bottom, Vue/Python footer, technical Settings rows and VERSION 0.3.9 were restored; all 41 baseline tests passed.
+
+ORIGINAL SHA256
+0996e6b125d9809496164497fabcc4eb6f8b819627e3491560cbdda801dd77c3  verification-artifacts/short-apple-cluster-name/original/cluster-lab/README.md
+7ba9018230af436dd67f7057f862ff2fec63f465a02078d6be14cad5aa184a5d  verification-artifacts/short-apple-cluster-name/original/cluster-lab/app.py
+ad2c0a615b9b298e5e60ed03f96b90dacf14b5e72f6f69d481ad704f318c7e3d  verification-artifacts/short-apple-cluster-name/original/cluster-lab/clusterlab/__init__.py
+11cb552b777af441db4e23b3a2db894b054eb5777e19fdf9249fa18b5202b57f  verification-artifacts/short-apple-cluster-name/original/cluster-lab/clusterlab/static/app.js
+34f089425b6890472f27a395507494fec0acec7a8d127e806b43df3efb23d7c3  verification-artifacts/short-apple-cluster-name/original/cluster-lab/clusterlab/static/index.html
+023f26a17fe8a5c0be3af6e6e565427b9c8f568dc9f7e2c279d35c08a5d245b5  verification-artifacts/short-apple-cluster-name/original/cluster-lab/frontend/index.html
+d42b50f954cc5c54ef606460ab4f05e7be92964cc7f5cb7dfe5b7cf1d759e81d  verification-artifacts/short-apple-cluster-name/original/cluster-lab/frontend/package-lock.json
+f05f41a4010bcaffb7951809ac10fa27376ef38765164e6e441ae26421480908  verification-artifacts/short-apple-cluster-name/original/cluster-lab/frontend/package.json
+4c768126d39a27fbd67ffdb55bf0a8316ad97a6239f09a46c70605208d53c044  verification-artifacts/short-apple-cluster-name/original/cluster-lab/frontend/src/App.vue
+90b67660aff9d2a67c936d72ff2717c31120a03fdeebd64593cc50cf6059548e  verification-artifacts/short-apple-cluster-name/original/cluster-lab/frontend/src/style.css
+c57a646b2d2c3af3bea1cae14f117caebe2989030c23b310d0c7be1fd8e8b36d  verification-artifacts/short-apple-cluster-name/original/cluster-lab/frontend/tests/live-feedback-config.test.mjs
+a9254b520cd7ebc9e24efef21db05fd91ba51077374b074a335271e50947c83b  verification-artifacts/short-apple-cluster-name/original/cluster-lab/frontend/src/views/Settings.vue

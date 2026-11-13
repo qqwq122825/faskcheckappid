@@ -1,3 +1,3 @@
 """Independent offline task orchestration; no FastCheck imports or adapters."""
 
-VERSION = '0.3.9'
+VERSION = '0.3.10'
