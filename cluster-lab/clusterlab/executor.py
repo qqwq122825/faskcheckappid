@@ -120,15 +120,21 @@ def execute_auth_unit(directory, descriptor, stop):
     DevicePool, gsa_check, result_bucket = _load_fastcheck()
 
     proxy = descriptor.get('proxy')
-    if not proxy and descriptor.get('proxy_api'):
+    proxies = []
+    if descriptor.get('proxy_api'):
         from fastcheck.proxy_pool import fetch_proxies
         scheme = descriptor.get('proxy_scheme') or 'socks5h'
+        # 一次多提几条，包内按账号分摊：一条隧道只承担一个账号，
+        # 比整包共用一条出口的失败率低得多。上限 1000 避免把配额一次抽干。
+        demand = min(1000, max(int(descriptor.get('rows') or 0), threads * 4, 20))
         try:
-            picked = fetch_proxies(descriptor['proxy_api'], 1,
-                                   scheme=None if scheme == 'http' else scheme)
+            proxies = fetch_proxies(descriptor['proxy_api'], demand,
+                                    scheme=None if scheme == 'http' else scheme)
         except Exception:                                          # noqa: BLE001
-            picked = []
-        proxy = picked[0] if picked else None
+            proxies = []
+        proxy = proxies[0] if proxies else None
+    elif not proxy:
+        proxy = None
     origin = descriptor.get('origin') or 'https://new.ani.sidestore.io'
     device_root = descriptor.get('device_root')
     slot = int(descriptor.get('slot') or 1)
@@ -170,22 +176,28 @@ def execute_auth_unit(directory, descriptor, stop):
             infos[index] = None
             identities[index] = None
 
+    def proxy_for(index):
+        if not proxies:
+            return proxy
+        return proxies[index % len(proxies)]
+
     def one(row, index, line):
         if stop.is_set():
             return row, line, {'status': 'unknown', 'kind': 'stopped'}
         account, password = _split_account(line)
         account_started = time.time()
         slot_id = 1 + (index % capacity)
+        account_proxy = proxy_for(index)
         identity = identities.get(slot_id)
         try:
             if identity is None:
                 # 预取失败的槽位在这里补一次
-                info = pool.info(timeout, proxy=proxy, provider_direct=True)
+                info = pool.info(timeout, proxy=account_proxy, provider_direct=True)
                 ready = pool.inspect(slot_id)['state'] == 'ready'
                 identity = pool.fetch_headers(slot_id, info, max(timeout, 40),
-                                              registered=ready, proxy=proxy,
+                                              registered=ready, proxy=account_proxy,
                                               provider_direct=True)
-            result = gsa_check(account, password, proxy, timeout=timeout, retries=0,
+            result = gsa_check(account, password, account_proxy, timeout=timeout, retries=0,
                                cancel=stop.is_set, identity=identity)
         except Exception as exc:                                   # noqa: BLE001
             return row, line, {'status': 'error', 'kind': type(exc).__name__,
