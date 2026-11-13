@@ -157,6 +157,20 @@ class Controller:
                        (processes, threads, int(data['enabled']), node_id))
             event(db, 'node_config', '节点执行配置已更新，下一次心跳下发；在途工作包保持原配置', node_id=node_id)
 
+    def _source_path(self, name):
+        """输入文件沿用用户给的名字；重名时加 -2、-3，避免覆盖已上传的文件。"""
+        stem = Path(str(name or 'upload')).stem.strip() or 'upload'
+        stem = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', '_', stem)[:60] or 'upload'
+        suffix = Path(str(name or '')).suffix or '.txt'
+        if suffix.lower() != '.txt':
+            suffix = '.txt'
+        candidate = self.inputs / f'{stem}{suffix}'
+        serial = 2
+        while candidate.exists():
+            candidate = self.inputs / f'{stem}-{serial}{suffix}'
+            serial += 1
+        return candidate
+
     def create_job(self, name, stream, unit_rows=500, mode='auth', enqueue=False):
         integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
         if type(enqueue) is not bool:
@@ -164,7 +178,7 @@ class Controller:
         if mode not in ('digest', 'simulate', 'auth'):
             raise ValueError('执行模式应为 digest / simulate / auth')
         job_id = uuid.uuid4().hex
-        target = (self.inputs / (job_id + '.txt')).resolve()
+        target = self._source_path(name).resolve()
         with target.open('xb') as output:
             target.chmod(0o600)
             shutil.copyfileobj(stream, output, 1024 * 1024)

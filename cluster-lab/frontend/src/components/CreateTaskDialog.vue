@@ -92,7 +92,7 @@ async function submit() {
           <template #tip><div class="el-upload__tip">UTF-8 编码，每行一条记录，最大 2 GiB。</div></template>
         </el-upload>
       </el-form-item>
-      <el-form-item label="任务名称（可选）"><el-input v-model="name" placeholder="不填写则使用文件名" maxlength="120" :disabled="busy" /></el-form-item>
+      <el-form-item label="任务名称（可选）"><el-input v-model="name" placeholder="不填写则使用上传的文件名；重名会自动加 -2、-3" maxlength="120" :disabled="busy" /></el-form-item>
       <el-collapse v-model="advanced" class="create-advanced"><el-collapse-item title="高级设置（通常无需调整）" name="advanced"><el-form-item label="每个分片的记录数"><el-input-number v-model="unitRows" :min="50" :max="maxUnitRows" :step="50" :precision="0" :disabled="busy" /><span class="field-note">总控上限 {{ maxUnitRows.toLocaleString('zh-CN') }} 条；默认 {{ Math.min(10000, maxUnitRows).toLocaleString('zh-CN') }} 条，同时受 32 MiB 字节上限约束。</span></el-form-item></el-collapse-item></el-collapse>
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
       <p class="muted">创建后自动加入执行队列；前一个任务全部确认后，轮到本任务自动开始。</p>
