@@ -41,6 +41,7 @@ class DeviceBuilder:
         for entry in slots:
             info = registry.get(str(entry['slot'])) or {}
             entry['proxy'] = info.get('proxy', '')
+            entry['model'] = info.get('model', '')
             entry['at'] = info.get('at', '')
         data.update(ready=ready, slots=slots,
                     capacity=max(data['capacity'], ready))
@@ -112,7 +113,7 @@ class DeviceBuilder:
                     output.cancel_join_thread(); output.close(); process.close()
                 ok = bool(result and result.get('ok')) and pool.inspect(slot)['state'] == 'ready'
                 if ok:
-                    self._record(slot, proxy)
+                    self._record(slot, proxy, (result or {}).get('model'))
                     self._update(built=self.state['built'] + 1,
                                  ready=self.state['ready'] + 1,
                                  message=f'第 {slot} 台已就绪')
@@ -129,7 +130,7 @@ class DeviceBuilder:
     def _registry_path(self):
         return self.node.root / 'device-pool' / 'registry.json'
 
-    def _record(self, slot, proxy):
+    def _record(self, slot, proxy, model=''):
         """记下每台设备注册时用的出口，供界面核对设备"出生地"。"""
         try:
             path = self._registry_path()
@@ -137,7 +138,7 @@ class DeviceBuilder:
             data = json.loads(path.read_text('utf-8')) if path.exists() else {}
         except (OSError, ValueError):
             data = {}
-        data[str(int(slot))] = {'proxy': str(proxy or ''),
+        data[str(int(slot))] = {'proxy': str(proxy or ''), 'model': str(model or ''),
                                 'at': time.strftime('%m-%d %H:%M'), 'ts': time.time()}
         try:
             self._registry_path().write_text(json.dumps(data), 'utf-8')
@@ -226,12 +227,17 @@ def _register(payload, output):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         DevicePool, _, _ = _load_fastcheck()
+        # 注册时就定下型号：设备身份一旦写死，之后执行必须报同一个型号，
+        # 否则同一台设备"注册时是 MacBookPro13,3、执行时变 iMac"会被判异常。
+        from fastcheck.workers import device_profile
         pool = DevicePool(payload['device_root'], payload['origin'],
                           max_devices=payload['capacity'])
         with pool.operation(payload['slot']):
             info = pool.info(payload['timeout'], proxy=payload['proxy'], provider_direct=True)
+            profile = device_profile(pool, payload['slot'])
+            info = dict(info, client_info=profile['client_info'], user_agent=profile['user_agent'])
             pool.fetch_headers(payload['slot'], info, payload['timeout'], registered=False,
                                proxy=payload['proxy'], provider_direct=True)
-        output.put({'ok': True})
+        output.put({'ok': True, 'model': profile['model']})
     except Exception as exc:                                       # noqa: BLE001
         output.put({'ok': False, 'error': type(exc).__name__})

@@ -21,6 +21,7 @@ const rows = computed(() => {
       slot: item.slot,
       state: item.state === 'ready' ? '已就绪' : item.state === 'pending' ? '待注册' : '未开始',
       proxy: item.proxy || '—',
+      model: item.model || '—',
       at: item.at || '—',
     }))
   }
@@ -28,7 +29,7 @@ const rows = computed(() => {
   return Array.from({ length: total }, (_, index) => ({
     slot: index + 1,
     state: index < ready.value ? '已就绪' : index < actual.value ? '已尝试' : '未开始',
-    proxy: '—', at: '—',
+    proxy: '—', model: '—', at: '—',
   }))
 })
 
@@ -113,8 +114,9 @@ async function cancelBuild() {
       </div>
       <el-table :data="rows" empty-text="尚未初始化设备" stripe max-height="360">
         <el-table-column prop="slot" label="设备编号" width="100" />
-        <el-table-column prop="state" label="状态" width="110" />
-        <el-table-column prop="proxy" label="注册出口 IP" min-width="160" show-overflow-tooltip />
+        <el-table-column prop="state" label="状态" width="100" />
+        <el-table-column prop="model" label="设备型号" min-width="150" show-overflow-tooltip />
+        <el-table-column prop="proxy" label="注册出口 IP" min-width="150" show-overflow-tooltip />
         <el-table-column prop="at" label="注册时间" width="120" />
       </el-table>
     </section>

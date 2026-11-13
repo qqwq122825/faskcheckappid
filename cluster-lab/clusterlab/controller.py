@@ -338,6 +338,7 @@ class Controller:
                 result['device_pool']['slots'] = [
                     {'slot': int(item.get('slot') or 0),
                      'state': str(item.get('state') or '')[:20],
+                     'model': str(item.get('model') or '')[:32],
                      'proxy': mask_proxy(str(item.get('proxy') or '')),
                      'at': str(item.get('at') or '')[:16]}
                     for item in slots[:64] if isinstance(item, dict)]
