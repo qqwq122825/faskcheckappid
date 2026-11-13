@@ -73,7 +73,11 @@ def _load_fastcheck():
     """cluster-lab 与 fastcheck 在同一仓库的兄弟目录，运行时按需挂载。"""
     import sys
     from pathlib import Path
-    root = Path(__file__).resolve().parents[2]
+    # cluster-lab 目录下的 fastcheck 软链接优先：父目录通常只有 x 权限，
+    # Python 的 FileFinder 要用 os.listdir 才能发现包，会 ImportError。
+    here = Path(__file__).resolve().parents[1]
+    candidates = [here, Path(__file__).resolve().parents[2]]
+    root = next((path for path in candidates if (path / 'fastcheck').exists()), candidates[-1])
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     try:
