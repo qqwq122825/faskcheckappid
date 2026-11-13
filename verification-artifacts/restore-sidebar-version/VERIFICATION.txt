@@ -1,0 +1,87 @@
+BRANCH/FIELD: main / App.vue sidebar-bottom full brand + session.version + built static UI / VERSION 0.3.11
+
+CHANGED RESULT
+- Sidebar bottom now renders: 苹果id校验集群系统 | v0.3.11
+- Top brand remains: 苹果集群系统
+- Vue/Python and 离线任务平台 labels remain absent.
+
+FOUR ARTIFACT PATHS
+MODIFIED_FILE=/Users/xxx/Documents/并发/verification-artifacts/restore-sidebar-version/MODIFIED_FILE
+DIFF_FILE=/Users/xxx/Documents/并发/verification-artifacts/restore-sidebar-version/DIFF_FILE
+VERIFICATION.txt=/Users/xxx/Documents/并发/verification-artifacts/restore-sidebar-version/VERIFICATION.txt
+ROLLBACK.sh=/Users/xxx/Documents/并发/verification-artifacts/restore-sidebar-version/ROLLBACK.sh
+
+ORIGINAL INPUT
+Git HEAD=c702d98a3313d7ab27edf657e5b4ceca5857e824
+App.vue SHA256=771602b637bd652d2a3a0876b9355aa936d2f6b69ac81092ba61a0a1f6fbbd47
+clusterlab/__init__.py SHA256=808bcacdaa95998242579bb17687d3c226cc89550b7f07800a48102ba2034981
+frontend/package.json SHA256=aba0cdf7c6fdfe28f050f812ca80acdbd4f72c618b25571c5184ee4d4a43fa03
+frontend/package-lock.json SHA256=37c926268cbe111ec73c7cefa5006d579f0d5ed5bfc939a826209137d51d2d30
+frontend live feedback test SHA256=c2c0e1ded0d6be312bad3a8114331bb3c922f9721f090882b2d106da1099903c
+
+BASELINE
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/restore-sidebar-version/baseline-check/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: unmodified Git HEAD c702d98a3313d7ab27edf657e5b4ceca5857e824
+Literal output/result:
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.807s
+
+OK
+BASELINE_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm test
+Input: sidebar-bottom full name plus session.version; package version 0.3.11
+Literal output/result: tests 11; pass 11; fail 0; duration_ms 49.722042; FRONTEND_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND BUILD
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm run build
+Input: Vue source and package version 0.3.11
+Literal output/result: 1652 modules transformed; built in 2.19s; FRONTEND_BUILD_EXIT=0
+Exit status: 0
+
+MODIFIED BACKEND TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python -m unittest discover -s tests
+Input: working tree with sidebar version display, built static UI, VERSION 0.3.11
+Literal output/result:
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.877s
+
+OK
+MODIFIED_TEST_EXIT=0
+Exit status: 0
+
+LABEL/VERSION SCAN
+Command: grep -RInE 'Vue \+ Python|Vue 3 \+ Element Plus|Python \+ Flask|离线任务平台' cluster-lab/frontend/src cluster-lab/clusterlab/static/ui cluster-lab/clusterlab/static/index.html; grep sidebar/version fields
+Input: source and production static UI
+Literal output/result: RESULT=no forbidden labels found; source contains 苹果id校验集群系统 and session.version; static bundle contains 苹果id校验集群系统; VERSION = '0.3.11'; SCAN_EXIT=0
+Exit status: 0
+
+ROLLBACK
+Command: /Users/xxx/Documents/并发/verification-artifacts/restore-sidebar-version/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/restore-sidebar-version/rollback-test-verified
+Input: second clean Git HEAD copy after applying DIFF_FILE
+Literal output/result: ROLLBACK_RESULT=restored sidebar footer without version and VERSION 0.3.10; ROLLBACK_COMMAND_EXIT=0
+Exit status: 0
+
+ROLLBACK COMPARISON
+Command: diff -qr /Users/xxx/Documents/并发/verification-artifacts/restore-sidebar-version/rollback-original-verified /Users/xxx/Documents/并发/verification-artifacts/restore-sidebar-version/rollback-test-verified
+Input: original HEAD copy and rolled-back second copy
+Literal output/result: ROLLBACK_DIFF_EXIT=0
+Exit status: 0
+
+ROLLBACK TEST
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/restore-sidebar-version/rollback-test-verified/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: rolled-back second copy
+Literal output/result:
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.796s
+
+OK
+ROLLBACK_TEST_EXIT=0
+Exit status: 0
+Restored behavior/status: sidebar bottom again shows only 苹果id校验集群系统 without a version; application version is restored to 0.3.10; all 41 tests pass.

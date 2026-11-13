@@ -31,7 +31,7 @@ test('Application omits the offline platform label everywhere', () => {
   const styles = source('src/style.css')
   assert.doesNotMatch(app, /\u79bb\u7ebf\u4efb\u52a1\u5e73\u53f0/)
   assert.match(app, /苹果集群系统/)
-  assert.match(app, /sidebar-bottom"><span>苹果id校验集群系统/)
+  assert.match(app, /sidebar-bottom"><span>苹果id校验集群系统<\/span><span>v\{\{ session\.version \}\}/)
   assert.doesNotMatch(app, /Vue \+ Python/)
   assert.match(styles, /\.brand\{[^}]*font-size:22px/)
 })
