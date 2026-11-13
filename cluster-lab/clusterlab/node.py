@@ -219,9 +219,10 @@ class Node:
             limit = int(value.get('device_rotate_after') or 0)
             if auto and not self.builder.state['running']:
                 if limit:
+                    # 有用满次数的设备 → 触发一次轮换；淘汰对象是出生最早的那台
                     stale = self.builder.retirable(limit)
                     if stale:
-                        self.builder.retire(stale)
+                        self.builder.retire(self.builder.oldest(len(stale)))
                 capacity = int(self.builder.state['capacity'] or 0)
                 if capacity:
                     try:

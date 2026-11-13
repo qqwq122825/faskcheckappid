@@ -137,7 +137,8 @@ class DeviceBuilder:
             data = json.loads(path.read_text('utf-8')) if path.exists() else {}
         except (OSError, ValueError):
             data = {}
-        data[str(int(slot))] = {'proxy': str(proxy or ''), 'at': time.strftime('%m-%d %H:%M')}
+        data[str(int(slot))] = {'proxy': str(proxy or ''),
+                                'at': time.strftime('%m-%d %H:%M'), 'ts': time.time()}
         try:
             self._registry_path().write_text(json.dumps(data), 'utf-8')
         except OSError:
@@ -164,6 +165,18 @@ class DeviceBuilder:
         return sorted(int(slot) for slot, used in counts.items()
                       if isinstance(used, int) and used >= limit)
 
+    def oldest(self, count=1):
+        """按注册时间取最老的槽位：轮换时先淘汰设备 1，再 2、3……"""
+        registry = self.registry()
+        entries = []
+        for key, info in registry.items():
+            try:
+                entries.append((int(key), float(info.get('ts') or 0)))
+            except (TypeError, ValueError):
+                continue
+        entries.sort(key=lambda item: item[1])
+        return [slot for slot, _ in entries[:max(0, int(count))]]
+
     def retire(self, slots):
         """删掉这些槽位的设备身份，下次执行会自动重新 provisioning。"""
         removed = []
@@ -183,10 +196,13 @@ class DeviceBuilder:
                 path.unlink(missing_ok=True)
             removed.append(int(slot))
         counts = self.usage()
+        registry = self.registry()
         for slot in removed:
             counts.pop(str(slot), None)
+            registry.pop(str(slot), None)     # 出生记录一起清，否则 oldest 还会选中它
         try:
             (pool_dir / 'usage.json').write_text(json.dumps(counts), 'utf-8')
+            self._registry_path().write_text(json.dumps(registry), 'utf-8')
         except OSError:
             pass
         self._update(message=f'已轮换 {len(removed)} 台设备')
