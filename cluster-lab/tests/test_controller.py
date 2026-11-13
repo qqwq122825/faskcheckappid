@@ -154,6 +154,27 @@ class ControllerTests(unittest.TestCase):
         unit = self.service.lease(node['id'], 'big-session')
         self.assertIsNotNone(unit)
         self.assertEqual(unit['threads'], 100)
+        self.assertEqual(unit['processes'], 50)  # 50 rows cannot use more than 50 processes.
+        self.assertIsNone(self.service.lease(node['id'], 'big-session'))
+
+    def test_lease_carries_job_timeout_and_indexed_package_bytes(self):
+        job = self.service.create_job('indexed', io.BytesIO(b'hello\n' * 100), 50,
+                                      timeout=37, retries=3)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = next(j for j in self.service.snapshot()['jobs'] if j['id'] == job)
+            if state['status'] == 'ready':
+                break
+            time.sleep(.01)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual((unit['timeout'], unit['retries']), (37, 3))
+        self.assertEqual(unit['bytes'], 300)
+        indexed = self.service.unit_for_node(self.node['id'], unit['id'], unit['token'])
+        self.assertEqual(b''.join(self.service.unit_blocks(indexed)), b'hello\n' * 50)
+        with self.service.db.connect() as db:
+            paths = {row['path'] for row in db.execute('SELECT path FROM units WHERE job_id=?', (job,))}
+        self.assertEqual(len(paths), 1, 'all packages should reference the one uploaded source file')
 
     def test_late_result_after_lease_expiry_is_still_accepted(self):
         """P0：租约过期后迟到的结果仍要接受，否则节点白算一遍。"""
@@ -294,8 +315,9 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(state['rows'], 80)
         self.assertEqual(state['units'], 2)
         with self.service.db.connect() as db:
-            paths = [Path(r['path']) for r in db.execute('SELECT path FROM units WHERE job_id=?', (job,))]
-        self.assertTrue(all(p.stat().st_size <= 4 * 1024 * 1024 for p in paths))
+            ranges = [(r['byte_start'], r['byte_end']) for r in
+                      db.execute('SELECT byte_start,byte_end FROM units WHERE job_id=?', (job,))]
+        self.assertTrue(all(end - start <= 4 * 1024 * 1024 for start, end in ranges))
 
     def test_prepare_does_not_query_settings_per_row(self):
         """解析阶段每行查一次数据库会把 10 万行拖到 30 秒以上（回归防护）。"""
@@ -345,11 +367,11 @@ class ControllerTests(unittest.TestCase):
         observed = []
         while unit := self.service.lease(self.node['id'], 'test-session'):
             observed.append((unit['first_row'], unit['rows']))
-            path = self.service.unit_for_node(self.node['id'], unit['id'], unit['token'])['path']
+            indexed = self.service.unit_for_node(self.node['id'], unit['id'], unit['token'])
             payload = b''.join((json.dumps({'row': unit['first_row'] + offset,
                                 'sha256': hashlib.sha256(line.rstrip(b'\r\n')).hexdigest(),
                                 'bytes': len(line.rstrip(b'\r\n'))}) + '\n').encode()
-                               for offset, line in enumerate(Path(path).read_bytes().splitlines(keepends=True)))
+                               for offset, line in enumerate(self.service.unit_lines(indexed)))
             self.service.accept_result(self.node['id'], unit['id'], unit['token'], io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
         self.assertEqual(observed, [(start, 1000) for start in range(1, 10001, 1000)])
         response = client.get(f'/api/jobs/{job}/results')
@@ -415,9 +437,11 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(state['status'], 'ready')
         self.assertEqual((state['rows'], state['units']), (10002, 2))
         with self.service.db.connect() as db:
-            units = list(db.execute('SELECT first_row,rows,path FROM units WHERE job_id=? ORDER BY seq', (job,)))
+            units = [dict(row) for row in db.execute(
+                'SELECT first_row,rows,path,byte_start,byte_end FROM units WHERE job_id=? ORDER BY seq',
+                (job,))]
         self.assertEqual([(unit['first_row'], unit['rows']) for unit in units], [(1, 10000), (10001, 2)])
-        self.assertEqual(Path(units[1]['path']).read_bytes(), b'\n\n')
+        self.assertEqual(b''.join(self.service.unit_lines(units[1])), b'\n\n')
 
         self.service.job_action(job, 'start')
         first = self.service.lease(self.node['id'], 'test-session')

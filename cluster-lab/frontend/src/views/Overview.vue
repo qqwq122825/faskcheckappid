@@ -23,7 +23,7 @@ const queue = computed<any[]>(() => state.value?.queue || [])
     </div>
     <div class="home-task-toolbar"><span class="current-task-label">{{ state.current_job_id ? '当前任务' : job?.status === 'queued' || job?.status === 'preparing' ? '等待执行' : '最近任务' }}</span><el-button :icon="ArrowRight" @click="router.push('/jobs')">任务管理</el-button></div>
     <el-card v-if="job" shadow="never" class="section-card">
-      <div class="section-heading"><div><div class="task-name"><h2>{{ job.name }}</h2><StatusBadge :status="job.status" :unit-counts="job.unit_counts" /></div><p>{{ date(job.created) }} 创建 · {{ fmt(job.confirmed) }} / {{ fmt(job.rows) }} 条已确认</p></div><el-button type="primary" :icon="ArrowRight" @click="router.push('/jobs/' + job.id)">查看任务详情</el-button></div>
+      <div class="section-heading"><div><div class="task-name"><h2>{{ job.name }}</h2><StatusBadge :status="job.status" :unit-counts="job.unit_counts" /></div><p>{{ date(job.created) }} 创建 · {{ fmt(Math.max(job.processed || 0, job.confirmed || 0)) }} 条已处理 · {{ fmt(job.confirmed) }} 条已确认</p></div><el-button type="primary" :icon="ArrowRight" @click="router.push('/jobs/' + job.id)">查看任务详情</el-button></div>
       <el-progress class="summary-progress" :percentage="Number(percent(job).toFixed(1))" :stroke-width="10" />
       <p v-if="job.status === 'paused'" class="muted">当前任务暂停中，后续任务保留排队顺序。</p>
     </el-card>

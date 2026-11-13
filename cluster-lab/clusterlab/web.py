@@ -8,7 +8,7 @@ import tempfile
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-from flask import Flask, Response, jsonify, request, send_file, session
+from flask import Flask, Response, jsonify, request, send_file, session, stream_with_context
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -247,7 +247,13 @@ def create_app(role, service, password=None):
         @app.get('/agent/units/<unit_id>/input')
         def unit_input(unit_id):
             unit = service.unit_for_node(request.node_id, unit_id, request.headers.get('X-Lease-Token'))
-            return send_file(unit['path'], mimetype='application/octet-stream', as_attachment=True, download_name=unit_id + '.part')
+            start = int(unit.get('byte_start') or 0)
+            end = int(unit.get('byte_end') or 0)
+            length = end - start if end > start else Path(unit['path']).stat().st_size
+            return Response(stream_with_context(service.unit_blocks(unit)),
+                            mimetype='application/octet-stream',
+                            headers={'Content-Length': str(length),
+                                     'Content-Disposition': f'attachment; filename="{unit_id}.part"'})
 
         @app.post('/agent/units/<unit_id>/result')
         def unit_result(unit_id):

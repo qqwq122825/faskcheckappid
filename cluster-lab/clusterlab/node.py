@@ -13,7 +13,7 @@ import requests
 
 from . import VERSION
 from .common import Database, atomic_json, file_digest, integer, private_dir, read_json
-from .executor import execute_auth_unit, execute_unit
+from .executor import execute_unit_group
 from .telemetry import HostTelemetry
 
 SCHEMA = '''
@@ -151,6 +151,27 @@ class Node:
                 with self.lock:
                     self.active.pop(unit_id, None)
 
+    def _refresh_progress(self):
+        """Persist coordinator counters immediately before a heartbeat."""
+        with self.lock:
+            unit_ids = list(self.active)
+        now = time.time()
+        with self.db.transaction() as db:
+            for unit_id in unit_ids:
+                progress = read_json(self.spool / unit_id / 'progress.json', {})
+                db.execute('UPDATE tasks SET processed=MAX(processed,?),updated=? WHERE id=?',
+                           (int(progress.get('processed') or 0), now, unit_id))
+
+    def _active_worker_count(self):
+        with self.lock:
+            unit_ids = list(self.active)
+        workers = 0
+        for unit_id in unit_ids:
+            progress = read_json(self.spool / unit_id / 'progress.json', {})
+            workers += int(progress['workers'] if 'workers' in progress
+                           else progress.get('worker_limit') or 0)
+        return workers
+
     def _device_slots(self):
         """设备池明细：编号、状态、注册出口。心跳带上，总控页面直接展示。"""
         try:
@@ -170,6 +191,7 @@ class Node:
             self.origin = str(config.get('origin') or self.origin)
 
     def _heartbeat(self):
+        self._refresh_progress()
         with self.db.connect() as db:
             values, interrupted = [], []
             for task in db.execute("SELECT * FROM tasks WHERE status IN ('running','outbox','interrupted')"):
@@ -183,7 +205,8 @@ class Node:
         with self._request('POST', '/agent/heartbeat', json={'session': self.instance, 'hostname': socket.gethostname(),
                            'version': VERSION, 'max_processes': self.max_processes, 'max_threads': self.max_threads,
                            'active': values, 'interrupted': interrupted, 'ack_stop_version': self.stop_version,
-                           'telemetry': dict(self.telemetry.latest, worker_processes=len(self.active)),
+                           'telemetry': dict(self.telemetry.latest,
+                                             worker_processes=self._active_worker_count()),
                            'devices': {**{k: self.builder.state[k] for k in
                                           ('running', 'capacity', 'ready', 'built', 'failed')},
                                        'slots': self._device_slots()},
@@ -282,14 +305,14 @@ class Node:
         # 认证模式需要本地设备目录；节点自己决定路径，不接受总控指定。
         if descriptor.get('mode') == 'auth':
             descriptor.setdefault('device_root', str(private_dir(self.root / 'device-pool')))
-            descriptor.setdefault('device_capacity', self.max_processes)
+            descriptor.setdefault('device_capacity', int(descriptor.get('processes') or 1))
             descriptor.setdefault('timeout', 20)
             descriptor.setdefault('retries', 0)
         atomic_json(directory / 'manifest.json', descriptor)
         stop = self.context.Event()
-        runner = execute_auth_unit if descriptor.get('mode') == 'auth' else execute_unit
-        process = self.context.Process(target=runner, args=(str(directory), descriptor, stop),
-                                       name='unit-worker')
+        process = self.context.Process(target=execute_unit_group,
+                                       args=(str(directory), descriptor, stop),
+                                       name='package-coordinator')
         with self.db.transaction() as db:
             db.execute("UPDATE tasks SET status='running',processed=0,error=NULL WHERE id=?", (unit_id,))
         process.start()
@@ -356,7 +379,9 @@ class Node:
                     with self.db.connect() as db:
                         backlog = db.execute("SELECT COUNT(*) FROM tasks WHERE status='outbox'").fetchone()[0]
                     with self.lock:
-                        capacity = settings['processes'] - len(self.active) if backlog < settings['processes'] * 2 else 0
+                        # One package consumes this node's complete process
+                        # budget; execute_unit_group performs local fan-out.
+                        capacity = 1 - len(self.active) if backlog < 2 else 0
                     for _ in range(max(0, capacity)):
                         with self.lock:
                             if generation != self.generation:
@@ -380,14 +405,15 @@ class Node:
             settings = dict(self.settings)
             connected = self.connected and self.last_success and time.time() - self.last_success < 10
             error, last_success = self.error, self.last_success
-            active_processes = len(self.active)
+            active_processes = self._active_worker_count()
         with self.db.connect() as db:
             tasks = []
             for task in db.execute('SELECT * FROM tasks ORDER BY created DESC LIMIT 60'):
                 descriptor = json.loads(task['descriptor'])
                 progress = read_json(self.spool / task['id'] / 'progress.json', {})
                 tasks.append({'id': task['id'], 'job_id': task['job_id'], 'seq': task['seq'],
-                              'rows': descriptor['rows'], 'threads': descriptor['threads'],
+                              'rows': descriptor['rows'], 'processes': descriptor.get('processes', 1),
+                              'threads': descriptor['threads'],
                               'status': task['status'], 'processed': progress.get('processed', task['processed']),
                               'created': task['created'], 'updated': task['updated'], 'error': task['error']})
             confirmed, outbox, processed = db.execute("SELECT COALESCE(SUM(CASE WHEN status='confirmed' THEN processed ELSE 0 END),0),COALESCE(SUM(CASE WHEN status='outbox' THEN processed ELSE 0 END),0),COALESCE(SUM(processed),0) FROM tasks").fetchone()

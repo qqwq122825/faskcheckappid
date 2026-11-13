@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import { UploadFilled } from '@element-plus/icons-vue'
 import { api, busy, createTaskOpen, refresh, session, state } from '../composables/useCluster'
 const router = useRouter()
-const name = ref(''), unitRows = ref(1000), file = ref<File>(), error = ref(''), advanced = ref<string[]>([])
+const name = ref(''), unitRows = ref(10000), file = ref<File>(), error = ref('')
 const files = ref<any[]>([]), chosen = ref(''), mode = ref<'new' | 'reuse'>('new')
 const timeout = ref(20), retries = ref(0)
 const uploadPercent = ref<number | null>(null)
@@ -12,7 +12,7 @@ const maxUnitRows = computed(() => state.value?.settings?.max_unit_rows || 10000
 watch(createTaskOpen, open => {
   if (open) {
     error.value = ''; file.value = undefined; name.value = ''
-    unitRows.value = Math.min(10000, maxUnitRows.value); advanced.value = ['advanced']
+    unitRows.value = Math.min(10000, maxUnitRows.value)
     timeout.value = 20; retries.value = 0; uploadPercent.value = null
     chosen.value = ''; mode.value = 'new'
     loadFiles()
@@ -105,7 +105,7 @@ async function submit() {
           <el-option v-for="item in files" :key="item.id" :value="item.id"
                      :label="`${item.name} · ${sizeText(item.bytes)} · ${item.rows ? item.rows.toLocaleString('zh-CN') + ' 条' : '待解析'}`" />
         </el-select>
-        <span class="field-note">复用同一份源文件再建任务，不用重复上传；分片大小可以重新选。</span>
+        <span class="field-note">复用同一份源文件再建任务，不用重复上传。</span>
       </el-form-item>
       <el-form-item v-if="mode === 'new'" label="TXT 文件">
         <el-upload drag :auto-upload="false" :limit="1" :disabled="busy" accept=".txt" :on-change="chooseFile" :on-remove="() => file = undefined" :on-exceed="() => error = '一次选择一个 TXT 文件，请先移除已选文件'">
@@ -114,20 +114,11 @@ async function submit() {
         </el-upload>
       </el-form-item>
       <el-form-item label="任务名称（可选）"><el-input v-model="name" placeholder="不填写则使用上传的文件名；重名会自动加 -2、-3" maxlength="120" :disabled="busy" /></el-form-item>
-      <el-collapse v-model="advanced" class="create-advanced"><el-collapse-item title="高级设置（通常无需调整）" name="advanced">
-          <el-form-item label="每个分片的记录数">
-            <el-input-number v-model="unitRows" :min="50" :max="maxUnitRows" :step="50" :precision="0" :disabled="busy" />
-            <span class="field-note">总控上限 {{ maxUnitRows.toLocaleString('zh-CN') }} 条；默认 {{ Math.min(10000, maxUnitRows).toLocaleString('zh-CN') }} 条，同时受 32 MiB 字节上限约束。</span>
-          </el-form-item>
-          <el-form-item label="单请求超时 / 秒">
-            <el-input-number v-model="timeout" :min="5" :max="120" :step="5" :precision="0" :disabled="busy" />
-            <span class="field-note">单条记录的一次网络请求最多等多久，超过就算超时。</span>
-          </el-form-item>
-          <el-form-item label="超时后重试次数">
-            <el-input-number v-model="retries" :min="0" :max="5" :step="1" :precision="0" :disabled="busy" />
-            <span class="field-note">只对可重试的失败生效（超时、TLS、5xx）；密码错误、锁定这类结论不会重试。</span>
-          </el-form-item>
-        </el-collapse-item></el-collapse>
+      <el-form-item label="单条请求超时 / 秒">
+        <el-input-number v-model="timeout" :min="5" :max="120" :step="5" :precision="0" :disabled="busy" />
+        <span class="field-note">单条记录的一次网络请求最多等待时间。分包、进程、线程和重试均由系统自动管理。</span>
+      </el-form-item>
+      <el-alert title="总控自动按每包最多 10,000 条建立字节索引；节点领包后使用全部进程和线程处理。" type="info" :closable="false" show-icon />
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
       <p class="muted">创建后自动加入执行队列；前一个任务全部确认后，轮到本任务自动开始。</p>
     </el-form>

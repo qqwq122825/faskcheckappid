@@ -54,7 +54,7 @@ export async function refresh() {
   finally { polling = false }
 }
 function schedule() {
-  timer = setTimeout(async () => { await refresh(); schedule() }, 1500)
+  timer = setTimeout(async () => { await refresh(); schedule() }, 1000)
 }
 export async function initialize() {
   clearTimeout(timer)
@@ -75,7 +75,8 @@ export async function mutate(path: string, data: any = {}, message = '操作已�
   finally { busy.value = false }
 }
 export const fmt = (value: any) => Number(value || 0).toLocaleString('zh-CN', { maximumFractionDigits: 1 })
-export const percent = (job: any) => job?.rows ? Math.min(100, job.confirmed / job.rows * 100) : 0
+export const percent = (job: any) => job?.rows
+  ? Math.min(100, Math.max(job.confirmed || 0, job.processed || 0) / job.rows * 100) : 0
 export const date = (timestamp: number) => timestamp ? new Date(timestamp * 1000).toLocaleString('zh-CN', { hour12: false }) : '尚未连接'
 export const bandwidth = (value: number | null | undefined) => value == null ? '—' : value >= 1048576 ? `${(value / 1048576).toFixed(2)} MiB/s` : `${(value / 1024).toFixed(1)} KiB/s`
 export const metric = (value: number | null | undefined) => value == null ? '—' : `${fmt(value)}%`

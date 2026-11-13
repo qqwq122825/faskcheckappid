@@ -10,8 +10,8 @@ const props = defineProps<{
   capacity?: string,
   processed?: number, unitCounts?: Record<string, number>,
 }>()
-const percentage = computed(() => props.total ? Math.min(100, props.completed / props.total * 100) : 0)
 const reportedProcessed = computed(() => props.processed == null ? null : Math.max(props.completed, Math.min(props.total, props.processed)))
+const percentage = computed(() => props.total ? Math.min(100, (reportedProcessed.value ?? props.completed) / props.total * 100) : 0)
 const awaitingConfirmation = computed(() => reportedProcessed.value == null ? null : Math.max(0, reportedProcessed.value - props.completed))
 interface Cell { label: string; value: number | null | undefined; tone?: string; suffix?: string }
 const categories = computed(() => props.categorized || {})
@@ -19,7 +19,7 @@ const cells = computed<Cell[]>(() => [
   { label: '总数', value: props.total },
   { label: '完成', value: props.completed,
     tone: props.total && props.completed >= props.total ? 'success' : undefined },
-  { label: '剩余', value: Math.max(0, props.total - props.completed) },
+  { label: '剩余', value: Math.max(0, props.total - (reportedProcessed.value ?? props.completed)) },
   { label: '在途记录', value: props.active },
   { label: '密正', value: categories.value.valid ?? 0, tone: 'success' },
   { label: '密码错误', value: categories.value.wrong_password ?? 0 },
@@ -38,7 +38,7 @@ const cells = computed<Cell[]>(() => [
     </div></div></template>
     <div class="feedback-grid"><div v-for="cell in cells" :key="cell.label" class="feedback-cell" :class="cell.tone"><span>{{ cell.label }}</span><strong>{{ cell.value == null ? '—' : fmt(cell.value) }}<small v-if="cell.suffix">{{ cell.suffix }}</small></strong></div></div>
     <div class="feedback-footer">
-      <div class="feedback-progress-label"><span>总控已确认 {{ fmt(completed) }} / {{ fmt(total) }}</span><strong>{{ percentage.toFixed(1) }}%</strong></div>
+      <div class="feedback-progress-label"><span>实时已处理 {{ fmt(reportedProcessed ?? completed) }} / {{ fmt(total) }}</span><strong>{{ percentage.toFixed(1) }}%</strong></div>
       <el-progress :percentage="Number(percentage.toFixed(1))" :show-text="false" :stroke-width="10" /><div v-if="$slots.actions" class="feedback-actions"><slot name="actions" /></div>
       <div v-if="!preview" class="feedback-meta" aria-label="任务进度口径">
         <span>节点已处理 {{ reportedProcessed == null ? '尚未上报' : fmt(reportedProcessed) + ' 条' }}</span>
@@ -47,7 +47,7 @@ const cells = computed<Cell[]>(() => [
       </div>
       <p v-if="!preview && active > 0 && !reportedProcessed">等待节点上报中间进度；在途记录数不代表同时执行数量。</p>
       <div class="feedback-meta"><span v-if="capacity">工作进程 {{ capacity }}</span><span>用时 {{ elapsed == null ? '—' : fmt(elapsed) }} 秒 · {{ fmt(rate) }} 条/小时</span></div>
-      <p>{{ preview ? '合成统计，不代表真实任务结果。' : '进度条按总控已确认数量计算，工作包回传后可能批量更新；完成表示结果回传已确认，分类结果见上方统计。' }}</p>
+      <p>{{ preview ? '合成统计，不代表真实任务结果。' : '进度条按节点每秒上报的实时已处理数量计算；完成状态仍以总控确认全部结果为准。' }}</p>
     </div>
   </el-card>
 </template>

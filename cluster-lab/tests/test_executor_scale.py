@@ -1,5 +1,6 @@
 import hashlib
 import json
+import multiprocessing as mp
 from pathlib import Path
 import sys
 import tempfile
@@ -9,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import _execute_auth_unit
+from clusterlab.executor import _execute_auth_unit, execute_unit_group
 
 
 class FakePool:
@@ -27,6 +28,27 @@ class FakePool:
 
 
 class ExecutorScaleTests(unittest.TestCase):
+    def test_one_package_fans_out_to_processes_and_merges_in_row_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lines = [f'row-{row:04d}' for row in range(123)]
+            (root / 'input.part').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+            descriptor = {'rows': len(lines), 'first_row': 7001, 'processes': 4,
+                          'threads': 3, 'mode': 'digest'}
+            stop = mp.get_context('spawn').Event()
+            execute_unit_group(root, descriptor, stop)
+            done = json.loads((root / 'done.json').read_text('utf-8'))
+            progress = json.loads((root / 'progress.json').read_text('utf-8'))
+            records = [json.loads(line) for line in
+                       (root / 'results.jsonl').read_text('utf-8').splitlines()]
+            self.assertTrue(done['ok'], done)
+            self.assertEqual(done['workers'], 4)
+            self.assertEqual(progress['worker_limit'], 4)
+            self.assertEqual([record['row'] for record in records], list(range(7001, 7124)))
+            self.assertEqual([record['account'] for record in records], lines)
+            self.assertEqual(done['checksum'], hashlib.sha256(
+                (root / 'results.jsonl').read_bytes()).hexdigest())
+
     def test_auth_unit_bounds_futures_hashes_incrementally_and_batches_usage_write(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

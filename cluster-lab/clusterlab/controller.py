@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE TABLE IF NOT EXISTS units (
  id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), seq INTEGER NOT NULL,
  first_row INTEGER NOT NULL, rows INTEGER NOT NULL, path TEXT NOT NULL,
+ byte_start INTEGER NOT NULL DEFAULT 0, byte_end INTEGER NOT NULL DEFAULT 0,
  checksum TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', node_id TEXT,
  lease_token TEXT, lease_until REAL, attempt INTEGER NOT NULL DEFAULT 0,
  processed INTEGER NOT NULL DEFAULT 0, result_path TEXT, result_checksum TEXT,
@@ -121,6 +122,10 @@ class Controller:
             unit_columns = {row['name'] for row in db.execute('PRAGMA table_info(units)')}
             if 'result_counts' not in unit_columns:
                 db.execute('ALTER TABLE units ADD COLUMN result_counts TEXT')
+            if 'byte_start' not in unit_columns:
+                db.execute('ALTER TABLE units ADD COLUMN byte_start INTEGER NOT NULL DEFAULT 0')
+            if 'byte_end' not in unit_columns:
+                db.execute('ALTER TABLE units ADD COLUMN byte_end INTEGER NOT NULL DEFAULT 0')
         self.lease_seconds, self.offline_seconds = lease_seconds, offline_seconds
         # 全局派发闸门：整个集群每秒最多放多少个新工作包。0 表示不限。
         self.dispatch_per_second = max(0, int(dispatch_per_second or 0))
@@ -407,11 +412,17 @@ class Controller:
             # 字节预算必须提到循环外：每行调一次 settings() 就是每行一次数据库查询，
             # 10 万行会被这种写法拖到 30 秒以上。
             byte_limit = self.settings()['unit_byte_limit']
-            seq, rows, first_row, buffer, buffered_bytes = 0, 0, 1, [], 0
+            # The source stays as one file.  A unit stores only byte offsets and
+            # a range digest, so a 4 GB upload is not copied into thousands of
+            # package files and preparation memory is independent of file size.
+            seq, rows, first_row = 0, 0, 1
+            unit_start, unit_rows, unit_bytes = 0, 0, 0
+            unit_digest = hashlib.sha256()
             with Path(job['source']).open('rb') as source:
                 while True:
                     if self.closing.is_set():
                         return
+                    line_start = source.tell()
                     line = source.readline(65537)
                     if not line:
                         break
@@ -421,19 +432,27 @@ class Controller:
                     # 每一行都是输入文件中的一条记录，空白行也必须保留。
                     # 这样文件末尾的剩余记录仍会形成正常的小包，不会被静默丢弃。
                     # 不补换行：分包内容与上传文件逐字节一致，导出才能原样还原
-                    if buffer and buffered_bytes + len(line) > byte_limit:
+                    if unit_rows and unit_bytes + len(line) > byte_limit:
                         seq += 1
-                        self._save_unit(job_id, seq, first_row, buffer, directory, rows)
-                        first_row, buffer, buffered_bytes = rows + 1, [], 0
-                    buffer.append(line)
-                    buffered_bytes += len(buffer[-1])
+                        self._save_unit(job_id, seq, first_row, unit_rows, job['source'],
+                                        unit_start, line_start, unit_digest.hexdigest(), rows)
+                        first_row, unit_start = rows + 1, line_start
+                        unit_rows, unit_bytes = 0, 0
+                        unit_digest = hashlib.sha256()
+                    unit_digest.update(line)
+                    unit_rows += 1
+                    unit_bytes += len(line)
                     rows += 1
-                    if len(buffer) == job['unit_rows'] or buffered_bytes >= byte_limit:
+                    if unit_rows == job['unit_rows'] or unit_bytes >= byte_limit:
                         seq += 1
-                        self._save_unit(job_id, seq, first_row, buffer, directory, rows)
-                        first_row, buffer, buffered_bytes = rows + 1, [], 0
-                if buffer:
-                    self._save_unit(job_id, seq + 1, first_row, buffer, directory, rows)
+                        self._save_unit(job_id, seq, first_row, unit_rows, job['source'],
+                                        unit_start, source.tell(), unit_digest.hexdigest(), rows)
+                        first_row, unit_start = rows + 1, source.tell()
+                        unit_rows, unit_bytes = 0, 0
+                        unit_digest = hashlib.sha256()
+                if unit_rows:
+                    self._save_unit(job_id, seq + 1, first_row, unit_rows, job['source'],
+                                    unit_start, source.tell(), unit_digest.hexdigest(), rows)
             with self.db.transaction() as db:
                 db.execute("UPDATE jobs SET status=CASE WHEN queued_at IS NOT NULL THEN 'queued' ELSE 'ready' END,rows=?,updated=? WHERE id=?", (rows, time.time(), job_id))
                 event(db, 'job_ready', f'文件准备完成，共 {rows:,} 条记录', job_id=job_id)
@@ -458,16 +477,13 @@ class Controller:
             db.execute("UPDATE jobs SET status='running',updated=? WHERE id=?", (time.time(), head['id']))
             event(db, 'job_started', '轮到本任务，自动开始派发', job_id=head['id'])
 
-    def _save_unit(self, job_id, seq, first_row, lines, directory, rows):
-        path = directory / f'{seq:08d}.part'
-        payload = b''.join(lines)
-        with path.open('wb') as output:
-            path.chmod(0o600)
-            output.write(payload)
+    def _save_unit(self, job_id, seq, first_row, unit_rows, source_path,
+                   byte_start, byte_end, checksum, rows):
         with self.db.transaction() as db:
-            db.execute('INSERT INTO units(id,job_id,seq,first_row,rows,path,checksum,updated) VALUES(?,?,?,?,?,?,?,?)',
-                       (uuid.uuid4().hex, job_id, seq, first_row, len(lines), str(path),
-                        hashlib.sha256(payload).hexdigest(), time.time()))
+            db.execute('INSERT INTO units(id,job_id,seq,first_row,rows,path,byte_start,byte_end,checksum,updated) '
+                       'VALUES(?,?,?,?,?,?,?,?,?,?)',
+                       (uuid.uuid4().hex, job_id, seq, first_row, unit_rows,
+                        str(source_path), byte_start, byte_end, checksum, time.time()))
             db.execute('UPDATE jobs SET rows=?,updated=? WHERE id=?', (rows, time.time(), job_id))
 
     def job_action(self, job_id, action):
@@ -616,9 +632,12 @@ class Controller:
             if node['session'] != session or not node['last_seen'] or time.time() - node['last_seen'] > self.offline_seconds:
                 raise Conflict('请先完成有效心跳')
             active = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? AND status IN ('leased','running')", (node_id,)).fetchone()[0]
-            if not node['enabled'] or active >= min(node['desired_processes'], node['max_processes'] or 1):
+            # A package is node-sized: the node fans it out across all local
+            # processes.  Leasing a second package would double the configured
+            # process/thread ceiling and recreate the old overload bug.
+            if not node['enabled'] or active >= 1:
                 return None
-            unit = db.execute("SELECT u.*,j.mode FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
+            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
             if not unit:
                 return None
             token = secrets.token_urlsafe(24)
@@ -631,6 +650,9 @@ class Controller:
                        'retries': unit['req_retries'] if 'req_retries' in unit.keys() else 0,
                        'first_row': unit['first_row'], 'rows': unit['rows'],
                        'checksum': unit['checksum'], 'token': token, 'mode': unit['mode'],
+                       'bytes': max(0, int(unit['byte_end']) - int(unit['byte_start'])),
+                       'processes': min(node['desired_processes'], node['max_processes'] or 1,
+                                        unit['rows']),
                        'threads': min(node['desired_threads'], node['max_threads'] or 1),
                        'lease_seconds': self.lease_seconds}
             if unit['mode'] == 'auth':
@@ -648,6 +670,42 @@ class Controller:
                     or unit['status'] not in ('leased', 'running', 'completed', 'unknown')):
                 raise Conflict('工作包租约已失效')
             return dict(unit)
+
+    @staticmethod
+    def unit_blocks(unit, block_size=64 * 1024):
+        """Yield exactly one indexed package without copying the source file."""
+        path = Path(unit['path'])
+        start = int(unit.get('byte_start') or 0)
+        end = int(unit.get('byte_end') or 0)
+        if end <= start:  # compatibility with packages prepared before 0.3.5
+            end = path.stat().st_size
+        remaining = end - start
+        with path.open('rb') as source:
+            source.seek(start)
+            while remaining:
+                block = source.read(min(block_size, remaining))
+                if not block:
+                    raise OSError('source file ended inside indexed package')
+                remaining -= len(block)
+                yield block
+
+    @staticmethod
+    def unit_lines(unit):
+        """Yield original lines inside a byte-indexed package."""
+        path = Path(unit['path'])
+        start = int(unit.get('byte_start') or 0)
+        end = int(unit.get('byte_end') or 0)
+        if end <= start:
+            end = path.stat().st_size
+        remaining = end - start
+        with path.open('rb') as source:
+            source.seek(start)
+            while remaining:
+                line = source.readline(min(65537, remaining))
+                if not line:
+                    raise OSError('source file ended inside indexed package')
+                remaining -= len(line)
+                yield line
 
     def accept_result(self, node_id, unit_id, token, stream, expected_digest):
         # 先把租约推到当前时刻：结果文件可能十几 MB，读完再校验时租约容易刚好过期，
@@ -908,9 +966,9 @@ class Controller:
                 raise ValueError('任务不存在')
             if job['status'] != 'completed':
                 raise Conflict('全部工作包确认后才可导出')
-            units = list(db.execute(
-                "SELECT seq,path,result_path FROM units WHERE job_id=? AND status='completed' ORDER BY seq",
-                (job_id,)))
+            units = [dict(row) for row in db.execute(
+                "SELECT seq,path,byte_start,byte_end,result_path FROM units WHERE job_id=? AND status='completed' ORDER BY seq",
+                (job_id,))]
 
         def rows():
             for unit in units:
@@ -919,8 +977,8 @@ class Controller:
                     continue
                 try:
                     # 二进制模式：保留原始换行符（\r\n 不能被文本模式转成 \n）
-                    with source.open('rb') as src, Path(result).open('rb') as res:
-                        for original, line in zip(src, res):
+                    with Path(result).open('rb') as res:
+                        for original, line in zip(self.unit_lines(unit), res):
                             line = line.strip()
                             if not line:
                                 continue

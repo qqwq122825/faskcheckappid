@@ -1,0 +1,65 @@
+BRANCH/FIELD
+main / units.byte_start+byte_end + lease.processes + node package coordinator + 1 Hz processed progress + VERSION 0.3.5
+
+FOUR ARTIFACT PATHS
+MODIFIED_FILE=/Users/xxx/Documents/并发/verification-artifacts/node-local-fanout-4m/MODIFIED_FILE
+DIFF_FILE=/Users/xxx/Documents/并发/verification-artifacts/node-local-fanout-4m/DIFF_FILE
+VERIFICATION.txt=/Users/xxx/Documents/并发/verification-artifacts/node-local-fanout-4m/VERIFICATION.txt
+ROLLBACK.sh=/Users/xxx/Documents/并发/verification-artifacts/node-local-fanout-4m/ROLLBACK.sh
+
+ORIGINAL INPUT
+path=/Users/xxx/Downloads/123_打乱后_002_005.txt
+bytes=165517993
+rows=4000000
+sha256=e3ca7a3e722681a7c80fb6e07af726771e7065d0f17bce312df8b4c09ed66827
+
+BASELINE
+command=cd /Users/xxx/Documents/并发/verification-artifacts/node-local-fanout-4m/baseline-check/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+input=HEAD 06bd20533188ee4e1830461b4059a8ded3211521 source tree
+literal_output=Ran 33 tests in 3.610s; OK; BASELINE_TEST_EXIT=0
+exit_status=0
+behavior=materialized .part files; one leased package starts one process; browser poll interval 1.5 seconds; VERSION 0.3.4
+
+MODIFIED UNIT/INTEGRATION TEST
+command=cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python -m unittest discover -s tests -v
+input=modified 0.3.5 source tree
+literal_output=Ran 35 tests in 3.693s; OK; MODIFIED_CLUSTER_EXIT=0
+exit_status=0
+
+MODIFIED FRONTEND TEST
+command=cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm test
+input=frontend 0.3.5 source
+literal_output=tests 8; pass 8; fail 0; FRONTEND_TEST_EXIT=0
+exit_status=0
+
+MODIFIED FRONTEND BUILD
+command=cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm run build
+input=frontend 0.3.5 source
+literal_output=1652 modules transformed; built in 1.97s; FRONTEND_BUILD_EXIT=0
+exit_status=0
+
+ROOT REGRESSION
+command=cd /Users/xxx/Documents/并发 && .venv/bin/python -m unittest discover -s tests -v
+input=modified repository with unchanged root FastCheck sources
+literal_output=Ran 114 tests in 34.373s; OK
+exit_status=0
+
+TEN-MINUTE FOUR-NODE SOAK
+command=/Users/xxx/Documents/并发/cluster-lab/.venv/bin/python /Users/xxx/Documents/并发/cluster-lab/tools/verify_four_nodes_soak.py --input /Users/xxx/Downloads/123_打乱后_002_005.txt --report /Users/xxx/Documents/并发/cluster-lab/runtime/four-nodes-4m-soak/report.json --duration 600 --completion-grace 240 --processes 10 --threads 10 --unit-rows 10000 --simulate-delay 0.04
+input=165517993 bytes; 4000000 physical rows; SHA-256 e3ca7a3e722681a7c80fb6e07af726771e7065d0f17bce312df8b4c09ed66827; local simulate mode with no external authentication
+literal_output=status=completed; packages=400; source_copies=1; indexed_bytes=165517993; upload_seconds=0.326; index_seconds=2.371; soak_samples=601; completed_seconds=606.837; confirmed_rows=4000000; node_confirmed_rows=4000000; max_active_packages=4; max_worker_processes=40; max_progress_update_gap_seconds=2.007; node_outbox=0; distribution=100 packages/1000000 rows on each of 4 nodes; download_matches_input=true; wall_seconds=627.120
+exit_status=0
+result_report=/Users/xxx/Documents/并发/cluster-lab/runtime/four-nodes-4m-soak/report.json
+
+ROLLBACK
+command=/Users/xxx/Documents/并发/verification-artifacts/node-local-fanout-4m/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/node-local-fanout-4m/rollback-test
+input=a separate HEAD copy with DIFF_FILE applied
+literal_output=ROLLBACK_RESULT=restored indexed packages to materialized package files, one-package-per-process execution, 1.5-second UI polling, VERSION=0.3.4; ROLLBACK_COMMAND_EXIT=0; ROLLBACK_DIFF_EXIT=0
+exit_status=0
+
+ROLLBACK TEST
+command=cd /Users/xxx/Documents/并发/verification-artifacts/node-local-fanout-4m/rollback-test/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests -v
+input=separate rolled-back copy
+literal_output=Ran 33 tests in 3.771s; OK; ROLLBACK_TEST_EXIT=0
+exit_status=0
+restored_behavior_status=exact byte-for-byte match with the clean HEAD archive; materialized package files restored; one package again maps to one process; UI polling restored to 1.5 seconds; VERSION restored to 0.3.4
