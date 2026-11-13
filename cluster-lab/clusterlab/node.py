@@ -151,6 +151,14 @@ class Node:
                 with self.lock:
                     self.active.pop(unit_id, None)
 
+    def _device_slots(self):
+        """设备池明细：编号、状态、注册出口。心跳带上，总控页面直接展示。"""
+        try:
+            snapshot = self.builder.snapshot()
+        except Exception:                                          # noqa: BLE001
+            return []
+        return snapshot.get('slots', [])[:64]
+
     def apply_config(self, config):
         """总控下发的出口配置；只在内存里保存，不落盘。
 
@@ -176,7 +184,9 @@ class Node:
                            'version': VERSION, 'max_processes': self.max_processes, 'max_threads': self.max_threads,
                            'active': values, 'interrupted': interrupted, 'ack_stop_version': self.stop_version,
                            'telemetry': dict(self.telemetry.latest, worker_processes=len(self.active)),
-                           'devices': {k: self.builder.state[k] for k in ('running', 'capacity', 'ready', 'built', 'failed')},
+                           'devices': {**{k: self.builder.state[k] for k in
+                                          ('running', 'capacity', 'ready', 'built', 'failed')},
+                                       'slots': self._device_slots()},
                            'error': ''}) as response:
             value = response.json()
         with self.lock:

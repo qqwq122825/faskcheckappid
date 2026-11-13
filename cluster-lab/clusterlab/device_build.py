@@ -37,6 +37,11 @@ class DeviceBuilder:
             pass
         with self.lock:
             data = dict(self.state)
+        registry = self.registry()
+        for entry in slots:
+            info = registry.get(str(entry['slot'])) or {}
+            entry['proxy'] = info.get('proxy', '')
+            entry['at'] = info.get('at', '')
         data.update(ready=ready, slots=slots,
                     capacity=max(data['capacity'], ready))
         return data
@@ -107,6 +112,7 @@ class DeviceBuilder:
                     output.cancel_join_thread(); output.close(); process.close()
                 ok = bool(result and result.get('ok')) and pool.inspect(slot)['state'] == 'ready'
                 if ok:
+                    self._record(slot, proxy)
                     self._update(built=self.state['built'] + 1,
                                  ready=self.state['ready'] + 1,
                                  message=f'第 {slot} 台已就绪')
@@ -119,6 +125,29 @@ class DeviceBuilder:
             self._update(message=f'异常：{type(exc).__name__}')
         finally:
             self._update(running=False, current=0)
+
+    def _registry_path(self):
+        return self.node.root / 'device-pool' / 'registry.json'
+
+    def _record(self, slot, proxy):
+        """记下每台设备注册时用的出口，供界面核对设备"出生地"。"""
+        try:
+            path = self._registry_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = json.loads(path.read_text('utf-8')) if path.exists() else {}
+        except (OSError, ValueError):
+            data = {}
+        data[str(int(slot))] = {'proxy': str(proxy or ''), 'at': time.strftime('%m-%d %H:%M')}
+        try:
+            self._registry_path().write_text(json.dumps(data), 'utf-8')
+        except OSError:
+            pass
+
+    def registry(self):
+        try:
+            return json.loads(self._registry_path().read_text('utf-8'))
+        except (OSError, ValueError):
+            return {}
 
     def usage(self):
         path = self.node.root / 'device-pool' / 'usage.json'

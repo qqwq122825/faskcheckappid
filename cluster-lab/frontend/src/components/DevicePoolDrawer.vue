@@ -14,10 +14,20 @@ const building = computed(() => Boolean(pool.value.running))
 const ready = computed(() => pool.value.ready || 0)
 const actual = computed(() => (pool.value.built || 0) + (pool.value.failed || 0))
 const rows = computed(() => {
+  const reported = pool.value.slots
+  if (Array.isArray(reported) && reported.length) {
+    return reported.map((item: any) => ({
+      slot: item.slot,
+      state: item.state === 'ready' ? '已就绪' : item.state === 'pending' ? '待注册' : '未开始',
+      proxy: item.proxy || '—',
+      at: item.at || '—',
+    }))
+  }
   const total = Math.max(pool.value.capacity || 0, capacity.value)
   return Array.from({ length: total }, (_, index) => ({
     slot: index + 1,
     state: index < ready.value ? '已就绪' : index < actual.value ? '已尝试' : '未开始',
+    proxy: '—', at: '—',
   }))
 })
 
@@ -79,9 +89,11 @@ async function cancelBuild() {
       <div class="section-heading device-list-heading"><h2>设备列表</h2>
         <span class="muted">{{ building ? `正在注册第 ${pool.built + pool.failed + 1} 台` : '等待中' }}</span>
       </div>
-      <el-table :data="rows" empty-text="尚未初始化设备" stripe max-height="320">
-        <el-table-column prop="slot" label="设备编号" width="120" />
-        <el-table-column prop="state" label="状态" min-width="120" />
+      <el-table :data="rows" empty-text="尚未初始化设备" stripe max-height="360">
+        <el-table-column prop="slot" label="设备编号" width="100" />
+        <el-table-column prop="state" label="状态" width="110" />
+        <el-table-column prop="proxy" label="注册出口 IP" min-width="160" show-overflow-tooltip />
+        <el-table-column prop="at" label="注册时间" width="120" />
       </el-table>
     </section>
   </el-drawer>

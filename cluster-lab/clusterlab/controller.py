@@ -63,6 +63,19 @@ class Conflict(ValueError):
     pass
 
 
+def mask_proxy(value):
+    """只保留出口 host:port，去掉查询串和认证信息。"""
+    if not value:
+        return ''
+    text = str(value)
+    if '@' in text:
+        text = text.split('@', 1)[1]
+    for prefix in ('socks5h://', 'socks5://', 'http://', 'https://'):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    return text.split('?', 1)[0][:64]
+
+
 def mask_api(value):
     """回显时隐去 password/token，避免代理凭证出现在页面和接口响应里。"""
     if not value:
@@ -308,6 +321,14 @@ class Controller:
         if isinstance(pool, dict):
             result['device_pool'] = {key: pool.get(key) for key in
                                      ('running', 'capacity', 'ready', 'built', 'failed', 'current')}
+            slots = pool.get('slots')
+            if isinstance(slots, list):
+                result['device_pool']['slots'] = [
+                    {'slot': int(item.get('slot') or 0),
+                     'state': str(item.get('state') or '')[:20],
+                     'proxy': mask_proxy(str(item.get('proxy') or '')),
+                     'at': str(item.get('at') or '')[:16]}
+                    for item in slots[:64] if isinstance(item, dict)]
         return result
 
     def files(self):
