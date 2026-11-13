@@ -16,8 +16,8 @@ def main():
     parser.add_argument('--allow-http', action='store_true', help='允许节点连接非回环 HTTP 总控，仅受信内网测试使用')
     args = parser.parse_args()
     password = os.environ.get('CLUSTER_LAB_ADMIN_PASSWORD')
-    if args.host not in ('127.0.0.1', 'localhost', '::1') and (not password or len(password) < 12):
-        parser.error('非回环监听需要通过 CLUSTER_LAB_ADMIN_PASSWORD 设置至少 12 位管理密码')
+    if args.host not in ('127.0.0.1', 'localhost', '::1') and (not password or len(password) < 8):
+        parser.error('非回环监听需要通过 CLUSTER_LAB_ADMIN_PASSWORD 设置至少 8 位管理密码')
     port = args.port or (18770 if args.role == 'controller' else 18771)
     if not 1 <= port <= 65535:
         parser.error('端口应为 1–65535')

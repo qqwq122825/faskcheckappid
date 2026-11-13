@@ -13,7 +13,7 @@
 
 - 根目录：`/www/wwwroot/cluster-controller`
 - 启动命令：`python controller.py --host 127.0.0.1 --port 18770`
-- 环境变量：`CLUSTER_LAB_ADMIN_PASSWORD`，自行设置至少 12 位管理密码。
+- 环境变量：`CLUSTER_LAB_ADMIN_PASSWORD`，自行设置至少 8 位管理密码，建议使用 12 位以上随机密码。
 - 管理用户名：`admin`。
 - 宝塔 Nginx 通过 HTTPS 域名反向代理到 `127.0.0.1:18770`。
 - Nginx 与应用都需要允许上传体大小；应用首版上限是 2 GiB。代理 `/agent/` 和 `/api/`，不对外提供源码目录静态访问。
