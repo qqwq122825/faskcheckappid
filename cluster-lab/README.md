@@ -4,6 +4,8 @@
 
 ## 运行
 
+总控与节点使用同一份 Git 仓库，区别是分别运行 `controller.py` 与 `node.py`。宝塔均选择仓库下的 `cluster-lab/` 作为 Python 项目根目录；仓库外层执行 `git pull --ff-only origin main` 后重启本机角色。完整目录与迁移说明见 [DEPLOY_BT.md](DEPLOY_BT.md)。
+
 需要 Python 3.11+。首次安装：
 
 ```bash
