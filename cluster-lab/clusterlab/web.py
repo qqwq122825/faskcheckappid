@@ -102,6 +102,10 @@ def create_app(role, service, password=None):
         return jsonify(service.snapshot())
 
     if role == 'controller':
+        @app.post('/api/settings/proxy')
+        def configure_proxy():
+            return jsonify(service.configure_proxy(request.get_json() or {}))
+
         @app.post('/api/settings')
         def configure_settings():
             return jsonify(service.configure_settings(request.get_json() or {}))

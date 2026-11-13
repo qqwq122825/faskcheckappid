@@ -51,11 +51,21 @@ CREATE TABLE IF NOT EXISTS controller_settings (
  key TEXT PRIMARY KEY, value INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('max_unit_rows',100000);
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_api','');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_scheme','socks5h');
 '''
 
 
 class Conflict(ValueError):
     pass
+
+
+def mask_api(value):
+    """回显时隐去 password/token，避免代理凭证出现在页面和接口响应里。"""
+    if not value:
+        return ''
+    import re as _re
+    return _re.sub(r'(?i)(password|passwd|pwd|token|key)=[^&\s]+', r'\1=***', str(value))
 
 
 class Controller:
@@ -169,15 +179,45 @@ class Controller:
 
     def settings(self):
         with self.db.connect() as db:
-            maximum = db.execute("SELECT value FROM controller_settings WHERE key='max_unit_rows'").fetchone()[0]
+            values = {row['key']: row['value'] for row in db.execute('SELECT key,value FROM controller_settings')}
+        maximum = int(values.get('max_unit_rows', 100000))
         return {'max_unit_rows': maximum, 'default_unit_rows': min(10000, maximum),
-                'unit_byte_limit': 32 * 1024 * 1024}
+                'unit_byte_limit': 32 * 1024 * 1024,
+                'proxy_api': mask_api(values.get('proxy_api', '')),
+                'proxy_configured': bool(values.get('proxy_api', '')),
+                'proxy_scheme': values.get('proxy_scheme', 'socks5h')}
+
+    def proxy_config(self):
+        """下发节点用的原文配置；只在服务端内部调用，不进任何接口响应。"""
+        with self.db.connect() as db:
+            values = {row['key']: row['value'] for row in db.execute('SELECT key,value FROM controller_settings')}
+        return {'api': values.get('proxy_api', ''), 'scheme': values.get('proxy_scheme', 'socks5h')}
 
     def configure_settings(self, data):
         maximum = integer(data.get('max_unit_rows'), '单个分片最大条数', 50, 100000)
         with self.db.transaction() as db:
             db.execute("UPDATE controller_settings SET value=? WHERE key='max_unit_rows'", (maximum,))
             event(db, 'controller_config', f'新任务单个分片最大条数已设置为 {maximum:,} 条；已有任务保持原配置')
+        return self.settings()
+
+    def configure_proxy(self, data):
+        api = str(data.get('proxy_api', '')).strip()
+        scheme = str(data.get('proxy_scheme', 'socks5h')).strip()
+        if scheme not in ('socks5h', 'socks5', 'http', 'https'):
+            raise ValueError('代理协议应为 socks5h / socks5 / http / https')
+        if api:
+            from urllib.parse import urlsplit
+            parts = [p for p in api.split() if p]
+            if len(parts) > 8:
+                raise ValueError('最多支持 8 个代理 API 链接')
+            for part in parts:
+                parsed = urlsplit(part)
+                if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+                    raise ValueError('代理 API 需要是 http(s) 地址')
+        with self.db.transaction() as db:
+            db.execute("UPDATE controller_settings SET value=? WHERE key='proxy_api'", (api,))
+            db.execute("UPDATE controller_settings SET value=? WHERE key='proxy_scheme'", (scheme,))
+            event(db, 'controller_config', '代理 API 配置已更新' if api else '代理 API 配置已清空')
         return self.settings()
 
     def stop_node(self, node_id):
