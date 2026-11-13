@@ -1,0 +1,159 @@
+BRANCH/FIELD
+main / units.live_counts + heartbeat.active[].counts + retry UI + node 10x100 + VERSION 0.3.6
+Original baseline commit: 63c86ed2cdecae5fbc4f3fe862ef84cde9cf17f8
+Original file hashes: /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/original-sha256.txt
+
+FOUR ARTIFACTS
+MODIFIED_FILE=/Users/xxx/Documents/并发/verification-artifacts/live-category-retries/MODIFIED_FILE
+DIFF_FILE=/Users/xxx/Documents/并发/verification-artifacts/live-category-retries/DIFF_FILE
+VERIFICATION.txt=/Users/xxx/Documents/并发/verification-artifacts/live-category-retries/VERIFICATION.txt
+ROLLBACK.sh=/Users/xxx/Documents/并发/verification-artifacts/live-category-retries/ROLLBACK.sh
+
+BASELINE
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/baseline-check/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: HEAD 63c86ed2cdecae5fbc4f3fe862ef84cde9cf17f8; no runtime input.
+Literal output/result:
+...................................
+----------------------------------------------------------------------
+Ran 35 tests in 3.721s
+
+OK
+BASELINE_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED BACKEND
+Command: cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python -m unittest discover -s tests -v
+Input: modified working tree, including live category, retry, node-limit and migration tests.
+Literal output/result:
+----------------------------------------------------------------------
+Ran 38 tests in 3.931s
+
+OK
+MODIFIED_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND TESTS
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm test
+Input: frontend source with visible retry selector, node 10x100 controls and live speed display.
+Literal output/result:
+ℹ tests 10
+ℹ suites 0
+ℹ pass 10
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 52.917459
+FRONTEND_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND BUILD
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm run build
+Input: frontend source VERSION 0.3.6.
+Literal output/result:
+✓ 1652 modules transformed.
+✓ built in 2.51s
+FRONTEND_BUILD_EXIT=0
+Exit status: 0
+
+FULL PROJECT REGRESSION
+Command: cd /Users/xxx/Documents/并发 && .venv/bin/python -m unittest discover -s tests
+Input: complete modified working tree; no runtime input.
+Literal output/result:
+----------------------------------------------------------------------
+Ran 114 tests in 34.910s
+
+OK
+ROOT_TEST_EXIT=0
+Exit status: 0
+
+REAL HTTP LIVE-FEEDBACK VERIFICATION
+Command: cd /Users/xxx/Documents/并发 && cluster-lab/.venv/bin/python cluster-lab/tools/verify_live_feedback.py --report cluster-lab/runtime/live-feedback-036/report.json
+Input: generated 50-row local auth package; legacy node desired 10x32/version 0.3.5 reporting max 10x100; task timeout=35, retries=4; heartbeat samples processed=10 then 20; final result=50.
+Literal output/result:
+{
+  "version": "0.3.6",
+  "lease": {
+    "processes": 10,
+    "threads": 100,
+    "timeout": 35.0,
+    "retries": 4
+  },
+  "samples": [
+    {
+      "elapsed": 0.003,
+      "processed": 10,
+      "categorized": {
+        "locked": 2,
+        "need_2fa": 0,
+        "timeout": 0,
+        "unknown": 5,
+        "valid": 0,
+        "wrong_password": 3
+      }
+    },
+    {
+      "elapsed": 0.007,
+      "processed": 20,
+      "categorized": {
+        "locked": 4,
+        "need_2fa": 0,
+        "timeout": 0,
+        "unknown": 10,
+        "valid": 0,
+        "wrong_password": 6
+      }
+    }
+  ],
+  "final": {
+    "locked": 4,
+    "need_2fa": 0,
+    "timeout": 0,
+    "unknown": 10,
+    "valid": 30,
+    "wrong_password": 6
+  },
+  "result": "live categories updated before package completion; final counts did not double"
+}
+LIVE_FEEDBACK_EXIT=0
+Exit status: 0
+Report: /Users/xxx/Documents/并发/cluster-lab/runtime/live-feedback-036/report.json
+
+ROLLBACK
+Command: /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/rollback-test && diff -qr /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/rollback-original /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/rollback-test && cd /Users/xxx/Documents/并发/verification-artifacts/live-category-retries/rollback-test/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: a second clean copy of baseline commit with DIFF_FILE applied, then reversed by executable ROLLBACK.sh.
+Literal output/result:
+ROLLBACK_RESULT=restored pre-change source, built UI, version, retry UI, node limits, and final-only category behavior
+ROLLBACK_DIFF_EXIT=0
+...................................
+----------------------------------------------------------------------
+Ran 35 tests in 3.782s
+
+OK
+ROLLBACK_TEST_EXIT=0
+Exit status: 0
+Restored behavior/status: byte-for-byte tree comparison matched the original copy; legacy final-only category display, legacy node UI/defaults, hidden retry control and VERSION 0.3.5 were restored; all 35 baseline tests passed.
+
+OBSERVED MODIFIED BEHAVIOR
+- The task form exposes timeout retry count 0..5 and leases preserve the selected value (observed: retries=4).
+- Node configuration defaults to 10 processes x 100 threads, offers “use machine maximum,” and the next lease uses the saved values (observed: 10x100).
+- A legacy node stuck at 32 threads is migrated once to 100 when it reports that capacity.
+- processed and category counts update from the 1-second heartbeat before package completion.
+- Final result counters replace live counters atomically; the observed final values were not doubled.
+
+ORIGINAL SHA256
+7385259e52e9afbd1893978a8f3794fb37a6b5e25b219815e8d56afff601c76e  verification-artifacts/live-category-retries/original/cluster-lab/README.md
+bcac6fbf3948d4e5811dde2c6c289d2e86423b9eceb2b19040647fd7b5d6286f  verification-artifacts/live-category-retries/original/cluster-lab/app.py
+219eea32455fb8b81a8e39d7422e4ceeaf0045c2c8d4f6a20857d45dfbdd24b1  verification-artifacts/live-category-retries/original/cluster-lab/clusterlab/__init__.py
+34033c407f079eab46c758b4409fe1e91070a3f9960b29400ba0016821cb6540  verification-artifacts/live-category-retries/original/cluster-lab/clusterlab/controller.py
+b2a53ccdb5a66a6fc01614f99fcdc9e9c4d5ef246d90094f6a075f707504acca  verification-artifacts/live-category-retries/original/cluster-lab/clusterlab/executor.py
+62cb94ae9d71449d28bc73cdb1a32809ac3d41e0fb9b45b88565f0e8eb579d5d  verification-artifacts/live-category-retries/original/cluster-lab/clusterlab/node.py
+a8c85f99f76ee8a772091f4d28912e05baea847c5f9e36670ca1876ace3610d2  verification-artifacts/live-category-retries/original/cluster-lab/frontend/package-lock.json
+1dca0c9ffa706ef8f3320d99bd925f31005e8ac7bd231c72d782e26f93488512  verification-artifacts/live-category-retries/original/cluster-lab/frontend/package.json
+61c9c4645952f2bd18285c120b5455d3b8f956c01a0508e03801bdbd51a46830  verification-artifacts/live-category-retries/original/cluster-lab/frontend/src/components/CreateTaskDialog.vue
+d2d965bbaa0fef86d76b932c7ae528246d4fa875eb880fde90b0fe97cdc48dd9  verification-artifacts/live-category-retries/original/cluster-lab/frontend/src/components/NodeDialogs.vue
+3ecb91e67cf3c8bfa633eb4d7bc1f8b3e8e920092c09eefe2dfabba7f7f6dcf2  verification-artifacts/live-category-retries/original/cluster-lab/frontend/src/components/TaskFeedback.vue
+5f27c1154879974a62a9dccf9f0b07f78aca8a0cc54071e850309f66c9208d8a  verification-artifacts/live-category-retries/original/cluster-lab/frontend/src/views/JobDetail.vue
+3491004dc8c395c234d1e9e974a28d934c35a7592eae7b1c2abe31aa4f65caa8  verification-artifacts/live-category-retries/original/cluster-lab/tests/test_controller.py
+c1ba550cedd6af48ad81a4ff5f24a0b4cee9c88bf165f2c372f414f918b5a6ef  verification-artifacts/live-category-retries/original/cluster-lab/tests/test_executor_scale.py
+f0f1b04ccc828c1d9ef4f00d9e1bacd2f4eea9b5504dfd5a1af915abeca8d5ab  verification-artifacts/live-category-retries/original/cluster-lab/tests/test_node.py

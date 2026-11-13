@@ -26,14 +26,16 @@ const issueMessage = computed(() => jobIssueMessage(job.value))
 const count = (key: string) => job.value?.row_counts?.[key] || 0
 // 全程平均速度：任务结束后瞬时速度归零，"0 条/秒"没有参考价值
 const elapsedSeconds = computed(() => {
-  const start = job.value?.created, end = job.value?.updated
+  const start = job.value?.created
+  const end = job.value?.status === 'running' ? state.value?.server_time : job.value?.updated
   if (!start || !end || end <= start) return 0
   return Math.max(0, Math.round(end - start))
 })
 // 参照单机版的展示口径：条/小时
 const hourlyRate = computed(() => {
   const span = elapsedSeconds.value
-  return span > 0 ? Math.round((job.value?.confirmed || 0) * 3600 / span) : 0
+  const completed = Math.max(job.value?.processed || 0, job.value?.confirmed || 0)
+  return span > 0 ? Math.round(completed * 3600 / span) : 0
 })
 const capacityText = computed(() => {
   const active = state.value?.nodes?.filter((n: any) => n.status !== 'offline' && n.status !== 'stopping') || []

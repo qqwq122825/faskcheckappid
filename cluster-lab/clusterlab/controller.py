@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS units (
  lease_token TEXT, lease_until REAL, attempt INTEGER NOT NULL DEFAULT 0,
  processed INTEGER NOT NULL DEFAULT 0, result_path TEXT, result_checksum TEXT,
  result_counts TEXT,
+ live_counts TEXT,
  updated REAL NOT NULL, UNIQUE(job_id,seq)
 );
 CREATE INDEX IF NOT EXISTS units_queue ON units(status,job_id,seq);
@@ -93,6 +94,8 @@ class Controller:
     MAX_PROCESSES = 200
     MAX_THREADS = 512
     MAX_ACTIVE_UNITS = 512
+    RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked',
+                      'timeout', 'undetermined', 'unknown')
 
     def __init__(self, root, lease_seconds=30, offline_seconds=12, dispatch_per_second=0):
         self.root = private_dir(root)
@@ -126,6 +129,8 @@ class Controller:
                 db.execute('ALTER TABLE units ADD COLUMN byte_start INTEGER NOT NULL DEFAULT 0')
             if 'byte_end' not in unit_columns:
                 db.execute('ALTER TABLE units ADD COLUMN byte_end INTEGER NOT NULL DEFAULT 0')
+            if 'live_counts' not in unit_columns:
+                db.execute('ALTER TABLE units ADD COLUMN live_counts TEXT')
         self.lease_seconds, self.offline_seconds = lease_seconds, offline_seconds
         # 全局派发闸门：整个集群每秒最多放多少个新工作包。0 表示不限。
         self.dispatch_per_second = max(0, int(dispatch_per_second or 0))
@@ -356,6 +361,21 @@ class Controller:
                     for item in slots[:64] if isinstance(item, dict)]
         return result
 
+    @classmethod
+    def clean_live_counts(cls, value, processed, rows):
+        if not isinstance(value, dict):
+            return {}
+        result = {}
+        for key in cls.RESULT_BUCKETS:
+            count = value.get(key, 0)
+            if type(count) is not int or count < 0 or count > rows:
+                raise ValueError('实时分类计数无效')
+            if count:
+                result[key] = count
+        if sum(result.values()) > processed:
+            raise ValueError('实时分类数超过已处理数')
+        return result
+
     def files(self):
         """列出上传过的源文件，供新建任务时复用，避免重复上传大文件。"""
         with self.db.connect() as db:
@@ -515,12 +535,12 @@ class Controller:
                 db.execute("UPDATE jobs SET status='stopped',queued_at=NULL,updated=? WHERE id=?",
                            (time.time(), job_id))
                 db.execute("UPDATE units SET status='pending',node_id=NULL,lease_token=NULL,"
-                           "lease_until=NULL,processed=0,updated=? WHERE job_id=? "
+                           "lease_until=NULL,processed=0,live_counts=NULL,updated=? WHERE job_id=? "
                            "AND status IN ('leased','running','unknown')", (time.time(), job_id))
                 event(db, 'job_stopped', '任务已停止，在途工作包退回待分配', job_id=job_id)
                 self._advance_queue(db)
             elif action == 'retry_unknown' and job['status'] in ('running', 'paused', 'ready'):
-                count = db.execute("UPDATE units SET status='pending',node_id=NULL,lease_token=NULL,lease_until=NULL,processed=0,updated=? WHERE job_id=? AND status='unknown'",
+                count = db.execute("UPDATE units SET status='pending',node_id=NULL,lease_token=NULL,lease_until=NULL,processed=0,live_counts=NULL,updated=? WHERE job_id=? AND status='unknown'",
                                    (time.time(), job_id)).rowcount
                 event(db, 'units_requeued', f'人工重新排队 {count} 个待确认工作包（仅离线可重复任务）', job_id=job_id)
             else:
@@ -554,6 +574,15 @@ class Controller:
             if (node['session'] and node['session'] != session and node['last_seen']
                     and now - node['last_seen'] < self.offline_seconds):
                 raise Conflict('同一节点身份已有另一个实例在线；请等待旧实例离线或使用独立接入凭证')
+            desired_processes = node['desired_processes']
+            desired_threads = node['desired_threads']
+            # 0.3.5 前端把线程数上限错误限制为 32。对正好卡在
+            # 旧上限、而本机明确支持 100 线程的节点做一次升级。
+            if desired_threads == 32 and max_t >= 100 and str(node['version'] or '') != '0.3.6':
+                desired_threads = 100
+                db.execute('UPDATE nodes SET desired_threads=? WHERE id=?', (desired_threads, node_id))
+                event(db, 'node_config', '已将旧版 32 线程上限升级为本机 100 线程；下一工作包生效',
+                      node_id=node_id)
             reject, confirmed, interrupted_ack = [], [], []
             for value in interrupted:
                 unit = db.execute('SELECT * FROM units WHERE id=? AND node_id=?', (value.get('id'), node_id)).fetchone()
@@ -561,7 +590,7 @@ class Controller:
                     reject.append(value.get('id'))
                     continue
                 count = integer(value.get('processed', 0), '中断记录数', 0, unit['rows'])
-                db.execute("UPDATE units SET status='unknown',processed=?,lease_token=NULL,lease_until=NULL,updated=? WHERE id=?",
+                db.execute("UPDATE units SET status='unknown',processed=?,live_counts=NULL,lease_token=NULL,lease_until=NULL,updated=? WHERE id=?",
                            (count, now, unit['id']))
                 interrupted_ack.append(unit['id'])
                 reason = str(value.get('error') or '')[:120]
@@ -577,8 +606,14 @@ class Controller:
                     reject.append(value.get('id'))
                     continue
                 count = integer(value.get('processed', 0), '已处理数量', 0, unit['rows'])
-                db.execute("UPDATE units SET status='running',processed=MAX(processed,?),lease_until=?,updated=? WHERE id=?",
-                           (count, now + self.lease_seconds, now, unit['id']))
+                live_counts = self.clean_live_counts(value.get('counts'), count, unit['rows'])
+                if count >= unit['processed']:
+                    db.execute("UPDATE units SET status='running',processed=?,live_counts=?,lease_until=?,updated=? WHERE id=?",
+                               (count, json.dumps(live_counts, separators=(',', ':')),
+                                now + self.lease_seconds, now, unit['id']))
+                else:
+                    db.execute("UPDATE units SET status='running',lease_until=?,updated=? WHERE id=?",
+                               (now + self.lease_seconds, now, unit['id']))
             total = db.execute("SELECT COALESCE(SUM(processed),0) FROM units WHERE node_id=? AND status IN ('leased','running','completed')", (node_id,)).fetchone()[0]
             elapsed = now - (node['last_seen'] or now)
             instant = max(0, total - node['last_total']) / elapsed if elapsed > 0.1 else 0
@@ -596,8 +631,8 @@ class Controller:
             if not node['last_seen'] or now - node['last_seen'] > self.offline_seconds:
                 event(db, 'node_online', f'节点已连接：{node["name"]}', node_id=node_id)
             return {'node_id': node_id, 'name': node['name'], 'enabled': bool(node['enabled']),
-                    'processes': min(node['desired_processes'], max_p), 'threads': min(node['desired_threads'], max_t),
-                    'desired_processes': node['desired_processes'], 'desired_threads': node['desired_threads'],
+                    'processes': min(desired_processes, max_p), 'threads': min(desired_threads, max_t),
+                    'desired_processes': desired_processes, 'desired_threads': desired_threads,
                     'rejected': reject, 'confirmed': confirmed, 'interrupted_ack': interrupted_ack,
                     'device_request': node['device_request'],
                     'device_rotate_after': self.settings().get('device_rotate_after', 0),
@@ -641,7 +676,7 @@ class Controller:
             if not unit:
                 return None
             token = secrets.token_urlsafe(24)
-            db.execute("UPDATE units SET status='leased',node_id=?,lease_token=?,lease_until=?,attempt=attempt+1,processed=0,updated=? WHERE id=?",
+            db.execute("UPDATE units SET status='leased',node_id=?,lease_token=?,lease_until=?,attempt=attempt+1,processed=0,live_counts=NULL,updated=? WHERE id=?",
                        (node_id, token, time.time() + self.lease_seconds, time.time(), unit['id']))
             event(db, 'unit_leased', f'工作包 #{unit["seq"]} 已分配（{unit["rows"]:,} 条）', unit['job_id'], node_id)
             self._rate_record()
@@ -780,7 +815,7 @@ class Controller:
                 else:
                     db.execute("UPDATE jobs SET updated=? WHERE id=?", (time.time(), unit['job_id']))
                 db.execute("UPDATE units SET status='completed',processed=rows,result_path=?,result_checksum=?,"
-                           "result_counts=?,lease_until=NULL,updated=? WHERE id=?",
+                           "result_counts=?,live_counts=NULL,lease_until=NULL,updated=? WHERE id=?",
                            (str(final), expected_digest,
                             json.dumps(dict(buckets), separators=(',', ':')), time.time(), unit_id))
                 event(db, 'result_confirmed', f'工作包 #{unit["seq"]} 结果已确认（{count:,} 条）', unit['job_id'], node_id)
@@ -816,11 +851,24 @@ class Controller:
                 counts = {r['status']: r['n'] for r in groups}
                 row_counts = {r['status']: r['rows'] for r in groups}
                 sums = db.execute("SELECT COALESCE(SUM(CASE WHEN status='completed' THEN rows ELSE 0 END),0), COALESCE(SUM(CASE WHEN status IN ('running','leased','completed') THEN processed ELSE 0 END),0) FROM units WHERE job_id=?", (row['id'],)).fetchone()
+                live = {key: 0 for key in self.RESULT_BUCKETS}
+                if row['mode'] == 'auth':
+                    for unit in db.execute("SELECT live_counts FROM units WHERE job_id=? AND status IN ('leased','running') AND live_counts IS NOT NULL",
+                                           (row['id'],)):
+                        try:
+                            unit_counts = json.loads(unit['live_counts'])
+                        except (TypeError, ValueError):
+                            continue
+                        for key in self.RESULT_BUCKETS:
+                            live[key] += int(unit_counts.get(key, 0) or 0)
                 value.update(units=sum(counts.values()), unit_counts=counts, row_counts=row_counts,
                              confirmed=sums[0], processed=sums[1],
-                             categorized={'valid': row['c_valid'], 'wrong_password': row['c_wrong'],
-                                          'need_2fa': row['c_2fa'], 'locked': row['c_locked'],
-                                          'timeout': row['c_timeout'], 'unknown': row['c_unknown']},
+                             categorized={'valid': row['c_valid'] + live['valid'],
+                                          'wrong_password': row['c_wrong'] + live['wrong_password'],
+                                          'need_2fa': row['c_2fa'] + live['need_2fa'],
+                                          'locked': row['c_locked'] + live['locked'],
+                                          'timeout': row['c_timeout'] + live['timeout'],
+                                          'unknown': row['c_unknown'] + live['undetermined'] + live['unknown']},
                              reported=row['reported_rows'])
                 jobs.append(value)
             nodes = []

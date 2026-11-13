@@ -197,7 +197,11 @@ class Node:
             for task in db.execute("SELECT * FROM tasks WHERE status IN ('running','outbox','interrupted')"):
                 descriptor = json.loads(task['descriptor'])
                 collection = interrupted if task['status'] == 'interrupted' else values
-                item = {'id': task['id'], 'token': descriptor['token'], 'processed': task['processed']}
+                progress = read_json(self.spool / task['id'] / 'progress.json', {})
+                item = {'id': task['id'], 'token': descriptor['token'],
+                        'processed': max(int(task['processed'] or 0),
+                                         int(progress.get('processed') or 0)),
+                        'counts': progress.get('counts') or {}}
                 # 失败原因一并上报，否则总控只能看到"待确认"，看不到为什么
                 if task['error']:
                     item['error'] = str(task['error'])[:180]

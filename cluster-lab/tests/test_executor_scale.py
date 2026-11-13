@@ -44,6 +44,7 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertTrue(done['ok'], done)
             self.assertEqual(done['workers'], 4)
             self.assertEqual(progress['worker_limit'], 4)
+            self.assertEqual(progress['counts'], {'valid': 123})
             self.assertEqual([record['row'] for record in records], list(range(7001, 7124)))
             self.assertEqual([record['account'] for record in records], lines)
             self.assertEqual(done['checksum'], hashlib.sha256(
@@ -74,6 +75,8 @@ class ExecutorScaleTests(unittest.TestCase):
             done = json.loads((root / 'done.json').read_text('utf-8'))
             payload = (root / 'results.jsonl').read_bytes()
             self.assertEqual(done['processed'], 500)
+            self.assertEqual(json.loads((root / 'progress.json').read_text('utf-8'))['counts'],
+                             {'valid': 500})
             self.assertEqual(done['checksum'], hashlib.sha256(payload).hexdigest())
             self.assertEqual(usage_calls, [{1: 250, 2: 250}])
             self.assertEqual(len(payload.splitlines()), 500)

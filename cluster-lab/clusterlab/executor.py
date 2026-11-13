@@ -61,16 +61,23 @@ def execute_unit(directory, descriptor, stop):
                         output_digest.update(result)
                         processed += 1
                     if time.monotonic() - last_progress > 0.25:
-                        atomic_json(directory / 'progress.json', {'processed': processed, 'started': started})
+                        atomic_json(directory / 'progress.json',
+                                    {'processed': processed, 'started': started,
+                                     'counts': {'valid': processed}})
                         last_progress = time.monotonic()
             output.flush()
         if processed != descriptor['rows']:
             raise ValueError('输入条数和工作包描述不一致')
-        atomic_json(directory / 'progress.json', {'processed': processed, 'started': started})
+        atomic_json(directory / 'progress.json',
+                    {'processed': processed, 'started': started,
+                     'counts': {'valid': processed}})
         atomic_json(directory / 'done.json', {'ok': True, 'processed': processed,
+                    'counts': {'valid': processed},
                     'checksum': output_digest.hexdigest(), 'elapsed': time.time() - started})
     except Exception as exc:
-        atomic_json(directory / 'progress.json', {'processed': processed, 'started': started})
+        atomic_json(directory / 'progress.json',
+                    {'processed': processed, 'started': started,
+                     'counts': {'valid': processed}})
         atomic_json(directory / 'done.json', {'ok': False, 'processed': processed, 'error': type(exc).__name__})
 
 
@@ -158,10 +165,14 @@ def execute_unit_group(directory, descriptor, stop):
                     child_stop.set()
             processed = 0
             active = 0
+            live_counts = {}
             for process, _, child_dir in children:
                 active += int(process.is_alive())
                 try:
-                    processed += int(json.loads((child_dir / 'progress.json').read_text('utf-8')).get('processed') or 0)
+                    child_progress = json.loads((child_dir / 'progress.json').read_text('utf-8'))
+                    processed += int(child_progress.get('processed') or 0)
+                    for key, value in (child_progress.get('counts') or {}).items():
+                        live_counts[key] = live_counts.get(key, 0) + int(value)
                 except (OSError, ValueError):
                     pass
             now = time.monotonic()
@@ -169,7 +180,8 @@ def execute_unit_group(directory, descriptor, stop):
                 atomic_json(directory / 'progress.json',
                             {'processed': processed, 'started': started,
                              'workers': active, 'worker_limit': process_count,
-                             'threads_per_process': int(descriptor.get('threads') or 1)})
+                             'threads_per_process': int(descriptor.get('threads') or 1),
+                             'counts': live_counts})
                 last_write = now
             time.sleep(0.05)
 
@@ -208,7 +220,8 @@ def execute_unit_group(directory, descriptor, stop):
         atomic_json(directory / 'progress.json',
                     {'processed': processed, 'started': started, 'workers': 0,
                      'worker_limit': process_count,
-                     'threads_per_process': int(descriptor.get('threads') or 1)})
+                     'threads_per_process': int(descriptor.get('threads') or 1),
+                     'counts': merged_counts})
         atomic_json(directory / 'done.json',
                     {'ok': True, 'processed': processed, 'counts': merged_counts,
                      'checksum': output_digest.hexdigest(),
@@ -221,15 +234,20 @@ def execute_unit_group(directory, descriptor, stop):
                 process.terminate()
                 process.join(2)
         processed = 0
+        live_counts = {}
         for _, _, child_dir in children:
             try:
-                processed += int(json.loads((child_dir / 'progress.json').read_text('utf-8')).get('processed') or 0)
+                child_progress = json.loads((child_dir / 'progress.json').read_text('utf-8'))
+                processed += int(child_progress.get('processed') or 0)
+                for key, value in (child_progress.get('counts') or {}).items():
+                    live_counts[key] = live_counts.get(key, 0) + int(value)
             except (OSError, ValueError):
                 pass
         atomic_json(directory / 'progress.json',
                     {'processed': processed, 'started': started, 'workers': 0,
                      'worker_limit': process_count,
-                     'threads_per_process': int(descriptor.get('threads') or 1)})
+                     'threads_per_process': int(descriptor.get('threads') or 1),
+                     'counts': live_counts})
         atomic_json(directory / 'done.json',
                     {'ok': False, 'processed': processed,
                      'error': f'{type(exc).__name__}: {exc}'[:300]})
@@ -447,12 +465,15 @@ def _execute_auth_unit(directory, descriptor, stop):
                 usage_counts[device] += 1
                 if processed % 10 == 0:
                     atomic_json(directory / 'progress.json',
-                                {'processed': processed, 'started': started})
+                                {'processed': processed, 'started': started,
+                                 'counts': dict(counters)})
 
     if processed != int(descriptor.get('rows') or 0):
         raise ValueError('输入条数和工作包描述不一致')
     _bump_usage(device_root, usage_counts)
-    atomic_json(directory / 'progress.json', {'processed': processed, 'started': started})
+    atomic_json(directory / 'progress.json',
+                {'processed': processed, 'started': started,
+                 'counts': dict(counters)})
     atomic_json(directory / 'done.json',
                 {'ok': True, 'processed': processed, 'counts': dict(counters),
                  'checksum': output_digest.hexdigest(),

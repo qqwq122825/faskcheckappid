@@ -116,7 +116,11 @@ async function submit() {
       <el-form-item label="任务名称（可选）"><el-input v-model="name" placeholder="不填写则使用上传的文件名；重名会自动加 -2、-3" maxlength="120" :disabled="busy" /></el-form-item>
       <el-form-item label="单条请求超时 / 秒">
         <el-input-number v-model="timeout" :min="5" :max="120" :step="5" :precision="0" :disabled="busy" />
-        <span class="field-note">单条记录的一次网络请求最多等待时间。分包、进程、线程和重试均由系统自动管理。</span>
+        <span class="field-note">单条记录的一次网络请求最多等待时间。</span>
+      </el-form-item>
+      <el-form-item label="超时后重试次数">
+        <el-input-number v-model="retries" :min="0" :max="5" :step="1" :precision="0" :disabled="busy" />
+        <span class="field-note">0 表示不重试；只对超时、TLS 和 5xx 等可重试错误生效，密码错误、锁定等明确结论不重试。</span>
       </el-form-item>
       <el-alert title="总控自动按每包最多 10,000 条建立字节索引；节点领包后使用全部进程和线程处理。" type="info" :closable="false" show-icon />
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />

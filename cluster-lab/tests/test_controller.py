@@ -157,6 +157,17 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(unit['processes'], 50)  # 50 rows cannot use more than 50 processes.
         self.assertIsNone(self.service.lease(node['id'], 'big-session'))
 
+    def test_legacy_32_thread_ceiling_upgrades_to_node_100_thread_capacity(self):
+        node = self.service.add_node('legacy-32', 10, 32)
+        response = self.service.heartbeat(node['id'], {
+            'session': 'legacy-session', 'version': '0.3.5',
+            'max_processes': 10, 'max_threads': 100, 'active': [], 'interrupted': []})
+        self.assertEqual((response['processes'], response['threads']), (10, 100))
+        self.assertEqual(response['desired_threads'], 100)
+        with self.service.db.connect() as db:
+            self.assertEqual(db.execute('SELECT desired_threads FROM nodes WHERE id=?',
+                                        (node['id'],)).fetchone()[0], 100)
+
     def test_lease_carries_job_timeout_and_indexed_package_bytes(self):
         job = self.service.create_job('indexed', io.BytesIO(b'hello\n' * 100), 50,
                                       timeout=37, retries=3)
@@ -216,6 +227,39 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(hb['confirmed'], [unit['id']])
         self.assertEqual(self.service.snapshot()['jobs'][0]['confirmed'], 50)
         self.assertEqual(self.service.snapshot()['jobs'][0]['status'], 'completed')
+
+    def test_live_category_feedback_updates_each_heartbeat_without_double_counting(self):
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        live = {'wrong_password': 3, 'locked': 2, 'undetermined': 5}
+        self.service.heartbeat(self.node['id'], {
+            'session': 'test-session', 'version': '0.3.6',
+            'max_processes': 1, 'max_threads': 2, 'interrupted': [],
+            'active': [{'id': unit['id'], 'token': unit['token'],
+                        'processed': 10, 'counts': live}]})
+        state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
+        self.assertEqual(state['processed'], 10)
+        self.assertEqual(state['categorized'], {
+            'valid': 0, 'wrong_password': 3, 'need_2fa': 0,
+            'locked': 2, 'timeout': 0, 'unknown': 5})
+
+        statuses = (['wrong_password'] * 3 + ['locked'] * 2 +
+                    ['undetermined'] * 5 + ['valid'] * 40)
+        payload = b''.join((json.dumps({
+            'row': unit['first_row'] + offset, 'status': status,
+            'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
+            separators=(',', ':')) + '\n').encode()
+            for offset, status in enumerate(statuses))
+        self.service.accept_result(self.node['id'], unit['id'], unit['token'],
+                                   io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
+        state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
+        self.assertEqual(state['categorized'], {
+            'valid': 40, 'wrong_password': 3, 'need_2fa': 0,
+            'locked': 2, 'timeout': 0, 'unknown': 5})
+        with self.service.db.connect() as db:
+            self.assertIsNone(db.execute('SELECT live_counts FROM units WHERE id=?',
+                                         (unit['id'],)).fetchone()[0])
 
     def test_task_row_statistics_count_partial_final_unit(self):
         job = self.job(101)

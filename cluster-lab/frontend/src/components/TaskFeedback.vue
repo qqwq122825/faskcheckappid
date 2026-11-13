@@ -17,7 +17,7 @@ interface Cell { label: string; value: number | null | undefined; tone?: string;
 const categories = computed(() => props.categorized || {})
 const cells = computed<Cell[]>(() => [
   { label: '总数', value: props.total },
-  { label: '完成', value: props.completed,
+  { label: '已确认', value: props.completed,
     tone: props.total && props.completed >= props.total ? 'success' : undefined },
   { label: '剩余', value: Math.max(0, props.total - (reportedProcessed.value ?? props.completed)) },
   { label: '在途记录', value: props.active },
@@ -47,7 +47,7 @@ const cells = computed<Cell[]>(() => [
       </div>
       <p v-if="!preview && active > 0 && !reportedProcessed">等待节点上报中间进度；在途记录数不代表同时执行数量。</p>
       <div class="feedback-meta"><span v-if="capacity">工作进程 {{ capacity }}</span><span>用时 {{ elapsed == null ? '—' : fmt(elapsed) }} 秒 · {{ fmt(rate) }} 条/小时</span></div>
-      <p>{{ preview ? '合成统计，不代表真实任务结果。' : '进度条按节点每秒上报的实时已处理数量计算；完成状态仍以总控确认全部结果为准。' }}</p>
+      <p>{{ preview ? '合成统计，不代表真实任务结果。' : '进度和分类按节点每秒上报实时更新；运行中的分类尚待确认，完成状态仍以总控确认全部结果为准。' }}</p>
     </div>
   </el-card>
 </template>

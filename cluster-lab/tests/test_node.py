@@ -58,6 +58,22 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(self.node.snapshot()['confirmed'], 1)
         self.assertEqual(self.node.snapshot()['outbox'], 0)
 
+    def test_heartbeat_includes_live_category_counts(self):
+        (self.node.spool / self.unit / 'progress.json').write_text(
+            json.dumps({'processed': 1, 'counts': {'wrong_password': 1}}), 'utf-8')
+        captured = {}
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': []}
+
+        def request(*_args, **kwargs):
+            captured.update(kwargs['json'])
+            return Response(value)
+
+        with patch.object(self.node, '_request', side_effect=request):
+            self.node._heartbeat()
+        self.assertEqual(captured['active'][0]['processed'], 1)
+        self.assertEqual(captured['active'][0]['counts'], {'wrong_password': 1})
+
     def test_pending_results_block_controller_switch(self):
         with self.assertRaisesRegex(ValueError, '结果待上传'):
             self.node.connect('http://127.0.0.1:18772','x'*32)
