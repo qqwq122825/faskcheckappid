@@ -6,19 +6,24 @@ const props = defineProps<{
   total: number, completed: number, active: number, success: number,
   failed?: number | null, timeout?: number | null, unconfirmed: number,
   pending: number, rate: number, status: string, preview?: boolean, skipped?: number,
+  elapsed?: number | null, categorized?: Record<string, number> | null,
+  capacity?: string,
 }>()
 const percentage = computed(() => props.total ? Math.min(100, props.completed / props.total * 100) : 0)
-const cells = computed(() => [
+interface Cell { label: string; value: number | null | undefined; tone?: string; suffix?: string }
+const categories = computed(() => props.categorized || {})
+const cells = computed<Cell[]>(() => [
   { label: '总数', value: props.total },
-  { label: '完成', value: props.completed },
+  { label: '完成', value: props.completed,
+    tone: props.total && props.completed >= props.total ? 'success' : undefined },
   { label: '剩余', value: Math.max(0, props.total - props.completed) },
-  { label: '在途记录', value: props.active },
-  { label: '处理成功', value: props.success, tone: 'success' },
-  { label: '处理失败', value: props.failed, tone: 'danger' },
-  { label: '超时', value: props.timeout, tone: 'warning' },
-  { label: props.preview ? '跳过' : '待确认', value: props.preview ? props.skipped : props.unconfirmed },
-  { label: '待分配', value: props.pending },
-  { label: '处理速度', value: props.rate, suffix: '条 / 秒' },
+  { label: '当前校验', value: props.active },
+  { label: '密正', value: categories.value.valid ?? 0, tone: 'success' },
+  { label: '密码错误', value: categories.value.wrong_password ?? 0 },
+  { label: '双重验证', value: categories.value.need_2fa ?? 0 },
+  { label: '锁定', value: categories.value.locked ?? 0 },
+  { label: '超时', value: categories.value.timeout ?? 0, tone: 'warning' },
+  { label: '未判断', value: categories.value.unknown ?? 0 },
 ])
 </script>
-<template><el-card shadow="never" class="task-feedback"><template #header><div class="section-heading"><h2>进度与结果</h2><div class="feedback-state"><el-tag v-if="preview" type="warning" effect="plain">合成演示</el-tag><el-tag v-if="preview" :type="status === 'completed' ? 'success' : status === 'paused' ? 'warning' : 'primary'" round>{{ status === 'completed' ? '已完成' : status === 'paused' ? '已暂停' : '运行中' }}</el-tag><StatusBadge v-else :status="status" /></div></div></template><div class="feedback-grid"><div v-for="cell in cells" :key="cell.label" class="feedback-cell" :class="cell.tone"><span>{{ cell.label }}</span><strong>{{ cell.value == null ? '—' : fmt(cell.value) }}<small v-if="cell.suffix">{{ cell.suffix }}</small></strong></div></div><div class="feedback-footer"><div class="feedback-progress-label"><span>{{ fmt(completed) }} / {{ fmt(total) }}</span><strong>{{ percentage.toFixed(1) }}%</strong></div><el-progress :percentage="Number(percentage.toFixed(1))" :show-text="false" :stroke-width="10" /><p>{{ preview ? '仅为本地合成统计，不代表账号验证或真实任务结果。' : '完成数以总控确认结果为准；未采集的失败、超时分类显示为 —。' }}</p></div></el-card></template>
+<template><el-card shadow="never" class="task-feedback"><template #header><div class="section-heading"><h2>进度与结果</h2><div class="feedback-state"><el-tag v-if="preview" type="warning" effect="plain">合成演示</el-tag><el-tag v-if="preview" :type="status === 'completed' ? 'success' : status === 'paused' ? 'warning' : 'primary'" round>{{ status === 'completed' ? '已完成' : status === 'paused' ? '已暂停' : '运行中' }}</el-tag><StatusBadge v-else :status="status" /></div></div></template><div class="feedback-grid"><div v-for="cell in cells" :key="cell.label" class="feedback-cell" :class="cell.tone"><span>{{ cell.label }}</span><strong>{{ cell.value == null ? '—' : fmt(cell.value) }}<small v-if="cell.suffix">{{ cell.suffix }}</small></strong></div></div><div class="feedback-footer"><div class="feedback-progress-label"><span>{{ fmt(completed) }} / {{ fmt(total) }}</span><strong>{{ percentage.toFixed(1) }}%</strong></div><el-progress :percentage="Number(percentage.toFixed(1))" :show-text="false" :stroke-width="10" /><div class="feedback-meta"><span v-if="capacity">工作进程 {{ capacity }}</span><span>用时 {{ elapsed == null ? '—' : fmt(elapsed) }} 秒 · {{ fmt(rate) }} 条/小时</span></div><p>{{ preview ? '合成统计，不代表真实任务结果。' : '完成数以总控确认为准。' }}</p></div></el-card></template>

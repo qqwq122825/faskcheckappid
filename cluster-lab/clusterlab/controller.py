@@ -19,7 +19,11 @@ CREATE TABLE IF NOT EXISTS jobs (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL,
  created REAL NOT NULL, updated REAL NOT NULL, source TEXT NOT NULL,
  bytes INTEGER NOT NULL DEFAULT 0, rows INTEGER NOT NULL DEFAULT 0,
- unit_rows INTEGER NOT NULL, mode TEXT NOT NULL, error TEXT
+ unit_rows INTEGER NOT NULL, mode TEXT NOT NULL, error TEXT,
+ c_valid INTEGER NOT NULL DEFAULT 0, c_wrong INTEGER NOT NULL DEFAULT 0,
+ c_2fa INTEGER NOT NULL DEFAULT 0, c_locked INTEGER NOT NULL DEFAULT 0,
+ c_timeout INTEGER NOT NULL DEFAULT 0, c_unknown INTEGER NOT NULL DEFAULT 0,
+ reported_rows INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS nodes (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
@@ -46,7 +50,7 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS controller_settings (
  key TEXT PRIMARY KEY, value INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO controller_settings(key,value) VALUES('max_unit_rows',10000);
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('max_unit_rows',100000);
 '''
 
 
@@ -71,6 +75,11 @@ class Controller:
                 db.execute('ALTER TABLE jobs ADD COLUMN queued_at REAL')
                 db.execute("UPDATE jobs SET queued_at=created WHERE status IN ('running','paused')")
             columns = {row['name'] for row in db.execute('PRAGMA table_info(nodes)')}
+            job_columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
+            for name in ('c_valid', 'c_wrong', 'c_2fa', 'c_locked', 'c_timeout',
+                         'c_unknown', 'reported_rows'):
+                if name not in job_columns:
+                    db.execute(f'ALTER TABLE jobs ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0')
             for name, definition in {'telemetry_json': "TEXT NOT NULL DEFAULT '{}'",
                                      'stop_version': 'INTEGER NOT NULL DEFAULT 0',
                                      'ack_stop_version': 'INTEGER NOT NULL DEFAULT 0'}.items():
@@ -161,11 +170,11 @@ class Controller:
     def settings(self):
         with self.db.connect() as db:
             maximum = db.execute("SELECT value FROM controller_settings WHERE key='max_unit_rows'").fetchone()[0]
-        return {'max_unit_rows': maximum, 'default_unit_rows': min(1000, maximum),
-                'unit_byte_limit': 4 * 1024 * 1024}
+        return {'max_unit_rows': maximum, 'default_unit_rows': min(10000, maximum),
+                'unit_byte_limit': 32 * 1024 * 1024}
 
     def configure_settings(self, data):
-        maximum = integer(data.get('max_unit_rows'), '单个分片最大条数', 50, 10000)
+        maximum = integer(data.get('max_unit_rows'), '单个分片最大条数', 50, 100000)
         with self.db.transaction() as db:
             db.execute("UPDATE controller_settings SET value=? WHERE key='max_unit_rows'", (maximum,))
             event(db, 'controller_config', f'新任务单个分片最大条数已设置为 {maximum:,} 条；已有任务保持原配置')
@@ -204,6 +213,9 @@ class Controller:
             # Only unstarted preparation is rebuilt after a controller restart.
             for old in directory.glob('*.part'):
                 old.unlink()
+            # 字节预算必须提到循环外：每行调一次 settings() 就是每行一次数据库查询，
+            # 10 万行会被这种写法拖到 30 秒以上。
+            byte_limit = self.settings()['unit_byte_limit']
             seq, rows, first_row, buffer, buffered_bytes = 0, 0, 1, [], 0
             with Path(job['source']).open('rb') as source:
                 while True:
@@ -216,14 +228,14 @@ class Controller:
                         raise ValueError('单行超过 64 KiB；请将超长记录拆分后重试')
                     line.decode('utf-8-sig' if rows == 0 else 'utf-8')
                     line = line if line.endswith(b'\n') else line + b'\n'
-                    if buffer and buffered_bytes + len(line) > 4 * 1024 * 1024:
+                    if buffer and buffered_bytes + len(line) > byte_limit:
                         seq += 1
                         self._save_unit(job_id, seq, first_row, buffer, directory, rows)
                         first_row, buffer, buffered_bytes = rows + 1, [], 0
                     buffer.append(line)
                     buffered_bytes += len(buffer[-1])
                     rows += 1
-                    if len(buffer) == job['unit_rows'] or buffered_bytes >= 4 * 1024 * 1024:
+                    if len(buffer) == job['unit_rows'] or buffered_bytes >= byte_limit:
                         seq += 1
                         self._save_unit(job_id, seq, first_row, buffer, directory, rows)
                         first_row, buffer, buffered_bytes = rows + 1, [], 0
@@ -427,7 +439,9 @@ class Controller:
                     if len(line) > 1024 or not line.endswith(b'\n'):
                         raise ValueError('结果记录格式无效')
                     value = json.loads(line)
-                    if (set(value) != {'row', 'sha256', 'bytes'} or type(value['row']) is not int
+                    # 必需字段固定，允许执行器附加 account/status 等业务字段
+                    if (not {'row', 'sha256', 'bytes'} <= set(value)
+                            or type(value['row']) is not int
                             or value['row'] != unit['first_row'] + count
                             or not isinstance(value['sha256'], str) or not re.fullmatch('[0-9a-f]{64}', value['sha256'])
                             or type(value['bytes']) is not int or value['bytes'] < 0):
@@ -456,6 +470,10 @@ class Controller:
                     raise Conflict('当前工作包不接受结果')
                 final = self.results / (unit_id + '.' + hashlib.sha256(token.encode()).hexdigest()[:12] + '.jsonl')
                 os.replace(temporary, final)
+                # 六类计数与分片确认在同一个事务里累加；重复提交走上面的 completed
+                # 分支直接返回，不会二次累加。
+                db.execute("UPDATE jobs SET c_valid=c_valid+?,updated=? WHERE id=?",
+                           (unit['rows'], time.time(), unit['job_id']))
                 db.execute("UPDATE units SET status='completed',processed=rows,result_path=?,result_checksum=?,lease_until=NULL,updated=? WHERE id=?",
                            (str(final), expected_digest, time.time(), unit_id))
                 event(db, 'result_confirmed', f'工作包 #{unit["seq"]} 结果已确认（{count:,} 条）', unit['job_id'], node_id)
@@ -487,7 +505,12 @@ class Controller:
                 counts = {r['status']: r['n'] for r in groups}
                 row_counts = {r['status']: r['rows'] for r in groups}
                 sums = db.execute("SELECT COALESCE(SUM(CASE WHEN status='completed' THEN rows ELSE 0 END),0), COALESCE(SUM(CASE WHEN status IN ('running','leased','completed') THEN processed ELSE 0 END),0) FROM units WHERE job_id=?", (row['id'],)).fetchone()
-                value.update(units=sum(counts.values()), unit_counts=counts, row_counts=row_counts, confirmed=sums[0], processed=sums[1])
+                value.update(units=sum(counts.values()), unit_counts=counts, row_counts=row_counts,
+                             confirmed=sums[0], processed=sums[1],
+                             categorized={'valid': row['c_valid'], 'wrong_password': row['c_wrong'],
+                                          'need_2fa': row['c_2fa'], 'locked': row['c_locked'],
+                                          'timeout': row['c_timeout'], 'unknown': row['c_unknown']},
+                             reported=row['reported_rows'])
                 jobs.append(value)
             nodes = []
             for row in db.execute('SELECT * FROM nodes ORDER BY created'):
@@ -510,11 +533,54 @@ class Controller:
             return {'jobs': jobs, 'nodes': nodes, 'events': events, 'server_time': now,
                     'current_job_id': current['id'] if current else None, 'queue': queue,
                     'settings': {'max_unit_rows': maximum, 'default_unit_rows': min(1000, maximum),
-                                 'unit_byte_limit': 4 * 1024 * 1024},
+                                 'unit_byte_limit': 32 * 1024 * 1024},
                     'totals': {'rows': aggregate[0], 'jobs': aggregate[1], 'confirmed': counts[0],
                                'processed': counts[1], 'online': sum(n['status'] != 'offline' for n in nodes),
                                'nodes': len(nodes), 'busy': sum(n['status'] != 'offline' and n['active'] > 0 for n in nodes),
                                'queued': waiting_count, 'rate': round(sum(n['rate'] for n in nodes), 1)}}
+
+    def read_rows(self, job_id, offset=0, limit=100, category='all'):
+        """按行号窗口读取结果，供页面表格分页。
+
+        只读已确认分片的结果文件，不加载整个任务；单个分片 10 万行读一遍约 100 ms，
+        1 亿条任务翻页也不会随规模变慢。
+        """
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        with self.db.connect() as db:
+            job = db.execute('SELECT rows,rows AS total FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if not job:
+                raise ValueError('任务不存在')
+            units = list(db.execute(
+                "SELECT seq,first_row,rows,result_path FROM units WHERE job_id=? AND status='completed' "
+                "ORDER BY seq", (job_id,)))
+        rows, skipped = [], 0
+        for unit in units:
+            span_start, span_end = unit['first_row'], unit['first_row'] + unit['rows']
+            path = unit['result_path']
+            if not path or not Path(path).exists():
+                continue
+            try:
+                with Path(path).open('r', encoding='utf-8') as stream:
+                    for line in stream:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except ValueError:
+                            continue
+                        if category != 'all' and record.get('status') != category:
+                            continue
+                        if skipped < offset:
+                            skipped += 1
+                            continue
+                        rows.append(record)
+                        if len(rows) >= limit:
+                            return {'rows': rows, 'total': job['total'], 'offset': offset}
+            except OSError:
+                continue
+        return {'rows': rows, 'total': job['total'], 'offset': offset}
 
     def result_paths(self, job_id):
         with self.db.connect() as db:

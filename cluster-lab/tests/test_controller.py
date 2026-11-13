@@ -271,6 +271,9 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn(self.node['token'], response.get_data(as_text=True))
 
     def test_work_packages_have_a_byte_budget_as_well_as_a_row_budget(self):
+        # 显式压低字节预算，验证"条数没到上限也会按字节切包"的行为本身
+        self.service.settings = lambda: {'max_unit_rows': 100000, 'default_unit_rows': 10000,
+                                        'unit_byte_limit': 4 * 1024 * 1024}
         job = self.service.create_job('bytes', io.BytesIO((b'x' * 60000 + b'\n') * 80), 10000)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -285,13 +288,21 @@ class ControllerTests(unittest.TestCase):
             paths = [Path(r['path']) for r in db.execute('SELECT path FROM units WHERE job_id=?', (job,))]
         self.assertTrue(all(p.stat().st_size <= 4 * 1024 * 1024 for p in paths))
 
+    def test_prepare_does_not_query_settings_per_row(self):
+        """解析阶段每行查一次数据库会把 10 万行拖到 30 秒以上（回归防护）。"""
+        calls = []
+        original = self.service.settings
+        self.service.settings = lambda: (calls.append(1), original())[1]
+        self.job(count=400)
+        self.assertLess(len(calls), 6, f'解析期间调用了 {len(calls)} 次 settings()')
+
     def test_shard_limit_is_persistent_and_only_changes_new_jobs(self):
-        self.assertEqual(self.service.settings()['max_unit_rows'], 10000)
-        for value in (49, 10001, True, 1000.5):
+        self.assertEqual(self.service.settings()['max_unit_rows'], 100000)
+        for value in (49, 100001, True, 1000.5):
             with self.assertRaises(ValueError):
                 self.service.configure_settings({'max_unit_rows': value})
         with self.assertRaises(ValueError):
-            self.service.create_job('over', io.BytesIO(b'hello\n'), 10001)
+            self.service.create_job('over', io.BytesIO(b'hello\n'), 100001)
         job = self.job(101)
         self.service.configure_settings({'max_unit_rows': 50})
         with self.assertRaises(ValueError):

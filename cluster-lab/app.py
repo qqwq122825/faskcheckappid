@@ -35,7 +35,10 @@ def main():
     print(f'Cluster Lab {args.role} · http://{args.host}:{port}/', flush=True)
     print(f'数据目录：{root.resolve()}', flush=True)
     try:
-        serve(application, host=args.host, port=port, threads=8)
+        # waitress 的 max_request_body_size 默认只有 1 GiB，Flask 那边的
+        # MAX_CONTENT_LENGTH 调多大都没用——超过 1 GiB 会直接 413。
+        serve(application, host=args.host, port=port, threads=8,
+              max_request_body_size=8 * 1024 * 1024 * 1024)
     except KeyboardInterrupt:
         pass
     finally:

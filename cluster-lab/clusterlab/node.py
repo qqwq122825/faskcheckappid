@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 
 class Node:
+    # 必须 >= 总控的 unit_byte_limit（controller.settings 里是 32 MiB）。
+    # 两处不一致时总控切得出、节点收不下，大包会一直重试到租约过期。
+    UNIT_BYTE_LIMIT = 34 * 1024 * 1024
+
     def __init__(self, root, max_processes=2, max_threads=8, allow_http=False, interval=1.0):
         self.root = private_dir(root)
         self.spool = private_dir(self.root / 'spool')
@@ -217,7 +221,7 @@ class Node:
                 path.chmod(0o600)
                 for block in response.iter_content(64 * 1024):
                     total += len(block)
-                    if total > 5 * 1024 * 1024:
+                    if total > self.UNIT_BYTE_LIMIT:
                         raise ValueError('工作包超过允许大小')
                     output.write(block)
         if file_digest(path) != descriptor['checksum']:

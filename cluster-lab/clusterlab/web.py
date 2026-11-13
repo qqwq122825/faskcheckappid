@@ -25,7 +25,7 @@ def create_app(role, service, password=None):
         atomic_json(service.root / 'web-session.json', state)
     password_hash = generate_password_hash(password) if password else None
     app.secret_key = state['secret']
-    app.config.update(MAX_CONTENT_LENGTH=2 * 1024 * 1024 * 1024, MAX_FORM_MEMORY_SIZE=512 * 1024,
+    app.config.update(MAX_CONTENT_LENGTH=8 * 1024 * 1024 * 1024, MAX_FORM_MEMORY_SIZE=512 * 1024,
                       SESSION_COOKIE_NAME='clusterlab_' + hashlib.sha256(str(service.root).encode()).hexdigest()[:10],
                       SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict')
     app.extensions['service'] = service
@@ -121,6 +121,24 @@ def create_app(role, service, password=None):
             service.stop_node(node_id)
             return jsonify(ok=True, message='停止请求已发送，等待节点确认')
 
+        @app.post('/api/jobs/stream')
+        def upload_stream():
+            """裸流上传：请求体就是文件内容，不经 multipart 解析，不落临时文件。
+
+            参数走 query，避免读取 request.form 触发 werkzeug 把整个文件先解到
+            临时目录（那样 4 GB 文件会占双倍磁盘，还多一次全量拷贝）。
+            """
+            name = request.args.get('name', '')
+            unit_rows = int(request.args.get('unit_rows', str(service.settings()['default_unit_rows'])))
+            enqueue = request.args.get('enqueue', 'false')
+            if enqueue not in ('true', 'false'):
+                raise ValueError('加入队列选项无效')
+            if not request.content_length:
+                raise ValueError('缺少 Content-Length，无法确认上传完整性')
+            job_id = service.create_job(name or '未命名任务', request.stream, unit_rows,
+                                        'digest', enqueue == 'true')
+            return jsonify(id=job_id, bytes=request.content_length), 202
+
         @app.post('/api/jobs')
         def upload():
             uploaded = request.files.get('file')
@@ -150,6 +168,13 @@ def create_app(role, service, password=None):
         def job_action(job_id, action):
             service.job_action(job_id, action)
             return jsonify(ok=True)
+
+        @app.get('/api/jobs/<job_id>/rows')
+        def job_rows(job_id):
+            offset = int(request.args.get('offset', 0))
+            limit = int(request.args.get('limit', 100))
+            category = request.args.get('category', 'all')
+            return jsonify(service.read_rows(job_id, offset, limit, category))
 
         @app.get('/api/jobs/<job_id>/results')
         def download_results(job_id):

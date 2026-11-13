@@ -24,8 +24,11 @@ def execute_unit(directory, descriptor, stop):
         raw = line.rstrip(b'\r\n')
         if descriptor['mode'] == 'simulate':
             time.sleep(0.004)
-        return (json.dumps({'row': row, 'sha256': hashlib.sha256(raw).hexdigest(), 'bytes': len(raw)},
-                           separators=(',', ':')) + '\n').encode()
+        # account 保留原始记录，供总控逐行核对；status 是分类结果。
+        # 离线摘要没有业务判定，统一记为 valid，接入真实执行器后由执行器给值。
+        record = {'row': row, 'account': raw.decode('utf-8', 'replace')[:512],
+                  'status': 'valid', 'sha256': hashlib.sha256(raw).hexdigest(), 'bytes': len(raw)}
+        return (json.dumps(record, separators=(',', ':')) + '\n').encode()
 
     try:
         with (directory / 'input.part').open('rb') as source, output_path.open('wb') as output:
