@@ -6,14 +6,14 @@ import { api, busy, createTaskOpen, refresh, session, state } from '../composabl
 const router = useRouter()
 const name = ref(''), unitRows = ref(10000), file = ref<File>(), error = ref('')
 const files = ref<any[]>([]), chosen = ref(''), mode = ref<'new' | 'reuse'>('new')
-const timeout = ref(20), retries = ref(0)
+const timeout = ref(20), retries = ref(0), deviceCapacity = ref(30)
 const uploadPercent = ref<number | null>(null)
 const maxUnitRows = computed(() => state.value?.settings?.max_unit_rows || 10000)
 watch(createTaskOpen, open => {
   if (open) {
     error.value = ''; file.value = undefined; name.value = ''
     unitRows.value = Math.min(10000, maxUnitRows.value)
-    timeout.value = 20; retries.value = 0; uploadPercent.value = null
+    timeout.value = 20; retries.value = 0; deviceCapacity.value = 30; uploadPercent.value = null
     chosen.value = ''; mode.value = 'new'
     loadFiles()
   }
@@ -37,7 +37,7 @@ function sizeText(bytes: number) {
 function uploadStream(selected: File): Promise<any> {
   const query = new URLSearchParams({ name: name.value.trim() || selected.name,
     unit_rows: String(unitRows.value), mode: 'auth', timeout: String(timeout.value),
-    retries: String(retries.value), enqueue: 'true' })
+    retries: String(retries.value), device_capacity: String(deviceCapacity.value), enqueue: 'true' })
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `/api/jobs/stream?${query}`)
@@ -67,7 +67,8 @@ async function submit() {
     try {
       await api('/api/jobs/from-file', { source: chosen.value, name: name.value.trim(),
                                          unit_rows: unitRows.value, mode: 'auth', enqueue: 'true',
-                                         timeout: timeout.value, retries: retries.value }, 'POST')
+                                         timeout: timeout.value, retries: retries.value,
+                                         device_capacity: deviceCapacity.value }, 'POST')
       createTaskOpen.value = false
       await refresh()
       await router.push('/jobs')
@@ -121,6 +122,10 @@ async function submit() {
       <el-form-item label="超时后重试次数">
         <el-input-number v-model="retries" :min="0" :max="5" :step="1" :precision="0" :disabled="busy" />
         <span class="field-note">0 表示不重试；只对超时、TLS 和 5xx 等可重试错误生效，密码错误、锁定等明确结论不重试。</span>
+      </el-form-item>
+      <el-form-item label="预计设备池数量">
+        <el-input-number v-model="deviceCapacity" :min="1" :max="200" :step="1" :precision="0" :disabled="busy" />
+        <span class="field-note">默认 30 台。任务开始后立即运行，同时在节点后台注册并补齐设备池；不同工作包轮换使用池内设备。</span>
       </el-form-item>
       <el-alert title="总控自动按每包最多 10,000 条建立字节索引；节点领包后使用全部进程和线程处理。" type="info" :closable="false" show-icon />
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />

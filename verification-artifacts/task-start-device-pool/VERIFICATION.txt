@@ -1,0 +1,107 @@
+BRANCH/FIELD
+main / jobs.device_capacity -> lease.device_capacity -> node device_target + reserved device_slots -> DeviceBuilder background refill / VERSION 0.3.7
+Original baseline commit: dca2df84658e5bf77a15786ff6ef1d5958a0eecf
+
+FOUR ARTIFACTS
+MODIFIED_FILE=/Users/xxx/Documents/并发/verification-artifacts/task-start-device-pool/MODIFIED_FILE
+DIFF_FILE=/Users/xxx/Documents/并发/verification-artifacts/task-start-device-pool/DIFF_FILE
+VERIFICATION.txt=/Users/xxx/Documents/并发/verification-artifacts/task-start-device-pool/VERIFICATION.txt
+ROLLBACK.sh=/Users/xxx/Documents/并发/verification-artifacts/task-start-device-pool/ROLLBACK.sh
+
+BASELINE
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/task-start-device-pool/baseline-check/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: baseline commit dca2df84658e5bf77a15786ff6ef1d5958a0eecf; no runtime input.
+Literal output/result:
+.......................................
+----------------------------------------------------------------------
+Ran 39 tests in 3.748s
+
+OK
+BASELINE_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED BACKEND
+Command: cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python -m unittest discover -s tests -v
+Input: modified tree; device-pool target=30; unit seq=2; processes=10; task rows=10,000.
+Literal output/result:
+----------------------------------------------------------------------
+Ran 41 tests in 3.783s
+
+OK
+MODIFIED_TEST_EXIT=0
+Exit status: 0
+Observed branch/field result: lease device_capacity=30; node assigned slots [11,12,13,14,15,16,17,18,19,20], reserved them from the background builder, and started DeviceBuilder(30).
+
+MODIFIED FRONTEND TESTS
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm test
+Input: task dialog with expected device-pool target default 30.
+Literal output/result:
+ℹ tests 10
+ℹ suites 0
+ℹ pass 10
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 56.896542
+FRONTEND_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND BUILD
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm run build
+Input: frontend source VERSION 0.3.7.
+Literal output/result:
+✓ 1652 modules transformed.
+✓ built in 2.59s
+FRONTEND_BUILD_EXIT=0
+Exit status: 0
+
+FULL PROJECT REGRESSION
+Command: cd /Users/xxx/Documents/并发 && .venv/bin/python -m unittest discover -s tests
+Input: complete modified tree; no runtime input.
+Literal output/result:
+----------------------------------------------------------------------
+Ran 114 tests in 34.350s
+
+OK
+ROOT_TEST_EXIT=0
+Exit status: 0
+
+ROLLBACK
+Command: /Users/xxx/Documents/并发/verification-artifacts/task-start-device-pool/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/task-start-device-pool/rollback-test && diff -qr /Users/xxx/Documents/并发/verification-artifacts/task-start-device-pool/rollback-original /Users/xxx/Documents/并发/verification-artifacts/task-start-device-pool/rollback-test && cd /Users/xxx/Documents/并发/verification-artifacts/task-start-device-pool/rollback-test/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: second baseline copy with DIFF_FILE applied, then reversed using executable ROLLBACK.sh.
+Literal output/result:
+ROLLBACK_RESULT=restored pre-0.3.7 task creation, lease, node device builder, executor slot assignment, UI and version
+ROLLBACK_DIFF_EXIT=0
+.......................................
+----------------------------------------------------------------------
+Ran 39 tests in 3.864s
+
+OK
+ROLLBACK_TEST_EXIT=0
+Exit status: 0
+Restored behavior/status: byte-for-byte comparison matched the baseline copy; task-start automatic device-pool refill and task device target were removed; VERSION 0.3.6 and all 39 baseline tests were restored.
+
+OBSERVED MODIFIED BEHAVIOR
+- Task creation shows “预计设备池数量”, default 30, range 1..200.
+- The target is persisted in jobs.device_capacity and delivered in every auth lease.
+- The node starts the task immediately and starts DeviceBuilder in parallel; it does not wait for all 30 devices.
+- Ten task processes reserve their ten slots, so the background builder skips those slots and fills the remaining pool without duplicate registration.
+- Package sequence rotates slot groups: with 10 processes and a 30-device target, packages use 1..10, 11..20, 21..30, then repeat.
+- If a smaller manual build is already running, the node retains the task target and continues refilling to 30 after that build completes.
+- When task processes end, their slot reservations are released.
+
+ORIGINAL SHA256
+7e5d9bcbc6c0a8dba45aabd4bb48fcded4267599ff17aa6486207cdaeb43d017  verification-artifacts/task-start-device-pool/original/cluster-lab/README.md
+d826b7ba179433ed0015d83fc267a343c80742e369dc3a0b7cc3285139102395  verification-artifacts/task-start-device-pool/original/cluster-lab/clusterlab/__init__.py
+af89332fa6e5c4414e615cc03d76efe81d1d2ff78f8d230ea37e7173968b7d77  verification-artifacts/task-start-device-pool/original/cluster-lab/clusterlab/controller.py
+ef7e357a1cc42810d050ebbc302e445a6cedf508aaea193c88e27f95a4cf745c  verification-artifacts/task-start-device-pool/original/cluster-lab/clusterlab/device_build.py
+17f39f9e1a2a24234e104e59b0f10ff23eeb76367ec815d4817fe081e47fcaa5  verification-artifacts/task-start-device-pool/original/cluster-lab/clusterlab/executor.py
+5f0d064781edf968724bfc82002863af0bed76b2ccf620a2d40009672dc61225  verification-artifacts/task-start-device-pool/original/cluster-lab/clusterlab/node.py
+99a5b602b064e9db8702f824e65122ecd9a0994d5d3365dd480820d6732a1a4b  verification-artifacts/task-start-device-pool/original/cluster-lab/clusterlab/web.py
+e0f38c6db17fda792a5c3024470ce5c5b7a207009550abe86c7cf88cc5eb673e  verification-artifacts/task-start-device-pool/original/cluster-lab/frontend/package-lock.json
+ef708602f5f604ddef5e817b3bee89805d12293ab989044f19a2e4c5717ee142  verification-artifacts/task-start-device-pool/original/cluster-lab/frontend/package.json
+a8a21537b7dc8db20bad74b2ea9d5fea7920c607a90f77b399d8a7135c251931  verification-artifacts/task-start-device-pool/original/cluster-lab/frontend/src/components/CreateTaskDialog.vue
+98f38d0f38c918881fed01f0528e4bacf993d8f183b4bc616278b6a72a75ab4a  verification-artifacts/task-start-device-pool/original/cluster-lab/tests/test_controller.py
+584faeb96f1ea1d1a58e1c4b73d1041256ff096c86d725d8a900e66c7f9d77ff  verification-artifacts/task-start-device-pool/original/cluster-lab/tests/test_executor_scale.py
+f51955e06084c849ab15fc795125d5b5818b1d5c4c94450beca2c013d6c0e38e  verification-artifacts/task-start-device-pool/original/cluster-lab/tests/test_node.py

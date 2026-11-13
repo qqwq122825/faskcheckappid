@@ -78,6 +78,17 @@ class NodeRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '结果待上传'):
             self.node.connect('http://127.0.0.1:18772','x'*32)
 
+    def test_auth_task_starts_background_pool_build_and_rotates_slots(self):
+        descriptor = {'mode': 'auth', 'rows': 10000, 'seq': 2,
+                      'processes': 10, 'device_capacity': 30}
+        with patch.object(self.node.builder, 'start') as start:
+            self.node._prepare_auth_devices(descriptor)
+        self.assertEqual(descriptor['device_pool_capacity'], 30)
+        self.assertEqual(descriptor['device_slots'], list(range(11, 21)))
+        start.assert_called_once_with(30)
+        self.assertTrue(set(range(11, 21)).issubset(self.node.builder.reserved))
+        self.node.builder.release(descriptor['device_slots'])
+
     def test_remote_http_requires_explicit_test_override(self):
         with self.assertRaisesRegex(ValueError, 'HTTPS'):
             self.node.connect('http://example.com','x'*32)

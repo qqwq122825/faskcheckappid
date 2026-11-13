@@ -17,6 +17,7 @@ class DeviceBuilder:
         self.lock = threading.Lock()
         self.thread = None
         self.stop = threading.Event()
+        self.reserved = set()
         self.state = {'running': False, 'capacity': 0, 'ready': 0, 'built': 0,
                       'failed': 0, 'current': 0, 'message': '', 'started_at': None}
 
@@ -68,6 +69,23 @@ class DeviceBuilder:
     def cancel(self):
         self.stop.set()
 
+    def reserve(self, slots):
+        """任务进程占用的槽位由执行器注册，后台构建设备时主动避开。"""
+        with self.lock:
+            self.reserved.update(int(slot) for slot in slots if int(slot) > 0)
+
+    def release(self, slots):
+        with self.lock:
+            self.reserved.difference_update(int(slot) for slot in slots if int(slot) > 0)
+
+    def _reserved(self, slot):
+        with self.lock:
+            return int(slot) in self.reserved
+
+    def reserved_slots(self):
+        with self.lock:
+            return set(self.reserved)
+
     def _update(self, **fields):
         with self.lock:
             self.state.update(fields)
@@ -83,6 +101,9 @@ class DeviceBuilder:
                 if self.stop.is_set():
                     self._update(message='已取消')
                     break
+                if self._reserved(slot):
+                    self._update(message=f'第 {slot} 台由任务进程初始化，后台继续补充')
+                    continue
                 if pool.inspect(slot)['state'] == 'ready':
                     self._update(ready=self.state['ready'] + 1)
                     continue

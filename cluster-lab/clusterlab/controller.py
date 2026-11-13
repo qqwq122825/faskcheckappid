@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS jobs (
  c_2fa INTEGER NOT NULL DEFAULT 0, c_locked INTEGER NOT NULL DEFAULT 0,
  c_timeout INTEGER NOT NULL DEFAULT 0, c_unknown INTEGER NOT NULL DEFAULT 0,
  reported_rows INTEGER NOT NULL DEFAULT 0,
- req_timeout REAL NOT NULL DEFAULT 20, req_retries INTEGER NOT NULL DEFAULT 0
+ req_timeout REAL NOT NULL DEFAULT 20, req_retries INTEGER NOT NULL DEFAULT 0,
+ device_capacity INTEGER NOT NULL DEFAULT 30
 );
 CREATE TABLE IF NOT EXISTS nodes (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
@@ -111,9 +112,10 @@ class Controller:
             columns = {row['name'] for row in db.execute('PRAGMA table_info(nodes)')}
             job_columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
             for name in ('c_valid', 'c_wrong', 'c_2fa', 'c_locked', 'c_timeout',
-                         'c_unknown', 'reported_rows', 'req_timeout', 'req_retries'):
+                         'c_unknown', 'reported_rows', 'req_timeout', 'req_retries',
+                         'device_capacity'):
                 if name not in job_columns:
-                    default = '20' if name == 'req_timeout' else '0'
+                    default = '20' if name == 'req_timeout' else ('30' if name == 'device_capacity' else '0')
                     column_type = 'REAL' if name == 'req_timeout' else 'INTEGER'
                     db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {column_type} NOT NULL DEFAULT {default}')
             for name, definition in {'telemetry_json': "TEXT NOT NULL DEFAULT '{}'",
@@ -214,13 +216,14 @@ class Controller:
         return value, count
 
     def create_job(self, name, stream, unit_rows=500, mode='auth', enqueue=False,
-                   timeout=20.0, retries=0):
+                   timeout=20.0, retries=0, device_capacity=30):
         integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
         if type(enqueue) is not bool:
             raise ValueError('加入队列选项无效')
         if mode not in ('digest', 'simulate', 'auth'):
             raise ValueError('执行模式应为 digest / simulate / auth')
         timeout, retries = self._check_exec(timeout, retries)
+        device_capacity = integer(int(device_capacity), '预计设备池', 1, 200)
         job_id = uuid.uuid4().hex
         target = self._source_path(name).resolve()
         with target.open('xb') as output:
@@ -231,9 +234,10 @@ class Controller:
             raise ValueError('文件为空')
         now = time.time()
         with self.db.transaction() as db:
-            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,device_capacity) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                        (job_id, str(name).strip()[:120] or '未命名任务', 'preparing', now, now,
-                        str(target), target.stat().st_size, unit_rows, mode, now if enqueue else None, timeout, retries))
+                        str(target), target.stat().st_size, unit_rows, mode, now if enqueue else None,
+                        timeout, retries, device_capacity))
             event(db, 'job_uploaded', '输入文件已保存，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
@@ -394,12 +398,13 @@ class Controller:
         return result
 
     def create_job_from_file(self, source, name, unit_rows=10000, mode='auth', enqueue=False,
-                             timeout=20.0, retries=0):
+                             timeout=20.0, retries=0, device_capacity=30):
         """复用已上传的源文件创建任务，不再接收文件内容。"""
         integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
         if mode not in ('digest', 'simulate', 'auth'):
             raise ValueError('执行模式应为 digest / simulate / auth')
         timeout, retries = self._check_exec(timeout, retries)
+        device_capacity = integer(int(device_capacity), '预计设备池', 1, 200)
         path = Path(str(source))
         if not path.exists():
             raise ValueError('源文件不存在或不可复用')
@@ -409,10 +414,11 @@ class Controller:
         job_id = uuid.uuid4().hex
         now = time.time()
         with self.db.transaction() as db:
-            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries) '
-                       'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,device_capacity) '
+                       'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                        (job_id, str(name).strip()[:120] or path.name, 'preparing', now, now,
-                        str(path), path.stat().st_size, unit_rows, mode, now if enqueue else None, timeout, retries))
+                        str(path), path.stat().st_size, unit_rows, mode, now if enqueue else None,
+                        timeout, retries, device_capacity))
             event(db, 'job_uploaded', '复用已有输入文件，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
@@ -672,7 +678,7 @@ class Controller:
             # process/thread ceiling and recreate the old overload bug.
             if not node['enabled'] or active >= 1:
                 return None
-            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
+            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries,j.device_capacity FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
             if not unit:
                 return None
             token = secrets.token_urlsafe(24)
@@ -689,6 +695,7 @@ class Controller:
                        'processes': min(node['desired_processes'], node['max_processes'] or 1,
                                         unit['rows']),
                        'threads': min(node['desired_threads'], node['max_threads'] or 1),
+                       'device_capacity': int(unit['device_capacity'] or 30),
                        'lease_seconds': self.lease_seconds}
             if unit['mode'] == 'auth':
                 # 认证任务额外带设备与出口配置；代理地址取服务端保存的原文。

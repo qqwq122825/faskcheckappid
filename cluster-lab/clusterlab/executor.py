@@ -136,11 +136,14 @@ def execute_unit_group(directory, descriptor, stop):
                     output.write(line)
             child = dict(descriptor, first_row=current_row, rows=count, processes=1)
             if descriptor.get('mode') == 'auth':
-                # One stable device slot per process.  DevicePool still sees
-                # the full node capacity, but a child initializes only its own
-                # slot instead of every process initializing all devices.
-                child['device_slots'] = [index + 1]
-                child['device_pool_capacity'] = process_count
+                # 每个进程稳定占用一个槽位。节点可以把连续工作包轮流分配到
+                # 30 台等更大的池子，后台注册器同时补齐其余未占用槽位。
+                assigned = descriptor.get('device_slots') or []
+                child['device_slots'] = [int(assigned[index]) if index < len(assigned)
+                                         else index + 1]
+                child['device_pool_capacity'] = max(
+                    process_count, int(descriptor.get('device_pool_capacity') or
+                                       descriptor.get('device_capacity') or process_count))
             atomic_json(child_dir / 'manifest.json', child)
             child_descriptors.append((child_dir, child))
             current_row += count

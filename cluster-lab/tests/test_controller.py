@@ -187,6 +187,18 @@ class ControllerTests(unittest.TestCase):
             paths = {row['path'] for row in db.execute('SELECT path FROM units WHERE job_id=?', (job,))}
         self.assertEqual(len(paths), 1, 'all packages should reference the one uploaded source file')
 
+    def test_lease_carries_task_device_pool_target(self):
+        job = self.service.create_job('devices', io.BytesIO(b'hello\n' * 50), 50,
+                                      enqueue=True, device_capacity=30)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = next(item for item in self.service.snapshot()['jobs'] if item['id'] == job)
+            if state['status'] == 'running':
+                break
+            time.sleep(.01)
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual(unit['device_capacity'], 30)
+
     def test_late_result_after_lease_expiry_is_still_accepted(self):
         """P0：租约过期后迟到的结果仍要接受，否则节点白算一遍。"""
         self.service.lease_seconds = 1
