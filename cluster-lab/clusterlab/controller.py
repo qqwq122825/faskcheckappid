@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, code TEXT NOT NULL,
  message TEXT NOT NULL, job_id TEXT, node_id TEXT
 );
+CREATE TABLE IF NOT EXISTS controller_settings (
+ key TEXT PRIMARY KEY, value INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('max_unit_rows',10000);
 '''
 
 
@@ -123,7 +127,7 @@ class Controller:
             event(db, 'node_config', '节点执行配置已更新，下一次心跳下发；在途工作包保持原配置', node_id=node_id)
 
     def create_job(self, name, stream, unit_rows=500, mode='digest'):
-        integer(unit_rows, '每包记录数', 50, 100000)
+        integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
         if mode not in ('digest', 'simulate'):
             raise ValueError('仅支持离线摘要或模拟任务')
         job_id = uuid.uuid4().hex
@@ -142,6 +146,19 @@ class Controller:
             event(db, 'job_uploaded', '输入文件已保存，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
+
+    def settings(self):
+        with self.db.connect() as db:
+            maximum = db.execute("SELECT value FROM controller_settings WHERE key='max_unit_rows'").fetchone()[0]
+        return {'max_unit_rows': maximum, 'default_unit_rows': min(1000, maximum),
+                'unit_byte_limit': 4 * 1024 * 1024}
+
+    def configure_settings(self, data):
+        maximum = integer(data.get('max_unit_rows'), '单个分片最大条数', 50, 10000)
+        with self.db.transaction() as db:
+            db.execute("UPDATE controller_settings SET value=? WHERE key='max_unit_rows'", (maximum,))
+            event(db, 'controller_config', f'新任务单个分片最大条数已设置为 {maximum:,} 条；已有任务保持原配置')
+        return self.settings()
 
     def stop_node(self, node_id):
         with self.db.transaction() as db:
@@ -446,7 +463,10 @@ class Controller:
             events = [dict(r) for r in db.execute('SELECT * FROM events ORDER BY id DESC LIMIT 40')]
             aggregate = db.execute('SELECT COALESCE(SUM(rows),0),COUNT(*) FROM jobs').fetchone()
             counts = db.execute("SELECT COALESCE(SUM(CASE WHEN status='completed' THEN rows ELSE 0 END),0),COALESCE(SUM(CASE WHEN status IN ('running','leased','completed') THEN processed ELSE 0 END),0) FROM units").fetchone()
+            maximum = db.execute("SELECT value FROM controller_settings WHERE key='max_unit_rows'").fetchone()[0]
             return {'jobs': jobs, 'nodes': nodes, 'events': events, 'server_time': now,
+                    'settings': {'max_unit_rows': maximum, 'default_unit_rows': min(1000, maximum),
+                                 'unit_byte_limit': 4 * 1024 * 1024},
                     'totals': {'rows': aggregate[0], 'jobs': aggregate[1], 'confirmed': counts[0],
                                'processed': counts[1], 'online': sum(n['status'] != 'offline' for n in nodes),
                                'nodes': len(nodes), 'rate': round(sum(n['rate'] for n in nodes), 1)}}
@@ -457,3 +477,13 @@ class Controller:
             if not job or job['status'] != 'completed':
                 raise Conflict('全部工作包确认后才可下载完整结果')
             return [r['result_path'] for r in db.execute('SELECT result_path FROM units WHERE job_id=? ORDER BY seq', (job_id,))]
+
+    def text_export(self, job_id):
+        with self.db.connect() as db:
+            job = db.execute('SELECT status,source,rows FROM jobs WHERE id=?', (job_id,)).fetchone()
+            confirmed = db.execute("SELECT COALESCE(SUM(CASE WHEN status='completed' THEN rows ELSE 0 END),0) FROM units WHERE job_id=?", (job_id,)).fetchone()[0]
+            if not job or job['status'] != 'completed' or confirmed != job['rows']:
+                raise Conflict('全部工作包确认后才可下载完整结果')
+            # All records passed the offline executor. Stream the original TXT to
+            # preserve ordering, duplicate records, encoding and line endings.
+            return Path(job['source']), job['rows']

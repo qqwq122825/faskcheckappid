@@ -10,9 +10,9 @@ const credentials = reactive({ username: 'admin', password: '' })
 const menu = computed(() => isNode.value ? [
   { path: '/', label: '总控连接', icon: Connection }, { path: '/jobs', label: '本机工作包', icon: List }, { path: '/events', label: '连接状态', icon: Document }, { path: '/settings', label: '系统信息', icon: Setting },
 ] : [
-  { path: '/', label: '首页', icon: House }, { path: '/jobs', label: '任务管理', icon: List }, { path: '/nodes', label: '节点配置', icon: Connection }, { path: '/events', label: '运行日志', icon: Document }, { path: '/settings', label: '系统信息', icon: Setting },
+  { path: '/', label: '首页', icon: House }, { path: '/jobs', label: '任务管理', icon: List }, { path: '/nodes', label: '节点配置', icon: Connection }, { path: '/events', label: '运行日志', icon: Document }, { path: '/settings', label: '系统设置', icon: Setting },
 ])
-const title = computed(() => isNode.value && route.path === '/' ? '节点连接' : isNode.value && route.path === '/jobs' ? '本机工作包' : route.meta.title)
+const title = computed(() => isNode.value && route.path === '/settings' ? '系统信息' : isNode.value && route.path === '/' ? '节点连接' : isNode.value && route.path === '/jobs' ? '本机工作包' : route.meta.title)
 const active = computed(() => route.path.startsWith('/jobs') ? '/jobs' : route.path)
 async function submitLogin() {
   loggingIn.value = true; loginError.value = ''

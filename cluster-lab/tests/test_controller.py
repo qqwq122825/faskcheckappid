@@ -190,7 +190,7 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn(self.node['token'], response.get_data(as_text=True))
 
     def test_work_packages_have_a_byte_budget_as_well_as_a_row_budget(self):
-        job = self.service.create_job('bytes', io.BytesIO((b'x' * 60000 + b'\n') * 80), 100000)
+        job = self.service.create_job('bytes', io.BytesIO((b'x' * 60000 + b'\n') * 80), 10000)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             state = next(j for j in self.service.snapshot()['jobs'] if j['id'] == job)
@@ -203,6 +203,63 @@ class ControllerTests(unittest.TestCase):
         with self.service.db.connect() as db:
             paths = [Path(r['path']) for r in db.execute('SELECT path FROM units WHERE job_id=?', (job,))]
         self.assertTrue(all(p.stat().st_size <= 4 * 1024 * 1024 for p in paths))
+
+    def test_shard_limit_is_persistent_and_only_changes_new_jobs(self):
+        self.assertEqual(self.service.settings()['max_unit_rows'], 10000)
+        for value in (49, 10001, True, 1000.5):
+            with self.assertRaises(ValueError):
+                self.service.configure_settings({'max_unit_rows': value})
+        with self.assertRaises(ValueError):
+            self.service.create_job('over', io.BytesIO(b'hello\n'), 10001)
+        job = self.job(101)
+        self.service.configure_settings({'max_unit_rows': 50})
+        with self.assertRaises(ValueError):
+            self.service.create_job('over configured limit', io.BytesIO(b'hello\n'), 51)
+        self.assertEqual(self.service.snapshot()['jobs'][0]['unit_rows'], 50)
+        self.service.close()
+        self.service = Controller(self.temp.name)
+        self.assertEqual(self.service.settings()['max_unit_rows'], 50)
+        self.assertEqual(self.service.snapshot()['jobs'][0]['id'], job)
+        client = create_app('controller', self.service).test_client()
+        self.assertEqual(client.post('/api/settings', json={'max_unit_rows': 10000}).status_code, 403)
+        csrf = client.get('/api/session').json['csrf']
+        response = client.post('/api/settings', json={'max_unit_rows': 10000}, headers={'X-CSRF-Token': csrf})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json['max_unit_rows'], 10000)
+
+    def test_ten_shards_export_original_txt_without_duplicates_or_missing_rows(self):
+        source = ('\ufeff' + '\r\n'.join(f'离线记录-{i:05d}' for i in range(1, 10001))).encode('utf-8')
+        job = self.service.create_job('TXT export', io.BytesIO(source), 1000)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = next(j for j in self.service.snapshot()['jobs'] if j['id'] == job)
+            if state['status'] != 'preparing':
+                break
+            time.sleep(.01)
+        self.assertEqual((state['rows'], state['units']), (10000, 10))
+        client = create_app('controller', self.service).test_client()
+        self.assertEqual(client.get(f'/api/jobs/{job}/results').status_code, 409)
+        self.service.configure_settings({'max_unit_rows': 500})
+        self.service.job_action(job, 'start')
+        observed = []
+        while unit := self.service.lease(self.node['id'], 'test-session'):
+            observed.append((unit['first_row'], unit['rows']))
+            path = self.service.unit_for_node(self.node['id'], unit['id'], unit['token'])['path']
+            payload = b''.join((json.dumps({'row': unit['first_row'] + offset,
+                                'sha256': hashlib.sha256(line.rstrip(b'\r\n')).hexdigest(),
+                                'bytes': len(line.rstrip(b'\r\n'))}) + '\n').encode()
+                               for offset, line in enumerate(Path(path).read_bytes().splitlines(keepends=True)))
+            self.service.accept_result(self.node['id'], unit['id'], unit['token'], io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
+        self.assertEqual(observed, [(start, 1000) for start in range(1, 10001, 1000)])
+        response = client.get(f'/api/jobs/{job}/results')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, 'text/plain')
+        from urllib.parse import unquote
+        disposition = unquote(response.headers['Content-Disposition'])
+        self.assertRegex(disposition, r'\d{4}-\d{2}-\d{2}_处理成功_10000条\.txt')
+        self.assertEqual(response.data, source)
+        self.assertEqual(len(response.data.splitlines()), 10000)
+        response.close()
 
     def test_another_node_cannot_download_a_leased_package(self):
         job = self.job(50)

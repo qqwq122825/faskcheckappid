@@ -81,13 +81,10 @@ def main():
         elapsed = time.monotonic()-prepared
         response = master.get(MASTER_URL+f'/api/jobs/{job_id}/results',timeout=15)
         response.raise_for_status()
-        records = [json.loads(line) for line in response.iter_lines()]
-        assert len(records)==10000
-        assert [r['row'] for r in records]==list(range(1,10001))
-        for record in records:
-            n=record['row']
-            raw=f'demo-{n:08d}@example.invalid----SYNTHETIC-ONLY-{n:08d}'.encode()
-            assert record['sha256']==hashlib.sha256(raw).hexdigest()
+        records = list(response.iter_lines())
+        expected = [f'demo-{n:08d}@example.invalid----SYNTHETIC-ONLY-{n:08d}'.encode() for n in range(1,10001)]
+        assert records == expected
+        assert response.headers['Content-Type'].startswith('text/plain')
         db=sqlite3.connect(ROOT/'runtime'/'controller'/'controller.sqlite3')
         distribution=[{'node_id':r[0],'units':r[1],'confirmed':r[2]} for r in db.execute(
             "SELECT node_id,COUNT(*),SUM(rows) FROM units WHERE job_id=? AND status='completed' GROUP BY node_id",(job_id,))]
@@ -103,7 +100,7 @@ def main():
         wait(reconciled)
         profile={'node_count':count,'job_id':job_id,'prepare_seconds':round(prepared-begin,3),
                  'execution_and_reporting_seconds':round(elapsed,3), 'confirmed':job['confirmed'],
-                 'all_digests_verified':True,'unique_rows':len({r['row'] for r in records}),
+                 'txt_matches_source':True,'unique_rows':len(set(records)),
                  'distribution':distribution,'samples':samples}
         receipt['profiles'].append(profile)
         (ROOT/'runtime'/'benchmark-two-nodes.json').write_text(json.dumps(receipt,ensure_ascii=False,indent=2))

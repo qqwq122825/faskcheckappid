@@ -60,13 +60,10 @@ def main():
         raise RuntimeError('job did not complete')
     response = master.get(controller_url + f'/api/jobs/{job_id}/results', timeout=20)
     response.raise_for_status()
-    records = [json.loads(line) for line in response.iter_lines()]
-    assert len(records) == 10000
-    assert [r['row'] for r in records] == list(range(1,10001))
-    for row in records:
-        raw = f'demo-{row["row"]:08d}@example.invalid----SYNTHETIC-ONLY-{row["row"]:08d}'.encode()
-        assert row['sha256'] == hashlib.sha256(raw).hexdigest()
-        assert row['bytes'] == len(raw)
+    records = list(response.iter_lines())
+    expected = [f'demo-{n:08d}@example.invalid----SYNTHETIC-ONLY-{n:08d}'.encode() for n in range(1,10001)]
+    assert records == expected
+    assert response.headers['Content-Type'].startswith('text/plain')
     for _ in range(40):
         node = worker.get(node_url + '/api/state', timeout=5).json()
         if node['confirmed'] == 10000:
@@ -75,7 +72,7 @@ def main():
     assert node['confirmed'] == 10000 and node['outbox'] == 0
     receipt = {'job_id':job_id,'synthetic_rows':10000,'confirmed_rows':job['confirmed'],
                'unit_count':job['units'],'node_confirmed':node['confirmed'],
-               'node_outbox':node['outbox'],'all_digests_verified':True,'unique_rows':len({r['row'] for r in records}),
+               'node_outbox':node['outbox'],'txt_matches_source':True,'unique_rows':len(set(records)),
                'elapsed_seconds':round(samples[-1]['at']-samples[0]['at'],2),'samples':samples}
     target = Path(__file__).resolve().parents[1] / 'runtime' / 'verification.json'
     target.write_text(json.dumps(receipt,ensure_ascii=False,indent=2))

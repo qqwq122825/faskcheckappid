@@ -9,7 +9,7 @@ export const router = createRouter({
     { path: '/jobs/:id', component: () => import('./views/JobDetail.vue'), meta: { title: '任务详情', description: '本页统计仅属于当前任务。' } },
     { path: '/nodes', component: () => import('./views/Nodes.vue'), meta: { title: '节点配置', description: '集中查看节点状态，调整后续工作包的执行配置。' } },
     { path: '/events', component: () => import('./views/Events.vue'), meta: { title: '运行日志', description: '查看任务操作、节点连接与结果确认记录。' } },
-    { path: '/settings', component: () => import('./views/Settings.vue'), meta: { title: '系统信息', description: '当前部署信息与功能范围。' } },
+    { path: '/settings', component: () => import('./views/Settings.vue'), meta: { title: '系统设置', description: '配置新任务分片上限，查看当前部署信息。' } },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })

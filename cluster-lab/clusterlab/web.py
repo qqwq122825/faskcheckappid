@@ -1,11 +1,13 @@
 import hashlib
+from datetime import datetime
 import io
 import os
 from pathlib import Path
 import secrets
 import tempfile
+from zoneinfo import ZoneInfo
 
-from flask import Flask, Response, jsonify, request, send_file, session
+from flask import Flask, jsonify, request, send_file, session
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -100,6 +102,10 @@ def create_app(role, service, password=None):
         return jsonify(service.snapshot())
 
     if role == 'controller':
+        @app.post('/api/settings')
+        def configure_settings():
+            return jsonify(service.configure_settings(request.get_json() or {}))
+
         @app.post('/api/nodes')
         def add_node():
             data = request.get_json() or {}
@@ -120,7 +126,7 @@ def create_app(role, service, password=None):
             uploaded = request.files.get('file')
             if not uploaded:
                 raise ValueError('请选择 UTF-8 文本文件')
-            unit_rows = int(request.form.get('unit_rows', '1000'))
+            unit_rows = int(request.form.get('unit_rows', str(service.settings()['default_unit_rows'])))
             job_id = service.create_job(request.form.get('name') or uploaded.filename, uploaded.stream, unit_rows, 'digest')
             return jsonify(id=job_id), 202
 
@@ -128,7 +134,8 @@ def create_app(role, service, password=None):
         def demo():
             data = request.get_json(silent=True) or {}
             count = integer(data.get('rows', 10000), '演示记录数', 1, 100000)
-            unit_rows = integer(data.get('unit_rows', 1000), '每包记录数', 50, 100000)
+            settings = service.settings()
+            unit_rows = integer(data.get('unit_rows', settings['default_unit_rows']), '每包记录数', 50, settings['max_unit_rows'])
             with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as stream:
                 for number in range(1, count + 1):
                     stream.write(f'demo-{number:08d}@example.invalid----SYNTHETIC-ONLY-{number:08d}\n'.encode())
@@ -143,13 +150,10 @@ def create_app(role, service, password=None):
 
         @app.get('/api/jobs/<job_id>/results')
         def download_results(job_id):
-            paths = service.result_paths(job_id)
-            def blocks():
-                for path in paths:
-                    with Path(path).open('rb') as stream:
-                        yield from iter(lambda: stream.read(64 * 1024), b'')
-            return Response(blocks(), mimetype='application/x-ndjson',
-                            headers={'Content-Disposition': f'attachment; filename="{job_id}-results.jsonl"'})
+            path, rows = service.text_export(job_id)
+            date = datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d')
+            return send_file(path, mimetype='text/plain', as_attachment=True,
+                             download_name=f'{date}_处理成功_{rows}条.txt', conditional=False)
 
         @app.post('/agent/heartbeat')
         def heartbeat():
