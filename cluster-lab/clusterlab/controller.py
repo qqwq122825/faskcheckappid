@@ -413,6 +413,10 @@ class Controller:
                     if len(line) > 65536:
                         raise ValueError('单行超过 64 KiB；请将超长记录拆分后重试')
                     line.decode('utf-8-sig' if rows == 0 else 'utf-8')
+                    # 纯空白行不切进分片：否则会生成"只有空行"的包，
+                    # 执行器拿不到账号会判定 EmptyInput 并让任务卡在待确认。
+                    if not line.strip():
+                        continue
                     # 不补换行：分包内容与上传文件逐字节一致，导出才能原样还原
                     if buffer and buffered_bytes + len(line) > byte_limit:
                         seq += 1

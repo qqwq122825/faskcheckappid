@@ -174,7 +174,9 @@ def _execute_auth_unit(directory, descriptor, stop):
             if line.strip():
                 accounts.append(line)
     if not accounts:
-        atomic_json(directory / 'done.json', {'ok': False, 'processed': 0, 'error': 'EmptyInput'})
+        # 空包不算失败：分包与校验都已通过，只是没有可执行记录。
+        (directory / 'results.jsonl').write_bytes(b'')
+        atomic_json(directory / 'done.json', {'ok': True, 'processed': 0, 'counts': {}})
         return
 
     pool = DevicePool(device_root, origin, max_devices=capacity)
