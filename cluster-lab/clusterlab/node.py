@@ -167,7 +167,11 @@ class Node:
             for task in db.execute("SELECT * FROM tasks WHERE status IN ('running','outbox','interrupted')"):
                 descriptor = json.loads(task['descriptor'])
                 collection = interrupted if task['status'] == 'interrupted' else values
-                collection.append({'id': task['id'], 'token': descriptor['token'], 'processed': task['processed']})
+                item = {'id': task['id'], 'token': descriptor['token'], 'processed': task['processed']}
+                # 失败原因一并上报，否则总控只能看到"待确认"，看不到为什么
+                if task['error']:
+                    item['error'] = str(task['error'])[:180]
+                collection.append(item)
         with self._request('POST', '/agent/heartbeat', json={'session': self.instance, 'hostname': socket.gethostname(),
                            'version': VERSION, 'max_processes': self.max_processes, 'max_threads': self.max_threads,
                            'active': values, 'interrupted': interrupted, 'ack_stop_version': self.stop_version,

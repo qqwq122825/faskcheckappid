@@ -34,7 +34,7 @@ const events = computed(() => state.value?.events?.filter((e: any) => e.job_id =
 </script>
 <template>
   <el-button :icon="ArrowLeft" class="back-button" @click="router.push('/jobs')">返回任务管理</el-button>
-  <template v-if="job && !isNode"><el-card shadow="never" class="section-card task-heading"><div class="section-heading"><div><div class="task-name"><h2>{{ job.name }}</h2><StatusBadge :status="job.status" /></div><p>{{ date(job.created) }} 创建 · {{ job.mode === 'simulate' ? '合成离线演示' : '逐行 SHA-256 摘要' }}</p></div><TaskActions :job="job" /></div></el-card>
+  <template v-if="job && !isNode"><el-card shadow="never" class="section-card task-heading"><div class="section-heading"><div><div class="task-name"><h2>{{ job.name }}</h2><StatusBadge :status="job.status" /></div><p>{{ date(job.created) }} 创建 · {{ job.mode === 'auth' ? '账号校验' : job.mode === 'simulate' ? '合成离线演示' : '文件摘要' }}</p></div><TaskActions :job="job" /></div></el-card>
     <el-alert v-if="job.status === 'queued'" :title="`任务排队中，等待第 ${job.queue_position} 位。轮到后自动开始。`" type="info" :closable="false" show-icon /><el-alert v-if="job.error" :title="job.error" type="error" :closable="false" show-icon />
     <el-alert v-else-if="job.unit_counts.unknown" title="存在待确认工作包，未自动重新执行。请核对后再决定是否重新排队。" type="warning" :closable="false" show-icon />
     <el-alert v-else-if="job.status === 'paused'" title="已暂停派发新工作包，在途工作会继续执行并回传。" type="info" :closable="false" show-icon />

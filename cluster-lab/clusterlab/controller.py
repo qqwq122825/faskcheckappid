@@ -489,7 +489,10 @@ class Controller:
                 db.execute("UPDATE units SET status='unknown',processed=?,lease_token=NULL,lease_until=NULL,updated=? WHERE id=?",
                            (count, now, unit['id']))
                 interrupted_ack.append(unit['id'])
-                event(db, 'unit_interrupted', f'节点已中止工作包 #{unit["seq"]}，未完成包进入待确认', unit['job_id'], node_id)
+                reason = str(value.get('error') or '')[:120]
+                event(db, 'unit_interrupted',
+                      f'节点已中止工作包 #{unit["seq"]}，未完成包进入待确认'
+                      + (f'（{reason}）' if reason else ''), unit['job_id'], node_id)
             for value in active:
                 unit = db.execute('SELECT * FROM units WHERE id=? AND node_id=?', (value.get('id'), node_id)).fetchone()
                 if unit and unit['lease_token'] == value.get('token') and unit['status'] == 'completed':

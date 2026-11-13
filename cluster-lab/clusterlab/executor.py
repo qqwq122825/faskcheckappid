@@ -76,7 +76,13 @@ def _load_fastcheck():
     root = Path(__file__).resolve().parents[2]
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    from fastcheck.devices import DevicePool
+    try:
+        from fastcheck.devices import DevicePool
+    except ModuleNotFoundError as exc:
+        if (root / 'fastcheck').exists():
+            raise RuntimeError(
+                f'无法导入 fastcheck（{root / "fastcheck"} 存在但不可读或缺少依赖）：{exc}') from exc
+        raise RuntimeError(f'找不到 fastcheck 目录：{root / "fastcheck"}') from exc
     from fastcheck.protocols.gsa_status import check as gsa_check
     from fastcheck.status import result_bucket
     return DevicePool, gsa_check, result_bucket
@@ -109,7 +115,16 @@ def _bump_usage(device_root, slot):
 
 
 def execute_auth_unit(directory, descriptor, stop):
-    """真实认证执行：读账号 → 取设备参数 → 逐条校验 → 写分类结果。"""
+    """真实认证执行入口：任何异常都落成 done.json，避免节点只看到"进程退出"。"""
+    try:
+        _execute_auth_unit(directory, descriptor, stop)
+    except Exception as exc:                                       # noqa: BLE001
+        atomic_json(Path(directory) / 'done.json',
+                    {'ok': False, 'processed': 0,
+                     'error': f'{type(exc).__name__}: {exc}'[:300]})
+
+
+def _execute_auth_unit(directory, descriptor, stop):
     from concurrent.futures import ThreadPoolExecutor
     from collections import Counter
     import sys
