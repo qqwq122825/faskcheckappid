@@ -47,6 +47,10 @@ class DeviceBuilder:
                 raise RuntimeError('正在初始化设备，请等待本轮结束')
             if not 1 <= int(capacity) <= 200:
                 raise ValueError('设备数量应为 1–200')
+            # 设备注册会连 Apple；没有代理就变成用机房 IP 注册，出生地不可改，
+            # 宁可拒绝也不留这种设备。
+            if not (self.node.proxy_api or '').strip():
+                raise ValueError('总控未下发代理 API，拒绝直连注册设备')
             self.stop.clear()
             self.state.update(running=True, capacity=int(capacity), ready=0, built=0,
                               failed=0, current=0, message='准备中',

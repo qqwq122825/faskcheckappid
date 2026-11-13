@@ -191,6 +191,18 @@ class Controller:
                 'proxy_scheme': values.get('proxy_scheme', 'socks5h'),
                 'device_rotate_after': int(values.get('device_rotate_after', 0) or 0)}
 
+    def proxy_for_node(self, node):
+        """节点专属出口：按创建顺序把链接分给各节点，避免所有节点抢同一条配额。"""
+        config = self.proxy_config()
+        parts = [part for part in (config.get('api') or '').split() if part]
+        if not parts:
+            return config
+        with self.db.connect() as db:
+            index = db.execute('SELECT COUNT(*) FROM nodes WHERE created < ?',
+                               (node['created'],)).fetchone()[0]
+        return {'api': parts[index % len(parts)], 'scheme': config.get('scheme', 'socks5h'),
+                'shared': len(parts) < index + 1, 'index': index % len(parts)}
+
     def proxy_config(self):
         """下发节点用的原文配置；只在服务端内部调用，不进任何接口响应。"""
         with self.db.connect() as db:
@@ -220,8 +232,8 @@ class Controller:
         if api:
             from urllib.parse import urlsplit
             parts = [p for p in api.split() if p]
-            if len(parts) > 8:
-                raise ValueError('最多支持 8 个代理 API 链接')
+            if len(parts) > 16:
+                raise ValueError('最多支持 16 个代理 API 链接')
             for part in parts:
                 parsed = urlsplit(part)
                 if parsed.scheme not in ('http', 'https') or not parsed.hostname:
@@ -452,7 +464,10 @@ class Controller:
                     'rejected': reject, 'confirmed': confirmed, 'interrupted_ack': interrupted_ack,
                     'device_request': node['device_request'],
                     'device_rotate_after': self.settings().get('device_rotate_after', 0),
-                    'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds, 'server_time': now}
+                    'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds,
+                    'server_time': now,
+                    'config': {**self.proxy_for_node(node),
+                               'origin': self.settings().get('origin') or 'https://new.ani.sidestore.io'}}
 
     def _rate_allows(self):
         """整个集群每秒最多派发 dispatch_per_second 个包；0 表示不限。"""
