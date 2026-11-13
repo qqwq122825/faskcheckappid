@@ -148,7 +148,7 @@ def create_app(role, service, password=None):
                 raise ValueError('加入队列选项无效')
             if not request.content_length:
                 raise ValueError('缺少 Content-Length，无法确认上传完整性')
-            mode = request.args.get('mode', 'digest')
+            mode = request.args.get('mode', 'auth')
             job_id = service.create_job(name or '未命名任务', request.stream, unit_rows,
                                         mode, enqueue == 'true')
             return jsonify(id=job_id, bytes=request.content_length), 202
@@ -162,7 +162,7 @@ def create_app(role, service, password=None):
             enqueue = request.form.get('enqueue', 'false')
             if enqueue not in ('true', 'false'):
                 raise ValueError('加入队列选项无效')
-            mode = request.form.get('mode', 'digest')
+            mode = request.form.get('mode', 'auth')
             job_id = service.create_job(request.form.get('name') or uploaded.filename, uploaded.stream,
                                         unit_rows, mode, enqueue == 'true')
             return jsonify(id=job_id), 202

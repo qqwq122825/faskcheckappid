@@ -157,7 +157,7 @@ class Controller:
                        (processes, threads, int(data['enabled']), node_id))
             event(db, 'node_config', '节点执行配置已更新，下一次心跳下发；在途工作包保持原配置', node_id=node_id)
 
-    def create_job(self, name, stream, unit_rows=500, mode='digest', enqueue=False):
+    def create_job(self, name, stream, unit_rows=500, mode='auth', enqueue=False):
         integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
         if type(enqueue) is not bool:
             raise ValueError('加入队列选项无效')
