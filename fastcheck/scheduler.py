@@ -32,6 +32,9 @@ class Settings:
     proxy_target: int = 0
     proxy_ttl: float = 60
     proxy_scheme: str = 'http'
+    # True=anisette（sidestore.io）也走代理。服务器直连境外 anisette 常超时，
+    # 打开后注册/刷新都借任务隧道，代价是每台设备注册慢约 1 秒。
+    anisette_proxy: bool = False
     timeout: float = 10
     prepare_timeout: float = 12
     attempt_budget: float = 35
@@ -48,11 +51,13 @@ class Settings:
             raise ValueError('设备选择必须是 balanced 或 prefer_new。')
         if self.proxy_scheme not in ('http','socks5','socks5h'):
             raise ValueError('代理协议必须是 http、socks5 或 socks5h。')
+        if type(self.anisette_proxy) is not bool:
+            raise ValueError('anisette_proxy 必须是布尔值。')
         for name, low, high in (('processes', 1, None), ('threads', 1, None),
                                 ('device_capacity', 1, None), ('proxy_target', 0, None),
                                 ('device_parallelism',0,None),
                                 ('device_rest_after', 0, None), ('device_rest_slots', 1, None),
-                                ('warmup_devices', 1, self.device_capacity), ('max_attempts', 1, 2)):
+                                ('warmup_devices', 1, self.device_capacity), ('max_attempts', 1, 6)):
             value = getattr(self, name)
             if type(value) is not int or value < low or (high is not None and value > high):
                 raise ValueError(f'{name} 必须不少于 {low}'+(f' 且不超过 {high}' if high is not None else '')+'。')
@@ -82,6 +87,11 @@ class Task:
         self.history = []
 
 
+# 身份池调度策略（供维护参考，不在界面上展示）：
+#   · device_parallelism 固定 0：单身份并发跟随总体线程容量，设备之间按在途数
+#     均匀分配，不做额外限流；这个参数不再暴露到界面上；
+#   · warmup_devices 默认 2，够 2 台就绪就派发任务，注册线程在后台继续补齐；
+#   · device_rest_after / device_rest_seconds 为 0 时关闭休息策略。
 class Supervisor:
     def __init__(self, accounts, api_url, root, directory, settings, *, proxy_auth='',
                  handler=protocol_attempt, registration=register_device, fetcher=None,progress=None,console=True):
@@ -152,6 +162,10 @@ class Supervisor:
 
     def prepare_devices(self):
         s = self.settings
+        # 单台注册失败不该终止整轮：隧道路由抖一次就把后面几十个空槽位全部放弃，
+        # 后面的任务会因为凑不够启动门槛直接判死。连续失败到上限才收手。
+        max_consecutive_failures = 3
+        failures = 0
         try:
             for slot in range(1, s.device_capacity+1):
                 if self.stop.is_set():
@@ -160,7 +174,10 @@ class Supervisor:
                     continue
                 if self.pool.inspect(slot)['state'] == 'invalid':
                     self.log('registration_failed', device=slot, error_type='InvalidSavedState')
-                    break
+                    failures += 1
+                    if failures >= max_consecutive_failures:
+                        break
+                    continue
                 lease = None
                 until = time.monotonic()+s.resource_timeout
                 while lease is None and not self.stop.is_set() and time.monotonic() < until:
@@ -168,11 +185,15 @@ class Supervisor:
                     lease = self.proxies.take(timeout=.2, min_remaining=s.registration_budget+3,
                                               share=True)
                 if lease is None:
-                    break
+                    failures += 1
+                    if failures >= max_consecutive_failures:
+                        break
+                    continue
                 output = self.context.Queue(maxsize=2048)
                 payload = {'slot': slot, 'proxy': lease.url, 'device_root': str(self.device_root),
                            'origin': s.origin, 'prepare_timeout': max(.1, s.registration_budget-3),
-                           'device_capacity': s.device_capacity, 'debug': s.debug}
+                           'device_capacity': s.device_capacity, 'debug': s.debug,
+                           'anisette_proxy': s.anisette_proxy}
                 process = self.context.Process(target=self.registration, args=(payload, output),
                                                name=f'device-register-{slot}')
                 result = None
@@ -199,9 +220,17 @@ class Supervisor:
                     self.log('registration_failed', device=slot, **(result or {'kind':'timeout'}))
                     if result and result.get('http') == 429:
                         self.request_stop('registration_ratelimit')
-                    break
+                        break
+                    failures += 1
+                    if failures >= max_consecutive_failures:
+                        break
+                    continue
                 if self.pool.inspect(slot)['state'] != 'ready':
-                    break
+                    failures += 1
+                    if failures >= max_consecutive_failures:
+                        break
+                    continue
+                failures = 0
                 with self.resource_lock:
                     self.devices.add(slot)
                     self.device_scheduler.add(slot)
@@ -289,6 +318,7 @@ class Supervisor:
                        'timeout': s.timeout, 'prepare_timeout': s.prepare_timeout, 'debug': s.debug,
                        'device_root': str(self.device_root), 'device_capacity': s.device_capacity, 'origin': s.origin}
             payload['device_parallelism']=self.device_parallelism
+            payload['anisette_proxy']=s.anisette_proxy
             deadline = min(time.monotonic()+s.attempt_budget, lease.expires_at-2)
             row = job.account.row
             self.active[row] = {'job': job, 'worker': worker, 'lease': lease, 'deadline': deadline}
@@ -334,12 +364,17 @@ class Supervisor:
         job.history.append(dict(result, attempt=job.attempt, worker=item['worker']))
         # 只有传输层失败才说明出口本身不可用。HTTP 5xx/超时是目标站或链路抖动，
         # 跟着丢弃整条隧道会让供应商重复提取同一批出口，白烧额度、白等补货。
-        transient = result.get('status') == 'error' and result.get('kind') in ('network', 'tls')
-        self.proxies.release(item['lease'], valid=not transient)
+        # 两件事要分开：出口坏没坏（决定是否回收隧道）和这次值不值得重试。
+        # 超时/5xx 是链路抖动，重试有意义；但把它们当成"出口坏了"去丢弃，
+        # 会让供应商反复重新提取同一批出口。
+        lease_failed = result.get('status') == 'error' and result.get('kind') in ('network', 'tls')
+        self.proxies.release(item['lease'], valid=not lease_failed)
+        retryable = result.get('status') == 'error' and result.get('kind') in (
+            'network', 'tls', 'timeout', 'server')
         if result.get('kind') == 'ratelimit' or result.get('http') == 429:
             self.finish(job, result)
             self.request_stop('authentication_ratelimit')
-        elif (transient and result.get('stage') in ('init', 'anisette_refresh')
+        elif (retryable and result.get('stage') in ('init', 'anisette_refresh')
               and job.attempt < self.settings.max_attempts and not self.stop.is_set()):
             job.ready_at = time.monotonic()+1
             self.pending.append(job)

@@ -7,6 +7,7 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import tempfile
 import threading
@@ -106,6 +107,23 @@ class JobManager:
             try:values.append(self.get(path.parent.name))
             except (OSError,ValueError):continue
         return sorted(values,key=lambda v:v['created_at'],reverse=True)[:100]
+
+    def clear_history(self):
+        """删除全部历史任务目录；有非终态任务时拒绝执行。"""
+        with self.lock:
+            for job_id in list(self.owned):
+                if self.get(job_id)['state'] not in TERMINAL:
+                    raise RuntimeError('有任务正在运行，先停止再清空。')
+            removed = 0
+            for path in (self.root/'jobs').glob('*/state.json'):
+                try:
+                    shutil.rmtree(path.parent)
+                    removed += 1
+                except OSError:
+                    continue
+            with self.result_lock:
+                self.result_cache.clear()
+            return removed
 
     def read_results(self,job_id,category='all',offset=0,limit=100):
         """Read only appended complete records; never reread the whole log each poll."""

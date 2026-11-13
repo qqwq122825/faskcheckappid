@@ -4,6 +4,8 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+
+from fastcheck.version import VERSION
 from unittest.mock import patch
 import zipfile
 
@@ -31,7 +33,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/settings',json={}).status_code,403)
         self.login()
         self.assertEqual(self.client.get('/api/settings').status_code,200)
-        self.assertEqual(self.client.get('/healthz').json['version'],'4.1.0-preview.4')
+        self.assertEqual(self.client.get('/healthz').json['version'],VERSION)
 
     def test_private_api_configuration_is_saved_but_never_returned(self):
         self.login()

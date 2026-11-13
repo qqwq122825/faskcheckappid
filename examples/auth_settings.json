@@ -17,5 +17,7 @@
   "resource_timeout": 120,
   "max_attempts": 1,
   "debug": false,
-  "proxy_scheme": "http"
+  "proxy_scheme": "http",
+  "protocol": "gsa",
+  "anisette_proxy": false
 }

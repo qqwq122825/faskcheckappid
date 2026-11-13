@@ -22,6 +22,7 @@ from fastcheck.status import result_bucket
 from fastcheck.version import VERSION
 from .bootstrap import ROOT,data_root
 from .runtime import JobManager
+from fastcheck.device_build import DeviceBuilder
 
 
 def create_app(data_dir=None):
@@ -36,6 +37,8 @@ def create_app(data_dir=None):
                       SESSION_COOKIE_SECURE=os.environ.get('GSA_COOKIE_SECURE')=='1',
                       PERMANENT_SESSION_LIFETIME=timedelta(hours=8))
     manager=JobManager(root);app.extensions['jobs']=manager
+    builder=DeviceBuilder(root,Settings().origin,root/'config/batch-device-pool')
+    app.extensions['builder']=builder
     login_attempts={};login_lock=threading.Lock()
 
     def defaults():
@@ -45,7 +48,9 @@ def create_app(data_dir=None):
         return json.loads(path.read_text()) if path.exists() else asdict(Settings(max_attempts=1,device_parallelism=0,device_selection='prefer_new'))
 
     def options(data):
-        if not isinstance(data,dict) or set(data)-{f.name for f in fields(Settings)}:raise ValueError('任务配置字段无效。')
+        if not isinstance(data,dict):raise ValueError('任务配置字段无效。')
+        extra=set(data)-{f.name for f in fields(Settings)}
+        if extra:raise ValueError('配置里有当前版本不认识的字段：'+'、'.join(sorted(extra))+'。请刷新页面或更新服务端。')
         values=defaults();values.update(data)
         if type(values.get('debug')) is not bool:raise ValueError('调试模式必须为布尔值。')
         return Settings(**values)
@@ -138,6 +143,63 @@ def create_app(data_dir=None):
             return jsonify(state),202
         finally:
             for account in accounts:account.password=''
+
+    @app.post('/api/proxy/check')
+    def proxy_check():
+        """取一条出口，实际打一次目标站，回报出口 IP 与延迟。"""
+        import time as _time
+        import requests as _requests
+        from fastcheck.proxy_pool import fetch_proxies
+        from fastcheck.protocols.proxy_api import inject_auth, mask
+        data = request.get_json(silent=True) or {}
+        selected = options(data.get('settings', {}))
+        api = (data.get('api_url') or '').strip() or load_api(root)
+        if not api:
+            raise ValueError('请先填写或保存代理 API 地址。')
+        scheme = None if selected.proxy_scheme == 'http' else selected.proxy_scheme
+        started = _time.monotonic()
+        try:
+            proxies = fetch_proxies(api, 1, scheme=scheme)
+        except Exception as exc:
+            raise ValueError(f'提取失败：{type(exc).__name__}') from None
+        if not proxies:
+            raise ValueError('提取返回空，供应商没给出口。')
+        auth = (data.get('proxy_auth') or '').strip()
+        proxy = inject_auth(proxies, auth)[0] if auth else proxies[0]
+        fetch_ms = round((_time.monotonic()-started)*1000)
+        started = _time.monotonic()
+        try:
+            response = _requests.get('https://api.ipify.org',
+                                     proxies={'http': proxy, 'https': proxy},
+                                     timeout=min(20, selected.timeout*2))
+        except Exception as exc:
+            raise ValueError(f'出口不可用：{type(exc).__name__}') from None
+        return jsonify(ok=True, proxy=mask(proxy), exit_ip=response.text.strip()[:64],
+                       fetch_ms=fetch_ms, request_ms=round((_time.monotonic()-started)*1000))
+
+    @app.post('/api/devices/build')
+    def devices_build_start():
+        data = request.get_json(silent=True) or {}
+        selected = options(data.get('settings', {}))
+        api = (data.get('api_url') or '').strip() or load_api(root)
+        if not api:
+            raise ValueError('请先填写或保存代理 API 地址。')
+        builder.start(selected.device_capacity, api, selected.proxy_scheme,
+                      (data.get('proxy_auth') or '').strip())
+        return jsonify(builder.snapshot(selected.device_capacity)), 202
+
+    @app.get('/api/devices/build')
+    def devices_build_status():
+        selected = options({})
+        return jsonify(builder.snapshot(selected.device_capacity))
+
+    @app.post('/api/devices/build/cancel')
+    def devices_build_cancel():
+        builder.cancel()
+        return jsonify(ok=True)
+
+    @app.post('/api/jobs/clear')
+    def clear_jobs():return jsonify(removed=manager.clear_history(),jobs=manager.history())
 
     @app.get('/api/jobs/<job_id>')
     def status(job_id):return jsonify(manager.get(job_id))

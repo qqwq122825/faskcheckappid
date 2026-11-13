@@ -86,7 +86,8 @@ class SupervisorTests(unittest.TestCase):
         self.assertLessEqual(summary['max_active'],50)
         events=self.events()
         requests=[e['requested'] for e in events if e['event']=='proxy_fetch_start']
-        self.assertEqual(requests,[100])
+        # 首次固定探测 1000 条，看供应商真实上限；池子只按 target=100 入池
+        self.assertEqual(requests,[1000])
         self.assertEqual(len({e['worker_pid'] for e in events if e['event']=='worker_ready'}),5)
         self.assertEqual(len([e for e in events if e['event']=='task_dispatch']),100)
         self.assertEqual(runner.proxies.target,0)

@@ -2,9 +2,11 @@
 from concurrent.futures import ThreadPoolExecutor
 import os
 import queue
+import random
 import signal
 import threading
 import hashlib
+import json
 import re
 import time
 
@@ -23,29 +25,93 @@ _SESSION_CACHE = threading.local()
 _SESSION_LIMIT = 6
 
 
+# 每台设备报一个不同的 Mac 型号：同一批池子里全是 MacBookPro13,3 本身就是特征。
+# 下面这些型号都能跑 macOS 10.12.6（16G29 / Darwin 16.7.0），所以型号换、系统版本
+# 不换，组合仍然自洽；Apple 那边不会出现"2016 款装 macOS 14"这种矛盾。
+_OS = 'Mac OS X;10.12.6;16G29'
+_UA = 'akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0'
+_KIT = '<com.apple.AuthKit/1 (com.apple.akd/1.0)>'
+DEVICE_MODELS = (
+    'MacBookPro11,1', 'MacBookPro11,2', 'MacBookPro11,3', 'MacBookPro11,4', 'MacBookPro11,5',
+    'MacBookPro12,1', 'MacBookPro13,1', 'MacBookPro13,2', 'MacBookPro13,3',
+    'MacBookPro14,1', 'MacBookPro14,2', 'MacBookPro14,3',
+    'MacBookAir6,1', 'MacBookAir6,2', 'MacBookAir7,1', 'MacBookAir7,2',
+    'iMac14,1', 'iMac14,2', 'iMac14,3', 'iMac14,4', 'iMac15,1', 'iMac16,1', 'iMac16,2', 'iMac17,1',
+    'Macmini7,1', 'MacPro6,1',
+)
+
+
+def _random_profile():
+    model = random.SystemRandom().choice(DEVICE_MODELS)
+    return {'model': model, 'client_info': f'<{model}> <{_OS}> {_KIT}', 'user_agent': _UA}
+
+
+def device_profile(pool, slot):
+    """注册时随机挑一个型号并落到设备目录，之后这台设备永远用它。
+
+    随机是为了避免"槽位 1 永远是 MacBookPro11,1"这种规律；持久化是为了让
+    同一台设备不会一会儿报 MacBook、一会儿报 iMac —— 那比型号单调更可疑。
+    """
+    path = pool.slot_directory(slot) / 'device-profile.json'
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data, dict) and data.get('client_info') and data.get('user_agent'):
+                return data
+        except (OSError, ValueError):
+            pass
+    profile = _random_profile()
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            handle.write(json.dumps(profile, ensure_ascii=False))
+        return profile
+    except FileExistsError:
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            return profile
+    except OSError:
+        return profile
+
+
 # 同一台设备的 OTP 参数在短时间内可以复用：实测每任务重刷要 1.8 秒（其中
 # 1.5 秒是到 anisette 服务的 TLS 握手），占 GSA 单任务耗时的 40%。
 _IDENTITY_CACHE = {}
+_IDENTITY_LOCKS = {}
 _IDENTITY_LOCK = threading.Lock()
 _IDENTITY_TTL = 30.0
 
 
-def cached_identity(pool, slot, prepare_timeout, proxy, diagnostic):
+def cached_identity(pool, slot, prepare_timeout, proxy, diagnostic, direct=True):
     """30 秒内同一设备复用设备参数，省掉一次 anisette 往返。"""
     now = time.monotonic()
     with _IDENTITY_LOCK:
         hit = _IDENTITY_CACHE.get(slot)
-    if hit and now-hit[0] < _IDENTITY_TTL:
-        return hit[1]
-    # anisette 是第三方参数服务（sidestore.io），不是 Apple：直连更快（1.8s vs 2.5s），
-    # 也不占用任务用的出口隧道。真正打 Apple 的请求由 gsa/idmsa 各自走代理。
-    with phase(diagnostic, 'device_headers_refresh'):
-        info = pool.info(prepare_timeout, proxy=proxy, diagnostics=diagnostic, provider_direct=True)
-        identity = pool.fetch_headers(slot, info, prepare_timeout,
-                                      proxy=proxy, diagnostics=diagnostic, provider_direct=True)
-    with _IDENTITY_LOCK:
-        _IDENTITY_CACHE[slot] = (time.monotonic(), identity)
-    return identity
+        if hit and now-hit[0] < _IDENTITY_TTL:
+            return hit[1]
+        # 同一台设备同一时刻只放一个线程去刷新：200 个线程抢一台设备时，
+        # 缓存一过期就会同时冲出去把 anisette 服务打超时（HTTP 0 / 5s）。
+        slot_lock = _IDENTITY_LOCKS.setdefault(slot, threading.Lock())
+    with slot_lock:
+        with _IDENTITY_LOCK:
+            hit = _IDENTITY_CACHE.get(slot)
+            if hit and time.monotonic()-hit[0] < _IDENTITY_TTL:
+                return hit[1]
+        # anisette 是第三方参数服务（sidestore.io），不是 Apple：直连更快（1.8s vs 2.5s），
+        # 也不占用任务用的出口隧道。真正打 Apple 的请求由 gsa/idmsa 各自走代理。
+        with phase(diagnostic, 'device_headers_refresh'):
+            info = pool.info(prepare_timeout, proxy=proxy, diagnostics=diagnostic,
+                             provider_direct=direct)
+            profile = device_profile(pool, slot)
+            info = dict(info, client_info=profile['client_info'], user_agent=profile['user_agent'])
+            identity = pool.fetch_headers(slot, info, prepare_timeout,
+                                          proxy=proxy, diagnostics=diagnostic,
+                                          provider_direct=direct)
+        with _IDENTITY_LOCK:
+            _IDENTITY_CACHE[slot] = (time.monotonic(), identity)
+        return identity
 
 
 def shared_session(proxy, want_trace=False):
@@ -139,7 +205,8 @@ def protocol_attempt(payload, output, stop):
         pool.allowed(payload['slot'])
         try:
             identity = cached_identity(pool, payload['slot'], payload['prepare_timeout'],
-                                       payload['proxy'], diagnostic)
+                                       payload['proxy'], diagnostic,
+                                       direct=not payload.get('anisette_proxy', False))
             if diagnostic:
                 diagnostic.context['otp_fingerprint']=hashlib.sha256(identity['X-Apple-I-MD'].encode()).hexdigest()[:16]
                 diagnostic({'event':'device_identity_refreshed','phase':'device_headers_refresh'})
@@ -211,12 +278,13 @@ def register_device(payload, output):
     from fastcheck.protocols.anisette_v3 import Client
     pool = DevicePool(payload['device_root'], payload['origin'], max_devices=payload['device_capacity'],
                       client_factory=TracedClient if diagnostic else Client)
+    direct = not payload.get('anisette_proxy', False)
     try:
         with pool.operation(payload['slot']):
             info = pool.info(payload['prepare_timeout'], proxy=payload['proxy'],
-                             diagnostics=diagnostic, provider_direct=True)
+                             diagnostics=diagnostic, provider_direct=direct)
             pool.fetch_headers(payload['slot'], info, payload['prepare_timeout'], registered=False,
-                               proxy=payload['proxy'], diagnostics=diagnostic, provider_direct=True)
+                               proxy=payload['proxy'], diagnostics=diagnostic, provider_direct=direct)
         output.put({'ok': True})
     except Exception as exc:
         output.put({'ok': False, 'error_type': type(exc).__name__, 'http': getattr(exc, 'http', 0)})

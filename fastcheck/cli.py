@@ -78,7 +78,7 @@ def main(argv=None):
     parser.add_argument('--proxy-target', type=int, help='首批 IP 数量；0=按线程容量 ×1.5 预取，API 每次最多 200')
     parser.add_argument('--scheme', dest='proxy_scheme', choices=('http','socks5','socks5h'),
                         help='代理传输协议；供应商只返回 ip:port 时必填，隧道式住宅代理用 socks5h')
-    parser.add_argument('--retries',type=int,choices=(0,1),help='网络失败重试次数')
+    parser.add_argument('--retries',type=int,choices=range(0,6),help='初始化阶段的网络失败/超时重试次数（0-5）')
     parser.add_argument('--accounts', help='本机账号文件；邮箱----密码，每行一个')
     parser.add_argument('--debug', action='store_true', default=None)
     parser.add_argument('--demo', action='store_true', help='20 个合成任务，禁止网络，不读取账号文件')

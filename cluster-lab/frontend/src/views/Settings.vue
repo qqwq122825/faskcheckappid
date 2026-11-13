@@ -1,0 +1,4 @@
+<script setup lang="ts">
+import { session, isNode } from '../composables/useCluster'
+</script>
+<template><el-card shadow="never" class="section-card"><template #header><h2>当前部署</h2></template><el-descriptions :column="1" border><el-descriptions-item label="版本">{{ session?.version }}</el-descriptions-item><el-descriptions-item label="服务角色">{{ isNode ? '执行节点' : '集群总控' }}</el-descriptions-item><el-descriptions-item label="管理登录">{{ session?.password_required ? '已启用密码登录' : '本地预览，无管理密码' }}</el-descriptions-item><el-descriptions-item label="前端">Vue 3 + Element Plus</el-descriptions-item><el-descriptions-item label="后端">Python + Flask</el-descriptions-item><el-descriptions-item label="内置任务">离线行摘要、合成模拟任务</el-descriptions-item></el-descriptions><el-alert class="settings-note" title="数据保留策略、传输限速和设备服务尚未接入。当前页面展示部署信息，不会修改服务器配置。" type="info" :closable="false" show-icon /></el-card></template>

@@ -44,7 +44,8 @@ class RunOptionsTests(unittest.TestCase):
         pool=ProxyPool('https://api.example.invalid/?num=200',stop,lambda *a,**k:None,
                        target=500,fetcher=fetch)
         pool._supply()
-        self.assertEqual(requested,[200])
+        # 首次提取固定探 1000，用来确认供应商真实上限；入池仍按 target 截断
+        self.assertEqual(requested,[1000])
 
     def test_gsa_options_include_capacity_and_rest_without_waiting_for_entire_pool(self):
         args=SimpleNamespace(processes=None,threads=None,proxy_target=None)

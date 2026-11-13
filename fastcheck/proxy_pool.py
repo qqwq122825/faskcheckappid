@@ -179,6 +179,10 @@ class ProxyPool:
         self.available, self.busy, self.known = deque(), {}, {}
         self.serial, self.waiters = 0, 0
         self.prefill = True
+        # 首次提取时越过自身上限去探一次供应商真实上限：链接里写 num=200
+        # 不代表它只能给 200，实测这家一次能返回 400-1000 条。
+        self.probed = False
+        self.probe_limit = 1000
         self.thread = threading.Thread(target=self._supply, daemon=True, name='proxy-supplier')
 
     def start(self):
@@ -223,14 +227,26 @@ class ProxyPool:
                 if count <= 0:
                     self.condition.wait(.25)
                     continue
-            self.log('proxy_fetch_start', requested=count)
+            # 首次提取固定探一次供应商真实上限：链接里写 num=200 只是"每次至少给
+            # 200"，不代表它只能给 200。探到的数量只用于记录，入池仍按 target 截断，
+            # 免得池子被撑大、把供应商额度耗在永远用不到的出口上。
+            probe_now = not self.probed and self.target > 0
+            request_count = max(count, self.probe_limit) if probe_now else count
+            self.log('proxy_fetch_start', requested=request_count)
             # 多链接轮询：每个账号的提取配额独立，轮流取能同时用满两边。
             api = self.api_urls[self.fetch_serial % len(self.api_urls)]
             self.fetch_serial += 1
             # TTL starts before fetching: response latency cannot extend a lease.
             fetched_at = self.clock()
             try:
-                addresses = self.fetcher(api, count)
+                try:
+                    addresses = self.fetcher(api, request_count)
+                except ProxyFetchError:
+                    if request_count <= count:
+                        raise
+                    # 供应商不接受这么大的 num，退回按需提取。
+                    addresses = self.fetcher(api, count)
+                    request_count = count
                 accepted = 0
                 with self.condition:
                     self._prune()
@@ -244,6 +260,11 @@ class ProxyPool:
                         accepted += 1
                     remaining = len(self.available)
                     self.condition.notify_all()
+                if probe_now:
+                    self.probed = True
+                    self.log('proxy_probe', requested=request_count, received=len(addresses),
+                             accepted=accepted, target=self.target,
+                             batch_limit=self.batch_limit)
                 self.log('proxy_fetch_done', received=accepted, available=remaining)
                 failures = 0
                 if accepted == 0:

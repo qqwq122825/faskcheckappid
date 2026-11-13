@@ -1,0 +1,47 @@
+"""Run controller or node as an independent service."""
+import argparse
+import multiprocessing
+import os
+from pathlib import Path
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Cluster Lab · 离线任务总控与节点')
+    parser.add_argument('role', choices=('controller', 'node'))
+    parser.add_argument('--host', default='127.0.0.1')
+    parser.add_argument('--port', type=int)
+    parser.add_argument('--data-dir', type=Path)
+    parser.add_argument('--max-processes', type=int, default=200)
+    parser.add_argument('--max-threads', type=int, default=512)
+    parser.add_argument('--allow-http', action='store_true', help='允许节点连接非回环 HTTP 总控，仅受信内网测试使用')
+    args = parser.parse_args()
+    password = os.environ.get('CLUSTER_LAB_ADMIN_PASSWORD')
+    if args.host not in ('127.0.0.1', 'localhost', '::1') and (not password or len(password) < 12):
+        parser.error('非回环监听需要通过 CLUSTER_LAB_ADMIN_PASSWORD 设置至少 12 位管理密码')
+    port = args.port or (18770 if args.role == 'controller' else 18771)
+    if not 1 <= port <= 65535:
+        parser.error('端口应为 1–65535')
+    from clusterlab.controller import Controller
+    from clusterlab.node import Node
+    from clusterlab.web import create_app
+    from waitress import serve
+    root = args.data_dir or Path(__file__).resolve().parent / 'runtime' / args.role
+    dispatch_qps = int(os.environ.get('CLUSTER_DISPATCH_QPS', '0'))
+    service = (Controller(root, dispatch_per_second=dispatch_qps) if args.role == 'controller'
+               else Node(root, args.max_processes, args.max_threads, args.allow_http))
+    application = create_app(args.role, service, password)
+    if args.role == 'node':
+        service.start()
+    print(f'Cluster Lab {args.role} · http://{args.host}:{port}/', flush=True)
+    print(f'数据目录：{root.resolve()}', flush=True)
+    try:
+        serve(application, host=args.host, port=port, threads=8)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        service.close()
+
+
+if __name__ == '__main__':
+    multiprocessing.freeze_support()
+    main()

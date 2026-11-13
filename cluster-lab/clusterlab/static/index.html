@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Cluster Lab · 集群控制台</title>
+  <link rel="stylesheet" href="/static/style.css"><link rel="stylesheet" href="/static/control.css"><script src="/static/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span>Cluster<span class="brand-light">Lab</span><small>OFFLINE TASK PLATFORM</small></span></a>
+    <div class="workspace"><span class="workspace-icon">C</span><div><strong id="workspace-name">本地工作空间</strong><small id="workspace-desc">独立离线任务平台</small></div><span class="workspace-arrow">⌄</span></div>
+    <div class="nav-label">工作空间</div>
+    <nav id="navigation">
+      <button class="nav-item selected" data-view="overview"><span>◫</span>运行总览<span class="nav-dot"></span></button>
+      <button class="nav-item" data-view="jobs"><span>▤</span>任务管理<span id="job-count" class="nav-count">0</span></button>
+      <button class="nav-item" data-view="nodes"><span>▦</span><b id="node-nav-label">执行节点</b><span id="node-count" class="nav-count">0</span></button>
+      <button class="nav-item" data-view="events"><span>◷</span>通信与事件</button>
+    </nav>
+    <div class="sidebar-note"><span class="note-icon">↗</span><strong id="role-note-title">控制与执行，各司其职</strong><p id="role-note">总控负责派发与结果确认，工作节点负责离线执行。</p><span class="mini-label">仅内置离线任务</span></div>
+    <footer class="sidebar-footer"><span class="avatar">CL</span><div><strong>本地预览</strong><small id="version">v0.1.0</small></div><button id="logout" class="icon-button hidden" title="退出登录">↗</button></footer>
+  </aside>
+  <main>
+    <header class="topbar"><a class="simple-brand" href="/">Cluster<span>Lab</span></a><nav class="simple-nav" aria-label="主要导航"><button class="nav-item selected" data-view="overview">控制台</button><button class="nav-item" data-view="jobs">任务历史</button><button class="nav-item" data-view="events">通信日志</button></nav><div class="breadcrumbs"><strong id="breadcrumb">运行总览</strong></div><div class="topbar-right"><span id="connection" class="connection"><i></i>正在连接</span><span class="topbar-separator"></span><span id="clock">--:--:--</span></div></header>
+    <div class="page">
+      <section class="page-heading"><div><div class="eyebrow" id="eyebrow">CONTROL CENTER</div><h1 id="page-title">集群控制台</h1><p id="page-subtitle">统一开始任务、调整节点、核对执行结果。</p></div><div id="heading-actions" class="actions"><button class="button secondary" id="demo">离线演示</button><button class="button secondary" id="add-node">添加节点</button><button class="button primary" id="upload-main">上传任务文件</button></div></section>
+      <div id="notice" class="notice hidden" role="status"></div>
+      <section id="login-panel" class="login-card hidden"><div class="eyebrow">WORKSPACE ACCESS</div><h2>登录管理页面</h2><p>使用部署时设置的管理密码。</p><form id="login-form"><label>用户名<input name="username" value="admin" autocomplete="username" required></label><label>管理密码<input name="password" type="password" autocomplete="current-password" required></label><button class="button primary">登录</button></form></section>
+      <div id="dashboard" class="hidden">
+        <section id="focus-card" class="panel focus-card" aria-label="当前任务"></section>
+        <section id="stats" class="stats"></section>
+        <div class="overview-grid" id="overview-panels">
+          <section class="panel activity-panel"><div class="panel-heading"><div><h2>处理速率</h2><p>来自节点心跳的已执行增量</p></div><span class="soft-badge"><i class="live-dot"></i>实时采样</span></div><div class="chart-number"><strong id="chart-rate">0</strong><span>条 / 秒</span><small id="chart-note">等待节点上报</small></div><div class="chart-wrap"><div class="chart-axis"><span id="axis-max">0</span><span id="axis-mid">0</span><span>0</span></div><svg id="rate-chart" viewBox="0 0 680 120" preserveAspectRatio="none" aria-label="处理速率趋势"><defs><linearGradient id="chart-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#12a88c" stop-opacity=".19"/><stop offset="100%" stop-color="#12a88c" stop-opacity="0"/></linearGradient></defs><path d="M0 15H680 M0 60H680 M0 105H680" class="grid-lines"/><path id="chart-area" fill="url(#chart-fill)"/><path id="chart-line" class="chart-line"/></svg></div><div class="chart-labels"><span>最近 60 次采样</span><span>每秒更新 · 当前浏览器会话</span><span>现在</span></div></section>
+          <section class="panel reconcile-panel"><div class="panel-heading"><div><h2>数据核对</h2><p>执行完成 ≠ 总控确认</p></div><span class="mini-icon">✓</span></div><div class="reconcile-total"><span>总控已确认</span><strong id="reconciled">0<span>条</span></strong></div><div class="reconcile-bar"><i id="reconcile-fill"></i></div><div class="reconcile-row"><span><i class="legend teal"></i>节点已执行</span><strong id="executed">0</strong></div><div class="reconcile-row"><span><i class="legend gray"></i>执行记录待确认</span><strong id="unconfirmed">0</strong></div><div class="reconcile-foot" id="reconcile-foot">结果回传并校验后，才计入已确认。</div></section>
+        </div>
+        <section class="panel section-panel" id="nodes-section"><div class="panel-heading"><div><h2 id="nodes-title">执行节点 <span id="nodes-total" class="count-tag">0</span></h2><p id="nodes-subtitle">CPU、内存和上下行为整机采样；同一主机上的节点会共享整机指标。</p></div><span class="small-muted" id="node-summary">尚无节点</span></div><div class="table-scroll" id="nodes-content"></div></section>
+        <section class="panel section-panel" id="jobs-section"><div class="panel-heading"><div><h2 id="jobs-title">任务队列 <span id="jobs-total" class="count-tag">0</span></h2><p id="jobs-subtitle">先准备工作包，再开始分发</p></div><button id="upload-open" class="button secondary small">↑ 上传任务文件</button></div><div id="jobs-content"></div></section>
+        <section class="panel section-panel" id="events-section"><div class="panel-heading"><div><h2>通信与事件</h2><p>记录领取、心跳上线与结果确认，便于核对</p></div><span class="small-muted">最近事件</span></div><div id="events-content" class="events"></div></section>
+        <footer class="page-footer"><span><i class="live-dot"></i>Cluster Lab · 独立于单机项目</span><span>仅支持离线行摘要和模拟执行 · 无外部认证请求</span></footer>
+      </div>
+    </div>
+  </main>
+  <dialog id="modal"><div class="modal-heading"><div><div id="modal-eyebrow" class="eyebrow">WORKSPACE</div><h2 id="modal-title"></h2></div><button id="modal-close" class="close-button" aria-label="关闭对话框">×</button></div><div id="modal-body"></div></dialog>
+</body>
+</html>

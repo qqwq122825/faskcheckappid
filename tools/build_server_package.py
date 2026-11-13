@@ -22,7 +22,7 @@ def build():
     names=['README.md','app.py','cli.py','requirements.txt','install.sh','start.sh','启动Web.command','启动Web.cmd',
            'examples/accounts.txt','examples/auth_settings.json','deploy/gunicorn.conf.py','deploy/nginx.example.conf',
            'docs/DEPLOY_BT.md','docs/WINDOWS.md','docs/TASKS.md','docs/PROTOCOLS.md',
-           'tools/check_web_load.py','scripts/windows/CLI.cmd','scripts/macos/GSA任务.command','scripts/macos/网页任务.command',
+           'tools/check_web_load.py','tools/diagnose.py','scripts/windows/CLI.cmd','scripts/macos/GSA任务.command','scripts/macos/网页任务.command',
            'fastcheck/protocols/classification_reference.json','fastcheck/assets/certificates/apple-root-ca.pem']
     names+=[str(path.relative_to(ROOT)) for path in (ROOT/'fastcheck').rglob('*.py')]
     names+=['fastcheck/web/static/'+name for name in ('index.html','style.css','metrics.js','app.js')]
