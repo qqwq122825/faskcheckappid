@@ -4,10 +4,10 @@ import { useRouter } from 'vue-router'
 import { UploadFilled } from '@element-plus/icons-vue'
 import { api, busy, createTaskOpen, refresh, state } from '../composables/useCluster'
 const router = useRouter()
-const name = ref(''), unitRows = ref(1000), file = ref<File>(), error = ref(''), advanced = ref<string[]>([])
+const name = ref(''), unitRows = ref(1000), mode = ref('auth'), file = ref<File>(), error = ref(''), advanced = ref<string[]>([])
 const maxUnitRows = computed(() => state.value?.settings?.max_unit_rows || 10000)
 watch(createTaskOpen, open => {
-  if (open) { error.value = ''; file.value = undefined; name.value = ''; unitRows.value = Math.min(1000, maxUnitRows.value); advanced.value = [] }
+  if (open) { error.value = ''; file.value = undefined; name.value = ''; mode.value = 'auth'; unitRows.value = Math.min(1000, maxUnitRows.value); advanced.value = [] }
 })
 function chooseFile(upload: { raw?: File }) {
   file.value = upload.raw
@@ -29,6 +29,7 @@ async function submit() {
     data.append('file', file.value)
     data.append('name', name.value.trim() || file.value.name)
     data.append('unit_rows', String(unitRows.value))
+    data.append('mode', mode.value)
     data.append('enqueue', 'true')
     await api('/api/jobs', data)
     createTaskOpen.value = false
@@ -41,6 +42,16 @@ async function submit() {
 <template>
   <el-dialog v-model="createTaskOpen" title="上传 TXT 创建任务" width="600px" :close-on-click-modal="!busy" :close-on-press-escape="!busy" :show-close="!busy" destroy-on-close>
     <el-form label-position="top" @submit.prevent="submit">
+      <el-form-item label="执行模式">
+        <el-select v-model="mode" style="width:260px" :disabled="busy">
+          <el-option label="账号校验（真实登录）" value="auth" />
+          <el-option label="离线摘要（仅计算 SHA-256）" value="digest" />
+        </el-select>
+        <span class="field-note">
+          账号校验会经代理真实请求目标站点，结果按密正/密码错误/锁定等分类；
+          离线摘要只做本地计算，不产生业务分类。
+        </span>
+      </el-form-item>
       <el-form-item label="TXT 文件">
         <el-upload drag :auto-upload="false" :limit="1" :disabled="busy" accept=".txt" :on-change="chooseFile" :on-remove="() => file = undefined" :on-exceed="() => error = '一次选择一个 TXT 文件，请先移除已选文件'">
           <el-icon class="el-icon--upload"><UploadFilled /></el-icon><div>点击选择或拖入 TXT 文件</div>

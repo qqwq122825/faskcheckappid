@@ -584,12 +584,18 @@ class Controller:
                 os.replace(temporary, final)
                 # 六类计数与分片确认在同一个事务里累加；重复提交走上面的 completed
                 # 分支直接返回，不会二次累加。分类取自结果行里的 status。
-                db.execute(
-                    "UPDATE jobs SET c_valid=c_valid+?,c_wrong=c_wrong+?,c_2fa=c_2fa+?,"
-                    "c_locked=c_locked+?,c_timeout=c_timeout+?,c_unknown=c_unknown+?,updated=? WHERE id=?",
-                    (buckets['valid'], buckets['wrong_password'], buckets['need_2fa'],
-                     buckets['locked'], buckets['timeout'],
-                     buckets['undetermined'] + buckets['unknown'], time.time(), unit['job_id']))
+                job_mode = db.execute('SELECT mode FROM jobs WHERE id=?',
+                                      (unit['job_id'],)).fetchone()['mode']
+                if job_mode == 'auth':
+                    # 只有账号校验才产生业务分类；摘要任务记成"密正"会误导
+                    db.execute(
+                        "UPDATE jobs SET c_valid=c_valid+?,c_wrong=c_wrong+?,c_2fa=c_2fa+?,"
+                        "c_locked=c_locked+?,c_timeout=c_timeout+?,c_unknown=c_unknown+?,updated=? WHERE id=?",
+                        (buckets['valid'], buckets['wrong_password'], buckets['need_2fa'],
+                         buckets['locked'], buckets['timeout'],
+                         buckets['undetermined'] + buckets['unknown'], time.time(), unit['job_id']))
+                else:
+                    db.execute("UPDATE jobs SET updated=? WHERE id=?", (time.time(), unit['job_id']))
                 db.execute("UPDATE units SET status='completed',processed=rows,result_path=?,result_checksum=?,lease_until=NULL,updated=? WHERE id=?",
                            (str(final), expected_digest, time.time(), unit_id))
                 event(db, 'result_confirmed', f'工作包 #{unit["seq"]} 结果已确认（{count:,} 条）', unit['job_id'], node_id)
