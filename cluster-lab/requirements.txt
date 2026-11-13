@@ -2,3 +2,7 @@ Flask==3.1.3
 requests==2.34.2
 waitress==3.0.2
 psutil==7.2.0
+# 真实认证执行器需要（与仓库根目录的 fastcheck 共用同一套依赖）
+portalocker==4.4.2
+websockets==16.1.1
+python-socks==3.2.1

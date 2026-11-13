@@ -13,7 +13,7 @@ import requests
 
 from . import VERSION
 from .common import Database, atomic_json, file_digest, integer, private_dir, read_json
-from .executor import execute_unit
+from .executor import execute_auth_unit, execute_unit
 from .telemetry import HostTelemetry
 
 SCHEMA = '''
@@ -53,6 +53,10 @@ class Node:
         self.generation = 0
         self.stop_version = read_json(self.root / 'control.json', {}).get('stop_version', 0)
         self.telemetry = HostTelemetry()
+        self.proxy_api, self.proxy_scheme = '', 'socks5h'
+        self.origin = 'https://new.ani.sidestore.io'
+        from .device_build import DeviceBuilder
+        self.builder = DeviceBuilder(self)
         # Unfinished tasks never get silently executed again after restart.
         with self.db.transaction() as db:
             for task in db.execute("SELECT id FROM tasks WHERE status IN ('downloading','running')").fetchall():
@@ -152,6 +156,13 @@ class Node:
                 with self.lock:
                     self.active.pop(unit_id, None)
 
+    def apply_config(self, config):
+        """总控下发的出口配置；只在内存里保存，不落盘。"""
+        if isinstance(config, dict):
+            self.proxy_api = str(config.get('proxy_api') or '')
+            self.proxy_scheme = str(config.get('proxy_scheme') or 'socks5h')
+            self.origin = str(config.get('origin') or self.origin)
+
     def _heartbeat(self):
         with self.db.connect() as db:
             values, interrupted = [], []
@@ -162,7 +173,9 @@ class Node:
         with self._request('POST', '/agent/heartbeat', json={'session': self.instance, 'hostname': socket.gethostname(),
                            'version': VERSION, 'max_processes': self.max_processes, 'max_threads': self.max_threads,
                            'active': values, 'interrupted': interrupted, 'ack_stop_version': self.stop_version,
-                           'telemetry': dict(self.telemetry.latest, worker_processes=len(self.active)), 'error': ''}) as response:
+                           'telemetry': dict(self.telemetry.latest, worker_processes=len(self.active)),
+                           'devices': {k: self.builder.state[k] for k in ('running', 'capacity', 'ready', 'built', 'failed')},
+                           'error': ''}) as response:
             value = response.json()
         with self.lock:
             self.settings = value
@@ -179,6 +192,21 @@ class Node:
             for unit_id in value.get('confirmed', []):
                 with self.db.transaction() as db:
                     db.execute("UPDATE tasks SET status='confirmed',updated=? WHERE id=? AND status='outbox'", (time.time(), unit_id))
+            # 总控下发的出口配置与设备初始化请求都在心跳响应里
+            if 'config' in value:
+                self.apply_config(value['config'])
+            requested = value.get('device_request') or 0
+            if requested and not self.builder.state['running']:
+                try:
+                    self.builder.start(int(requested))
+                except (RuntimeError, ValueError):
+                    pass
+            # 运行中轮换：用够次数的设备删身份重注册，池子始终是新的
+            limit = int(value.get('device_rotate_after') or 0)
+            if limit and not self.builder.state['running']:
+                stale = self.builder.retirable(limit)
+                if stale:
+                    self.builder.retire(stale[:max(1, len(stale) // 2)])
             for unit_id in value['rejected']:
                 if unit_id in self.active:
                     self.active[unit_id][1].set()
@@ -229,9 +257,16 @@ class Node:
         # A retried unit gets a new token; old completion markers must not be reused.
         (directory / 'done.json').unlink(missing_ok=True)
         (directory / 'progress.json').unlink(missing_ok=True)
+        # 认证模式需要本地设备目录；节点自己决定路径，不接受总控指定。
+        if descriptor.get('mode') == 'auth':
+            descriptor.setdefault('device_root', str(private_dir(self.root / 'device-pool')))
+            descriptor.setdefault('device_capacity', self.max_processes)
+            descriptor.setdefault('timeout', 15)
         atomic_json(directory / 'manifest.json', descriptor)
         stop = self.context.Event()
-        process = self.context.Process(target=execute_unit, args=(str(directory), descriptor, stop), name='offline-line-worker')
+        runner = execute_auth_unit if descriptor.get('mode') == 'auth' else execute_unit
+        process = self.context.Process(target=runner, args=(str(directory), descriptor, stop),
+                                       name='unit-worker')
         with self.db.transaction() as db:
             db.execute("UPDATE tasks SET status='running',processed=0,error=NULL WHERE id=?", (unit_id,))
         process.start()

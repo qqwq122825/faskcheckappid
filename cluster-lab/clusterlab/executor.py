@@ -67,3 +67,164 @@ def execute_unit(directory, descriptor, stop):
     except Exception as exc:
         atomic_json(directory / 'progress.json', {'processed': processed, 'started': started})
         atomic_json(directory / 'done.json', {'ok': False, 'processed': processed, 'error': type(exc).__name__})
+
+
+def _load_fastcheck():
+    """cluster-lab 与 fastcheck 在同一仓库的兄弟目录，运行时按需挂载。"""
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from fastcheck.devices import DevicePool
+    from fastcheck.protocols.gsa_status import check as gsa_check
+    from fastcheck.status import result_bucket
+    return DevicePool, gsa_check, result_bucket
+
+
+def _split_account(line):
+    """输入行形如 账号----密码；没有分隔符时整行当账号、密码留空。"""
+    for separator in ('----', '\t', ':'):
+        if separator in line:
+            account, _, password = line.partition(separator)
+            return account.strip(), password.strip()
+    return line.strip(), ''
+
+
+def _bump_usage(device_root, slot):
+    """记录每台设备被用过多少次；同一个 usage.json 由多个进程共享。"""
+    if not device_root or not slot:
+        return
+    path = Path(device_root) / 'usage.json'
+    try:
+        data = json.loads(path.read_text('utf-8')) if path.exists() else {}
+    except (OSError, ValueError):
+        data = {}
+    key = str(int(slot))
+    data[key] = int(data.get(key) or 0) + 1
+    try:
+        path.write_text(json.dumps(data), 'utf-8')
+    except OSError:
+        pass
+
+
+def execute_auth_unit(directory, descriptor, stop):
+    """真实认证执行：读账号 → 取设备参数 → 逐条校验 → 写分类结果。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from collections import Counter
+    import sys
+
+    directory = Path(directory)
+    started = time.time()
+    output_path = directory / 'results.jsonl'
+    DevicePool, gsa_check, result_bucket = _load_fastcheck()
+
+    proxy = descriptor.get('proxy')
+    if not proxy and descriptor.get('proxy_api'):
+        from fastcheck.proxy_pool import fetch_proxies
+        scheme = descriptor.get('proxy_scheme') or 'socks5h'
+        try:
+            picked = fetch_proxies(descriptor['proxy_api'], 1,
+                                   scheme=None if scheme == 'http' else scheme)
+        except Exception:                                          # noqa: BLE001
+            picked = []
+        proxy = picked[0] if picked else None
+    origin = descriptor.get('origin') or 'https://new.ani.sidestore.io'
+    device_root = descriptor.get('device_root')
+    slot = int(descriptor.get('slot') or 1)
+    capacity = int(descriptor.get('device_capacity') or 8)
+    timeout = float(descriptor.get('timeout') or 15)
+    workers = max(1, int(descriptor.get('threads') or 1))
+    counters = Counter()
+    processed = 0
+
+    accounts = []
+    with (directory / 'input.part').open('r', encoding='utf-8', errors='replace') as source:
+        for line in source:
+            if stop.is_set():
+                break
+            line = line.rstrip('\r\n')
+            if line.strip():
+                accounts.append(line)
+    if not accounts:
+        atomic_json(directory / 'done.json', {'ok': False, 'processed': 0, 'error': 'EmptyInput'})
+        return
+
+    pool = DevicePool(device_root, origin, max_devices=capacity)
+    from fastcheck.workers import device_profile
+
+    # 一个包内把账号摊到所有设备上：一台设备只承担 rows/capacity 条，
+    # 比固定用 1 号设备更分散，明显降低单设备被风控的概率。
+    identities, infos = {}, {}
+    for index in range(1, capacity + 1):
+        try:
+            base_info = pool.info(timeout, proxy=proxy, provider_direct=True)
+            profile = device_profile(pool, index)
+            infos[index] = dict(base_info, client_info=profile['client_info'],
+                                user_agent=profile['user_agent'])
+            ready = pool.inspect(index)['state'] == 'ready'
+            identities[index] = pool.fetch_headers(index, infos[index], max(timeout, 40),
+                                                   registered=ready, proxy=proxy,
+                                                   provider_direct=True)
+        except Exception as exc:                                   # noqa: BLE001
+            infos[index] = None
+            identities[index] = None
+
+    def one(row, index, line):
+        if stop.is_set():
+            return row, line, {'status': 'unknown', 'kind': 'stopped'}
+        account, password = _split_account(line)
+        account_started = time.time()
+        slot_id = 1 + (index % capacity)
+        identity = identities.get(slot_id)
+        try:
+            if identity is None:
+                # 预取失败的槽位在这里补一次
+                info = pool.info(timeout, proxy=proxy, provider_direct=True)
+                ready = pool.inspect(slot_id)['state'] == 'ready'
+                identity = pool.fetch_headers(slot_id, info, max(timeout, 40),
+                                              registered=ready, proxy=proxy,
+                                              provider_direct=True)
+            result = gsa_check(account, password, proxy, timeout=timeout, retries=0,
+                               cancel=stop.is_set, identity=identity)
+        except Exception as exc:                                   # noqa: BLE001
+            return row, line, {'status': 'error', 'kind': type(exc).__name__,
+                               'detail': str(exc)[:180], 'slot': slot_id,
+                               'elapsed': round(time.time() - account_started, 2)}
+        result['elapsed'] = round(time.time() - account_started, 2)
+        result['slot'] = slot_id
+        return row, line, result
+
+    stop_flag = stop
+    with output_path.open('wb') as output:
+        output_path.chmod(0o600)
+        first_row = int(descriptor.get('first_row') or 1)
+        with ThreadPoolExecutor(max_workers=workers) as workers_pool:
+            futures = [workers_pool.submit(one, first_row + index, index, line)
+                       for index, line in enumerate(accounts)]
+            for future in futures:
+                if stop_flag.is_set():
+                    break
+                row, line, result = future.result()
+                status = result_bucket(result)
+                counters[status] += 1
+                processed += 1
+                # sha256/bytes 是总控的必需字段（结果完整性校验），认证模式同样补齐
+                raw_line = line.encode('utf-8')
+                record = {'row': row, 'account': _split_account(line)[0], 'status': status,
+                          'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
+                          'stage': result.get('stage') or '', 'http': result.get('http'),
+                          'code': (result.get('detail') or result.get('kind') or '')[:180],
+                          'device': result.get('slot') or slot_id,
+                          'elapsed': result.get('elapsed'), 'attempts': 0}
+                output.write((json.dumps(record, separators=(',', ':')) + '\n').encode())
+                _bump_usage(device_root, record['device'])
+                if processed % 10 == 0:
+                    atomic_json(directory / 'progress.json',
+                                {'processed': processed, 'started': started})
+
+    atomic_json(directory / 'progress.json', {'processed': processed, 'started': started})
+    atomic_json(directory / 'done.json',
+                {'ok': True, 'processed': processed, 'counts': dict(counters),
+                 'checksum': hashlib.sha256(output_path.read_bytes()).hexdigest(),
+                 'elapsed': time.time() - started})

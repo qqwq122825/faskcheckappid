@@ -102,6 +102,10 @@ def create_app(role, service, password=None):
         return jsonify(service.snapshot())
 
     if role == 'controller':
+        @app.post('/api/settings/rotation')
+        def configure_rotation():
+            return jsonify(service.configure_rotation(request.get_json() or {}))
+
         @app.post('/api/settings/proxy')
         def configure_proxy():
             return jsonify(service.configure_proxy(request.get_json() or {}))
@@ -114,6 +118,11 @@ def create_app(role, service, password=None):
         def add_node():
             data = request.get_json() or {}
             return jsonify(service.add_node(data.get('name'), data.get('processes', 10), data.get('threads', 100))), 201
+
+        @app.post('/api/nodes/<node_id>/devices')
+        def request_devices(node_id):
+            data = request.get_json() or {}
+            return jsonify(service.request_devices(node_id, data.get('capacity') or 0))
 
         @app.post('/api/nodes/<node_id>/config')
         def configure_node(node_id):
@@ -139,8 +148,9 @@ def create_app(role, service, password=None):
                 raise ValueError('加入队列选项无效')
             if not request.content_length:
                 raise ValueError('缺少 Content-Length，无法确认上传完整性')
+            mode = request.args.get('mode', 'digest')
             job_id = service.create_job(name or '未命名任务', request.stream, unit_rows,
-                                        'digest', enqueue == 'true')
+                                        mode, enqueue == 'true')
             return jsonify(id=job_id, bytes=request.content_length), 202
 
         @app.post('/api/jobs')
@@ -152,7 +162,9 @@ def create_app(role, service, password=None):
             enqueue = request.form.get('enqueue', 'false')
             if enqueue not in ('true', 'false'):
                 raise ValueError('加入队列选项无效')
-            job_id = service.create_job(request.form.get('name') or uploaded.filename, uploaded.stream, unit_rows, 'digest', enqueue == 'true')
+            mode = request.form.get('mode', 'digest')
+            job_id = service.create_job(request.form.get('name') or uploaded.filename, uploaded.stream,
+                                        unit_rows, mode, enqueue == 'true')
             return jsonify(id=job_id), 202
 
         @app.post('/api/demo')
@@ -208,6 +220,21 @@ def create_app(role, service, password=None):
             return jsonify(service.accept_result(request.node_id, unit_id, request.form.get('lease_token'),
                                                  result.stream, request.form.get('checksum')))
     else:
+        @app.post('/api/devices/build')
+        def devices_build():
+            data = request.get_json() or {}
+            service.builder.start(int(data.get('capacity') or 0))
+            return jsonify(service.builder.snapshot()), 202
+
+        @app.get('/api/devices/build')
+        def devices_build_status():
+            return jsonify(service.builder.snapshot())
+
+        @app.post('/api/devices/build/cancel')
+        def devices_build_cancel():
+            service.builder.cancel()
+            return jsonify(ok=True)
+
         @app.post('/api/connect')
         def connect_node():
             data = request.get_json() or {}

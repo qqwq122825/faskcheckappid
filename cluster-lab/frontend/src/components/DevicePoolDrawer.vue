@@ -1,38 +1,88 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { fmt } from '../composables/useCluster'
-const visible = ref(false), node = ref<any>(null), expected = ref(0), error = ref('')
-const key = computed(() => 'clusterlab.device-pool-preview.' + node.value?.id)
+import { api, fmt, state } from '../composables/useCluster'
+
+const visible = ref(false), nodeId = ref(''), capacity = ref(2), error = ref('')
+// 每次刷新都从全局状态里取最新节点，设备池进度才会跟着心跳走
+const node = computed(() => state.value?.nodes?.find((n: any) => n.id === nodeId.value))
+const busy = ref(false), timer = 0 as any
+
+// 设备池状态来自节点的心跳上报，总控只是展示
+const pool = computed(() => node.value?.telemetry?.device_pool || {})
+const building = computed(() => Boolean(pool.value.running))
+const ready = computed(() => pool.value.ready || 0)
+const actual = computed(() => (pool.value.built || 0) + (pool.value.failed || 0))
+const rows = computed(() => {
+  const total = Math.max(pool.value.capacity || 0, capacity.value)
+  return Array.from({ length: total }, (_, index) => ({
+    slot: index + 1,
+    state: index < ready.value ? '已就绪' : index < actual.value ? '已尝试' : '未开始',
+  }))
+})
+
 function show(value: any) {
-  node.value = value
-  expected.value = 0
+  nodeId.value = value?.id || ''
+  capacity.value = Math.max(1, Number(value?.telemetry?.device_pool?.capacity) || 2)
   error.value = ''
-  try {
-    const saved = Number(localStorage.getItem(key.value))
-    if (Number.isInteger(saved) && saved >= 0 && saved <= 100000) expected.value = saved
-  } catch { /* Browser storage can be unavailable; the preview still opens. */ }
   visible.value = true
 }
-function savePreview() {
-  error.value = ''
-  if (!Number.isInteger(expected.value) || expected.value < 0 || expected.value > 100000) {
-    error.value = '请输入 0–100,000 之间的整数'
-    return
-  }
-  try {
-    localStorage.setItem(key.value, String(expected.value))
-    ElMessage.success('预计数量已保存在当前浏览器，未下发节点')
-  } catch { error.value = '浏览器存储不可用，无法保存预览数量' }
-}
 defineExpose({ show })
+
+async function initialize() {
+  error.value = ''
+  if (!node.value?.id) { error.value = '节点不可用'; return }
+  if (!Number.isInteger(capacity.value) || capacity.value < 1 || capacity.value > 200) {
+    error.value = '设备数量应为 1–200 的整数'; return
+  }
+  busy.value = true
+  try {
+    await api(`/api/nodes/${node.value.id}/devices`, { capacity: capacity.value }, 'POST')
+    ElMessage.success(`已请求节点初始化 ${capacity.value} 台设备`)
+  } catch (exc: any) {
+    error.value = exc?.message || '请求失败'
+  } finally { busy.value = false }
+}
+async function cancelBuild() {
+  try { await api(`/api/nodes/${node.value.id}/devices`, { capacity: 0 }, 'POST'); ElMessage.success('已请求停止') }
+  catch (exc: any) { error.value = exc?.message || '请求失败' }
+}
 </script>
+
 <template>
-  <el-drawer v-model="visible" :title="`${node?.name || ''} · 设备列表`" size="780px" class="device-pool-drawer" destroy-on-close>
-    <el-alert title="设备服务未接入：这里仅预览设备池配置，不会申请或初始化真实设备。" type="info" :closable="false" show-icon />
-    <section class="device-pool-target"><div class="section-heading"><h2>设备池</h2><el-tag type="info">未接入</el-tag></div><el-form label-position="top" @submit.prevent="savePreview"><el-form-item label="预计设备池数量"><el-input-number v-model="expected" :min="0" :max="100000" :step="1" :precision="0" /><span class="field-note">仅保存在当前浏览器，用于界面预览；尚未同步到总控或节点。</span></el-form-item><div class="actions"><el-button @click="savePreview">保存预览</el-button><el-button type="primary" disabled>初始化设备</el-button></div><el-alert v-if="error" :title="error" type="error" :closable="false" /></el-form></section>
-    <div class="device-pool-summary"><div><span>预计数量</span><strong>{{ fmt(expected) }}</strong></div><div><span>实际设备数</span><strong>—</strong></div><div><span>就绪设备数</span><strong>—</strong></div></div>
-    <section><div class="section-heading device-list-heading"><h2>设备列表</h2><span class="muted">等待设备服务接入</span></div><el-table :data="[]" empty-text="尚未接入设备服务，暂无可显示的设备" stripe><el-table-column prop="id" label="设备编号" min-width="160" /><el-table-column prop="status" label="状态" min-width="110" /><el-table-column prop="initialized" label="初始化时间" min-width="180" /></el-table></section>
-    <template #footer><el-button @click="visible = false">关闭</el-button></template>
+  <el-drawer v-model="visible" size="640px" title="设备池" class="device-pool-drawer">
+    <el-alert v-if="!node?.telemetry" type="info" :closable="false" show-icon
+              title="节点未上报状态，无法读取设备池。" />
+    <section class="device-pool-target">
+      <div class="section-heading"><h2>初始化设备</h2>
+        <el-tag :type="building ? 'warning' : ready ? 'success' : 'info'">
+          {{ building ? '初始化中' : ready ? '已就绪' : '未开始' }}</el-tag>
+      </div>
+      <el-form label-position="top" @submit.prevent="initialize">
+        <el-form-item label="设备数量">
+          <el-input-number v-model="capacity" :min="1" :max="200" :step="1" :precision="0" :disabled="building || busy" />
+          <span class="field-note">设备在节点本地注册，每台约 6–8 秒；不占用任务隧道。</span>
+        </el-form-item>
+        <div class="actions">
+          <el-button type="primary" native-type="submit" :loading="busy" :disabled="building">初始化设备</el-button>
+          <el-button v-if="building" @click="cancelBuild">停止</el-button>
+        </div>
+        <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
+      </el-form>
+    </section>
+    <div class="device-pool-summary">
+      <div><span>目标数量</span><strong>{{ fmt(pool.capacity || capacity) }}</strong></div>
+      <div><span>已尝试</span><strong>{{ fmt(actual) }}</strong></div>
+      <div><span>就绪设备</span><strong>{{ fmt(ready) }}</strong></div>
+    </div>
+    <section>
+      <div class="section-heading device-list-heading"><h2>设备列表</h2>
+        <span class="muted">{{ building ? `正在注册第 ${pool.built + pool.failed + 1} 台` : '等待中' }}</span>
+      </div>
+      <el-table :data="rows" empty-text="尚未初始化设备" stripe max-height="320">
+        <el-table-column prop="slot" label="设备编号" width="120" />
+        <el-table-column prop="state" label="状态" min-width="120" />
+      </el-table>
+    </section>
   </el-drawer>
 </template>

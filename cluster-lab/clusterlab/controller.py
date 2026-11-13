@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS controller_settings (
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('max_unit_rows',100000);
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_api','');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_scheme','socks5h');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('origin','https://new.ani.sidestore.io');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_rotate_after','0');
 '''
 
 
@@ -91,7 +93,8 @@ class Controller:
                 if name not in job_columns:
                     db.execute(f'ALTER TABLE jobs ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0')
             for name, definition in {'telemetry_json': "TEXT NOT NULL DEFAULT '{}'",
-                                     'stop_version': 'INTEGER NOT NULL DEFAULT 0',
+                                     'device_request': 'INTEGER NOT NULL DEFAULT 0',
+             'stop_version': 'INTEGER NOT NULL DEFAULT 0',
                                      'ack_stop_version': 'INTEGER NOT NULL DEFAULT 0'}.items():
                 if name not in columns:
                     db.execute(f'ALTER TABLE nodes ADD COLUMN {name} {definition}')
@@ -158,8 +161,8 @@ class Controller:
         integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
         if type(enqueue) is not bool:
             raise ValueError('加入队列选项无效')
-        if mode not in ('digest', 'simulate'):
-            raise ValueError('仅支持离线摘要或模拟任务')
+        if mode not in ('digest', 'simulate', 'auth'):
+            raise ValueError('执行模式应为 digest / simulate / auth')
         job_id = uuid.uuid4().hex
         target = self.inputs / (job_id + '.txt')
         with target.open('xb') as output:
@@ -185,7 +188,8 @@ class Controller:
                 'unit_byte_limit': 32 * 1024 * 1024,
                 'proxy_api': mask_api(values.get('proxy_api', '')),
                 'proxy_configured': bool(values.get('proxy_api', '')),
-                'proxy_scheme': values.get('proxy_scheme', 'socks5h')}
+                'proxy_scheme': values.get('proxy_scheme', 'socks5h'),
+                'device_rotate_after': int(values.get('device_rotate_after', 0) or 0)}
 
     def proxy_config(self):
         """下发节点用的原文配置；只在服务端内部调用，不进任何接口响应。"""
@@ -198,6 +202,14 @@ class Controller:
         with self.db.transaction() as db:
             db.execute("UPDATE controller_settings SET value=? WHERE key='max_unit_rows'", (maximum,))
             event(db, 'controller_config', f'新任务单个分片最大条数已设置为 {maximum:,} 条；已有任务保持原配置')
+        return self.settings()
+
+    def configure_rotation(self, data):
+        limit = integer(int(data.get('device_rotate_after') or 0), '设备轮换阈值', 0, 100000)
+        with self.db.transaction() as db:
+            db.execute("UPDATE controller_settings SET value=? WHERE key='device_rotate_after'", (limit,))
+            event(db, 'controller_config',
+                  f'设备轮换阈值设为 {limit} 条' if limit else '设备轮换已关闭')
         return self.settings()
 
     def configure_proxy(self, data):
@@ -220,6 +232,19 @@ class Controller:
             event(db, 'controller_config', '代理 API 配置已更新' if api else '代理 API 配置已清空')
         return self.settings()
 
+    def request_devices(self, node_id, capacity):
+        """把设备初始化意图挂到节点上，节点下次心跳取走执行。"""
+        capacity = integer(int(capacity), '设备数量', 0, 200)
+        with self.db.transaction() as db:
+            node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
+            if not node:
+                raise ValueError('节点不存在')
+            if not node['last_seen'] or time.time() - node['last_seen'] > self.offline_seconds:
+                raise Conflict('节点离线，无法初始化设备')
+            db.execute('UPDATE nodes SET device_request=? WHERE id=?', (capacity, node_id))
+            event(db, 'device_build_requested', f'已请求节点初始化 {capacity} 台设备', node_id=node_id)
+        return {'requested': capacity}
+
     def stop_node(self, node_id):
         with self.db.transaction() as db:
             changed = db.execute('UPDATE nodes SET enabled=0,stop_version=stop_version+1 WHERE id=?', (node_id,)).rowcount
@@ -239,6 +264,10 @@ class Controller:
         result.update(received_at=time.time(), scope='host_non_loopback')
         processes = value.get('worker_processes')
         result['worker_processes'] = processes if type(processes) is int and 0 <= processes <= 200 else None
+        pool = value.get('device_pool')
+        if isinstance(pool, dict):
+            result['device_pool'] = {key: pool.get(key) for key in
+                                     ('running', 'capacity', 'ready', 'built', 'failed', 'current')}
         return result
 
     def prepare(self, job_id):
@@ -336,6 +365,14 @@ class Controller:
             elif action == 'pause' and job['status'] == 'running':
                 db.execute("UPDATE jobs SET status='paused',updated=? WHERE id=?", (time.time(), job_id))
                 event(db, 'job_paused', '已暂停派发，在途工作包继续完成', job_id=job_id)
+            elif action == 'stop' and job['status'] in ('queued', 'running', 'paused', 'ready'):
+                db.execute("UPDATE jobs SET status='stopped',queued_at=NULL,updated=? WHERE id=?",
+                           (time.time(), job_id))
+                db.execute("UPDATE units SET status='pending',node_id=NULL,lease_token=NULL,"
+                           "lease_until=NULL,processed=0,updated=? WHERE job_id=? "
+                           "AND status IN ('leased','running','unknown')", (time.time(), job_id))
+                event(db, 'job_stopped', '任务已停止，在途工作包退回待分配', job_id=job_id)
+                self._advance_queue(db)
             elif action == 'retry_unknown' and job['status'] in ('running', 'paused', 'ready'):
                 count = db.execute("UPDATE units SET status='pending',node_id=NULL,lease_token=NULL,lease_until=NULL,processed=0,updated=? WHERE job_id=? AND status='unknown'",
                                    (time.time(), job_id)).rowcount
@@ -402,14 +439,19 @@ class Controller:
                         max_p, max_t, total, rate, str(data.get('error', ''))[:200], node_id))
             ack_stop = data.get('ack_stop_version', 0)
             ack_stop = max(0, min(ack_stop, node['stop_version'])) if type(ack_stop) is int else 0
+            merged = dict(data.get('telemetry') or {})
+            if isinstance(data.get('devices'), dict):
+                merged['device_pool'] = data['devices']
             db.execute('UPDATE nodes SET telemetry_json=?,ack_stop_version=? WHERE id=?',
-                       (json.dumps(self.clean_telemetry(data.get('telemetry'))), ack_stop, node_id))
+                       (json.dumps(self.clean_telemetry(merged)), ack_stop, node_id))
             if not node['last_seen'] or now - node['last_seen'] > self.offline_seconds:
                 event(db, 'node_online', f'节点已连接：{node["name"]}', node_id=node_id)
             return {'node_id': node_id, 'name': node['name'], 'enabled': bool(node['enabled']),
                     'processes': min(node['desired_processes'], max_p), 'threads': min(node['desired_threads'], max_t),
                     'desired_processes': node['desired_processes'], 'desired_threads': node['desired_threads'],
                     'rejected': reject, 'confirmed': confirmed, 'interrupted_ack': interrupted_ack,
+                    'device_request': node['device_request'],
+                    'device_rotate_after': self.settings().get('device_rotate_after', 0),
                     'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds, 'server_time': now}
 
     def _rate_allows(self):
@@ -446,9 +488,17 @@ class Controller:
                        (node_id, token, time.time() + self.lease_seconds, time.time(), unit['id']))
             event(db, 'unit_leased', f'工作包 #{unit["seq"]} 已分配（{unit["rows"]:,} 条）', unit['job_id'], node_id)
             self._rate_record()
-            return {'id': unit['id'], 'job_id': unit['job_id'], 'seq': unit['seq'], 'first_row': unit['first_row'],
-                    'rows': unit['rows'], 'checksum': unit['checksum'], 'token': token, 'mode': unit['mode'],
-                    'threads': min(node['desired_threads'], node['max_threads'] or 1), 'lease_seconds': self.lease_seconds}
+            payload = {'id': unit['id'], 'job_id': unit['job_id'], 'seq': unit['seq'],
+                       'first_row': unit['first_row'], 'rows': unit['rows'],
+                       'checksum': unit['checksum'], 'token': token, 'mode': unit['mode'],
+                       'threads': min(node['desired_threads'], node['max_threads'] or 1),
+                       'lease_seconds': self.lease_seconds}
+            if unit['mode'] == 'auth':
+                # 认证任务额外带设备与出口配置；代理地址取服务端保存的原文。
+                config = self.proxy_config()
+                payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
+                               origin=self.settings().get('origin', 'https://new.ani.sidestore.io'))
+            return payload
 
     def unit_for_node(self, node_id, unit_id, token):
         with self.db.transaction() as db:
@@ -469,6 +519,8 @@ class Controller:
         unit = self.unit_for_node(node_id, unit_id, token)
         temporary = self.results / (secrets.token_hex(16) + '.upload')
         digest, count = hashlib.sha256(), 0
+        from collections import Counter as _Counter
+        buckets = _Counter()
         try:
             with temporary.open('xb') as output:
                 temporary.chmod(0o600)
@@ -486,6 +538,11 @@ class Controller:
                             or not isinstance(value['sha256'], str) or not re.fullmatch('[0-9a-f]{64}', value['sha256'])
                             or type(value['bytes']) is not int or value['bytes'] < 0):
                         raise ValueError('结果编号或摘要格式无效')
+                    bucket = value.get('status') or 'valid'
+                    if bucket not in ('valid', 'wrong_password', 'need_2fa',
+                                      'locked', 'timeout', 'undetermined', 'unknown'):
+                        bucket = 'unknown'
+                    buckets[bucket] += 1
                     count += 1
                     if count > unit['rows']:
                         raise ValueError('结果条数超过工作包记录数')
@@ -511,9 +568,13 @@ class Controller:
                 final = self.results / (unit_id + '.' + hashlib.sha256(token.encode()).hexdigest()[:12] + '.jsonl')
                 os.replace(temporary, final)
                 # 六类计数与分片确认在同一个事务里累加；重复提交走上面的 completed
-                # 分支直接返回，不会二次累加。
-                db.execute("UPDATE jobs SET c_valid=c_valid+?,updated=? WHERE id=?",
-                           (unit['rows'], time.time(), unit['job_id']))
+                # 分支直接返回，不会二次累加。分类取自结果行里的 status。
+                db.execute(
+                    "UPDATE jobs SET c_valid=c_valid+?,c_wrong=c_wrong+?,c_2fa=c_2fa+?,"
+                    "c_locked=c_locked+?,c_timeout=c_timeout+?,c_unknown=c_unknown+?,updated=? WHERE id=?",
+                    (buckets['valid'], buckets['wrong_password'], buckets['need_2fa'],
+                     buckets['locked'], buckets['timeout'],
+                     buckets['undetermined'] + buckets['unknown'], time.time(), unit['job_id']))
                 db.execute("UPDATE units SET status='completed',processed=rows,result_path=?,result_checksum=?,lease_until=NULL,updated=? WHERE id=?",
                            (str(final), expected_digest, time.time(), unit_id))
                 event(db, 'result_confirmed', f'工作包 #{unit["seq"]} 结果已确认（{count:,} 条）', unit['job_id'], node_id)
@@ -572,8 +633,7 @@ class Controller:
             maximum = db.execute("SELECT value FROM controller_settings WHERE key='max_unit_rows'").fetchone()[0]
             return {'jobs': jobs, 'nodes': nodes, 'events': events, 'server_time': now,
                     'current_job_id': current['id'] if current else None, 'queue': queue,
-                    'settings': {'max_unit_rows': maximum, 'default_unit_rows': min(1000, maximum),
-                                 'unit_byte_limit': 32 * 1024 * 1024},
+                    'settings': self.settings(),
                     'totals': {'rows': aggregate[0], 'jobs': aggregate[1], 'confirmed': counts[0],
                                'processed': counts[1], 'online': sum(n['status'] != 'offline' for n in nodes),
                                'nodes': len(nodes), 'busy': sum(n['status'] != 'offline' and n['active'] > 0 for n in nodes),
