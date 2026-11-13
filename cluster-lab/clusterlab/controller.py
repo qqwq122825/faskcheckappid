@@ -57,6 +57,7 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_scheme','sock
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('origin','https://new.ani.sidestore.io');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_rotate_after','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_auto_rotate','0');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
 '''
 
 
@@ -233,7 +234,8 @@ class Controller:
                 'proxy_scheme': values.get('proxy_scheme', 'socks5h'),
                 'device_rotate_after': int(values.get('device_rotate_after', 0) or 0),
                 # column 声明是 INTEGER，存 '1' 会读回整数 1，比较时统一转字符串
-                'device_auto_rotate': str(values.get('device_auto_rotate', '0')) in ('1', 'True', 'true')}
+                'device_auto_rotate': str(values.get('device_auto_rotate', '0')) in ('1', 'True', 'true'),
+                'proxy_ttl': int(values.get('proxy_ttl', 50) or 50)}
 
     def proxy_for_node(self, node):
         """节点专属出口：按创建顺序把链接分给各节点，避免所有节点抢同一条配额。"""
@@ -577,6 +579,7 @@ class Controller:
                     'device_request': node['device_request'],
                     'device_rotate_after': self.settings().get('device_rotate_after', 0),
                     'device_auto_rotate': bool(self.settings().get('device_auto_rotate')),
+                    'proxy_ttl': int(self.settings().get('proxy_ttl') or 50),
                     'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds,
                     'server_time': now,
                     'config': {**self.proxy_for_node(node),

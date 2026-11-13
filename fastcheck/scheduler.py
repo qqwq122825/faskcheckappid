@@ -30,7 +30,8 @@ class Settings:
     device_rest_seconds: float = 30
     device_rest_slots: int = 1
     proxy_target: int = 0
-    proxy_ttl: float = 60
+    # 供应商的隧道默认只有 60 秒存活，留 10 秒余量避免请求打到将死的端口上
+    proxy_ttl: float = 50
     proxy_scheme: str = 'http'
     # True=anisette（sidestore.io）也走代理。服务器直连境外 anisette 常超时，
     # 打开后注册/刷新都借任务隧道，代价是每台设备注册慢约 1 秒。
