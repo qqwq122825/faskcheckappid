@@ -134,6 +134,23 @@ def create_app(role, service, password=None):
             service.stop_node(node_id)
             return jsonify(ok=True, message='停止请求已发送，等待节点确认')
 
+        @app.get('/api/files')
+        def list_files():
+            return jsonify(files=service.files())
+
+        @app.post('/api/jobs/from-file')
+        def job_from_file():
+            data = request.get_json() or {}
+            source = data.get('source') or ''
+            if not source:
+                raise ValueError('请选择已上传的文件')
+            unit_rows = int(data.get('unit_rows') or service.settings()['default_unit_rows'])
+            enqueue = data.get('enqueue', 'true')
+            job_id = service.create_job_from_file(source, data.get('name') or '',
+                                                  unit_rows, data.get('mode') or 'auth',
+                                                  str(enqueue) == 'true')
+            return jsonify(id=job_id), 202
+
         @app.post('/api/jobs/stream')
         def upload_stream():
             """裸流上传：请求体就是文件内容，不经 multipart 解析，不落临时文件。

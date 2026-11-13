@@ -282,6 +282,42 @@ class Controller:
                                      ('running', 'capacity', 'ready', 'built', 'failed', 'current')}
         return result
 
+    def files(self):
+        """列出上传过的源文件，供新建任务时复用，避免重复上传大文件。"""
+        with self.db.connect() as db:
+            rows = db.execute("""
+                SELECT source, MAX(created) AS created, MAX(bytes) AS bytes, MAX(rows) AS rows,
+                       COUNT(*) AS jobs, MAX(name) AS name
+                FROM jobs WHERE source != '' GROUP BY source ORDER BY created DESC LIMIT 100
+            """).fetchall()
+        result = []
+        for row in rows:
+            if not Path(row['source']).exists():
+                continue
+            result.append({'id': row['source'], 'name': Path(row['source']).name,
+                           'bytes': row['bytes'], 'rows': row['rows'],
+                           'jobs': row['jobs'], 'created': row['created']})
+        return result
+
+    def create_job_from_file(self, source, name, unit_rows=10000, mode='auth', enqueue=False):
+        """复用已上传的源文件创建任务，不再接收文件内容。"""
+        integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
+        if mode not in ('digest', 'simulate', 'auth'):
+            raise ValueError('执行模式应为 digest / simulate / auth')
+        path = Path(str(source))
+        if not path.exists() or path.parent != self.inputs:
+            raise ValueError('源文件不存在或不可复用')
+        job_id = uuid.uuid4().hex
+        now = time.time()
+        with self.db.transaction() as db:
+            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at) '
+                       'VALUES(?,?,?,?,?,?,?,?,?,?)',
+                       (job_id, str(name).strip()[:120] or path.name, 'preparing', now, now,
+                        str(path), path.stat().st_size, unit_rows, mode, now if enqueue else None))
+            event(db, 'job_uploaded', '复用已有输入文件，正在后台准备工作包', job_id=job_id)
+        self.preparer.submit(self.prepare, job_id)
+        return job_id
+
     def prepare(self, job_id):
         directory = private_dir(self.units_dir / job_id)
         try:
