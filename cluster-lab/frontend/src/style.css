@@ -16,3 +16,5 @@
 .feedback-meta{display:flex;justify-content:space-between;gap:16px;margin-top:14px;font-size:13px;color:#8a97a0}.result-large p+p{margin-top:6px}
 
 .export-actions{display:flex;gap:10px;align-items:center}
+
+.feedback-actions{display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap}

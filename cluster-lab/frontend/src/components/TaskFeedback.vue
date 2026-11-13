@@ -39,7 +39,7 @@ const cells = computed<Cell[]>(() => [
     <div class="feedback-grid"><div v-for="cell in cells" :key="cell.label" class="feedback-cell" :class="cell.tone"><span>{{ cell.label }}</span><strong>{{ cell.value == null ? '—' : fmt(cell.value) }}<small v-if="cell.suffix">{{ cell.suffix }}</small></strong></div></div>
     <div class="feedback-footer">
       <div class="feedback-progress-label"><span>总控已确认 {{ fmt(completed) }} / {{ fmt(total) }}</span><strong>{{ percentage.toFixed(1) }}%</strong></div>
-      <el-progress :percentage="Number(percentage.toFixed(1))" :show-text="false" :stroke-width="10" />
+      <el-progress :percentage="Number(percentage.toFixed(1))" :show-text="false" :stroke-width="10" /><div v-if="$slots.actions" class="feedback-actions"><slot name="actions" /></div>
       <div v-if="!preview" class="feedback-meta" aria-label="任务进度口径">
         <span>节点已处理 {{ reportedProcessed == null ? '尚未上报' : fmt(reportedProcessed) + ' 条' }}</span>
         <span>总控已确认 {{ fmt(completed) }} 条</span>
