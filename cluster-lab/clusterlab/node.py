@@ -264,7 +264,8 @@ class Node:
         if descriptor.get('mode') == 'auth':
             descriptor.setdefault('device_root', str(private_dir(self.root / 'device-pool')))
             descriptor.setdefault('device_capacity', self.max_processes)
-            descriptor.setdefault('timeout', 15)
+            descriptor.setdefault('timeout', 20)
+            descriptor.setdefault('retries', 0)
         atomic_json(directory / 'manifest.json', descriptor)
         stop = self.context.Event()
         runner = execute_auth_unit if descriptor.get('mode') == 'auth' else execute_unit

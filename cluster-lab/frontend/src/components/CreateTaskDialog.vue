@@ -6,11 +6,13 @@ import { api, busy, createTaskOpen, refresh, state } from '../composables/useClu
 const router = useRouter()
 const name = ref(''), unitRows = ref(1000), file = ref<File>(), error = ref(''), advanced = ref<string[]>([])
 const files = ref<any[]>([]), chosen = ref(''), mode = ref<'new' | 'reuse'>('new')
+const timeout = ref(20), retries = ref(0)
 const maxUnitRows = computed(() => state.value?.settings?.max_unit_rows || 10000)
 watch(createTaskOpen, open => {
   if (open) {
     error.value = ''; file.value = undefined; name.value = ''
-    unitRows.value = Math.min(10000, maxUnitRows.value); advanced.value = []
+    unitRows.value = Math.min(10000, maxUnitRows.value); advanced.value = ['advanced']
+    timeout.value = 20; retries.value = 0
     chosen.value = ''; mode.value = 'new'
     loadFiles()
   }
@@ -41,7 +43,8 @@ async function submit() {
     busy.value = true
     try {
       await api('/api/jobs/from-file', { source: chosen.value, name: name.value.trim(),
-                                         unit_rows: unitRows.value, mode: 'auth', enqueue: 'true' }, 'POST')
+                                         unit_rows: unitRows.value, mode: 'auth', enqueue: 'true',
+                                         timeout: timeout.value, retries: retries.value }, 'POST')
       createTaskOpen.value = false
       await refresh()
       await router.push('/jobs')
@@ -60,6 +63,8 @@ async function submit() {
     data.append('name', name.value.trim() || file.value.name)
     data.append('unit_rows', String(unitRows.value))
     data.append('mode', 'auth')
+    data.append('timeout', String(timeout.value))
+    data.append('retries', String(retries.value))
     data.append('enqueue', 'true')
     await api('/api/jobs', data)
     createTaskOpen.value = false
@@ -93,7 +98,20 @@ async function submit() {
         </el-upload>
       </el-form-item>
       <el-form-item label="任务名称（可选）"><el-input v-model="name" placeholder="不填写则使用上传的文件名；重名会自动加 -2、-3" maxlength="120" :disabled="busy" /></el-form-item>
-      <el-collapse v-model="advanced" class="create-advanced"><el-collapse-item title="高级设置（通常无需调整）" name="advanced"><el-form-item label="每个分片的记录数"><el-input-number v-model="unitRows" :min="50" :max="maxUnitRows" :step="50" :precision="0" :disabled="busy" /><span class="field-note">总控上限 {{ maxUnitRows.toLocaleString('zh-CN') }} 条；默认 {{ Math.min(10000, maxUnitRows).toLocaleString('zh-CN') }} 条，同时受 32 MiB 字节上限约束。</span></el-form-item></el-collapse-item></el-collapse>
+      <el-collapse v-model="advanced" class="create-advanced"><el-collapse-item title="高级设置（通常无需调整）" name="advanced">
+          <el-form-item label="每个分片的记录数">
+            <el-input-number v-model="unitRows" :min="50" :max="maxUnitRows" :step="50" :precision="0" :disabled="busy" />
+            <span class="field-note">总控上限 {{ maxUnitRows.toLocaleString('zh-CN') }} 条；默认 {{ Math.min(10000, maxUnitRows).toLocaleString('zh-CN') }} 条，同时受 32 MiB 字节上限约束。</span>
+          </el-form-item>
+          <el-form-item label="单请求超时 / 秒">
+            <el-input-number v-model="timeout" :min="5" :max="120" :step="5" :precision="0" :disabled="busy" />
+            <span class="field-note">单条记录的一次网络请求最多等多久，超过就算超时。</span>
+          </el-form-item>
+          <el-form-item label="超时后重试次数">
+            <el-input-number v-model="retries" :min="0" :max="5" :step="1" :precision="0" :disabled="busy" />
+            <span class="field-note">只对可重试的失败生效（超时、TLS、5xx）；密码错误、锁定这类结论不会重试。</span>
+          </el-form-item>
+        </el-collapse-item></el-collapse>
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
       <p class="muted">创建后自动加入执行队列；前一个任务全部确认后，轮到本任务自动开始。</p>
     </el-form>

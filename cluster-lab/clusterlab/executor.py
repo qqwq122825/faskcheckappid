@@ -159,7 +159,8 @@ def _execute_auth_unit(directory, descriptor, stop):
     device_root = descriptor.get('device_root')
     slot = int(descriptor.get('slot') or 1)
     capacity = int(descriptor.get('device_capacity') or 8)
-    timeout = float(descriptor.get('timeout') or 15)
+    timeout = float(descriptor.get('timeout') or 20)
+    retries = max(0, int(descriptor.get('retries') or 0))
     workers = max(1, int(descriptor.get('threads') or 1))
     counters = Counter()
     processed = 0
@@ -217,7 +218,8 @@ def _execute_auth_unit(directory, descriptor, stop):
                 identity = pool.fetch_headers(slot_id, info, max(timeout, 40),
                                               registered=ready, proxy=account_proxy,
                                               provider_direct=True)
-            result = gsa_check(account, password, account_proxy, timeout=timeout, retries=0,
+            result = gsa_check(account, password, account_proxy, timeout=timeout,
+                               retries=retries,
                                cancel=stop.is_set, identity=identity)
         except Exception as exc:                                   # noqa: BLE001
             return row, line, {'status': 'error', 'kind': type(exc).__name__,
