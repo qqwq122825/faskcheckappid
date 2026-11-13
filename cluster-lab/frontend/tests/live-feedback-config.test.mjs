@@ -25,3 +25,9 @@ test('Running elapsed time and speed use live processed rows', () => {
   assert.match(detail, /state\.value\?\.server_time/)
   assert.match(detail, /Math\.max\(job\.value\?\.processed/)
 })
+
+test('Application omits the offline platform label everywhere', () => {
+  const app = source('src/App.vue')
+  assert.doesNotMatch(app, /\u79bb\u7ebf\u4efb\u52a1\u5e73\u53f0/)
+  assert.match(app, /苹果id校验集群系统/)
+})

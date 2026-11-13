@@ -1,0 +1,105 @@
+BRANCH/FIELD
+main / frontend App.vue sidebar+login+footer, frontend title, legacy static title/footer, CLI branding, built static UI / VERSION 0.3.8
+Original baseline commit: d32fa9d4f3094987a024a1e580bcac0b57e98792
+
+FOUR ARTIFACTS
+MODIFIED_FILE=/Users/xxx/Documents/并发/verification-artifacts/remove-sidebar-platform-label/MODIFIED_FILE
+DIFF_FILE=/Users/xxx/Documents/并发/verification-artifacts/remove-sidebar-platform-label/DIFF_FILE
+VERIFICATION.txt=/Users/xxx/Documents/并发/verification-artifacts/remove-sidebar-platform-label/VERIFICATION.txt
+ROLLBACK.sh=/Users/xxx/Documents/并发/verification-artifacts/remove-sidebar-platform-label/ROLLBACK.sh
+
+BASELINE
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/remove-sidebar-platform-label/baseline-check/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: baseline commit d32fa9d4f3094987a024a1e580bcac0b57e98792; no runtime input.
+Literal output/result:
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.930s
+
+OK
+BASELINE_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED BACKEND
+Command: cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python -m unittest discover -s tests
+Input: modified source and rebuilt static UI.
+Literal output/result:
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.766s
+
+OK
+MODIFIED_TEST_EXIT=0
+Exit status: 0
+
+FRONTEND TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm test
+Input: App.vue with the requested Chinese product name and forbidden-label regression assertion.
+Literal output/result:
+ℹ tests 11
+ℹ suites 0
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 49.467375
+FRONTEND_TEST_EXIT=0
+Exit status: 0
+
+FRONTEND BUILD
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm run build
+Input: frontend VERSION 0.3.8.
+Literal output/result:
+✓ 1652 modules transformed.
+✓ built in 1.98s
+FRONTEND_BUILD_EXIT=0
+Exit status: 0
+
+GLOBAL FORBIDDEN-LABEL SCAN
+Command: grep -R "离线任务平台" -n cluster-lab --exclude-dir=node_modules --exclude-dir=.venv --exclude-dir=runtime --exclude='*.pyc'
+Input: all project source, legacy static files and built Vue assets.
+Literal output/result:
+FORBIDDEN_LABEL_MATCHES=0
+SCAN_EXIT=0
+Exit status: 0 (verification wrapper treats grep no-match status as success)
+Observed replacement: 苹果id校验集群系统 appears in the browser title, sidebar brand, login brand, page footer, legacy UI, CLI output and README heading.
+
+FULL PROJECT REGRESSION
+Command: cd /Users/xxx/Documents/并发 && .venv/bin/python -m unittest discover -s tests
+Input: complete modified tree.
+Literal output/result:
+----------------------------------------------------------------------
+Ran 114 tests in 33.586s
+
+OK
+ROOT_TEST_EXIT=0
+Exit status: 0
+
+ROLLBACK
+Command: /Users/xxx/Documents/并发/verification-artifacts/remove-sidebar-platform-label/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/remove-sidebar-platform-label/rollback-test && diff -qr /Users/xxx/Documents/并发/verification-artifacts/remove-sidebar-platform-label/rollback-original /Users/xxx/Documents/并发/verification-artifacts/remove-sidebar-platform-label/rollback-test && cd /Users/xxx/Documents/并发/verification-artifacts/remove-sidebar-platform-label/rollback-test/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: second baseline copy with DIFF_FILE applied, then reversed by executable ROLLBACK.sh.
+Literal output/result:
+ROLLBACK_RESULT=restored old Cluster Lab branding, offline-platform labels, built UI and VERSION 0.3.7
+ROLLBACK_DIFF_EXIT=0
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.751s
+
+OK
+ROLLBACK_TEST_EXIT=0
+Exit status: 0
+Restored behavior/status: byte-for-byte comparison matched the baseline copy; the previous Cluster Lab labels and VERSION 0.3.7 were restored, and all 41 baseline tests passed.
+
+ORIGINAL SHA256
+4590f712fbd1409311f84a995b0145cc74f1378fe85ccef2722a32feb0cfeb71  verification-artifacts/remove-sidebar-platform-label/original/cluster-lab/clusterlab/__init__.py
+2fa48720e1917449158200a728abbbfb106164c7ea57adaf2afbf2e01c44cf49  verification-artifacts/remove-sidebar-platform-label/original/cluster-lab/clusterlab/static/ui/index.html
+c9779e2a069c535f1f1240b45e29c7891bda38c15dfc2c461ec897f6fdeb09a1  verification-artifacts/remove-sidebar-platform-label/original/cluster-lab/frontend/package-lock.json
+614ce28d82cd96400a7cb119260f9e45c05421f9fad76b5670725a9929b51ad4  verification-artifacts/remove-sidebar-platform-label/original/cluster-lab/frontend/package.json
+f59a54c9aa378180c49f6116fdbc13903dc6b4ba2231c4002a1cfad770680ae0  verification-artifacts/remove-sidebar-platform-label/original/cluster-lab/frontend/src/App.vue
+f6654d23ae9e676cb6ee6339e4e6d5fa24cddaf9c84c454254fe466f32191713  verification-artifacts/remove-sidebar-platform-label/original/cluster-lab/frontend/tests/live-feedback-config.test.mjs
+f6b74fd13a84a7e9538a5c1c23fba354bae95a6b48c56247c12f95e1bc548560  verification-artifacts/remove-sidebar-platform-label/original/cluster-lab/README.md
+48a9e22acdd6205725955a6015b65c2f4d41bc54f9e82834901b89b3ec0ca251  verification-artifacts/remove-sidebar-platform-label/original/cluster-lab/clusterlab/static/index.html
+9853ed5fbc6e7ea536b724e92052cfbe1d1e546747eb2891ac4948216a514094  verification-artifacts/remove-sidebar-platform-label/original/cluster-lab/frontend/index.html
+eb99db2e1403f8dfecb1effed0d6f3229fe46b1ad55f38fce0122ca49db1bd4b  verification-artifacts/remove-sidebar-platform-label/original/cluster-lab/clusterlab/static/app.js
+14c1be502565f34da69b1f93d875858d9506071182dc3a7edbd6a59309d8e8d2  verification-artifacts/remove-sidebar-platform-label/original/cluster-lab/app.py
