@@ -13,10 +13,4 @@
 
 .summary-progress{margin-top:22px}.task-feedback{margin-bottom:24px}
 
-.feedback-meta{display:flex;justify-content:space-between;gap:16px;margin-top:14px;font-size:13px;color:#8a97a0}
-
-.result-tools{display:flex;gap:10px;align-items:center}
-.result-pager{display:flex;justify-content:space-between;align-items:center;padding-top:18px;font-size:13px;color:#8a97a0}
-
-.result-large{padding:26px 4px;text-align:center;color:#7f8d97;font-size:14px}
-.result-large p+p{margin-top:6px}
+.feedback-meta{display:flex;justify-content:space-between;gap:16px;margin-top:14px;font-size:13px;color:#8a97a0}.result-large p+p{margin-top:6px}
