@@ -1,0 +1,91 @@
+BRANCH/FIELD
+main / frontend style.css .brand sizing + built static CSS / VERSION 0.3.9
+Original baseline commit: 12775fecd2a4fb74690741dab69efd65490ac3ad
+
+FOUR ARTIFACTS
+MODIFIED_FILE=/Users/xxx/Documents/并发/verification-artifacts/fit-sidebar-brand/MODIFIED_FILE
+DIFF_FILE=/Users/xxx/Documents/并发/verification-artifacts/fit-sidebar-brand/DIFF_FILE
+VERIFICATION.txt=/Users/xxx/Documents/并发/verification-artifacts/fit-sidebar-brand/VERIFICATION.txt
+ROLLBACK.sh=/Users/xxx/Documents/并发/verification-artifacts/fit-sidebar-brand/ROLLBACK.sh
+
+BASELINE
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/fit-sidebar-brand/baseline-check/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: baseline commit 12775fecd2a4fb74690741dab69efd65490ac3ad; no runtime input.
+Literal output/result:
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.756s
+
+OK
+BASELINE_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED BACKEND
+Command: cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python -m unittest discover -s tests
+Input: brand CSS changed from gap=12/padding=11/font=22/letter=-0.6 to gap=10/padding=6/font=17/letter=-0.4, with rebuilt UI.
+Literal output/result:
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.699s
+
+OK
+MODIFIED_TEST_EXIT=0
+Exit status: 0
+
+FRONTEND TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm test
+Input: sidebar brand fitting regression assertion and VERSION 0.3.9.
+Literal output/result:
+ℹ tests 11
+ℹ suites 0
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 41.83325
+FRONTEND_TEST_EXIT=0
+Exit status: 0
+
+FRONTEND BUILD
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm run build
+Input: frontend source VERSION 0.3.9.
+Literal output/result:
+✓ 1652 modules transformed.
+✓ built in 2.09s
+FRONTEND_BUILD_EXIT=0
+Exit status: 0
+
+GLOBAL LABEL SCAN
+Command: grep -R "离线任务平台" -n cluster-lab --exclude-dir=node_modules --exclude-dir=.venv --exclude-dir=runtime --exclude='*.pyc'
+Input: all source and rebuilt static UI.
+Literal output/result:
+FORBIDDEN_LABEL_MATCHES=0
+SCAN_EXIT=0
+Exit status: 0 (wrapper maps no-match to successful verification)
+
+ROLLBACK
+Command: /Users/xxx/Documents/并发/verification-artifacts/fit-sidebar-brand/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/fit-sidebar-brand/rollback-test && diff -qr /Users/xxx/Documents/并发/verification-artifacts/fit-sidebar-brand/rollback-original /Users/xxx/Documents/并发/verification-artifacts/fit-sidebar-brand/rollback-test && cd /Users/xxx/Documents/并发/verification-artifacts/fit-sidebar-brand/rollback-test/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: second baseline copy with DIFF_FILE applied, then reversed by executable ROLLBACK.sh.
+Literal output/result:
+ROLLBACK_RESULT=restored 22px clipped sidebar brand CSS, previous built UI and VERSION 0.3.8
+ROLLBACK_DIFF_EXIT=0
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.769s
+
+OK
+ROLLBACK_TEST_EXIT=0
+Exit status: 0
+Restored behavior/status: byte-for-byte comparison matched the baseline copy; 22px clipped brand styling, previous built assets and VERSION 0.3.8 were restored; all 41 baseline tests passed.
+
+OBSERVED MODIFIED CSS
+.brand{display:flex;align-items:center;gap:10px;height:105px;padding:0 6px;white-space:nowrap;font-size:17px;color:#fff;letter-spacing:-.4px}
+This keeps “苹果id校验集群系统” on one line inside the existing 238px sidebar instead of clipping the final character.
+
+ORIGINAL SHA256
+4670dda1bc1418d7553edb7081c7f6a26cfdc6e7cedb03c0144a273fe68a115a  verification-artifacts/fit-sidebar-brand/original/cluster-lab/clusterlab/__init__.py
+ef3b21ecbde0c22a9b9e5b87f1b9bc211d300db7e55f67654dbf35e4d6717b77  verification-artifacts/fit-sidebar-brand/original/cluster-lab/frontend/package-lock.json
+7be1ae2eb0afc459063bb922cfdbe4776ea3f4365e3968b674dec511bb7a34cd  verification-artifacts/fit-sidebar-brand/original/cluster-lab/frontend/package.json
+eeb566c80dd6b16aa5d93a56e8058bae65d99284d5e068f9ef00f2db12c3c2de  verification-artifacts/fit-sidebar-brand/original/cluster-lab/frontend/src/style.css
+cd94f1dae7b1cfca7c67712ced0d1670ebfb0f143e03691718a4922c8549aaaa  verification-artifacts/fit-sidebar-brand/original/cluster-lab/frontend/tests/live-feedback-config.test.mjs
