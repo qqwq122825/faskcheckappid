@@ -197,6 +197,10 @@ def create_app(role, service, password=None):
                 job_id = service.create_job(f'通信验收 · {count:,} 条合成记录', stream, unit_rows, 'simulate')
             return jsonify(id=job_id), 202
 
+        @app.delete('/api/jobs/<job_id>')
+        def delete_job(job_id):
+            return jsonify(service.delete_job(job_id))
+
         @app.post('/api/jobs/<job_id>/<action>')
         def job_action(job_id, action):
             service.job_action(job_id, action)

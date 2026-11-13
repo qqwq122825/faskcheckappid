@@ -164,7 +164,7 @@ class Controller:
         if mode not in ('digest', 'simulate', 'auth'):
             raise ValueError('执行模式应为 digest / simulate / auth')
         job_id = uuid.uuid4().hex
-        target = self.inputs / (job_id + '.txt')
+        target = (self.inputs / (job_id + '.txt')).resolve()
         with target.open('xb') as output:
             target.chmod(0o600)
             shutil.copyfileobj(stream, output, 1024 * 1024)
@@ -305,7 +305,10 @@ class Controller:
         if mode not in ('digest', 'simulate', 'auth'):
             raise ValueError('执行模式应为 digest / simulate / auth')
         path = Path(str(source))
-        if not path.exists() or path.parent != self.inputs:
+        if not path.exists():
+            raise ValueError('源文件不存在或不可复用')
+        path = path.resolve()
+        if path.parent != self.inputs.resolve():
             raise ValueError('源文件不存在或不可复用')
         job_id = uuid.uuid4().hex
         now = time.time()
@@ -738,6 +741,26 @@ class Controller:
             except OSError:
                 continue
         return {'rows': rows, 'total': job['total'], 'offset': offset}
+
+    def delete_job(self, job_id):
+        """删除任务及其工作包；源文件被其他任务复用时保留。"""
+        with self.db.transaction() as db:
+            job = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if not job:
+                raise ValueError('任务不存在')
+            if job['status'] in ('running', 'paused', 'queued', 'preparing'):
+                raise Conflict('任务仍在运行或排队，请先停止')
+            db.execute('DELETE FROM units WHERE job_id=?', (job_id,))
+            db.execute('DELETE FROM jobs WHERE id=?', (job_id,))
+            event(db, 'job_deleted', f'任务已删除：{job["name"]}', job_id=None)
+            remaining = db.execute('SELECT COUNT(*) FROM jobs WHERE source=?',
+                                   (job['source'],)).fetchone()[0]
+        shutil.rmtree(self.units_dir / job_id, ignore_errors=True)
+        shutil.rmtree(self.results / job_id, ignore_errors=True)
+        source = Path(job['source']) if job['source'] else None
+        if source and remaining == 0 and source.exists() and source.parent == self.inputs:
+            source.unlink(missing_ok=True)
+        return {'deleted': job_id, 'source_kept': bool(remaining)}
 
     def result_paths(self, job_id):
         with self.db.connect() as db:
