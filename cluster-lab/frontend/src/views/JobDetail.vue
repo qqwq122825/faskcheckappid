@@ -7,7 +7,9 @@ import TaskFeedback from '../components/TaskFeedback.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import TaskActions from '../components/TaskActions.vue'
 import ResultList from '../components/ResultList.vue'
+import TaskRuntimeFeedback from '../components/TaskRuntimeFeedback.vue'
 import { jobIssueMessage } from '../lib/jobStatus.js'
+import { buildRuntimeFeedback } from '../lib/runtimeFeedback.js'
 const route = useRoute(), router = useRouter(), expanded = ref<string[]>([])
 const exportOptions = [
   { label: '全部结果', value: 'all' },
@@ -50,6 +52,11 @@ const capacityText = computed(() => {
 const processing = computed(() => Math.max(0, count('leased') + count('running') - Math.max(0, (job.value?.processed || 0) - (job.value?.confirmed || 0))))
 const waiting = computed(() => Math.max(0, (job.value?.processed || 0) - (job.value?.confirmed || 0)))
 const events = computed(() => state.value?.events?.filter((e: any) => e.job_id === route.params.id) || [])
+const runtimeFeedback = computed(() => buildRuntimeFeedback(
+  job.value,
+  state.value?.nodes || [],
+  state.value?.server_time || Date.now() / 1000,
+))
 
 </script>
 <template>
@@ -70,6 +77,8 @@ const events = computed(() => state.value?.events?.filter((e: any) => e.job_id =
                 :type="(job.unit_counts.leased || job.unit_counts.running) ? 'warning' : 'error'"
                 :closable="false" show-icon />
     </el-card>
+
+    <TaskRuntimeFeedback :feedback="runtimeFeedback" @open-nodes="router.push('/nodes')" />
 
     <TaskFeedback :processed="job.processed" :unit-counts="job.unit_counts" :total="job.rows"
                   :completed="job.confirmed" :active="count('leased') + count('running')"
