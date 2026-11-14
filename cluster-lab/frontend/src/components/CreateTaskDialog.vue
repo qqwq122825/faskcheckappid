@@ -127,13 +127,8 @@ async function submit() {
         <el-input-number v-model="retries" :min="0" :max="5" :step="1" :precision="0" :disabled="busy" />
         <span class="field-note">0 表示不重试；只对超时、TLS 和 5xx 等可重试错误生效，密码错误、锁定等明确结论不重试。</span>
       </el-form-item>
-      <el-form-item label="校验协议">
-        <div class="protocol-option"><strong>GSA（默认）</strong>
-          <el-checkbox v-model="dualRecheck" :disabled="busy">
-            GSA 返回 -20970 时使用网页协议复检
-          </el-checkbox>
-        </div>
-        <span class="field-note">网页复检明确返回 -20209 时归为“锁定”；HTTP 503/5xx 是服务临时异常，按上方重试次数处理，耗尽后保留为“其他未验证”。</span>
+      <el-form-item>
+        <el-checkbox v-model="dualRecheck" :disabled="busy">双协议校验</el-checkbox>
       </el-form-item>
       <el-form-item label="预计设备池数量">
         <el-input-number v-model="deviceCapacity" :min="1" :max="200" :step="1" :precision="0" :disabled="busy" />
@@ -147,6 +142,3 @@ async function submit() {
   </el-dialog>
 </template>
 
-<style scoped>
-.protocol-option { display: flex; flex-direction: column; gap: 10px; width: 100%; }
-</style>

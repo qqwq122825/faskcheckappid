@@ -131,13 +131,13 @@ test('Legacy categories remain visible while new -20970 tasks can be rechecked',
   assert.match(detail, /label: '其他未验证', value: 'undetermined'/)
 })
 
-test('Task creation exposes opt-in GSA to web dual-protocol recheck', () => {
+test('Task creation exposes one concise dual-protocol checkbox', () => {
   const dialog = source('src/components/CreateTaskDialog.vue')
   const detail = source('src/views/JobDetail.vue')
   assert.match(dialog, /const dualRecheck = ref\(false\)/)
   assert.match(dialog, /dual_recheck: String\(dualRecheck\.value\)/)
   assert.match(dialog, /dual_recheck: dualRecheck\.value/)
-  assert.match(dialog, /GSA 返回 -20970 时使用网页协议复检/)
-  assert.match(dialog, /HTTP 503\/5xx 是服务临时异常/)
+  assert.match(dialog, />双协议校验<\/el-checkbox>/)
+  assert.doesNotMatch(dialog, /校验协议|GSA（默认）|-20970|-20209|HTTP 503\/5xx/)
   assert.match(detail, /GSA \+ 网页复检/)
 })
