@@ -35,3 +35,12 @@ test('Application omits the offline platform label everywhere', () => {
   assert.doesNotMatch(app, /Vue \+ Python/)
   assert.match(styles, /\.brand\{[^}]*font-size:22px/)
 })
+
+test('Proxy settings add, list, delete, and explain node distribution', () => {
+  const settings = source('src/views/Settings.vue')
+  assert.match(settings, /action: 'add'/)
+  assert.match(settings, /action: 'delete'/)
+  assert.match(settings, /添加代理配置/)
+  assert.match(settings, /按节点创建顺序轮询分配/)
+  assert.match(settings, /proxy_apis/)
+})

@@ -1,0 +1,102 @@
+BRANCH/FIELD: main / controller proxy_api collection + proxy_for_node round-robin + auth lease payload + Settings multi-config UI / VERSION 0.3.12
+
+CHANGED RESULT
+- Settings can add up to 16 proxy API configurations without overwriting existing entries.
+- Saved configurations are masked, listed individually, and can be deleted individually.
+- Controller assigns configurations by stable node creation order using round robin.
+- Heartbeat device registration and auth task leases now receive the same node-specific proxy configuration.
+- Built production UI contains the new controls.
+
+FOUR ARTIFACT PATHS
+MODIFIED_FILE=/Users/xxx/Documents/并发/verification-artifacts/multi-proxy-distribution/MODIFIED_FILE
+DIFF_FILE=/Users/xxx/Documents/并发/verification-artifacts/multi-proxy-distribution/DIFF_FILE
+VERIFICATION.txt=/Users/xxx/Documents/并发/verification-artifacts/multi-proxy-distribution/VERIFICATION.txt
+ROLLBACK.sh=/Users/xxx/Documents/并发/verification-artifacts/multi-proxy-distribution/ROLLBACK.sh
+
+ORIGINAL INPUT
+Git HEAD=9ae1b05bed526a9e8de9f5be1d4a6e908e183f91
+Original hashes are recorded in /Users/xxx/Documents/并发/verification-artifacts/multi-proxy-distribution/original-sha256.txt.
+
+BASELINE
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/multi-proxy-distribution/baseline-check/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: unmodified Git HEAD 9ae1b05bed526a9e8de9f5be1d4a6e908e183f91
+Literal output/result:
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.724s
+
+OK
+BASELINE_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED CLUSTER TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python -m unittest discover -s tests
+Input: multi-proxy add/list/delete, node distribution, node-specific auth lease, VERSION 0.3.12
+Literal output/result:
+..........................................
+----------------------------------------------------------------------
+Ran 42 tests in 3.738s
+
+OK
+MODIFIED_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm test
+Input: Settings multi-proxy UI and distribution explanation
+Literal output/result: tests 12; pass 12; fail 0; duration_ms 46.240292; FRONTEND_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND BUILD
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm run build
+Input: frontend package 0.3.12 and multi-proxy Settings UI
+Literal output/result: 1652 modules transformed; built in 2.06s; FRONTEND_BUILD_EXIT=0
+Exit status: 0
+
+ROOT REGRESSION TEST
+Command: cd /Users/xxx/Documents/并发 && .venv/bin/python -m unittest discover -s tests
+Input: full repository after modification
+Literal output/result: Ran 114 tests in 34.105s; OK; ROOT_TEST_EXIT=0
+Exit status: 0
+
+DISTRIBUTION CHECK
+Command: cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python [inline isolated Controller fixture]
+Input: 2 proxy APIs and 4 nodes
+Literal output/result:
+INPUT=2 proxy APIs, 4 nodes
+ASSIGNMENT=a,b,a,b
+MASKED=https://proxy.example/a?password=***&num=200|https://proxy.example/b?password=***&num=200
+RESULT=round-robin distribution and credential masking verified
+DISTRIBUTION_CHECK_EXIT=0
+Exit status: 0
+
+IMPLEMENTATION SCAN
+Command: grep source/controller/static UI/VERSION for multi-proxy fields
+Input: source tree and generated production UI
+Literal output/result: multi-proxy UI found; config = self.proxy_for_node(node) found; built Settings bundle found; VERSION = '0.3.12'; SCAN_EXIT=0
+Exit status: 0
+
+ROLLBACK
+Command: /Users/xxx/Documents/并发/verification-artifacts/multi-proxy-distribution/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/multi-proxy-distribution/rollback-test-verified
+Input: second clean Git HEAD copy after applying DIFF_FILE
+Literal output/result: ROLLBACK_RESULT=restored single proxy input/distribution behavior and VERSION 0.3.11; ROLLBACK_COMMAND_EXIT=0
+Exit status: 0
+
+ROLLBACK COMPARISON
+Command: diff -qr /Users/xxx/Documents/并发/verification-artifacts/multi-proxy-distribution/rollback-original-verified /Users/xxx/Documents/并发/verification-artifacts/multi-proxy-distribution/rollback-test-verified
+Input: original HEAD copy and rolled-back second copy
+Literal output/result: ROLLBACK_DIFF_EXIT=0
+Exit status: 0
+
+ROLLBACK TEST
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/multi-proxy-distribution/rollback-test-verified/cluster-lab && /Users/xxx/Documents/并发/cluster-lab/.venv/bin/python -m unittest discover -s tests
+Input: rolled-back second copy
+Literal output/result:
+.........................................
+----------------------------------------------------------------------
+Ran 41 tests in 3.651s
+
+OK
+ROLLBACK_TEST_EXIT=0
+Exit status: 0
+Restored behavior/status: Settings returns to the single proxy input behavior, auth leases receive the former aggregate proxy string, VERSION returns to 0.3.11, and all 41 cluster tests pass.

@@ -11,6 +11,9 @@ watch(() => state.value?.settings?.device_rotate_after, value => {
 watch(() => state.value?.settings?.max_unit_rows, value => {
   if (value != null) maxUnitRows.value = value
 }, { immediate: true })
+watch(() => state.value?.settings?.proxy_scheme, value => {
+  if (value) proxyScheme.value = value
+}, { immediate: true })
 async function save() {
   error.value = ''
   if (!Number.isInteger(maxUnitRows.value) || maxUnitRows.value < 50 || maxUnitRows.value > 100000) {
@@ -27,15 +30,22 @@ async function saveRotation() {
   } catch (e) { ElMessage.error((e as Error).message) }
   finally { rotateBusy.value = false }
 }
-async function saveProxy() {
+async function addProxy() {
   proxyError.value = ''
   const value = proxyApi.value.trim()
-  if (value && !/^https?:\/\//i.test(value)) { proxyError.value = '代理 API 需要以 http:// 或 https:// 开头'; return }
+  if (!value) { proxyError.value = '请填写要添加的代理 API 地址'; return }
+  if (!/^https?:\/\//i.test(value)) { proxyError.value = '代理 API 需要以 http:// 或 https:// 开头'; return }
   proxyBusy.value = true
   try {
-    await mutate('/api/settings/proxy', { proxy_api: value, proxy_scheme: proxyScheme.value }, '代理 API 已保存')
+    await mutate('/api/settings/proxy', { action: 'add', proxy_api: value, proxy_scheme: proxyScheme.value }, '代理配置已添加')
     proxyApi.value = ''
   } catch (e) { proxyError.value = (e as Error).message; ElMessage.error(proxyError.value) }
+  finally { proxyBusy.value = false }
+}
+async function removeProxy(index: number) {
+  proxyBusy.value = true
+  try { await mutate('/api/settings/proxy', { action: 'delete', index }, '代理配置已删除') }
+  catch (e) { proxyError.value = (e as Error).message; ElMessage.error(proxyError.value) }
   finally { proxyBusy.value = false }
 }
 </script>
@@ -67,16 +77,17 @@ async function saveProxy() {
   </el-card>
   <el-card v-if="!isNode" shadow="never" class="section-card">
     <template #header><h2>出口代理</h2></template>
-    <el-form label-position="top" @submit.prevent="saveProxy">
+    <el-form label-position="top" @submit.prevent="addProxy">
       <el-form-item label="代理 API 地址">
-        <el-input v-model="proxyApi" type="text" spellcheck="false" :disabled="proxyBusy"
-                  placeholder="粘贴提取链接，多个用空格分隔" />
+        <el-input v-model="proxyApi" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }"
+                  spellcheck="false" :disabled="proxyBusy"
+                  placeholder="粘贴提取链接；也可一次粘贴多个，每行一个" />
         <span class="field-note">
-          支持 http/https 提取接口，链接里的 num 就是单次提取上限。
-          已保存时这里留空，输入新地址会覆盖。密码在页面上只显示为 ***。
+          最多 16 个。总控按节点创建顺序轮询分配，同一节点的设备注册和任务执行使用同一个配置。
+          密码在页面上只显示为 ***。
         </span>
       </el-form-item>
-      <el-form-item label="代理协议">
+      <el-form-item label="代理协议（全部配置共用）">
         <el-select v-model="proxyScheme" style="width:220px" :disabled="proxyBusy">
           <el-option label="socks5h（隧道住宅代理常用）" value="socks5h" />
           <el-option label="socks5" value="socks5" />
@@ -86,14 +97,19 @@ async function saveProxy() {
       </el-form-item>
       <el-descriptions :column="1" border>
         <el-descriptions-item label="当前状态">
-          {{ state?.settings?.proxy_configured ? '已配置' : '未配置' }}
-        </el-descriptions-item>
-        <el-descriptions-item label="已保存地址">
-          {{ state?.settings?.proxy_api || '—' }}
+          {{ state?.settings?.proxy_configured ? `已配置 ${state.settings.proxy_count} 个` : '未配置' }}
         </el-descriptions-item>
       </el-descriptions>
+      <el-table v-if="state?.settings?.proxy_apis?.length" :data="state.settings.proxy_apis" border>
+        <el-table-column type="index" label="#" width="60" />
+        <el-table-column label="已保存代理 API" min-width="520">
+          <template #default="scope"><span class="proxy-api-value">{{ scope.row }}</span></template>
+        </el-table-column>
+        <el-table-column label="分配" width="120"><template #default="scope">节点 {{ scope.$index + 1 }}、{{ scope.$index + 1 + state.settings.proxy_count }}…</template></el-table-column>
+        <el-table-column label="操作" width="100"><template #default="scope"><el-button type="danger" text :disabled="proxyBusy" @click="removeProxy(scope.$index)">删除</el-button></template></el-table-column>
+      </el-table>
       <el-alert v-if="proxyError" :title="proxyError" type="error" :closable="false" show-icon />
-      <el-button type="primary" native-type="submit" :loading="proxyBusy">保存代理配置</el-button>
+      <el-button type="primary" native-type="submit" :loading="proxyBusy">添加代理配置</el-button>
     </el-form>
   </el-card>
   <el-card shadow="never" class="section-card"><template #header><h2>当前部署</h2></template><el-descriptions :column="1" border><el-descriptions-item label="版本">{{ session?.version }}</el-descriptions-item><el-descriptions-item label="服务角色">{{ isNode ? '执行节点' : '集群总控' }}</el-descriptions-item><el-descriptions-item label="管理登录">{{ session?.password_required ? '已启用密码登录' : '本地预览，无管理密码' }}</el-descriptions-item><el-descriptions-item label="内置任务">离线行摘要、合成模拟任务</el-descriptions-item><el-descriptions-item label="任务导出">TXT 原始记录，一行一条，保持原顺序</el-descriptions-item></el-descriptions><el-alert class="settings-note" title="数据保留策略、传输限速和设备服务尚未接入。" type="info" :closable="false" show-icon /></el-card>

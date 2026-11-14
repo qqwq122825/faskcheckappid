@@ -144,6 +144,39 @@ class ControllerTests(unittest.TestCase):
         self.service.accept_result(self.node['id'], unit['id'], unit['token'], io.BytesIO(payload), checksum)
         self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
 
+    def test_multiple_proxy_apis_are_round_robin_distributed_to_nodes_and_leases(self):
+        first = 'https://proxy.example/one?password=secret&num=200'
+        second = 'https://proxy.example/two?token=hidden&num=200'
+        settings = self.service.configure_proxy({
+            'action': 'add', 'proxy_api': first, 'proxy_scheme': 'socks5h'})
+        settings = self.service.configure_proxy({
+            'action': 'add', 'proxy_api': second, 'proxy_scheme': 'socks5h'})
+        self.assertEqual(settings['proxy_count'], 2)
+        self.assertEqual(settings['proxy_apis'], [
+            'https://proxy.example/one?password=***&num=200',
+            'https://proxy.example/two?token=***&num=200'])
+
+        other = self.service.add_node('second-node', 2, 4)
+        self.service.heartbeat(other['id'], dict(session='second-session', max_processes=1,
+                               max_threads=2, active=[]))
+        with self.service.db.connect() as db:
+            nodes = list(db.execute('SELECT * FROM nodes ORDER BY created,id'))
+        self.assertEqual(self.service.proxy_for_node(nodes[0])['api'], first)
+        self.assertEqual(self.service.proxy_for_node(nodes[1])['api'], second)
+
+        job = self.service.create_job('auth-proxy', io.BytesIO(b'a@example.com----p\n' * 50),
+                                      50, mode='auth', enqueue=True)
+        deadline = time.monotonic() + 5
+        while self.service.snapshot()['current_job_id'] != job and time.monotonic() < deadline:
+            time.sleep(.01)
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual(unit['proxy_api'], first)
+        self.assertNotIn(second, unit['proxy_api'])
+
+        settings = self.service.configure_proxy({'action': 'delete', 'index': 0})
+        self.assertEqual(settings['proxy_count'], 1)
+        self.assertEqual(self.service.proxy_config()['api'], second)
+
     def test_large_node_capacity_is_accepted(self):
         """P0：单节点可以要 100 进程 / 100 线程，不再被 16/32 上限卡住。"""
         node = self.service.add_node('big', 100, 100)

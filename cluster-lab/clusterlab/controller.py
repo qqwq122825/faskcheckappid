@@ -246,10 +246,13 @@ class Controller:
         with self.db.connect() as db:
             values = {row['key']: row['value'] for row in db.execute('SELECT key,value FROM controller_settings')}
         maximum = int(values.get('max_unit_rows', 100000))
+        proxy_parts = [part for part in str(values.get('proxy_api', '')).split() if part]
         return {'max_unit_rows': maximum, 'default_unit_rows': min(10000, maximum),
                 'unit_byte_limit': 32 * 1024 * 1024,
                 'proxy_api': mask_api(values.get('proxy_api', '')),
-                'proxy_configured': bool(values.get('proxy_api', '')),
+                'proxy_apis': [mask_api(part) for part in proxy_parts],
+                'proxy_count': len(proxy_parts),
+                'proxy_configured': bool(proxy_parts),
                 'proxy_scheme': values.get('proxy_scheme', 'socks5h'),
                 'device_rotate_after': int(values.get('device_rotate_after', 0) or 0),
                 # column 声明是 INTEGER，存 '1' 会读回整数 1，比较时统一转字符串
@@ -263,8 +266,9 @@ class Controller:
         if not parts:
             return config
         with self.db.connect() as db:
-            index = db.execute('SELECT COUNT(*) FROM nodes WHERE created < ?',
-                               (node['created'],)).fetchone()[0]
+            index = db.execute(
+                'SELECT COUNT(*) FROM nodes WHERE created < ? OR (created = ? AND id < ?)',
+                (node['created'], node['created'], node['id'])).fetchone()[0]
         return {'api': parts[index % len(parts)], 'scheme': config.get('scheme', 'socks5h'),
                 'shared': len(parts) < index + 1, 'index': index % len(parts)}
 
@@ -299,23 +303,47 @@ class Controller:
         return self.settings()
 
     def configure_proxy(self, data):
-        api = str(data.get('proxy_api', '')).strip()
-        scheme = str(data.get('proxy_scheme', 'socks5h')).strip()
+        action = str(data.get('action') or 'replace').strip()
+        if action not in ('add', 'delete', 'clear', 'replace'):
+            raise ValueError('代理配置操作无效')
+        with self.db.connect() as db:
+            current = {row['key']: row['value'] for row in db.execute(
+                "SELECT key,value FROM controller_settings WHERE key IN ('proxy_api','proxy_scheme')")}
+        scheme = str(data.get('proxy_scheme') or current.get('proxy_scheme') or 'socks5h').strip()
         if scheme not in ('socks5h', 'socks5', 'http', 'https'):
             raise ValueError('代理协议应为 socks5h / socks5 / http / https')
-        if api:
-            from urllib.parse import urlsplit
-            parts = [p for p in api.split() if p]
-            if len(parts) > 16:
-                raise ValueError('最多支持 16 个代理 API 链接')
-            for part in parts:
-                parsed = urlsplit(part)
-                if parsed.scheme not in ('http', 'https') or not parsed.hostname:
-                    raise ValueError('代理 API 需要是 http(s) 地址')
+        existing = [part for part in str(current.get('proxy_api') or '').split() if part]
+        submitted = [part for part in str(data.get('proxy_api') or '').split() if part]
+        if action == 'add':
+            if not submitted:
+                raise ValueError('请填写要添加的代理 API 地址')
+            parts = list(dict.fromkeys(existing + submitted))
+        elif action == 'delete':
+            try:
+                index = int(data.get('index'))
+            except (TypeError, ValueError):
+                raise ValueError('代理配置编号无效') from None
+            if not 0 <= index < len(existing):
+                raise ValueError('代理配置不存在')
+            parts = existing[:index] + existing[index + 1:]
+        elif action == 'clear':
+            parts = []
+        else:
+            parts = list(dict.fromkeys(submitted))
+        if len(parts) > 16:
+            raise ValueError('最多支持 16 个代理 API 链接')
+        from urllib.parse import urlsplit
+        for part in parts:
+            parsed = urlsplit(part)
+            if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+                raise ValueError('代理 API 需要是 http(s) 地址')
+        api = '\n'.join(parts)
         with self.db.transaction() as db:
             db.execute("UPDATE controller_settings SET value=? WHERE key='proxy_api'", (api,))
             db.execute("UPDATE controller_settings SET value=? WHERE key='proxy_scheme'", (scheme,))
-            event(db, 'controller_config', '代理 API 配置已更新' if api else '代理 API 配置已清空')
+            event(db, 'controller_config',
+                  f'代理 API 配置已更新，当前 {len(parts)} 个，按节点轮询分配'
+                  if parts else '代理 API 配置已清空')
         return self.settings()
 
     def request_devices(self, node_id, capacity):
@@ -699,7 +727,9 @@ class Controller:
                        'lease_seconds': self.lease_seconds}
             if unit['mode'] == 'auth':
                 # 认证任务额外带设备与出口配置；代理地址取服务端保存的原文。
-                config = self.proxy_config()
+                # 必须和心跳下发使用同一个节点专属配置，不能把全部 API
+                # 串成一个地址交给执行器。
+                config = self.proxy_for_node(node)
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
                                origin=self.settings().get('origin', 'https://new.ani.sidestore.io'))
             return payload
