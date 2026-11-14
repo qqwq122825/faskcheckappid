@@ -1,0 +1,73 @@
+BRANCH/FIELD: main / TaskFeedback responsive numeric grid CSS / VERSION 0.3.15
+
+CHANGED RESULT
+- Values remain exact and comma-formatted; no abbreviated or hidden totals.
+- At viewport widths up to 1600 CSS px, result cards use 5 columns / 2 rows.
+- At widths up to 1000 CSS px, result cards use 3 columns.
+- At widths up to 600 CSS px, result cards use 2 columns with 24 px numerals.
+- Numeric values use no-wrap rendering, preventing adjacent totals from merging.
+
+FOUR ARTIFACT PATHS
+MODIFIED_FILE=/Users/xxx/Documents/并发/verification-artifacts/large-number-feedback-layout/MODIFIED_FILE
+DIFF_FILE=/Users/xxx/Documents/并发/verification-artifacts/large-number-feedback-layout/DIFF_FILE
+VERIFICATION.txt=/Users/xxx/Documents/并发/verification-artifacts/large-number-feedback-layout/VERIFICATION.txt
+ROLLBACK.sh=/Users/xxx/Documents/并发/verification-artifacts/large-number-feedback-layout/ROLLBACK.sh
+
+ORIGINAL INPUT
+Git HEAD=05c6dff05528e7715cefcb7d2b43a65418da7366
+Original SHA256 values are recorded in /Users/xxx/Documents/并发/verification-artifacts/large-number-feedback-layout/original-sha256.txt.
+
+BASELINE
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/large-number-feedback-layout/baseline-check/cluster-lab/frontend && npm test
+Input: unmodified Git HEAD 05c6dff05528e7715cefcb7d2b43a65418da7366, package 0.3.14
+Literal output/result: tests 13; pass 13; fail 0; duration_ms 65.929625; BASELINE_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm test
+Input: responsive 5/3/2-column result grid, no-wrap numerals, package 0.3.15
+Literal output/result: tests 14; pass 14; fail 0; duration_ms 44.820458; MODIFIED_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND BUILD
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm run build
+Input: responsive feedback CSS and frontend package 0.3.15
+Literal output/result: 1652 modules transformed; built in 2.03s; FRONTEND_BUILD_EXIT=0
+Exit status: 0
+
+MODIFIED CLUSTER TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python -m unittest discover -s tests
+Input: rebuilt production static UI and VERSION 0.3.15
+Literal output/result:
+..........................................
+----------------------------------------------------------------------
+Ran 42 tests in 3.773s
+
+OK
+CLUSTER_TEST_EXIT=0
+Exit status: 0
+
+LAYOUT SCAN
+Command: scan source and generated production CSS for 5/3/2-column rules and no-wrap values
+Input: frontend/src/style.css and clusterlab/static/ui assets
+Literal output/result: RESULT=5/3/2-column responsive layout and no-wrap numeric values present in source and production build; VERSION = '0.3.15'; LAYOUT_SCAN_EXIT=0
+Exit status: 0
+
+ROLLBACK
+Command: /Users/xxx/Documents/并发/verification-artifacts/large-number-feedback-layout/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/large-number-feedback-layout/rollback-test-verified
+Input: second clean Git HEAD copy after applying DIFF_FILE
+Literal output/result: ROLLBACK_RESULT=restored 10-column narrow layout and VERSION 0.3.14; ROLLBACK_COMMAND_EXIT=0
+Exit status: 0
+
+ROLLBACK COMPARISON
+Command: diff -qr /Users/xxx/Documents/并发/verification-artifacts/large-number-feedback-layout/rollback-original-verified /Users/xxx/Documents/并发/verification-artifacts/large-number-feedback-layout/rollback-test-verified
+Input: original HEAD copy and rolled-back second copy
+Literal output/result: ROLLBACK_DIFF_EXIT=0
+Exit status: 0
+
+ROLLBACK TEST
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/large-number-feedback-layout/rollback-test-verified/cluster-lab/frontend && npm test
+Input: rolled-back second copy, package 0.3.14
+Literal output/result: tests 13; pass 13; fail 0; duration_ms 41.8185; ROLLBACK_TEST_EXIT=0
+Exit status: 0
+Restored behavior/status: viewport widths from 1001–1300 CSS px return to the former 10-column/34 px layout, VERSION returns to 0.3.14, and all 13 original frontend tests pass.

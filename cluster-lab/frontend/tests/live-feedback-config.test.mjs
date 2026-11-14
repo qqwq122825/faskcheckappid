@@ -61,3 +61,11 @@ test('Executive-facing pages omit test, demo, preview, and unfinished feature co
     '预留配置', '未接入', 'OFFLINE TASK PLATFORM', 'ClusterLab',
   ]) assert.doesNotMatch(visible, new RegExp(label))
 })
+
+test('Large task totals use a non-overlapping responsive feedback grid', () => {
+  const styles = source('src/style.css')
+  assert.match(styles, /feedback-cell>strong\{[^}]*white-space:nowrap/)
+  assert.match(styles, /@media\(max-width:1600px\)\{.*?feedback-grid\{grid-template-columns:repeat\(5,minmax\(0,1fr\)\)/)
+  assert.match(styles, /@media\(max-width:1000px\)\{\.feedback-grid\{grid-template-columns:repeat\(3,minmax\(0,1fr\)\)/)
+  assert.match(styles, /@media\(max-width:600px\)\{\.feedback-grid\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)/)
+})
