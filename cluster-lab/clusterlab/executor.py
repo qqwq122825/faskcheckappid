@@ -12,11 +12,12 @@ from pathlib import Path
 import queue
 import threading
 import time
+from urllib.parse import urlsplit
 
 from .common import atomic_json
 
 
-PROXY_TTL_SECONDS = 45.0
+PROXY_TTL_SECONDS = 50.0
 PROXY_FETCH_LIMIT = 1000
 
 
@@ -38,6 +39,10 @@ class NodeProxyPool:
         self.reused = context.Value('q', 0)
         self.discarded = context.Value('q', 0)
         self.waits = context.Value('q', 0)
+        self.duplicates = context.Value('q', 0)
+        self.refreshed = context.Value('q', 0)
+        # Supplier-local history: no Manager/RPC on the worker hot path.
+        self._recent_exits = {}
         self.last_fetch_ms = context.Value('d', 0.0)
         self.refill = context.Event()
         self.refill.set()
@@ -53,19 +58,53 @@ class NodeProxyPool:
         with counter.get_lock():
             return counter.value
 
+    @staticmethod
+    def _exit_key(value):
+        parsed = urlsplit(str(value))
+        return ((parsed.hostname or str(value)).lower(), parsed.port)
+
     def add_fresh(self, values, fetched_at=None):
+        # Called by the single supplier; remember even in-flight/failed exits
+        # until their original expiry, without slowing worker acquisitions.
         fetched_at = time.monotonic() if fetched_at is None else float(fetched_at)
         expires_at = fetched_at + self.ttl
+        now = time.monotonic()
+        self._recent_exits = {key: expiry for key, expiry in self._recent_exits.items()
+                              if expiry > now}
+        if expires_at <= now:
+            self._add(self.discarded, sum(bool(value) for value in values))
+            return 0
         added = 0
         for value in values:
             if not value:
                 continue
             try:
+                key = self._exit_key(value)
+            except ValueError:
+                self._add(self.discarded, 1)
+                continue
+            if key in self._recent_exits:
+                self._add(self.duplicates, 1)
+                continue
+            self._add(self.fresh_count, 1)
+            try:
                 self.fresh.put_nowait((str(value), expires_at, 0))
             except queue.Full:
-                break
+                self._add(self.fresh_count, -1)
+                # Keep acquiring independent of the API: rotate one old queued
+                # exit when full, never an exit already leased to a worker.
+                oldest = self._take(self.fresh, self.fresh_count, 0.02)
+                if oldest is not None:
+                    self._add(self.discarded, 1)
+                    self._add(self.refreshed, 1)
+                self._add(self.fresh_count, 1)
+                try:
+                    self.fresh.put_nowait((str(value), expires_at, 0))
+                except queue.Full:
+                    self._add(self.fresh_count, -1)
+                    continue
+            self._recent_exits[key] = expires_at
             added += 1
-        self._add(self.fresh_count, added)
         self._add(self.fetched, added)
         return added
 
@@ -82,32 +121,30 @@ class NodeProxyPool:
             self._add(self.discarded, 1)
 
     def acquire(self, wait=1.0):
-        # multiprocessing.Queue 的 feeder 线程可能比共享计数慢几毫秒；
-        # 计数显示有新 IP 时给队列一个很短的可见窗口，避免误用复用池。
-        fresh_wait = .02 if self._value(self.fresh_count) else 0.0
-        lease = self._take(self.fresh, self.fresh_count, fresh_wait)
+        # Never wait for a new API response while a healthy queued exit exists.
+        lease = self._take(self.fresh, self.fresh_count)
         if lease is not None:
             if self._value(self.fresh_count) < self.low_water:
                 self.refill.set()
             return lease
         self.refill.set()
-        # API 提取约 0.6 秒；补池期间优先复用近期成功出口，工作线程不空等。
-        reusable_wait = .02 if self._value(self.reusable_count) else 0.0
-        lease = self._take(self.reusable, self.reusable_count, reusable_wait)
+        lease = self._take(self.reusable, self.reusable_count)
         if lease is not None:
             self._add(self.reused, 1)
             return (lease[0], lease[1], int(lease[2]) + 1)
+        # Queue feeder visibility can lag its published count. Only when both
+        # queues are empty do we allow the caller's bounded resource wait.
         self._add(self.waits, 1)
-        lease = self._take(self.fresh, self.fresh_count, max(0.0, float(wait)))
-        if lease is not None:
-            if self._value(self.fresh_count) < self.low_water:
-                self.refill.set()
-            return lease
-        reusable_wait = .02 if self._value(self.reusable_count) else 0.0
-        lease = self._take(self.reusable, self.reusable_count, reusable_wait)
-        if lease is not None:
-            self._add(self.reused, 1)
-            return (lease[0], lease[1], int(lease[2]) + 1)
+        deadline = time.monotonic() + max(0.0, float(wait))
+        while time.monotonic() < deadline:
+            lease = self._take(self.fresh, self.fresh_count,
+                               min(0.01, max(0.0, deadline - time.monotonic())))
+            if lease is not None:
+                return lease
+            lease = self._take(self.reusable, self.reusable_count)
+            if lease is not None:
+                self._add(self.reused, 1)
+                return (lease[0], lease[1], int(lease[2]) + 1)
         return None
 
     def release(self, lease, healthy):
@@ -116,12 +153,37 @@ class NodeProxyPool:
         if not healthy or float(lease[1]) <= time.monotonic():
             self._add(self.discarded, 1)
             return
+        self._add(self.reusable_count, 1)
         try:
             self.reusable.put_nowait(lease)
         except queue.Full:
+            self._add(self.reusable_count, -1)
             self._add(self.discarded, 1)
             return
-        self._add(self.reusable_count, 1)
+
+    def prune_expired(self):
+        """Remove idle expired leases, even when no worker acquires an exit."""
+        removed = 0
+        for channel, counter in ((self.fresh, self.fresh_count),
+                                 (self.reusable, self.reusable_count)):
+            for _ in range(self._value(counter)):
+                try:
+                    lease = channel.get(timeout=0.02)
+                except queue.Empty:
+                    break
+                self._add(counter, -1)
+                if float(lease[1]) <= time.monotonic():
+                    self._add(self.discarded, 1)
+                    removed += 1
+                    continue
+                self._add(counter, 1)
+                try:
+                    channel.put_nowait(lease)
+                except queue.Full:
+                    self._add(counter, -1)
+                    self._add(self.discarded, 1)
+                    removed += 1
+        return removed
 
     def note_fetch(self, milliseconds, error=False):
         self._add(self.fetch_calls, 1)
@@ -145,6 +207,8 @@ class NodeProxyPool:
             'reused': self._value(self.reused),
             'discarded': self._value(self.discarded),
             'waits': self._value(self.waits),
+            'duplicates': self._value(self.duplicates),
+            'refreshed': self._value(self.refreshed),
             'last_fetch_ms': round(last_fetch_ms, 1),
             'ttl_seconds': self.ttl,
         }
@@ -161,40 +225,48 @@ class NodeProxyPool:
 
 
 def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None):
-    """Continuously refill one node pool without blocking worker threads."""
+    """Fetch every second, rotate when full; workers use queued exits first."""
     if fetcher is None:
         from fastcheck.proxy_pool import fetch_proxies
         fetcher = fetch_proxies
-    while not stop.is_set():
-        pool.refill.wait(0.1)
-        if stop.is_set():
-            return
-        if not pool.refill.is_set() and pool.snapshot()['fresh'] >= pool.low_water:
-            continue
-        pool.refill.clear()
+    maintenance_stop = threading.Event()
+
+    def maintain():
+        # Expiry cleanup must not stall behind a slow external API call.
+        while not stop.is_set() and not maintenance_stop.is_set():
+            pool.prune_expired()
+            maintenance_stop.wait(1.0)
+
+    maintenance = threading.Thread(target=maintain, name='proxy-pool-expiry', daemon=True)
+    maintenance.start()
+    next_tick = time.monotonic()
+    try:
         while not stop.is_set():
+            if stop.wait(max(0.0, next_tick - time.monotonic())):
+                return
+            pool.refill.clear()
             needed = pool.target - pool.snapshot()['fresh']
-            if needed <= 0:
-                break
-            count = min(PROXY_FETCH_LIMIT, needed)
+            # Full pools still request one new exit per tick. Deficits are
+            # filled in bounded batches, not by blocking authentication work.
+            count = min(PROXY_FETCH_LIMIT, max(1, needed))
             started = time.monotonic()
             try:
                 values = fetcher(api_url, count,
                                  scheme=None if scheme == 'http' else scheme)
-                # 有效期从开始提取计算，不让慢 API 为已变旧的出口
-                # 额外延长寿命。
-                added = pool.add_fresh(values, fetched_at=started)
+                if stop.is_set():
+                    return
+                pool.add_fresh(values, fetched_at=started)
                 pool.note_fetch((time.monotonic() - started) * 1000)
             except Exception:                                      # noqa: BLE001
-                added = 0
                 pool.note_fetch((time.monotonic() - started) * 1000, error=True)
-            if added <= 0:
-                if stop.wait(0.25):
-                    return
-                pool.refill.set()
-                break
-            if added < count and stop.wait(0.05):
-                return
+            next_tick += 1.0
+            now = time.monotonic()
+            if next_tick < now:
+                # One in-flight request only; skip missed ticks, never pile up.
+                next_tick = now
+    finally:
+        maintenance_stop.set()
+        maintenance.join(1.5)
 
 
 def execute_unit(directory, descriptor, stop):
@@ -269,6 +341,12 @@ def execute_unit(directory, descriptor, stop):
 
 
 def _group_child(directory, descriptor, stop, proxy_pool=None):
+    if proxy_pool is not None:
+        # Proxy stock is expendable; result files are independently flushed.
+        # A child must not wait at exit for its reusable-queue feeder to drain
+        # into a pipe nobody reads while the coordinator waits for this child.
+        for channel in (proxy_pool.fresh, proxy_pool.reusable):
+            channel.cancel_join_thread()
     runner = execute_auth_unit if descriptor.get('mode') == 'auth' else execute_unit
     if runner is execute_auth_unit:
         runner(directory, descriptor, stop, proxy_pool=proxy_pool)
