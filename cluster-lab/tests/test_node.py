@@ -147,6 +147,23 @@ class NodeRecoveryTests(unittest.TestCase):
         finally:
             self.node.active.clear()
 
+    def test_rejected_unit_stops_local_process_and_records_delete_reason(self):
+        stop = threading.Event()
+        self.node.active[self.unit] = (None, stop)
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [self.unit], 'confirmed': []}
+        try:
+            with patch.object(self.node, '_request', return_value=Response(value)):
+                self.node._heartbeat()
+            self.assertTrue(stop.is_set())
+            with self.node.db.connect() as db:
+                task = db.execute('SELECT status,error FROM tasks WHERE id=?',
+                                  (self.unit,)).fetchone()
+            self.assertEqual(task['status'], 'rejected')
+            self.assertIn('总控已删除任务或撤销租约', task['error'])
+        finally:
+            self.node.active.clear()
+
 
 if __name__ == '__main__':
     unittest.main()

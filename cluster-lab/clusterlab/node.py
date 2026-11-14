@@ -290,7 +290,7 @@ class Node:
                 if unit_id in self.active:
                     self.active[unit_id][1].set()
                 with self.db.transaction() as db:
-                    db.execute("UPDATE tasks SET status='rejected',error='总控已拒绝过期租约；本地结果保留' WHERE id=?", (unit_id,))
+                    db.execute("UPDATE tasks SET status='rejected',error='总控已删除任务或撤销租约；节点已停止执行' WHERE id=?", (unit_id,))
         return value
 
     def _upload_one(self):

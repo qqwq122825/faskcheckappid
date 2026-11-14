@@ -78,3 +78,12 @@ test('Device pool explicitly saves target and shows persisted registration histo
   assert.match(drawer, /注册出口 IP/)
   assert.match(drawer, /注册时间/)
 })
+
+test('Deleting a running task explicitly stops its node work', () => {
+  const table = source('src/components/JobTable.vue')
+  assert.doesNotMatch(table, /const removable/)
+  assert.match(table, /如果节点正在执行，将在下一次心跳立即停止/)
+  assert.match(table, /confirmButtonText: '删除并停止任务'/)
+  assert.match(table, /:disabled="row\.status === 'preparing'"/)
+  assert.match(table, /已通知节点停止/)
+})

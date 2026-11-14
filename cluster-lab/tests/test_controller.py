@@ -514,6 +514,26 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.service.accept_result(self.node['id'], unit['id'], unit['token'], io.BytesIO(payload), checksum)
 
+    def test_delete_running_job_revokes_node_work_and_advances_queue(self):
+        first, second = self.queued_job(100, 50), self.queued_job(50, 50)
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual(unit['job_id'], first)
+
+        deleted = self.service.delete_job(first)
+        self.assertEqual(deleted['cancelled_units'], 1)
+        snapshot = self.service.snapshot()
+        self.assertNotIn(first, [job['id'] for job in snapshot['jobs']])
+        self.assertEqual(snapshot['current_job_id'], second)
+
+        response = self.service.heartbeat(self.node['id'], {
+            'session': 'test-session', 'max_processes': 1, 'max_threads': 2,
+            'active': [{'id': unit['id'], 'token': unit['token'], 'processed': 7}]})
+        self.assertEqual(response['rejected'], [unit['id']])
+        payload, checksum = self.output(unit)
+        with self.assertRaises(ValueError):
+            self.service.accept_result(self.node['id'], unit['id'], unit['token'],
+                                       io.BytesIO(payload), checksum)
+
     def test_10002_records_keep_the_final_two_record_package(self):
         source = b''.join(f'account-{index:05d}\n'.encode() for index in range(10000)) + b'\n\n'
         job = self.service.create_job('10002 records', io.BytesIO(source), 10000)

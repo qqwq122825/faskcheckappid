@@ -6,17 +6,18 @@ import { api, fmt, percent, date, refresh } from '../composables/useCluster'
 import StatusBadge from './StatusBadge.vue'
 defineProps<{ jobs: any[] }>()
 const router = useRouter()
-const removable = ['completed', 'failed', 'stopped', 'paused']
 
 async function remove(job: any) {
   try {
     await ElMessageBox.confirm(
-      `删除任务「${job.name}」？\n工作包与已生成的结果文件会一起删除，不能恢复。`,
-      '删除任务', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
+      `删除任务「${job.name}」？\n如果节点正在执行，将在下一次心跳立即停止。工作包和结果文件会一起删除，不能恢复。`,
+      '删除任务', { type: 'warning', confirmButtonText: '删除并停止任务', cancelButtonText: '取消' })
   } catch { return }
   try {
     const result = await api(`/api/jobs/${job.id}`, undefined, 'DELETE')
-    ElMessage.success(result.source_kept ? '任务已删除（源文件被其他任务复用，已保留）' : '任务已删除')
+    const stopped = Number(result.cancelled_units || 0)
+    ElMessage.success(stopped ? `任务已删除，已通知节点停止 ${stopped} 个在途工作包`
+      : result.source_kept ? '任务已删除（源文件被其他任务复用，已保留）' : '任务已删除')
     await refresh()
   } catch (exc: any) { ElMessage.error(exc?.message || '删除失败') }
 }
@@ -28,8 +29,8 @@ async function remove(job: any) {
     <el-table-column label="任务进度" min-width="220"><template #default="{ row }"><div class="progress-label">{{ fmt(Math.max(row.processed || 0, row.confirmed || 0)) }} / {{ fmt(row.rows) }} 条已处理</div><el-progress :percentage="Number(percent(row).toFixed(1))" :stroke-width="7" /></template></el-table-column>
     <el-table-column label="操作" width="210" fixed="right"><template #default="{ row }">
       <el-button plain @click="router.push('/jobs/' + row.id)">查看详情</el-button>
-      <el-tooltip :disabled="removable.includes(row.status)" content="任务正在执行，先停止再删除" placement="top">
-        <span><el-button :icon="Delete" :disabled="!removable.includes(row.status)" @click="remove(row)" /></span>
+      <el-tooltip :disabled="row.status !== 'preparing'" content="文件准备完成后可删除" placement="top">
+        <span><el-button :icon="Delete" :disabled="row.status === 'preparing'" @click="remove(row)" /></span>
       </el-tooltip>
     </template></el-table-column>
   </el-table>

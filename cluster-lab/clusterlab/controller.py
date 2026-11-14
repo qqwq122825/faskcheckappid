@@ -1016,22 +1016,21 @@ class Controller:
                     'offset': offset}
 
     def delete_job(self, job_id):
-        """删除任务及其工作包；源文件被其他任务复用时保留。"""
+        """删除任务并撤销已下发工作包；节点下次心跳会立即中止。"""
         with self.db.transaction() as db:
             job = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
             if not job:
                 raise ValueError('任务不存在')
-            if job['status'] in ('running', 'queued', 'preparing'):
-                raise Conflict('任务仍在运行或排队，请先停止')
-            if job['status'] == 'paused':
-                # 暂停的任务可以删，但节点上还有包在跑时要等它回传完
-                active = db.execute("SELECT COUNT(*) FROM units WHERE job_id=? "
-                                    "AND status IN ('leased','running')", (job_id,)).fetchone()[0]
-                if active:
-                    raise Conflict(f'仍有 {active} 个工作包在节点上执行，稍候再删除')
+            if job['status'] == 'preparing':
+                raise Conflict('文件正在准备工作包，准备完成后再删除')
+            active = db.execute("SELECT COUNT(*) FROM units WHERE job_id=? "
+                                "AND status IN ('leased','running','unknown')",
+                                (job_id,)).fetchone()[0]
             db.execute('DELETE FROM units WHERE job_id=?', (job_id,))
             db.execute('DELETE FROM jobs WHERE id=?', (job_id,))
-            event(db, 'job_deleted', f'任务已删除：{job["name"]}', job_id=None)
+            event(db, 'job_deleted',
+                  f'任务已删除：{job["name"]}；已撤销 {active} 个在途工作包', job_id=None)
+            self._advance_queue(db)
             remaining = db.execute('SELECT COUNT(*) FROM jobs WHERE source=?',
                                    (job['source'],)).fetchone()[0]
         shutil.rmtree(self.units_dir / job_id, ignore_errors=True)
@@ -1039,7 +1038,8 @@ class Controller:
         source = Path(job['source']) if job['source'] else None
         if source and remaining == 0 and source.exists() and source.parent == self.inputs:
             source.unlink(missing_ok=True)
-        return {'deleted': job_id, 'source_kept': bool(remaining)}
+        return {'deleted': job_id, 'source_kept': bool(remaining),
+                'cancelled_units': int(active)}
 
     def export_results(self, job_id, category='all'):
         """按分类流式导出，内容保持上传时的原始记录（`账号----密码`）。
