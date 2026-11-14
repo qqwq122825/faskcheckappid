@@ -43,4 +43,6 @@ test('Proxy settings add, list, delete, and explain node distribution', () => {
   assert.match(settings, /添加代理配置/)
   assert.match(settings, /按节点创建顺序轮询分配/)
   assert.match(settings, /proxy_apis/)
+  assert.doesNotMatch(settings, /内置任务/)
+  assert.doesNotMatch(settings, /离线行摘要、合成模拟任务/)
 })

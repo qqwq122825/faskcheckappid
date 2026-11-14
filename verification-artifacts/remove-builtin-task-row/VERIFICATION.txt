@@ -1,0 +1,71 @@
+BRANCH/FIELD: main / Settings.vue current-deployment descriptions: remove 内置任务 row / VERSION 0.3.13
+
+CHANGED RESULT
+- Removed the complete “内置任务 / 离线行摘要、合成模拟任务” row from Settings.
+- Rebuilt production static UI.
+- Version advanced to 0.3.13.
+
+FOUR ARTIFACT PATHS
+MODIFIED_FILE=/Users/xxx/Documents/并发/verification-artifacts/remove-builtin-task-row/MODIFIED_FILE
+DIFF_FILE=/Users/xxx/Documents/并发/verification-artifacts/remove-builtin-task-row/DIFF_FILE
+VERIFICATION.txt=/Users/xxx/Documents/并发/verification-artifacts/remove-builtin-task-row/VERIFICATION.txt
+ROLLBACK.sh=/Users/xxx/Documents/并发/verification-artifacts/remove-builtin-task-row/ROLLBACK.sh
+
+ORIGINAL INPUT
+Git HEAD=794ddcc146721b58159ef23d42ea170804d270aa
+Original SHA256 values are recorded in /Users/xxx/Documents/并发/verification-artifacts/remove-builtin-task-row/original-sha256.txt.
+
+BASELINE
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/remove-builtin-task-row/baseline-check/cluster-lab/frontend && npm test
+Input: unmodified Git HEAD 794ddcc146721b58159ef23d42ea170804d270aa, package 0.3.12
+Literal output/result: tests 12; pass 12; fail 0; duration_ms 43.978042; BASELINE_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm test
+Input: Settings without the builtin-task row, package 0.3.13
+Literal output/result: tests 12; pass 12; fail 0; duration_ms 46.71; MODIFIED_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND BUILD
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm run build
+Input: frontend source without the builtin-task row
+Literal output/result: 1652 modules transformed; built in 2.85s; FRONTEND_BUILD_EXIT=0
+Exit status: 0
+
+MODIFIED CLUSTER TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python -m unittest discover -s tests
+Input: rebuilt static UI and VERSION 0.3.13
+Literal output/result:
+..........................................
+----------------------------------------------------------------------
+Ran 42 tests in 3.918s
+
+OK
+CLUSTER_TEST_EXIT=0
+Exit status: 0
+
+REMOVAL SCAN
+Command: grep -RInE '内置任务|离线行摘要、合成模拟任务' cluster-lab/frontend/src/views/Settings.vue cluster-lab/clusterlab/static/ui
+Input: Settings source and generated static UI
+Literal output/result: RESULT=内置任务 row and value absent from source and production UI; VERSION = '0.3.13'; SCAN_EXIT=0
+Exit status: 0
+
+ROLLBACK
+Command: /Users/xxx/Documents/并发/verification-artifacts/remove-builtin-task-row/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/remove-builtin-task-row/rollback-test-verified
+Input: second clean Git HEAD copy after applying DIFF_FILE
+Literal output/result: ROLLBACK_RESULT=restored builtin task row and VERSION 0.3.12; ROLLBACK_COMMAND_EXIT=0
+Exit status: 0
+
+ROLLBACK COMPARISON
+Command: diff -qr /Users/xxx/Documents/并发/verification-artifacts/remove-builtin-task-row/rollback-original-verified /Users/xxx/Documents/并发/verification-artifacts/remove-builtin-task-row/rollback-test-verified
+Input: original HEAD copy and rolled-back second copy
+Literal output/result: ROLLBACK_DIFF_EXIT=0
+Exit status: 0
+
+ROLLBACK TEST
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/remove-builtin-task-row/rollback-test-verified/cluster-lab/frontend && npm test
+Input: rolled-back second copy, package 0.3.12
+Literal output/result: tests 12; pass 12; fail 0; duration_ms 46.042167; ROLLBACK_TEST_EXIT=0
+Exit status: 0
+Restored behavior/status: the builtin-task row is present again, VERSION is 0.3.12, and all 12 frontend tests pass.
