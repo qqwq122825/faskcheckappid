@@ -56,6 +56,7 @@ class Node:
         self.device_clear_version = control.get('device_clear_version', 0)
         self.telemetry = HostTelemetry()
         self.proxy_api, self.proxy_scheme = '', 'socks5h'
+        self.proxy_ttl = 50
         self.origin = 'https://new.ani.sidestore.io'
         from .device_build import DeviceBuilder
         self.builder = DeviceBuilder(self)
@@ -254,6 +255,10 @@ class Node:
             # 总控下发的出口配置与设备初始化请求都在心跳响应里
             if 'config' in value:
                 self.apply_config(value['config'])
+            try:
+                self.proxy_ttl = max(5, min(3600, int(value.get('proxy_ttl') or 50)))
+            except (TypeError, ValueError):
+                self.proxy_ttl = 50
             clear_version = int(value.get('device_clear_version') or 0)
             if clear_version > self.device_clear_version:
                 self.builder.cancel()
@@ -359,6 +364,7 @@ class Node:
             descriptor.setdefault('device_root', str(private_dir(self.root / 'device-pool')))
             descriptor.setdefault('timeout', 20)
             descriptor.setdefault('retries', 0)
+            descriptor.setdefault('proxy_ttl', self.proxy_ttl)
             self._prepare_auth_devices(descriptor)
         atomic_json(directory / 'manifest.json', descriptor)
         stop = self.context.Event()

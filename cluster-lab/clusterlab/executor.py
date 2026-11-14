@@ -9,9 +9,192 @@ import json
 import multiprocessing as mp
 import os
 from pathlib import Path
+import queue
+import threading
 import time
 
 from .common import atomic_json
+
+
+PROXY_TTL_SECONDS = 45.0
+PROXY_FETCH_LIMIT = 1000
+
+
+class NodeProxyPool:
+    """Fresh-first proxy pool shared by every process in one node package."""
+
+    def __init__(self, context, concurrency, ttl=PROXY_TTL_SECONDS):
+        concurrency = max(1, int(concurrency or 1))
+        self.target = max(20, min(5000, (concurrency * 3 + 1) // 2))
+        self.low_water = max(1, min(self.target, concurrency // 2 or 1))
+        self.ttl = max(1.0, float(ttl))
+        self.fresh = context.Queue(maxsize=self.target)
+        self.reusable = context.Queue(maxsize=self.target)
+        self.fresh_count = context.Value('i', 0)
+        self.reusable_count = context.Value('i', 0)
+        self.fetched = context.Value('q', 0)
+        self.fetch_calls = context.Value('q', 0)
+        self.fetch_errors = context.Value('q', 0)
+        self.reused = context.Value('q', 0)
+        self.discarded = context.Value('q', 0)
+        self.waits = context.Value('q', 0)
+        self.last_fetch_ms = context.Value('d', 0.0)
+        self.refill = context.Event()
+        self.refill.set()
+
+    @staticmethod
+    def _add(counter, delta):
+        with counter.get_lock():
+            counter.value = max(0, counter.value + int(delta))
+            return counter.value
+
+    @staticmethod
+    def _value(counter):
+        with counter.get_lock():
+            return counter.value
+
+    def add_fresh(self, values, fetched_at=None):
+        fetched_at = time.monotonic() if fetched_at is None else float(fetched_at)
+        expires_at = fetched_at + self.ttl
+        added = 0
+        for value in values:
+            if not value:
+                continue
+            try:
+                self.fresh.put_nowait((str(value), expires_at, 0))
+            except queue.Full:
+                break
+            added += 1
+        self._add(self.fresh_count, added)
+        self._add(self.fetched, added)
+        return added
+
+    def _take(self, channel, counter, timeout=0.0):
+        while True:
+            try:
+                item = channel.get(timeout=timeout) if timeout else channel.get_nowait()
+            except queue.Empty:
+                return None
+            self._add(counter, -1)
+            timeout = 0.0
+            if float(item[1]) > time.monotonic():
+                return item
+            self._add(self.discarded, 1)
+
+    def acquire(self, wait=1.0):
+        # multiprocessing.Queue 的 feeder 线程可能比共享计数慢几毫秒；
+        # 计数显示有新 IP 时给队列一个很短的可见窗口，避免误用复用池。
+        fresh_wait = .02 if self._value(self.fresh_count) else 0.0
+        lease = self._take(self.fresh, self.fresh_count, fresh_wait)
+        if lease is not None:
+            if self._value(self.fresh_count) < self.low_water:
+                self.refill.set()
+            return lease
+        self.refill.set()
+        # API 提取约 0.6 秒；补池期间优先复用近期成功出口，工作线程不空等。
+        reusable_wait = .02 if self._value(self.reusable_count) else 0.0
+        lease = self._take(self.reusable, self.reusable_count, reusable_wait)
+        if lease is not None:
+            self._add(self.reused, 1)
+            return (lease[0], lease[1], int(lease[2]) + 1)
+        self._add(self.waits, 1)
+        lease = self._take(self.fresh, self.fresh_count, max(0.0, float(wait)))
+        if lease is not None:
+            if self._value(self.fresh_count) < self.low_water:
+                self.refill.set()
+            return lease
+        reusable_wait = .02 if self._value(self.reusable_count) else 0.0
+        lease = self._take(self.reusable, self.reusable_count, reusable_wait)
+        if lease is not None:
+            self._add(self.reused, 1)
+            return (lease[0], lease[1], int(lease[2]) + 1)
+        return None
+
+    def release(self, lease, healthy):
+        if lease is None:
+            return
+        if not healthy or float(lease[1]) <= time.monotonic():
+            self._add(self.discarded, 1)
+            return
+        try:
+            self.reusable.put_nowait(lease)
+        except queue.Full:
+            self._add(self.discarded, 1)
+            return
+        self._add(self.reusable_count, 1)
+
+    def note_fetch(self, milliseconds, error=False):
+        self._add(self.fetch_calls, 1)
+        if error:
+            self._add(self.fetch_errors, 1)
+        with self.last_fetch_ms.get_lock():
+            self.last_fetch_ms.value = max(0.0, float(milliseconds))
+
+    def snapshot(self):
+        with self.last_fetch_ms.get_lock():
+            last_fetch_ms = self.last_fetch_ms.value
+        return {
+            'available': self._value(self.fresh_count) + self._value(self.reusable_count),
+            'fresh': self._value(self.fresh_count),
+            'reusable': self._value(self.reusable_count),
+            'target': self.target,
+            'low_water': self.low_water,
+            'fetched': self._value(self.fetched),
+            'fetch_calls': self._value(self.fetch_calls),
+            'fetch_errors': self._value(self.fetch_errors),
+            'reused': self._value(self.reused),
+            'discarded': self._value(self.discarded),
+            'waits': self._value(self.waits),
+            'last_fetch_ms': round(last_fetch_ms, 1),
+            'ttl_seconds': self.ttl,
+        }
+
+    def close(self):
+        for channel in (self.fresh, self.reusable):
+            try:
+                # 队列可能在节点结束时仍有库存；等待 feeder 把无人读取的
+                # 整池数据写完可能卡住协调进程，关闭时直接丢弃剩余库存。
+                channel.cancel_join_thread()
+                channel.close()
+            except (OSError, ValueError):
+                pass
+
+
+def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None):
+    """Continuously refill one node pool without blocking worker threads."""
+    if fetcher is None:
+        from fastcheck.proxy_pool import fetch_proxies
+        fetcher = fetch_proxies
+    while not stop.is_set():
+        pool.refill.wait(0.1)
+        if stop.is_set():
+            return
+        if not pool.refill.is_set() and pool.snapshot()['fresh'] >= pool.low_water:
+            continue
+        pool.refill.clear()
+        while not stop.is_set():
+            needed = pool.target - pool.snapshot()['fresh']
+            if needed <= 0:
+                break
+            count = min(PROXY_FETCH_LIMIT, needed)
+            started = time.monotonic()
+            try:
+                values = fetcher(api_url, count,
+                                 scheme=None if scheme == 'http' else scheme)
+                # 有效期从开始提取计算，不让慢 API 为已变旧的出口
+                # 额外延长寿命。
+                added = pool.add_fresh(values, fetched_at=started)
+                pool.note_fetch((time.monotonic() - started) * 1000)
+            except Exception:                                      # noqa: BLE001
+                added = 0
+                pool.note_fetch((time.monotonic() - started) * 1000, error=True)
+            if added <= 0:
+                if stop.wait(0.25):
+                    return
+                pool.refill.set()
+                break
+            if added < count and stop.wait(0.05):
+                return
 
 
 def execute_unit(directory, descriptor, stop):
@@ -81,9 +264,12 @@ def execute_unit(directory, descriptor, stop):
         atomic_json(directory / 'done.json', {'ok': False, 'processed': processed, 'error': type(exc).__name__})
 
 
-def _group_child(directory, descriptor, stop):
+def _group_child(directory, descriptor, stop, proxy_pool=None):
     runner = execute_auth_unit if descriptor.get('mode') == 'auth' else execute_unit
-    runner(directory, descriptor, stop)
+    if runner is execute_auth_unit:
+        runner(directory, descriptor, stop, proxy_pool=proxy_pool)
+    else:
+        runner(directory, descriptor, stop)
 
 
 def execute_unit_group(directory, descriptor, stop):
@@ -100,8 +286,30 @@ def execute_unit_group(directory, descriptor, stop):
     rows = max(0, int(descriptor.get('rows') or 0))
     process_limit = max(1, int(descriptor.get('processes') or 1))
     process_count = min(process_limit, max(1, rows))
+    context = mp.get_context('spawn')
+    proxy_pool = None
+    supplier_stop = None
+    supplier_thread = None
+    if descriptor.get('mode') == 'auth' and descriptor.get('proxy_api'):
+        concurrency = process_count * max(1, int(descriptor.get('threads') or 1))
+        proxy_pool = NodeProxyPool(
+            context, concurrency,
+            ttl=float(descriptor.get('proxy_ttl') or PROXY_TTL_SECONDS))
+        supplier_stop = threading.Event()
+        supplier_thread = threading.Thread(
+            target=proxy_supplier_loop,
+            args=(proxy_pool, descriptor['proxy_api'],
+                  descriptor.get('proxy_scheme') or 'socks5h', supplier_stop),
+            name='node-proxy-supplier', daemon=True)
+        supplier_thread.start()
     if process_count == 1:
-        _group_child(directory, descriptor, stop)
+        try:
+            _group_child(directory, descriptor, stop, proxy_pool)
+        finally:
+            if supplier_stop is not None:
+                supplier_stop.set()
+                proxy_pool.refill.set()
+                supplier_thread.join(2)
         progress = read_progress = {}
         try:
             read_progress = json.loads((directory / 'progress.json').read_text('utf-8'))
@@ -109,7 +317,17 @@ def execute_unit_group(directory, descriptor, stop):
             pass
         read_progress.update(workers=0, worker_limit=process_limit,
                              threads_per_process=int(descriptor.get('threads') or 1))
+        if proxy_pool is not None:
+            read_progress['proxy_pool'] = proxy_pool.snapshot()
         atomic_json(directory / 'progress.json', read_progress)
+        try:
+            done = json.loads((directory / 'done.json').read_text('utf-8'))
+            if proxy_pool is not None:
+                done['proxy_pool'] = proxy_pool.snapshot()
+            atomic_json(directory / 'done.json', done)
+        finally:
+            if proxy_pool is not None:
+                proxy_pool.close()
         return
 
     workers_root = directory / 'workers'
@@ -150,13 +368,12 @@ def execute_unit_group(directory, descriptor, stop):
         if source.read(1):
             raise ValueError('input contains more rows than package descriptor')
 
-    context = mp.get_context('spawn')
     children = []
     try:
         for index, (child_dir, child) in enumerate(child_descriptors):
             child_stop = context.Event()
             process = context.Process(target=_group_child,
-                                      args=(str(child_dir), child, child_stop),
+                                      args=(str(child_dir), child, child_stop, proxy_pool),
                                       name=f'package-worker-{index + 1:02d}')
             process.start()
             children.append((process, child_stop, child_dir))
@@ -184,7 +401,8 @@ def execute_unit_group(directory, descriptor, stop):
                             {'processed': processed, 'started': started,
                              'workers': active, 'worker_limit': process_count,
                              'threads_per_process': int(descriptor.get('threads') or 1),
-                             'counts': live_counts})
+                             'counts': live_counts,
+                             **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
                 last_write = now
             time.sleep(0.05)
 
@@ -224,11 +442,13 @@ def execute_unit_group(directory, descriptor, stop):
                     {'processed': processed, 'started': started, 'workers': 0,
                      'worker_limit': process_count,
                      'threads_per_process': int(descriptor.get('threads') or 1),
-                     'counts': merged_counts})
+                     'counts': merged_counts,
+                     **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
         atomic_json(directory / 'done.json',
                     {'ok': True, 'processed': processed, 'counts': merged_counts,
                      'checksum': output_digest.hexdigest(),
-                     'workers': process_count, 'elapsed': time.time() - started})
+                     'workers': process_count, 'elapsed': time.time() - started,
+                     **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
     except Exception as exc:                                      # noqa: BLE001
         for process, child_stop, _ in children:
             child_stop.set()
@@ -250,13 +470,21 @@ def execute_unit_group(directory, descriptor, stop):
                     {'processed': processed, 'started': started, 'workers': 0,
                      'worker_limit': process_count,
                      'threads_per_process': int(descriptor.get('threads') or 1),
-                     'counts': live_counts})
+                     'counts': live_counts,
+                     **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
         atomic_json(directory / 'done.json',
                     {'ok': False, 'processed': processed,
-                     'error': f'{type(exc).__name__}: {exc}'[:300]})
+                     'error': f'{type(exc).__name__}: {exc}'[:300],
+                     **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
     finally:
+        if supplier_stop is not None:
+            supplier_stop.set()
+            proxy_pool.refill.set()
+            supplier_thread.join(2)
         for process, _, _ in children:
             process.close()
+        if proxy_pool is not None:
+            proxy_pool.close()
 
 
 def _load_fastcheck():
@@ -338,17 +566,17 @@ def record_device_registration(device_root, slot, proxy, model=''):
         return False
 
 
-def execute_auth_unit(directory, descriptor, stop):
+def execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     """真实认证执行入口：任何异常都落成 done.json，避免节点只看到"进程退出"。"""
     try:
-        _execute_auth_unit(directory, descriptor, stop)
+        _execute_auth_unit(directory, descriptor, stop, proxy_pool=proxy_pool)
     except Exception as exc:                                       # noqa: BLE001
         atomic_json(Path(directory) / 'done.json',
                     {'ok': False, 'processed': 0,
                      'error': f'{type(exc).__name__}: {exc}'[:300]})
 
 
-def _execute_auth_unit(directory, descriptor, stop):
+def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     from concurrent.futures import ThreadPoolExecutor
     from collections import Counter
     import sys
@@ -359,7 +587,7 @@ def _execute_auth_unit(directory, descriptor, stop):
     DevicePool, gsa_check, result_bucket = _load_fastcheck()
     proxy = descriptor.get('proxy')
     proxies = []
-    if descriptor.get('proxy_api'):
+    if descriptor.get('proxy_api') and proxy_pool is None:
         from fastcheck.proxy_pool import fetch_proxies
         scheme = descriptor.get('proxy_scheme') or 'socks5h'
         # 一次多提几条，包内按账号分摊：一条隧道只承担一个账号，
@@ -397,25 +625,45 @@ def _execute_auth_unit(directory, descriptor, stop):
     # 比固定用 1 号设备更分散，明显降低单设备被风控的概率。
     identities, infos = {}, {}
     for index in slot_ids:
+        bootstrap_lease = proxy_pool.acquire(wait=2.0) if proxy_pool is not None else None
+        bootstrap_proxy = bootstrap_lease[0] if bootstrap_lease is not None else proxy
         try:
-            base_info = pool.info(timeout, proxy=proxy, provider_direct=True)
+            base_info = pool.info(timeout, proxy=bootstrap_proxy, provider_direct=True)
             profile = device_profile(pool, index)
             infos[index] = dict(base_info, client_info=profile['client_info'],
                                 user_agent=profile['user_agent'])
             ready = pool.inspect(index)['state'] == 'ready'
             identities[index] = pool.fetch_headers(index, infos[index], max(timeout, 40),
-                                                   registered=ready, proxy=proxy,
+                                                   registered=ready, proxy=bootstrap_proxy,
                                                    provider_direct=True)
             if not ready and pool.inspect(index)['state'] == 'ready':
-                record_device_registration(device_root, index, proxy, profile.get('model', ''))
+                record_device_registration(device_root, index, bootstrap_proxy,
+                                           profile.get('model', ''))
+            if proxy_pool is not None:
+                proxy_pool.release(bootstrap_lease, healthy=True)
         except Exception as exc:                                   # noqa: BLE001
             infos[index] = None
             identities[index] = None
+            if proxy_pool is not None:
+                proxy_pool.release(bootstrap_lease, healthy=False)
 
     def proxy_for(index):
+        if proxy_pool is not None:
+            lease = proxy_pool.acquire(wait=1.0)
+            return (lease[0] if lease is not None else None), lease
         if not proxies:
-            return proxy
-        return proxies[index % len(proxies)]
+            return proxy, None
+        return proxies[index % len(proxies)], None
+
+    def retryable_transport(result):
+        try:
+            http = int(result.get('http'))
+        except (TypeError, ValueError):
+            http = None
+        kind = result.get('kind') or ''
+        return (http in (0, 407, 429, 500, 502, 503, 504) or
+                kind in ('network', 'tls', 'proxy', 'proxy_auth', 'server',
+                         'ratelimit', 'endpoint'))
 
     def one(row, index, line):
         if stop.is_set():
@@ -428,29 +676,51 @@ def _execute_auth_unit(directory, descriptor, stop):
         if not line.strip():
             return row, line, {'status': 'undetermined', 'kind': 'blank_record',
                                'slot': slot_id, 'elapsed': 0}
-        account_proxy = proxy_for(index)
         identity = identities.get(slot_id)
-        try:
-            if identity is None:
-                # 预取失败的槽位在这里补一次
-                info = pool.info(timeout, proxy=account_proxy, provider_direct=True)
-                ready = pool.inspect(slot_id)['state'] == 'ready'
-                profile = device_profile(pool, slot_id)
-                info = dict(info, client_info=profile['client_info'],
-                            user_agent=profile['user_agent'])
-                identity = pool.fetch_headers(slot_id, info, max(timeout, 40),
-                                              registered=ready, proxy=account_proxy,
-                                              provider_direct=True)
-                if not ready and pool.inspect(slot_id)['state'] == 'ready':
-                    record_device_registration(device_root, slot_id, account_proxy,
-                                               profile.get('model', ''))
-            result = gsa_check(account, password, account_proxy, timeout=timeout,
-                               retries=retries,
-                               cancel=stop.is_set, identity=identity)
-        except Exception as exc:                                   # noqa: BLE001
-            return row, line, {'status': 'error', 'kind': type(exc).__name__,
-                               'detail': str(exc)[:180], 'slot': slot_id,
-                               'elapsed': round(time.time() - account_started, 2)}
+        result = None
+        # 用户设置的重试次数仍是唯一上限；节点池只负责每次重试换出口，
+        # 不会在“0 次重试”时暗中多发请求。
+        attempt_limit = retries + 1
+        for attempt in range(attempt_limit):
+            account_proxy, lease = proxy_for(index + attempt)
+            if proxy_pool is not None and lease is None:
+                result = {'status': 'error', 'kind': 'proxy', 'http': 0,
+                          'stage': 'init', 'detail': '代理池暂时无可用出口'}
+                continue
+            try:
+                if identity is None:
+                    # 预取失败的槽位在这里补一次
+                    info = pool.info(timeout, proxy=account_proxy, provider_direct=True)
+                    ready = pool.inspect(slot_id)['state'] == 'ready'
+                    profile = device_profile(pool, slot_id)
+                    info = dict(info, client_info=profile['client_info'],
+                                user_agent=profile['user_agent'])
+                    identity = pool.fetch_headers(slot_id, info, max(timeout, 40),
+                                                  registered=ready, proxy=account_proxy,
+                                                  provider_direct=True)
+                    if not ready and pool.inspect(slot_id)['state'] == 'ready':
+                        record_device_registration(device_root, slot_id, account_proxy,
+                                                   profile.get('model', ''))
+                # 换 IP 重试由节点池处理，协议层每次只使用当前出口一次。
+                result = gsa_check(account, password, account_proxy, timeout=timeout,
+                                   retries=0 if proxy_pool is not None else retries,
+                                   cancel=stop.is_set, identity=identity)
+            except Exception as exc:                               # noqa: BLE001
+                result = {'status': 'error', 'kind': type(exc).__name__, 'http': 0,
+                          'stage': 'init', 'detail': str(exc)[:180]}
+            transport_failed = retryable_transport(result)
+            if proxy_pool is not None:
+                try:
+                    healthy_exit = int(result.get('http')) == 200
+                except (TypeError, ValueError):
+                    healthy_exit = False
+                proxy_pool.release(lease, healthy=healthy_exit)
+            if not transport_failed or attempt + 1 >= attempt_limit:
+                result['_proxy_retries'] = attempt
+                break
+        if result is None:
+            result = {'status': 'error', 'kind': 'proxy', 'http': 0,
+                      'stage': 'init', 'detail': '代理池未返回结果', '_proxy_retries': 0}
         result['elapsed'] = round(time.time() - account_started, 2)
         result['slot'] = slot_id
         return row, line, result
@@ -498,7 +768,8 @@ def _execute_auth_unit(directory, descriptor, stop):
                           'code': str(business_code)[:180],
                           'protocol': 'GSA',
                           'device': device,
-                          'elapsed': result.get('elapsed'), 'attempts': 0}
+                          'elapsed': result.get('elapsed'),
+                          'attempts': int(result.get('_proxy_retries') or 0)}
                 encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
                 output.write(encoded)
                 output_digest.update(encoded)
