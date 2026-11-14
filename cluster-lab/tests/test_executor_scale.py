@@ -148,6 +148,8 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(record['protocol'], 'GSA → 网页复检')
             self.assertEqual((record['http'], record['code'], record['gsa_code'], record['web_code']),
                              (403, '-20209', -20970, -20209))
+            done = json.loads((root / 'done.json').read_text())
+            self.assertEqual(done['counts'], {'locked': 1, 'web_recheck': 1})
 
 
 if __name__ == '__main__':

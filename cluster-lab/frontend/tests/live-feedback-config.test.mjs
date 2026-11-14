@@ -151,3 +151,17 @@ test('Task creation exposes one concise dual-protocol switch', () => {
   assert.doesNotMatch(dialog, /校验协议|GSA（默认）|-20970|-20209|HTTP 503\/5xx/)
   assert.match(detail, /GSA \+ 网页复检/)
 })
+
+test('Dual-protocol task status and both protocol codes stay visible', () => {
+  const detail = source('src/views/JobDetail.vue')
+  const results = source('src/components/ResultList.vue')
+  assert.match(detail, /双协议校验已开启/)
+  assert.match(detail, /dual_recheck_stats\?\.triggered/)
+  assert.match(detail, /仅 GSA 初始阶段返回 -20970 才进入网页复检/)
+  assert.match(results, /label: '全部结果', value: 'all'/)
+  assert.match(results, /const category = ref\('all'\)/)
+  assert.match(results, /label="GSA 码"/)
+  assert.match(results, /label="网页码"/)
+  assert.match(results, /row\.gsa_code/)
+  assert.match(results, /row\.web_code/)
+})

@@ -490,6 +490,8 @@ def _execute_auth_unit(directory, descriptor, stop):
                 row, line, result = future.result()
                 status = result_bucket(result)
                 counters[status] += 1
+                if result.get('fallback_used'):
+                    counters['web_recheck'] += 1
                 processed += 1
                 # sha256/bytes 是总控的必需字段（结果完整性校验），认证模式同样补齐
                 raw_line = line.encode('utf-8')

@@ -4,7 +4,7 @@ import { api, fmt } from '../composables/useCluster'
 
 const props = defineProps<{ job: any }>()
 const pageSize = 100
-const category = ref('valid')
+const category = ref('all')
 const offset = ref(0)
 const rows = ref<any[]>([])
 const total = ref(0)
@@ -16,6 +16,7 @@ let backgroundPending = false
 let backgroundQueued = false
 
 const options = [
+  { label: '全部结果', value: 'all' },
   { label: '密正', value: 'valid' },
   { label: '密码错误', value: 'wrong_password' },
   { label: '双重验证', value: 'need_2fa' },
@@ -72,6 +73,8 @@ function changeCategory() { load(true) }
 function previous() { offset.value = Math.max(0, offset.value - pageSize); load() }
 function next() { offset.value += pageSize; load() }
 const elapsed = (value: any) => value == null ? '—' : `${Number(value).toFixed(2)}s`
+const display = (value: any) => value == null || value === '' ? '—' : value
+const gsaCode = (row: any) => display(row.gsa_code ?? (row.protocol === 'GSA' ? row.code : null))
 
 watch(
   () => [props.job?.id, Number(props.job?.confirmed) || 0] as const,
@@ -105,13 +108,16 @@ watch(
       <el-table-column prop="protocol" label="协议" min-width="150" show-overflow-tooltip />
       <el-table-column prop="stage" label="阶段" min-width="130" show-overflow-tooltip />
       <el-table-column prop="http" label="HTTP" width="90" />
-      <el-table-column prop="code" label="业务码" min-width="160" show-overflow-tooltip />
+      <el-table-column prop="code" label="结果码" min-width="140" show-overflow-tooltip />
+      <el-table-column label="GSA 码" min-width="130"><template #default="scope">{{ gsaCode(scope.row) }}</template></el-table-column>
+      <el-table-column label="网页码" min-width="130"><template #default="scope">{{ display(scope.row.web_code) }}</template></el-table-column>
       <el-table-column prop="device" label="设备" width="90" />
       <el-table-column label="耗时" width="100"><template #default="scope">{{ elapsed(scope.row.elapsed) }}</template></el-table-column>
       <el-table-column prop="attempts" label="重试" width="80" />
     </el-table>
     <div class="result-list-footer">
       <span v-if="valid">共 {{ fmt(total) }} 条密正结果 · 第 {{ page }} / {{ pageCount }} 页</span>
+      <span v-else-if="category === 'all'">共 {{ fmt(total) }} 条已确认结果，当前显示前 {{ fmt(visibleTotal) }} 条</span>
       <span v-else>共 {{ fmt(total) }} 条{{ labels[category] }}，当前显示前 {{ fmt(visibleTotal) }} 条</span>
       <div v-if="valid && total > pageSize" class="actions">
         <el-button :disabled="offset === 0 || loading" @click="previous">上一页</el-button>

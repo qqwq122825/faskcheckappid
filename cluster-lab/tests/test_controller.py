@@ -319,6 +319,39 @@ class ControllerTests(unittest.TestCase):
             self.assertIsNone(db.execute('SELECT live_counts FROM units WHERE id=?',
                                          (unit['id'],)).fetchone()[0])
 
+    def test_dual_protocol_status_counts_live_and_confirmed_web_rechecks(self):
+        job = self.service.create_job('dual status', io.BytesIO(b'hello\n' * 50), 50,
+                                      mode='auth', dual_recheck=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
+            if state['status'] != 'preparing':
+                break
+            time.sleep(.01)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.service.heartbeat(self.node['id'], {
+            'session': 'test-session', 'version': '0.3.28',
+            'max_processes': 1, 'max_threads': 2, 'interrupted': [],
+            'active': [{'id': unit['id'], 'token': unit['token'], 'processed': 1,
+                        'counts': {'locked': 1, 'web_recheck': 1}}]})
+        state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
+        self.assertEqual(state['dual_recheck_stats'], {'triggered': 1, 'confirmed': 0, 'live': 1})
+
+        payload = b''.join((json.dumps({
+            'row': unit['first_row'] + offset,
+            'status': 'locked' if offset == 0 else 'valid',
+            'protocol': 'GSA → 网页复检' if offset == 0 else 'GSA',
+            'gsa_code': -20970 if offset == 0 else None,
+            'web_code': -20209 if offset == 0 else None,
+            'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
+            separators=(',', ':')) + '\n').encode()
+            for offset in range(unit['rows']))
+        self.service.accept_result(self.node['id'], unit['id'], unit['token'],
+                                   io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
+        state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
+        self.assertEqual(state['dual_recheck_stats'], {'triggered': 1, 'confirmed': 1, 'live': 0})
+
     def test_task_row_statistics_count_partial_final_unit(self):
         job = self.job(101)
         snapshot = self.service.snapshot()['jobs'][0]

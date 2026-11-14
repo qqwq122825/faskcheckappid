@@ -65,6 +65,9 @@ const events = computed(() => state.value?.events?.filter((e: any) => e.job_id =
         </div>
         <TaskActions :job="job" />
       </div>
+      <el-alert v-if="job.dual_recheck" class="dual-recheck-status" type="info" :closable="false" show-icon
+                :title="`双协议校验已开启 · 已触发网页复检 ${fmt(job.dual_recheck_stats?.triggered || 0)} 条`"
+                :description="`其中 ${fmt(job.dual_recheck_stats?.confirmed || 0)} 条已由总控确认；仅 GSA 初始阶段返回 -20970 才进入网页复检，GSA 已直接给出 -20209 等明确结果时不会重复请求。`" />
       <el-alert v-if="job.error" :title="job.error" type="error" :closable="false" show-icon />
       <el-alert v-else-if="issueMessage" :title="issueMessage"
                 :type="(job.unit_counts.leased || job.unit_counts.running) ? 'warning' : 'error'"

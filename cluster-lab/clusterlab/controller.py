@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS jobs (
  c_valid INTEGER NOT NULL DEFAULT 0, c_wrong INTEGER NOT NULL DEFAULT 0,
  c_2fa INTEGER NOT NULL DEFAULT 0, c_locked INTEGER NOT NULL DEFAULT 0,
  c_timeout INTEGER NOT NULL DEFAULT 0, c_invalid INTEGER NOT NULL DEFAULT 0,
- c_unknown INTEGER NOT NULL DEFAULT 0,
+ c_unknown INTEGER NOT NULL DEFAULT 0, c_web_recheck INTEGER NOT NULL DEFAULT 0,
  reported_rows INTEGER NOT NULL DEFAULT 0,
  req_timeout REAL NOT NULL DEFAULT 20, req_retries INTEGER NOT NULL DEFAULT 0,
  device_capacity INTEGER NOT NULL DEFAULT 30,
@@ -99,6 +99,7 @@ class Controller:
     MAX_ACTIVE_UNITS = 512
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid',
                       'timeout', 'undetermined', 'unknown')
+    LIVE_METADATA_BUCKETS = ('web_recheck',)
 
     def __init__(self, root, lease_seconds=30, offline_seconds=12, dispatch_per_second=0):
         self.root = private_dir(root)
@@ -114,7 +115,7 @@ class Controller:
             columns = {row['name'] for row in db.execute('PRAGMA table_info(nodes)')}
             job_columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
             for name in ('c_valid', 'c_wrong', 'c_2fa', 'c_locked', 'c_timeout', 'c_invalid',
-                         'c_unknown', 'reported_rows', 'req_timeout', 'req_retries',
+                         'c_unknown', 'c_web_recheck', 'reported_rows', 'req_timeout', 'req_retries',
                          'device_capacity', 'dual_recheck'):
                 if name not in job_columns:
                     default = '20' if name == 'req_timeout' else ('30' if name == 'device_capacity' else '0')
@@ -425,13 +426,13 @@ class Controller:
         if not isinstance(value, dict):
             return {}
         result = {}
-        for key in cls.RESULT_BUCKETS:
+        for key in cls.RESULT_BUCKETS + cls.LIVE_METADATA_BUCKETS:
             count = value.get(key, 0)
             if type(count) is not int or count < 0 or count > rows:
                 raise ValueError('实时分类计数无效')
             if count:
                 result[key] = count
-        if sum(result.values()) > processed:
+        if sum(result.get(key, 0) for key in cls.RESULT_BUCKETS) > processed:
             raise ValueError('实时分类数超过已处理数')
         return result
 
@@ -849,6 +850,9 @@ class Controller:
                                       'locked', 'invalid', 'timeout', 'undetermined', 'unknown'):
                         bucket = 'unknown'
                     buckets[bucket] += 1
+                    if (value.get('protocol') == 'GSA → 网页复检'
+                            or value.get('web_code') is not None):
+                        buckets['web_recheck'] += 1
                     count += 1
                     if count > unit['rows']:
                         raise ValueError('结果条数超过工作包记录数')
@@ -882,10 +886,11 @@ class Controller:
                     db.execute(
                         "UPDATE jobs SET c_valid=c_valid+?,c_wrong=c_wrong+?,c_2fa=c_2fa+?,"
                         "c_locked=c_locked+?,c_timeout=c_timeout+?,c_invalid=c_invalid+?,"
-                        "c_unknown=c_unknown+?,updated=? WHERE id=?",
+                        "c_unknown=c_unknown+?,c_web_recheck=c_web_recheck+?,updated=? WHERE id=?",
                         (buckets['valid'], buckets['wrong_password'], buckets['need_2fa'],
                          buckets['locked'], buckets['timeout'], buckets['invalid'],
-                         buckets['undetermined'] + buckets['unknown'], time.time(), unit['job_id']))
+                         buckets['undetermined'] + buckets['unknown'], buckets['web_recheck'],
+                         time.time(), unit['job_id']))
                 else:
                     db.execute("UPDATE jobs SET updated=? WHERE id=?", (time.time(), unit['job_id']))
                 db.execute("UPDATE units SET status='completed',processed=rows,result_path=?,result_checksum=?,"
@@ -927,6 +932,7 @@ class Controller:
                 row_counts = {r['status']: r['rows'] for r in groups}
                 sums = db.execute("SELECT COALESCE(SUM(CASE WHEN status='completed' THEN rows ELSE 0 END),0), COALESCE(SUM(CASE WHEN status IN ('running','leased','completed') THEN processed ELSE 0 END),0) FROM units WHERE job_id=?", (row['id'],)).fetchone()
                 live = {key: 0 for key in self.RESULT_BUCKETS}
+                live_web_recheck = 0
                 if row['mode'] == 'auth':
                     for unit in db.execute("SELECT live_counts FROM units WHERE job_id=? AND status IN ('leased','running') AND live_counts IS NOT NULL",
                                            (row['id'],)):
@@ -936,6 +942,7 @@ class Controller:
                             continue
                         for key in self.RESULT_BUCKETS:
                             live[key] += int(unit_counts.get(key, 0) or 0)
+                        live_web_recheck += int(unit_counts.get('web_recheck', 0) or 0)
                 value.update(units=sum(counts.values()), unit_counts=counts, row_counts=row_counts,
                              confirmed=sums[0], processed=sums[1],
                              categorized={'valid': row['c_valid'] + live['valid'],
@@ -945,6 +952,9 @@ class Controller:
                                           'timeout': row['c_timeout'] + live['timeout'],
                                           'invalid': row['c_invalid'] + live['invalid'],
                                           'unknown': row['c_unknown'] + live['undetermined'] + live['unknown']},
+                             dual_recheck_stats={'triggered': row['c_web_recheck'] + live_web_recheck,
+                                                 'confirmed': row['c_web_recheck'],
+                                                 'live': live_web_recheck},
                              reported=row['reported_rows'])
                 jobs.append(value)
             nodes = []
