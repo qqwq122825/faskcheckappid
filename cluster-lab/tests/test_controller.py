@@ -233,8 +233,8 @@ class ControllerTests(unittest.TestCase):
         unit = self.service.lease(self.node['id'], 'test-session')
         self.assertEqual(unit['device_capacity'], 30)
 
-    def test_dual_protocol_choice_is_persisted_and_leased_to_node(self):
-        job = self.service.create_job('dual', io.BytesIO(b'hello\n' * 50), 50,
+    def test_legacy_dual_option_is_ignored_and_not_leased_to_node(self):
+        job = self.service.create_job('single protocol', io.BytesIO(b'hello\n' * 50), 50,
                                       enqueue=True, dual_recheck=True)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -242,9 +242,12 @@ class ControllerTests(unittest.TestCase):
             if state['status'] == 'running':
                 break
             time.sleep(.01)
-        self.assertTrue(state['dual_recheck'])
+        self.assertNotIn('dual_recheck', state)
         unit = self.service.lease(self.node['id'], 'test-session')
-        self.assertTrue(unit['dual_recheck'])
+        self.assertNotIn('dual_recheck', unit)
+        with self.service.db.connect() as db:
+            self.assertEqual(db.execute('SELECT dual_recheck FROM jobs WHERE id=?',
+                                        (job,)).fetchone()[0], 0)
 
     def test_late_result_after_lease_expiry_is_still_accepted(self):
         """P0：租约过期后迟到的结果仍要接受，否则节点白算一遍。"""
@@ -320,42 +323,9 @@ class ControllerTests(unittest.TestCase):
             self.assertIsNone(db.execute('SELECT live_counts FROM units WHERE id=?',
                                          (unit['id'],)).fetchone()[0])
 
-    def test_dual_protocol_status_counts_live_and_confirmed_web_rechecks(self):
-        job = self.service.create_job('dual status', io.BytesIO(b'hello\n' * 50), 50,
-                                      mode='auth', dual_recheck=True)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
-            if state['status'] != 'preparing':
-                break
-            time.sleep(.01)
-        self.service.job_action(job, 'start')
-        unit = self.service.lease(self.node['id'], 'test-session')
-        self.service.heartbeat(self.node['id'], {
-            'session': 'test-session', 'version': '0.3.28',
-            'max_processes': 1, 'max_threads': 2, 'interrupted': [],
-            'active': [{'id': unit['id'], 'token': unit['token'], 'processed': 1,
-                        'counts': {'locked': 1, 'web_recheck': 1}}]})
-        state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
-        self.assertEqual(state['dual_recheck_stats'], {'triggered': 1, 'confirmed': 0, 'live': 1})
-
-        payload = b''.join((json.dumps({
-            'row': unit['first_row'] + offset,
-            'status': 'locked' if offset == 0 else 'valid',
-            'protocol': 'GSA → 网页复检' if offset == 0 else 'GSA',
-            'gsa_code': -20970 if offset == 0 else None,
-            'web_code': -20209 if offset == 0 else None,
-            'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
-            separators=(',', ':')) + '\n').encode()
-            for offset in range(unit['rows']))
-        self.service.accept_result(self.node['id'], unit['id'], unit['token'],
-                                   io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
-        state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
-        self.assertEqual(state['dual_recheck_stats'], {'triggered': 1, 'confirmed': 1, 'live': 0})
-
-    def test_controller_upgrade_backfills_legacy_web_recheck_results_once(self):
-        job = self.service.create_job('legacy dual status', io.BytesIO(b'hello\n' * 50), 50,
-                                      mode='auth', dual_recheck=True)
+    def test_result_codes_override_legacy_node_statuses(self):
+        job = self.service.create_job('result code mapping', io.BytesIO(b'hello\n' * 50), 50,
+                                      mode='auth')
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
@@ -366,32 +336,25 @@ class ControllerTests(unittest.TestCase):
         unit = self.service.lease(self.node['id'], 'test-session')
         payload = b''.join((json.dumps({
             'row': unit['first_row'] + offset,
-            'status': 'locked' if offset == 0 else 'valid',
-            'protocol': 'GSA → 网页复检' if offset == 0 else 'GSA',
-            'gsa_code': -20970 if offset == 0 else None,
-            'web_code': None,
-            'http': 503 if offset == 0 else 200,
+            'status': 'undetermined' if offset < 2 else 'valid',
+            'protocol': 'GSA',
+            'code': -20970 if offset == 0 else (-20209 if offset == 1 else 0),
             'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
             separators=(',', ':')) + '\n').encode()
             for offset in range(unit['rows']))
         self.service.accept_result(self.node['id'], unit['id'], unit['token'],
                                    io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
-        self.service.close()
-        database = Path(self.temp.name) / 'controller.sqlite3'
-        with sqlite3.connect(database) as db:
-            counts = json.loads(db.execute(
-                'SELECT result_counts FROM units WHERE id=?', (unit['id'],)).fetchone()[0])
-            counts.pop('web_recheck')
-            db.execute('UPDATE units SET result_counts=? WHERE id=?',
-                       (json.dumps(counts, separators=(',', ':')), unit['id']))
-            db.execute('UPDATE jobs SET c_web_recheck=0 WHERE id=?', (job,))
-        self.service = Controller(self.temp.name)
         state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
-        self.assertEqual(state['dual_recheck_stats'], {'triggered': 1, 'confirmed': 1, 'live': 0})
-        with self.service.db.connect() as db:
-            stored = json.loads(db.execute(
-                'SELECT result_counts FROM units WHERE id=?', (unit['id'],)).fetchone()[0])
-        self.assertEqual(stored['web_recheck'], 1)
+        self.assertEqual(state['categorized'], {
+            'valid': 48, 'wrong_password': 0, 'need_2fa': 0,
+            'locked': 1, 'timeout': 0, 'invalid': 1, 'unknown': 0})
+        invalid = self.service.read_rows(job, 0, 100, 'invalid')
+        locked = self.service.read_rows(job, 0, 100, 'locked')
+        self.assertEqual((invalid['total'], invalid['rows'][0]['status'], invalid['rows'][0]['code']),
+                         (1, 'invalid', -20970))
+        self.assertEqual((locked['total'], locked['rows'][0]['status'], locked['rows'][0]['code']),
+                         (1, 'locked', -20209))
+        self.assertEqual(b''.join(self.service.export_results(job, 'invalid')), b'hello\n')
 
     def test_task_row_statistics_count_partial_final_unit(self):
         job = self.job(101)
@@ -745,7 +708,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json['bytes'], 300)
 
-    def test_raw_stream_upload_accepts_dual_protocol_recheck_choice(self):
+    def test_raw_stream_upload_ignores_removed_dual_protocol_option(self):
         client = create_app('controller', self.service).test_client()
         csrf = client.get('/api/session').json['csrf']
         response = client.post('/api/jobs/stream?name=dual.txt&unit_rows=50&mode=auth&enqueue=true&dual_recheck=true',
@@ -756,7 +719,7 @@ class ControllerTests(unittest.TestCase):
         with self.service.db.connect() as db:
             enabled = db.execute('SELECT dual_recheck FROM jobs WHERE id=?',
                                  (response.json['id'],)).fetchone()[0]
-        self.assertEqual(enabled, 1)
+        self.assertEqual(enabled, 0)
 
     def test_host_metrics_are_finite_and_do_not_accept_arbitrary_fields(self):
         value = self.service.clean_telemetry({'cpu_percent':25.2,'memory_percent':float('nan'),

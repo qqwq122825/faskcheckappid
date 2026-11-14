@@ -357,8 +357,6 @@ def _execute_auth_unit(directory, descriptor, stop):
     started = time.time()
     output_path = directory / 'results.jsonl'
     DevicePool, gsa_check, result_bucket = _load_fastcheck()
-    from fastcheck.protocols.dual_auth import recheck_gsa_20970
-
     proxy = descriptor.get('proxy')
     proxies = []
     if descriptor.get('proxy_api'):
@@ -449,10 +447,6 @@ def _execute_auth_unit(directory, descriptor, stop):
             result = gsa_check(account, password, account_proxy, timeout=timeout,
                                retries=retries,
                                cancel=stop.is_set, identity=identity)
-            result = recheck_gsa_20970(
-                account, password, account_proxy, result,
-                enabled=bool(descriptor.get('dual_recheck')), timeout=timeout,
-                retries=retries, cancel=stop.is_set)
         except Exception as exc:                                   # noqa: BLE001
             return row, line, {'status': 'error', 'kind': type(exc).__name__,
                                'detail': str(exc)[:180], 'slot': slot_id,
@@ -490,8 +484,6 @@ def _execute_auth_unit(directory, descriptor, stop):
                 row, line, result = future.result()
                 status = result_bucket(result)
                 counters[status] += 1
-                if result.get('fallback_used'):
-                    counters['web_recheck'] += 1
                 processed += 1
                 # sha256/bytes 是总控的必需字段（结果完整性校验），认证模式同样补齐
                 raw_line = line.encode('utf-8')
@@ -504,9 +496,7 @@ def _execute_auth_unit(directory, descriptor, stop):
                           'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
                           'stage': result.get('stage') or '', 'http': result.get('http'),
                           'code': str(business_code)[:180],
-                          'protocol': ('GSA → 网页复检' if result.get('fallback_used') else 'GSA'),
-                          'gsa_code': result.get('gsa_apple_ec'),
-                          'web_code': result.get('web_apple_ec'),
+                          'protocol': 'GSA',
                           'device': device,
                           'elapsed': result.get('elapsed'), 'attempts': 0}
                 encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()

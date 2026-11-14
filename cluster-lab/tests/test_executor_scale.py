@@ -115,7 +115,7 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual([item['processed'] for item in progress], [1, 1])
             self.assertEqual(progress[0]['counts'], {'wrong_password': 1})
 
-    def test_auth_unit_rechecks_gsa_20970_with_web_protocol_when_enabled(self):
+    def test_auth_unit_classifies_gsa_20970_as_invalid_without_web_recheck(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'input.part').write_text('account----password\n', encoding='utf-8')
@@ -124,32 +124,25 @@ class ExecutorScaleTests(unittest.TestCase):
                           'origin': 'http://127.0.0.1:1', 'timeout': 5,
                           'dual_recheck': True}
 
-            def web_check(*_args, **kwargs):
-                kwargs['trace']({'stage': 'init', 'http': 200, 'service_error_codes': []})
-                kwargs['trace']({'stage': 'complete', 'http': 403,
-                                 'service_error_codes': ['-20209']})
-                return {'status': 'security_lock', 'stage': 'complete', 'kind': '',
-                        'detail': 'locked', 'ms': 10}
-
             with patch('clusterlab.executor._load_fastcheck', return_value=(
                     FakePool,
                     lambda *_args, **_kwargs: {'status': 'error', 'kind': 'protocol',
                                                'stage': 'init', 'http': 200,
                                                'apple_ec': -20970, 'ms': 5},
-                    lambda result: 'locked' if result['status'] == 'security_lock' else 'undetermined')), \
+                    lambda result: 'invalid' if result.get('apple_ec') == -20970 else 'undetermined')), \
                  patch('fastcheck.workers.device_profile',
                        return_value={'client_info': 'test', 'user_agent': 'test'}), \
-                 patch('fastcheck.protocols.dual_auth.idmsa.check', side_effect=web_check), \
                  patch('clusterlab.executor._bump_usage'):
                 _execute_auth_unit(root, descriptor, threading.Event())
 
             record = json.loads((root / 'results.jsonl').read_text())
-            self.assertEqual(record['status'], 'locked')
-            self.assertEqual(record['protocol'], 'GSA → 网页复检')
-            self.assertEqual((record['http'], record['code'], record['gsa_code'], record['web_code']),
-                             (403, '-20209', -20970, -20209))
+            self.assertEqual(record['status'], 'invalid')
+            self.assertEqual(record['protocol'], 'GSA')
+            self.assertEqual((record['http'], record['code']), (200, '-20970'))
+            self.assertNotIn('gsa_code', record)
+            self.assertNotIn('web_code', record)
             done = json.loads((root / 'done.json').read_text())
-            self.assertEqual(done['counts'], {'locked': 1, 'web_recheck': 1})
+            self.assertEqual(done['counts'], {'invalid': 1})
 
 
 if __name__ == '__main__':

@@ -27,8 +27,9 @@ class StatusTests(unittest.TestCase):
         self.assertEqual({k:counts[k] for k in ('processed','remaining','active')},
                          {'processed':10,'remaining':2,'active':1})
         self.assertEqual([counts[k] for k in ('valid','wrong_password','need_2fa','locked','timeout','invalid','undetermined')],
-                         [1,1,1,2,1,0,4])
-        self.assertEqual(result_bucket({'status':'init_refused','stage':'init','apple_ec':-20970}), 'undetermined')
+                         [1,1,1,2,1,1,3])
+        self.assertEqual(result_bucket({'status':'init_refused','stage':'init','apple_ec':-20970}), 'invalid')
+        self.assertEqual(result_bucket({'status':'error','stage':'init','apple_ec':'-20209'}), 'locked')
         self.assertEqual(result_bucket({'status':'not_active'}),'undetermined')
         self.assertEqual(result_bucket({'status':'needs_setup','password_verified':True}),'valid')
         self.assertEqual(result_bucket({'status':'needs_setup'}),'undetermined')

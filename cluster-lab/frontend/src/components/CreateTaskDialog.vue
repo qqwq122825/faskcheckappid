@@ -7,7 +7,6 @@ const router = useRouter()
 const name = ref(''), unitRows = ref(10000), file = ref<File>(), error = ref('')
 const files = ref<any[]>([]), chosen = ref(''), mode = ref<'new' | 'reuse'>('new')
 const timeout = ref(20), retries = ref(0), deviceCapacity = ref(30)
-const dualRecheck = ref(false)
 const uploadPercent = ref<number | null>(null)
 const maxUnitRows = computed(() => state.value?.settings?.max_unit_rows || 10000)
 watch(createTaskOpen, open => {
@@ -15,7 +14,7 @@ watch(createTaskOpen, open => {
     error.value = ''; file.value = undefined; name.value = ''
     unitRows.value = Math.min(10000, maxUnitRows.value)
     timeout.value = 20; retries.value = 0; deviceCapacity.value = 30
-    dualRecheck.value = false; uploadPercent.value = null
+    uploadPercent.value = null
     chosen.value = ''; mode.value = 'new'
     loadFiles()
   }
@@ -40,7 +39,7 @@ function uploadStream(selected: File): Promise<any> {
   const query = new URLSearchParams({ name: name.value.trim() || selected.name,
     unit_rows: String(unitRows.value), mode: 'auth', timeout: String(timeout.value),
     retries: String(retries.value), device_capacity: String(deviceCapacity.value),
-    dual_recheck: String(dualRecheck.value), enqueue: 'true' })
+    enqueue: 'true' })
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `/api/jobs/stream?${query}`)
@@ -71,8 +70,7 @@ async function submit() {
       await api('/api/jobs/from-file', { source: chosen.value, name: name.value.trim(),
                                          unit_rows: unitRows.value, mode: 'auth', enqueue: 'true',
                                          timeout: timeout.value, retries: retries.value,
-                                         device_capacity: deviceCapacity.value,
-                                         dual_recheck: dualRecheck.value }, 'POST')
+                                         device_capacity: deviceCapacity.value }, 'POST')
       createTaskOpen.value = false
       await refresh()
       await router.push('/jobs')
@@ -126,9 +124,6 @@ async function submit() {
       <el-form-item label="超时后重试次数">
         <el-input-number v-model="retries" :min="0" :max="5" :step="1" :precision="0" :disabled="busy" />
         <span class="field-note">0 表示不重试；只对超时、TLS 和 5xx 等可重试错误生效，密码错误、锁定等明确结论不重试。</span>
-      </el-form-item>
-      <el-form-item>
-        <el-switch v-model="dualRecheck" active-text="双协议校验" :disabled="busy" />
       </el-form-item>
       <el-form-item label="预计设备池数量">
         <el-input-number v-model="deviceCapacity" :min="1" :max="200" :step="1" :precision="0" :disabled="busy" />

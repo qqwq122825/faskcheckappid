@@ -93,13 +93,31 @@ def mask_api(value):
     return _re.sub(r'(?i)(password|passwd|pwd|token|key)=[^&\s]+', r'\1=***', str(value))
 
 
+def result_record_bucket(value):
+    """Normalize result codes from current and older nodes to the active UI categories."""
+    codes = []
+    for key in ('code', 'apple_ec', 'gsa_code'):
+        try:
+            codes.append(int(value.get(key)))
+        except (TypeError, ValueError):
+            continue
+    if -20209 in codes:
+        return 'locked'
+    if -20970 in codes:
+        return 'invalid'
+    bucket = value.get('status') or 'valid'
+    if bucket not in ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid',
+                      'timeout', 'undetermined', 'unknown'):
+        return 'unknown'
+    return bucket
+
+
 class Controller:
     MAX_PROCESSES = 200
     MAX_THREADS = 512
     MAX_ACTIVE_UNITS = 512
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid',
                       'timeout', 'undetermined', 'unknown')
-    LIVE_METADATA_BUCKETS = ('web_recheck',)
 
     def __init__(self, root, lease_seconds=30, offline_seconds=12, dispatch_per_second=0):
         self.root = private_dir(root)
@@ -138,7 +156,6 @@ class Controller:
                 db.execute('ALTER TABLE units ADD COLUMN byte_end INTEGER NOT NULL DEFAULT 0')
             if 'live_counts' not in unit_columns:
                 db.execute('ALTER TABLE units ADD COLUMN live_counts TEXT')
-        self._backfill_legacy_web_rechecks()
         self.lease_seconds, self.offline_seconds = lease_seconds, offline_seconds
         # 全局派发闸门：整个集群每秒最多放多少个新工作包。0 表示不限。
         self.dispatch_per_second = max(0, int(dispatch_per_second or 0))
@@ -155,49 +172,6 @@ class Controller:
             preparing = [r['id'] for r in db.execute("SELECT id FROM jobs WHERE status='preparing' ORDER BY created,id")]
         for job_id in preparing:
             self.preparer.submit(self.prepare, job_id)
-
-    def _backfill_legacy_web_rechecks(self):
-        """Recover dual-protocol counts for results confirmed before the counter existed.
-
-        Legacy result files already contain the protocol and per-protocol codes.  Scan only
-        completed units whose persisted result_counts has no web_recheck key, then persist the
-        recovered count so later controller restarts do not reread large result files.
-        """
-        totals = {}
-        with self.db.transaction() as db:
-            units = list(db.execute(
-                "SELECT u.id,u.job_id,u.result_path,u.result_counts FROM units u "
-                "JOIN jobs j ON j.id=u.job_id "
-                "WHERE u.status='completed' AND u.result_path IS NOT NULL "
-                "AND j.mode='auth' AND j.dual_recheck=1"))
-            for unit in units:
-                try:
-                    counts = json.loads(unit['result_counts'] or '{}')
-                except (TypeError, ValueError):
-                    counts = {}
-                if 'web_recheck' not in counts:
-                    recovered = 0
-                    try:
-                        with Path(unit['result_path']).open('rb') as source:
-                            for line in source:
-                                try:
-                                    value = json.loads(line)
-                                except (TypeError, ValueError):
-                                    continue
-                                if (value.get('protocol') == 'GSA → 网页复检'
-                                        or value.get('web_code') is not None):
-                                    recovered += 1
-                    except OSError:
-                        recovered = 0
-                    counts['web_recheck'] = recovered
-                    db.execute('UPDATE units SET result_counts=? WHERE id=?',
-                               (json.dumps(counts, separators=(',', ':')), unit['id']))
-                totals[unit['job_id']] = totals.get(unit['job_id'], 0) + int(
-                    counts.get('web_recheck', 0) or 0)
-            for job_id, recovered in totals.items():
-                db.execute(
-                    'UPDATE jobs SET c_web_recheck=MAX(c_web_recheck,?) '
-                    "WHERE id=? AND mode='auth'", (recovered, job_id))
 
     def close(self):
         self.closing.set()
@@ -273,8 +247,8 @@ class Controller:
             raise ValueError('执行模式应为 digest / simulate / auth')
         timeout, retries = self._check_exec(timeout, retries)
         device_capacity = integer(int(device_capacity), '预计设备池', 1, 200)
-        if type(dual_recheck) is not bool:
-            raise ValueError('双协议复检选项无效')
+        # 兼容旧调用签名；双协议复检已撤回，所有新任务固定使用 GSA。
+        _ = dual_recheck
         job_id = uuid.uuid4().hex
         target = self._source_path(name).resolve()
         with target.open('xb') as output:
@@ -288,7 +262,7 @@ class Controller:
             db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,device_capacity,dual_recheck) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                        (job_id, str(name).strip()[:120] or '未命名任务', 'preparing', now, now,
                         str(target), target.stat().st_size, unit_rows, mode, now if enqueue else None,
-                        timeout, retries, device_capacity, int(dual_recheck)))
+                        timeout, retries, device_capacity, 0))
             event(db, 'job_uploaded', '输入文件已保存，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
@@ -470,7 +444,7 @@ class Controller:
         if not isinstance(value, dict):
             return {}
         result = {}
-        for key in cls.RESULT_BUCKETS + cls.LIVE_METADATA_BUCKETS:
+        for key in cls.RESULT_BUCKETS:
             count = value.get(key, 0)
             if type(count) is not int or count < 0 or count > rows:
                 raise ValueError('实时分类计数无效')
@@ -506,8 +480,8 @@ class Controller:
             raise ValueError('执行模式应为 digest / simulate / auth')
         timeout, retries = self._check_exec(timeout, retries)
         device_capacity = integer(int(device_capacity), '预计设备池', 1, 200)
-        if type(dual_recheck) is not bool:
-            raise ValueError('双协议复检选项无效')
+        # 兼容旧调用签名；双协议复检已撤回，所有新任务固定使用 GSA。
+        _ = dual_recheck
         path = Path(str(source))
         if not path.exists():
             raise ValueError('源文件不存在或不可复用')
@@ -521,7 +495,7 @@ class Controller:
                        'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                        (job_id, str(name).strip()[:120] or path.name, 'preparing', now, now,
                         str(path), path.stat().st_size, unit_rows, mode, now if enqueue else None,
-                        timeout, retries, device_capacity, int(dual_recheck)))
+                        timeout, retries, device_capacity, 0))
             event(db, 'job_uploaded', '复用已有输入文件，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
@@ -786,7 +760,7 @@ class Controller:
             # process/thread ceiling and recreate the old overload bug.
             if not node['enabled'] or active >= 1:
                 return None
-            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries,j.device_capacity,j.dual_recheck FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
+            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries,j.device_capacity FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
             if not unit:
                 return None
             token = secrets.token_urlsafe(24)
@@ -804,7 +778,6 @@ class Controller:
                                         unit['rows']),
                        'threads': min(node['desired_threads'], node['max_threads'] or 1),
                        'device_capacity': int(unit['device_capacity'] or 30),
-                       'dual_recheck': bool(unit['dual_recheck']),
                        'lease_seconds': self.lease_seconds}
             if unit['mode'] == 'auth':
                 # 认证任务额外带设备与出口配置；代理地址取服务端保存的原文。
@@ -889,14 +862,8 @@ class Controller:
                             or not isinstance(value['sha256'], str) or not re.fullmatch('[0-9a-f]{64}', value['sha256'])
                             or type(value['bytes']) is not int or value['bytes'] < 0):
                         raise ValueError('结果编号或摘要格式无效')
-                    bucket = value.get('status') or 'valid'
-                    if bucket not in ('valid', 'wrong_password', 'need_2fa',
-                                      'locked', 'invalid', 'timeout', 'undetermined', 'unknown'):
-                        bucket = 'unknown'
+                    bucket = result_record_bucket(value)
                     buckets[bucket] += 1
-                    if (value.get('protocol') == 'GSA → 网页复检'
-                            or value.get('web_code') is not None):
-                        buckets['web_recheck'] += 1
                     count += 1
                     if count > unit['rows']:
                         raise ValueError('结果条数超过工作包记录数')
@@ -930,11 +897,10 @@ class Controller:
                     db.execute(
                         "UPDATE jobs SET c_valid=c_valid+?,c_wrong=c_wrong+?,c_2fa=c_2fa+?,"
                         "c_locked=c_locked+?,c_timeout=c_timeout+?,c_invalid=c_invalid+?,"
-                        "c_unknown=c_unknown+?,c_web_recheck=c_web_recheck+?,updated=? WHERE id=?",
+                        "c_unknown=c_unknown+?,updated=? WHERE id=?",
                         (buckets['valid'], buckets['wrong_password'], buckets['need_2fa'],
                          buckets['locked'], buckets['timeout'], buckets['invalid'],
-                         buckets['undetermined'] + buckets['unknown'], buckets['web_recheck'],
-                         time.time(), unit['job_id']))
+                         buckets['undetermined'] + buckets['unknown'], time.time(), unit['job_id']))
                 else:
                     db.execute("UPDATE jobs SET updated=? WHERE id=?", (time.time(), unit['job_id']))
                 db.execute("UPDATE units SET status='completed',processed=rows,result_path=?,result_checksum=?,"
@@ -968,7 +934,6 @@ class Controller:
                 "ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END, queued_at, created, id LIMIT 1").fetchone()
             for row in db.execute("SELECT * FROM jobs ORDER BY CASE WHEN status IN ('running','paused') THEN 0 WHEN status='queued' OR (status='preparing' AND queued_at IS NOT NULL) THEN 1 ELSE 2 END,CASE WHEN status IN ('queued','running','paused') OR (status='preparing' AND queued_at IS NOT NULL) THEN queued_at END,created DESC,id LIMIT 50"):
                 value = {k: row[k] for k in ('id', 'name', 'status', 'created', 'updated', 'bytes', 'rows', 'unit_rows', 'mode', 'error', 'queued_at')}
-                value['dual_recheck'] = bool(row['dual_recheck'])
                 value['queue_position'] = (db.execute(f'SELECT COUNT(*) FROM jobs WHERE {queue_filter} AND (queued_at<? OR (queued_at=? AND id<=?))', (row['queued_at'], row['queued_at'], row['id'])).fetchone()[0]
                                            if row['status'] in ('queued', 'preparing') and row['queued_at'] is not None else None)
                 groups = db.execute('SELECT status,COUNT(*) AS n,SUM(rows) AS rows FROM units WHERE job_id=? GROUP BY status', (row['id'],)).fetchall()
@@ -976,7 +941,6 @@ class Controller:
                 row_counts = {r['status']: r['rows'] for r in groups}
                 sums = db.execute("SELECT COALESCE(SUM(CASE WHEN status='completed' THEN rows ELSE 0 END),0), COALESCE(SUM(CASE WHEN status IN ('running','leased','completed') THEN processed ELSE 0 END),0) FROM units WHERE job_id=?", (row['id'],)).fetchone()
                 live = {key: 0 for key in self.RESULT_BUCKETS}
-                live_web_recheck = 0
                 if row['mode'] == 'auth':
                     for unit in db.execute("SELECT live_counts FROM units WHERE job_id=? AND status IN ('leased','running') AND live_counts IS NOT NULL",
                                            (row['id'],)):
@@ -986,7 +950,6 @@ class Controller:
                             continue
                         for key in self.RESULT_BUCKETS:
                             live[key] += int(unit_counts.get(key, 0) or 0)
-                        live_web_recheck += int(unit_counts.get('web_recheck', 0) or 0)
                 value.update(units=sum(counts.values()), unit_counts=counts, row_counts=row_counts,
                              confirmed=sums[0], processed=sums[1],
                              categorized={'valid': row['c_valid'] + live['valid'],
@@ -996,9 +959,6 @@ class Controller:
                                           'timeout': row['c_timeout'] + live['timeout'],
                                           'invalid': row['c_invalid'] + live['invalid'],
                                           'unknown': row['c_unknown'] + live['undetermined'] + live['unknown']},
-                             dual_recheck_stats={'triggered': row['c_web_recheck'] + live_web_recheck,
-                                                 'confirmed': row['c_web_recheck'],
-                                                 'live': live_web_recheck},
                              reported=row['reported_rows'])
                 jobs.append(value)
             nodes = []
@@ -1087,7 +1047,8 @@ class Controller:
                                 record = json.loads(line)
                             except ValueError:
                                 continue
-                            if category != 'all' and (record.get('status') or 'valid') != category:
+                            record['status'] = result_record_bucket(record)
+                            if category != 'all' and record['status'] != category:
                                 continue
                             if category == 'all':
                                 absolute = unit['first_row'] + local_index
@@ -1162,7 +1123,7 @@ class Controller:
                                 continue
                             if category != 'all':
                                 try:
-                                    if json.loads(line).get('status') != category:
+                                    if result_record_bucket(json.loads(line)) != category:
                                         continue
                                 except ValueError:
                                     continue

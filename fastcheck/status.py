@@ -7,8 +7,18 @@ import unicodedata
 
 def result_bucket(result):
     status = result.get('status')
+    try:
+        apple_ec = int(result.get('apple_ec'))
+    except (TypeError, ValueError):
+        apple_ec = None
     if result.get('kind') == 'timeout' or status == 'timeout':
         return 'timeout'
+    # 业务展示口径：GSA -20970 归入“已失效”，-20209 归入“锁定”。
+    # 结果码优先于旧版执行器给出的 status，便于新总控兼容旧节点。
+    if apple_ec == -20970:
+        return 'invalid'
+    if apple_ec == -20209:
+        return 'locked'
     if status == 'need_2fa':
         return 'need_2fa'
     if status == 'valid' or (status == 'needs_setup' and result.get('password_verified') is True):
@@ -17,11 +27,6 @@ def result_bucket(result):
         return 'wrong_password'
     if status in ('security_lock', 'locked'):
         return 'locked'
-    # -20970 在 init 阶段没有完成密码证明。新任务可开启网页协议
-    # 复检；未开启或复检未得到明确结果时，不得猜测为已失效。
-    if (status == 'init_refused' or result.get('stage') == 'init') \
-            and result.get('apple_ec') == -20970:
-        return 'undetermined'
     return 'undetermined'
 
 

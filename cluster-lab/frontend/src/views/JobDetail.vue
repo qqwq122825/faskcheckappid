@@ -60,14 +60,11 @@ const events = computed(() => state.value?.events?.filter((e: any) => e.job_id =
         <div>
           <div class="task-name"><h2>{{ job.name }}</h2><StatusBadge :status="job.status" :unit-counts="job.unit_counts" /></div>
           <p>{{ date(job.created) }} 创建 · {{ job.mode === 'auth' ? '账号校验' : '数据任务' }}
-            <template v-if="job.mode === 'auth'"> · {{ job.dual_recheck ? 'GSA + 网页复检' : 'GSA' }}</template>
+            <template v-if="job.mode === 'auth'"> · GSA</template>
           </p>
         </div>
         <TaskActions :job="job" />
       </div>
-      <el-alert v-if="job.dual_recheck" class="dual-recheck-status" type="info" :closable="false" show-icon
-                :title="`双协议校验已开启 · 已触发网页复检 ${fmt(job.dual_recheck_stats?.triggered || 0)} 条`"
-                :description="`其中 ${fmt(job.dual_recheck_stats?.confirmed || 0)} 条已由总控确认；仅 GSA 初始阶段返回 -20970 才进入网页复检，GSA 已直接给出 -20209 等明确结果时不会重复请求。`" />
       <el-alert v-if="job.error" :title="job.error" type="error" :closable="false" show-icon />
       <el-alert v-else-if="issueMessage" :title="issueMessage"
                 :type="(job.unit_counts.leased || job.unit_counts.running) ? 'warning' : 'error'"

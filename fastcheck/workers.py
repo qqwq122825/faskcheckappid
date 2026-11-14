@@ -14,7 +14,7 @@ import requests
 
 from fastcheck.diagnostics import SafeDiagnostics, TracedClient
 from fastcheck.devices import DevicePool, PoolError, file_lease
-from fastcheck.protocols import dual_auth, gsa_status as gsa, idmsa
+from fastcheck.protocols import gsa_status as gsa, idmsa
 from fastcheck.protocols.anisette_v3 import Client
 from fastcheck.protocols.timing import phase
 
@@ -150,9 +150,7 @@ def shared_session(proxy, want_trace=False):
 
 def safe_result(result):
     keys = ('status', 'kind', 'stage', 'apple_ec', 'password_verified', 'two_factor_status',
-            'http', 'init_http', 'complete_http', 'error_type', 'fallback_used',
-            'verification_protocol', 'gsa_status', 'gsa_stage', 'gsa_http', 'gsa_apple_ec',
-            'web_status', 'web_stage', 'web_kind', 'web_http', 'web_apple_ec')
+            'http', 'init_http', 'complete_http', 'error_type')
     value = {key: result[key] for key in keys if key in result}
     value.setdefault('status', 'error')
     detail=str(result.get('detail',''))
@@ -220,16 +218,9 @@ def protocol_attempt(payload, output, stop):
             return {'status': 'error', 'stage': 'anisette_refresh',
                     'kind': kind,
                     'http': http, 'error_type': type(exc).__name__}
-        # -20970 is not a device verdict: do not increment legacy device-fault
-        # counters or replace the identity because an account was refused.
-        result = gsa.check(payload['email'], payload['password'], payload['proxy'],
-                           timeout=payload['timeout'], retries=0, identity=identity,
-                           cancel=stop.is_set, diagnostics=diagnostic)
-        return dual_auth.recheck_gsa_20970(
-            payload['email'], payload['password'], payload['proxy'], result,
-            enabled=bool(payload.get('dual_recheck')), timeout=payload['timeout'],
-            cancel=stop.is_set, diagnostics=diagnostic,
-            session=shared_session(payload['proxy'], want_trace=diagnostic is not None))
+        return gsa.check(payload['email'], payload['password'], payload['proxy'],
+                         timeout=payload['timeout'], retries=0, identity=identity,
+                         cancel=stop.is_set, diagnostics=diagnostic)
 
 
 def worker_process(worker_id, threads, incoming, outgoing, stop, handler=protocol_attempt):

@@ -130,41 +130,28 @@ test('Device pool has a guarded one-click clear action', () => {
   assert.match(drawer, /pool\.capacity \?\? capacity/)
 })
 
-test('Legacy categories remain visible while new -20970 tasks can be rechecked', () => {
+test('GSA result categories expose invalid and locked business states', () => {
   const feedback = source('src/components/TaskFeedback.vue')
   const detail = source('src/views/JobDetail.vue')
   assert.match(feedback, /label: '已失效'/)
   assert.match(feedback, /categories\.value\.invalid/)
-  assert.doesNotMatch(feedback, /label: '未判断'/)
   assert.match(detail, /label: '已失效', value: 'invalid'/)
-  assert.match(detail, /label: '其他未验证', value: 'undetermined'/)
+  assert.match(detail, /label: '锁定', value: 'locked'/)
 })
 
-test('Task creation exposes one concise dual-protocol switch', () => {
+test('Task creation and detail use GSA only', () => {
   const dialog = source('src/components/CreateTaskDialog.vue')
   const detail = source('src/views/JobDetail.vue')
-  assert.match(dialog, /const dualRecheck = ref\(false\)/)
-  assert.match(dialog, /dual_recheck: String\(dualRecheck\.value\)/)
-  assert.match(dialog, /dual_recheck: dualRecheck\.value/)
-  assert.match(dialog, /<el-switch v-model="dualRecheck" active-text="双协议校验"/)
-  assert.doesNotMatch(dialog, /<el-checkbox[^>]*dualRecheck/)
-  assert.doesNotMatch(dialog, /校验协议|GSA（默认）|-20970|-20209|HTTP 503\/5xx/)
-  assert.match(detail, /GSA \+ 网页复检/)
+  assert.doesNotMatch(dialog, /dualRecheck|dual_recheck|双协议|网页复检/)
+  assert.doesNotMatch(detail, /dual_recheck|双协议|网页复检|GSA \+ /)
+  assert.match(detail, /job\.mode === 'auth'"> · GSA/)
 })
 
-test('Dual-protocol task status and both protocol codes stay visible', () => {
-  const detail = source('src/views/JobDetail.vue')
+test('Result list keeps one result-code column without web recheck fields', () => {
   const results = source('src/components/ResultList.vue')
-  assert.match(detail, /双协议校验已开启/)
-  assert.match(detail, /dual_recheck_stats\?\.triggered/)
-  assert.match(detail, /仅 GSA 初始阶段返回 -20970 才进入网页复检/)
   assert.match(results, /label: '全部结果', value: 'all'/)
   assert.match(results, /const category = ref\('all'\)/)
-  assert.match(results, /label="GSA 码"/)
-  assert.match(results, /label="网页码"/)
-  assert.match(results, /row\.gsa_code/)
-  assert.match(results, /row\.web_code/)
+  assert.match(results, /prop="code" label="结果码"/)
+  assert.doesNotMatch(results, /GSA 码|网页码|gsa_code|web_code|网页复检/)
   assert.match(results, /labels\[row\.status\]/)
-  assert.match(results, /String\(row\.protocol \|\| ''\)\.includes\('网页复检'\)/)
-  assert.match(results, /`HTTP \$\{row\.http\}`/)
 })
