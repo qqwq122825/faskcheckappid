@@ -128,7 +128,7 @@ async function submit() {
         <span class="field-note">0 表示不重试；只对超时、TLS 和 5xx 等可重试错误生效，密码错误、锁定等明确结论不重试。</span>
       </el-form-item>
       <el-form-item>
-        <el-checkbox v-model="dualRecheck" :disabled="busy">双协议校验</el-checkbox>
+        <el-switch v-model="dualRecheck" active-text="双协议校验" :disabled="busy" />
       </el-form-item>
       <el-form-item label="预计设备池数量">
         <el-input-number v-model="deviceCapacity" :min="1" :max="200" :step="1" :precision="0" :disabled="busy" />
