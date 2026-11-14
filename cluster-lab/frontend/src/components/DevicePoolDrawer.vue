@@ -13,7 +13,7 @@ const busy = ref(false), timer = 0 as any
 const pool = computed(() => node.value?.telemetry?.device_pool || {})
 const building = computed(() => Boolean(pool.value.running))
 const ready = computed(() => pool.value.ready || 0)
-const actual = computed(() => (pool.value.built || 0) + (pool.value.failed || 0))
+const actual = computed(() => pool.value.attempted ?? ((pool.value.built || 0) + (pool.value.failed || 0)))
 const rows = computed(() => {
   const reported = pool.value.slots
   if (Array.isArray(reported) && reported.length) {
@@ -23,13 +23,14 @@ const rows = computed(() => {
       proxy: item.proxy || '—',
       model: item.model || '—',
       at: item.at || '—',
+      recorded: Boolean(item.recorded),
     }))
   }
   const total = Math.max(pool.value.capacity || 0, capacity.value)
   return Array.from({ length: total }, (_, index) => ({
     slot: index + 1,
     state: index < ready.value ? '已就绪' : index < actual.value ? '已尝试' : '未开始',
-    proxy: '—', model: '—', at: '—',
+    proxy: '—', model: '—', at: '—', recorded: false,
   }))
 })
 
@@ -86,7 +87,7 @@ async function cancelBuild() {
       <el-form label-position="top" @submit.prevent="initialize">
         <el-form-item label="设备数量">
           <el-input-number v-model="capacity" :min="1" :max="200" :step="1" :precision="0" :disabled="building || busy" />
-          <span class="field-note">设备在节点本地注册，每台约 6–8 秒；不占用任务隧道。</span>
+          <span class="field-note">修改数量后点击“保存并应用”，节点收到后会自动补齐新设备。</span>
         </el-form-item>
         <el-form-item label="自动补充">
           <el-switch v-model="autoRotate" :loading="savingAuto" :disabled="savingAuto"
@@ -97,7 +98,7 @@ async function cancelBuild() {
           </span>
         </el-form-item>
         <div class="actions">
-          <el-button type="primary" native-type="submit" :loading="busy" :disabled="building">初始化设备</el-button>
+          <el-button type="primary" native-type="submit" :loading="busy" :disabled="building">保存并应用</el-button>
           <el-button v-if="building" @click="cancelBuild">停止</el-button>
         </div>
         <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
@@ -117,7 +118,7 @@ async function cancelBuild() {
         <el-table-column prop="state" label="状态" width="100" />
         <el-table-column prop="model" label="设备型号" min-width="150" show-overflow-tooltip />
         <el-table-column prop="proxy" label="注册出口 IP" min-width="150" show-overflow-tooltip />
-        <el-table-column prop="at" label="注册时间" width="120" />
+        <el-table-column prop="at" label="注册时间" width="172" />
       </el-table>
     </section>
   </el-drawer>

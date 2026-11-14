@@ -381,7 +381,8 @@ class Controller:
         pool = value.get('device_pool')
         if isinstance(pool, dict):
             result['device_pool'] = {key: pool.get(key) for key in
-                                     ('running', 'capacity', 'ready', 'built', 'failed', 'current')}
+                                     ('running', 'capacity', 'ready', 'built', 'failed',
+                                      'current', 'attempted')}
             slots = pool.get('slots')
             if isinstance(slots, list):
                 result['device_pool']['slots'] = [
@@ -389,7 +390,8 @@ class Controller:
                      'state': str(item.get('state') or '')[:20],
                      'model': str(item.get('model') or '')[:32],
                      'proxy': mask_proxy(str(item.get('proxy') or '')),
-                     'at': str(item.get('at') or '')[:16]}
+                     'at': str(item.get('at') or '')[:19],
+                     'recorded': bool(item.get('recorded'))}
                     for item in slots[:64] if isinstance(item, dict)]
         return result
 

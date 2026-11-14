@@ -313,6 +313,31 @@ def _bump_usage(device_root, counts):
         pass
 
 
+def record_device_registration(device_root, slot, proxy, model=''):
+    """Persist the first observed registration facts for one device slot.
+
+    Each slot owns a separate file, so worker processes cannot overwrite one
+    another's history. O_EXCL also preserves the original time and proxy when
+    the same device is reused by later tasks.
+    """
+    if not device_root:
+        return False
+    directory = Path(device_root) / 'registrations'
+    path = directory / f'{int(slot):03d}.json'
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        value = {'slot': int(slot), 'proxy': str(proxy or ''), 'model': str(model or ''),
+                 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'ts': time.time()}
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            json.dump(value, handle, ensure_ascii=False, separators=(',', ':'))
+        return True
+    except FileExistsError:
+        return False
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def execute_auth_unit(directory, descriptor, stop):
     """真实认证执行入口：任何异常都落成 done.json，避免节点只看到"进程退出"。"""
     try:
@@ -382,6 +407,8 @@ def _execute_auth_unit(directory, descriptor, stop):
             identities[index] = pool.fetch_headers(index, infos[index], max(timeout, 40),
                                                    registered=ready, proxy=proxy,
                                                    provider_direct=True)
+            if not ready and pool.inspect(index)['state'] == 'ready':
+                record_device_registration(device_root, index, proxy, profile.get('model', ''))
         except Exception as exc:                                   # noqa: BLE001
             infos[index] = None
             identities[index] = None
@@ -409,9 +436,15 @@ def _execute_auth_unit(directory, descriptor, stop):
                 # 预取失败的槽位在这里补一次
                 info = pool.info(timeout, proxy=account_proxy, provider_direct=True)
                 ready = pool.inspect(slot_id)['state'] == 'ready'
+                profile = device_profile(pool, slot_id)
+                info = dict(info, client_info=profile['client_info'],
+                            user_agent=profile['user_agent'])
                 identity = pool.fetch_headers(slot_id, info, max(timeout, 40),
                                               registered=ready, proxy=account_proxy,
                                               provider_direct=True)
+                if not ready and pool.inspect(slot_id)['state'] == 'ready':
+                    record_device_registration(device_root, slot_id, account_proxy,
+                                               profile.get('model', ''))
             result = gsa_check(account, password, account_proxy, timeout=timeout,
                                retries=retries,
                                cancel=stop.is_set, identity=identity)

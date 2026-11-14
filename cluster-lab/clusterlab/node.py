@@ -183,6 +183,17 @@ class Node:
             return []
         return snapshot.get('slots', [])[:64]
 
+    def _device_status(self):
+        """Use one snapshot so summary counts and table rows always agree."""
+        try:
+            snapshot = self.builder.snapshot()
+        except Exception:                                          # noqa: BLE001
+            snapshot = dict(self.builder.state)
+            snapshot['slots'] = []
+        return {key: snapshot.get(key) for key in
+                ('running', 'capacity', 'ready', 'built', 'failed',
+                 'current', 'attempted', 'slots')}
+
     def apply_config(self, config):
         """总控下发的出口配置；只在内存里保存，不落盘。
 
@@ -214,9 +225,7 @@ class Node:
                            'active': values, 'interrupted': interrupted, 'ack_stop_version': self.stop_version,
                            'telemetry': dict(self.telemetry.latest,
                                              worker_processes=self._active_worker_count()),
-                           'devices': {**{k: self.builder.state[k] for k in
-                                          ('running', 'capacity', 'ready', 'built', 'failed')},
-                                       'slots': self._device_slots()},
+                           'devices': self._device_status(),
                            'error': ''}) as response:
             value = response.json()
         with self.lock:
@@ -240,7 +249,12 @@ class Node:
             requested = value.get('device_request') or 0
             if requested and not self.builder.state['running']:
                 try:
-                    self.builder.start(int(requested))
+                    requested = int(requested)
+                    snapshot = self.builder.snapshot()
+                    # device_request is a persistent desired size. Do not restart a
+                    # completed build on every heartbeat; only fill missing slots.
+                    if int(snapshot.get('ready') or 0) < requested:
+                        self.builder.start(requested)
                 except (RuntimeError, ValueError) as exc:
                     # 不能静默吞：面板上看不到原因会以为节点没响应
                     self.builder._update(message=str(exc))

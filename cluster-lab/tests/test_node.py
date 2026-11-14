@@ -89,6 +89,46 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertTrue(set(range(11, 21)).issubset(self.node.builder.reserved))
         self.node.builder.release(descriptor['device_slots'])
 
+    def test_ready_legacy_device_recovers_model_and_registration_time(self):
+        class Pool:
+            key = 'origin-key'
+
+            def __init__(inner, root, _origin, max_devices):
+                inner.base = Path(root) / 'pool'
+                inner.max_devices = max_devices
+
+            def slot_directory(inner, slot):
+                return inner.base / f'{slot:02d}'
+
+            def inspect(inner, slot):
+                return {'state': 'ready', 'device_id': 'device-1'}
+
+        self.node.builder.state['capacity'] = 1
+        directory = self.node.root / 'device-pool' / 'pool' / '01'
+        directory.mkdir(parents=True)
+        (directory / 'device-profile.json').write_text(json.dumps({'model': 'MacBookPro14,3'}))
+        state = directory / 'origin-key.json'
+        state.write_text('{}')
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)):
+            snapshot = self.node.builder.snapshot()
+        self.assertEqual(snapshot['attempted'], 1)
+        self.assertEqual(snapshot['ready'], 1)
+        self.assertEqual(snapshot['slots'][0]['model'], 'MacBookPro14,3')
+        self.assertEqual(snapshot['slots'][0]['proxy'], '历史未记录')
+        self.assertRegex(snapshot['slots'][0]['at'], r'^\d{4}-\d{2}-\d{2} ')
+        self.assertFalse(snapshot['slots'][0]['recorded'])
+
+    def test_completed_device_target_does_not_restart_each_heartbeat(self):
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 1}
+        complete = {'running': False, 'capacity': 1, 'ready': 1, 'built': 0,
+                    'failed': 0, 'current': 0, 'attempted': 1, 'slots': []}
+        with patch.object(self.node, '_request', return_value=Response(value)), \
+             patch.object(self.node.builder, 'snapshot', return_value=complete), \
+             patch.object(self.node.builder, 'start') as start:
+            self.node._heartbeat()
+        start.assert_not_called()
+
     def test_remote_http_requires_explicit_test_override(self):
         with self.assertRaisesRegex(ValueError, 'HTTPS'):
             self.node.connect('http://example.com','x'*32)

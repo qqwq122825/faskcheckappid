@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 
-from .executor import _load_fastcheck
+from .executor import _load_fastcheck, record_device_registration
 
 
 class DeviceBuilder:
@@ -30,10 +30,12 @@ class DeviceBuilder:
             pool = DevicePool(str(root), self.node.origin, max_devices=max(1, self.state['capacity'] or 1))
             limit = self.state['capacity'] or 1
             for slot in range(1, limit + 1):
-                state = pool.inspect(slot)['state']
+                inspected = pool.inspect(slot)
+                state = inspected['state']
                 if state == 'ready':
                     ready += 1
-                slots.append({'slot': slot, 'state': state})
+                slots.append({'slot': slot, 'state': state,
+                              'device_id': inspected.get('device_id', '')})
         except Exception:                                          # noqa: BLE001
             pass
         with self.lock:
@@ -41,12 +43,32 @@ class DeviceBuilder:
         registry = self.registry()
         for entry in slots:
             info = registry.get(str(entry['slot'])) or {}
-            entry['proxy'] = info.get('proxy', '')
-            entry['model'] = info.get('model', '')
-            entry['at'] = info.get('at', '')
-        data.update(ready=ready, slots=slots,
+            recovered = self._recover_slot(pool, entry['slot']) if entry['state'] == 'ready' else {}
+            entry['proxy'] = info.get('proxy', '') or ('历史未记录' if entry['state'] == 'ready' else '')
+            entry['model'] = info.get('model', '') or recovered.get('model', '')
+            entry['at'] = info.get('at', '') or recovered.get('at', '')
+            entry['recorded'] = bool(info)
+        attempted = sum(entry['state'] != 'missing' for entry in slots)
+        data.update(ready=ready, attempted=attempted, slots=slots,
                     capacity=max(data['capacity'], ready))
         return data
+
+    @staticmethod
+    def _recover_slot(pool, slot):
+        """Recover display facts for ready devices created before history existed."""
+        directory = pool.slot_directory(int(slot))
+        model = ''
+        try:
+            profile = json.loads((directory / 'device-profile.json').read_text('utf-8'))
+            model = str(profile.get('model') or '') if isinstance(profile, dict) else ''
+        except (OSError, ValueError, TypeError):
+            pass
+        try:
+            timestamp = (directory / f'{pool.key}.json').stat().st_mtime
+            at = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
+        except (OSError, ValueError, TypeError):
+            at = ''
+        return {'model': model, 'at': at}
 
     def start(self, capacity):
         with self.lock:
@@ -153,24 +175,26 @@ class DeviceBuilder:
 
     def _record(self, slot, proxy, model=''):
         """记下每台设备注册时用的出口，供界面核对设备"出生地"。"""
-        try:
-            path = self._registry_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            data = json.loads(path.read_text('utf-8')) if path.exists() else {}
-        except (OSError, ValueError):
-            data = {}
-        data[str(int(slot))] = {'proxy': str(proxy or ''), 'model': str(model or ''),
-                                'at': time.strftime('%m-%d %H:%M'), 'ts': time.time()}
-        try:
-            self._registry_path().write_text(json.dumps(data), 'utf-8')
-        except OSError:
-            pass
+        record_device_registration(self.node.root / 'device-pool', slot, proxy, model)
 
     def registry(self):
+        data = {}
         try:
-            return json.loads(self._registry_path().read_text('utf-8'))
+            legacy = json.loads(self._registry_path().read_text('utf-8'))
+            if isinstance(legacy, dict):
+                data.update(legacy)
         except (OSError, ValueError):
-            return {}
+            pass
+        directory = self.node.root / 'device-pool' / 'registrations'
+        for path in directory.glob('*.json') if directory.exists() else ():
+            try:
+                value = json.loads(path.read_text('utf-8'))
+                slot = int(value.get('slot') or path.stem)
+                if isinstance(value, dict):
+                    data[str(slot)] = value
+            except (OSError, ValueError, TypeError):
+                continue
+        return data
 
     def usage(self):
         path = self.node.root / 'device-pool' / 'usage.json'
@@ -222,6 +246,7 @@ class DeviceBuilder:
         for slot in removed:
             counts.pop(str(slot), None)
             registry.pop(str(slot), None)     # 出生记录一起清，否则 oldest 还会选中它
+            (pool_dir / 'registrations' / f'{int(slot):03d}.json').unlink(missing_ok=True)
         try:
             (pool_dir / 'usage.json').write_text(json.dumps(counts), 'utf-8')
             self._registry_path().write_text(json.dumps(registry), 'utf-8')

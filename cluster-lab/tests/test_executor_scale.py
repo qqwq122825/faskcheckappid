@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import _execute_auth_unit, atomic_json, execute_unit_group
+from clusterlab.executor import (_execute_auth_unit, atomic_json, execute_unit_group,
+                                 record_device_registration)
 
 
 class FakePool:
@@ -28,6 +29,17 @@ class FakePool:
 
 
 class ExecutorScaleTests(unittest.TestCase):
+    def test_registration_history_keeps_the_first_time_and_proxy_per_slot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertTrue(record_device_registration(temporary, 3, 'socks5h://first:9000',
+                                                       'MacBookPro14,3'))
+            self.assertFalse(record_device_registration(temporary, 3, 'socks5h://later:9001',
+                                                        'iMac17,1'))
+            value = json.loads((Path(temporary) / 'registrations' / '003.json').read_text())
+            self.assertEqual(value['proxy'], 'socks5h://first:9000')
+            self.assertEqual(value['model'], 'MacBookPro14,3')
+            self.assertRegex(value['at'], r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
+
     def test_one_package_fans_out_to_processes_and_merges_in_row_order(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
