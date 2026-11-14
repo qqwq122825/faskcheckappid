@@ -6,6 +6,7 @@ import { state, fmt, date, jobRates, isNode } from '../composables/useCluster'
 import TaskFeedback from '../components/TaskFeedback.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import TaskActions from '../components/TaskActions.vue'
+import ResultList from '../components/ResultList.vue'
 import { jobIssueMessage } from '../lib/jobStatus.js'
 const route = useRoute(), router = useRouter(), expanded = ref<string[]>([])
 const exportOptions = [
@@ -88,6 +89,8 @@ const events = computed(() => state.value?.events?.filter((e: any) => e.job_id =
         <el-button v-else disabled :icon="Download">等待全部确认后可导出</el-button>
       </template>
     </TaskFeedback>
+
+    <ResultList v-if="job.mode === 'auth'" :job="job" />
 
     <el-collapse v-model="expanded" class="section-card">
       <el-collapse-item title="操作记录" name="events">

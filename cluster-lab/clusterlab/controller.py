@@ -411,6 +411,8 @@ class Controller:
                      'model': str(item.get('model') or '')[:32],
                      'proxy': mask_proxy(str(item.get('proxy') or '')),
                      'at': str(item.get('at') or '')[:19],
+                     'used': (item.get('used') if type(item.get('used')) is int
+                              and 0 <= item.get('used') <= 10**12 else 0),
                      'recorded': bool(item.get('recorded'))}
                     for item in slots[:64] if isinstance(item, dict)]
         return result

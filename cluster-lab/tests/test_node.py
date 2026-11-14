@@ -109,6 +109,7 @@ class NodeRecoveryTests(unittest.TestCase):
         (directory / 'device-profile.json').write_text(json.dumps({'model': 'MacBookPro14,3'}))
         state = directory / 'origin-key.json'
         state.write_text('{}')
+        (self.node.root / 'device-pool' / 'usage.json').write_text('{"1":123}')
         with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)):
             snapshot = self.node.builder.snapshot()
         self.assertEqual(snapshot['attempted'], 1)
@@ -117,6 +118,7 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(snapshot['slots'][0]['proxy'], '历史未记录')
         self.assertRegex(snapshot['slots'][0]['at'], r'^\d{4}-\d{2}-\d{2} ')
         self.assertFalse(snapshot['slots'][0]['recorded'])
+        self.assertEqual(snapshot['slots'][0]['used'], 123)
 
     def test_completed_device_target_does_not_restart_each_heartbeat(self):
         value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,

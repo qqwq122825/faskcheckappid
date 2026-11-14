@@ -23,6 +23,7 @@ const rows = computed(() => {
       proxy: item.proxy || '—',
       model: item.model || '—',
       at: item.at || '—',
+      used: Math.max(0, Number(item.used) || 0),
       recorded: Boolean(item.recorded),
     }))
   }
@@ -31,7 +32,7 @@ const rows = computed(() => {
   return Array.from({ length: total }, (_, index) => ({
     slot: index + 1,
     state: index < ready.value ? '已就绪' : index < actual.value ? '已尝试' : '未开始',
-    proxy: '—', model: '—', at: '—', recorded: false,
+    proxy: '—', model: '—', at: '—', used: 0, recorded: false,
   }))
 })
 
@@ -137,6 +138,9 @@ async function clearPool() {
         <el-table-column prop="slot" label="设备编号" width="100" />
         <el-table-column prop="state" label="状态" width="100" />
         <el-table-column prop="model" label="设备型号" min-width="150" show-overflow-tooltip />
+        <el-table-column prop="used" label="已用账号" width="110">
+          <template #default="scope">{{ fmt(scope.row.used) }}</template>
+        </el-table-column>
         <el-table-column prop="proxy" label="注册出口 IP" min-width="150" show-overflow-tooltip />
         <el-table-column prop="at" label="注册时间" width="172" />
       </el-table>

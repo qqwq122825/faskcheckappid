@@ -14,6 +14,7 @@
 .summary-progress{margin-top:22px}.task-feedback{margin-bottom:24px}
 
 .feedback-meta{display:flex;justify-content:space-between;gap:16px;margin-top:14px;font-size:13px;color:#8a97a0}.result-large p+p{margin-top:6px}
+.result-list-heading{gap:24px}.result-list-heading p{margin:6px 0 0;color:#85939d}.result-filter{width:190px;flex:0 0 auto}.result-list-footer{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:18px;color:#66747e}.result-list-note{margin:12px 0 0;color:#8a97a0;font-size:13px}
 
 .export-actions{display:flex;gap:10px;align-items:center}
 

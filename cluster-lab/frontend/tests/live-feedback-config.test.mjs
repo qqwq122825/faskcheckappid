@@ -77,6 +77,19 @@ test('Device pool explicitly saves target and shows persisted registration histo
   assert.match(drawer, /pool\.value\.attempted/)
   assert.match(drawer, /注册出口 IP/)
   assert.match(drawer, /注册时间/)
+  assert.match(drawer, /已用账号/)
+  assert.match(drawer, /item\.used/)
+})
+
+test('Task detail lists all valid rows by page and caps each other category at 100', () => {
+  const detail = source('src/views/JobDetail.vue')
+  const results = source('src/components/ResultList.vue')
+  assert.match(detail, /<ResultList/)
+  assert.match(results, /const pageSize = 100/)
+  assert.match(results, /密正结果可逐页查看全部/)
+  assert.match(results, /其他分类各显示前 100 条/)
+  assert.match(results, /category=\$\{category\.value\}/)
+  assert.match(results, /props\.job\?\.confirmed/)
 })
 
 test('Deleting a running task explicitly stops its node work', () => {

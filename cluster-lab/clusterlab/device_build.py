@@ -26,6 +26,7 @@ class DeviceBuilder:
         root = self.node.root / 'device-pool'
         ready = 0
         slots = []
+        usage = self.usage()
         try:
             DevicePool, _, _ = _load_fastcheck()
             pool = DevicePool(str(root), self.node.origin, max_devices=max(1, self.state['capacity'] or 1))
@@ -35,8 +36,10 @@ class DeviceBuilder:
                 state = inspected['state']
                 if state == 'ready':
                     ready += 1
+                used = usage.get(str(slot), 0)
                 slots.append({'slot': slot, 'state': state,
-                              'device_id': inspected.get('device_id', '')})
+                              'device_id': inspected.get('device_id', ''),
+                              'used': used if type(used) is int and used >= 0 else 0})
         except Exception:                                          # noqa: BLE001
             pass
         with self.lock:
