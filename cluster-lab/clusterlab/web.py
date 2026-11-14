@@ -231,7 +231,7 @@ def create_app(role, service, password=None):
         def download_results(job_id):
             labels = {'all': '全部结果', 'valid': '密正', 'wrong_password': '密码错误',
                       'need_2fa': '双重验证', 'locked': '锁定', 'timeout': '超时',
-                      'undetermined': '未判断'}
+                      'invalid': '已失效', 'undetermined': '其他未验证'}
             category = request.args.get('category', 'all')
             if category not in labels:
                 raise ValueError('导出分类无效')

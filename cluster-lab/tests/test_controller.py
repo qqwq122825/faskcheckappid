@@ -277,7 +277,7 @@ class ControllerTests(unittest.TestCase):
         job = self.job(50)
         self.service.job_action(job, 'start')
         unit = self.service.lease(self.node['id'], 'test-session')
-        live = {'wrong_password': 3, 'locked': 2, 'undetermined': 5}
+        live = {'wrong_password': 3, 'locked': 2, 'invalid': 4, 'undetermined': 1}
         self.service.heartbeat(self.node['id'], {
             'session': 'test-session', 'version': '0.3.6',
             'max_processes': 1, 'max_threads': 2, 'interrupted': [],
@@ -287,10 +287,10 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(state['processed'], 10)
         self.assertEqual(state['categorized'], {
             'valid': 0, 'wrong_password': 3, 'need_2fa': 0,
-            'locked': 2, 'timeout': 0, 'unknown': 5})
+            'locked': 2, 'timeout': 0, 'invalid': 4, 'unknown': 1})
 
         statuses = (['wrong_password'] * 3 + ['locked'] * 2 +
-                    ['undetermined'] * 5 + ['valid'] * 40)
+                    ['invalid'] * 4 + ['undetermined'] + ['valid'] * 40)
         payload = b''.join((json.dumps({
             'row': unit['first_row'] + offset, 'status': status,
             'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
@@ -301,7 +301,7 @@ class ControllerTests(unittest.TestCase):
         state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
         self.assertEqual(state['categorized'], {
             'valid': 40, 'wrong_password': 3, 'need_2fa': 0,
-            'locked': 2, 'timeout': 0, 'unknown': 5})
+            'locked': 2, 'timeout': 0, 'invalid': 4, 'unknown': 1})
         with self.service.db.connect() as db:
             self.assertIsNone(db.execute('SELECT live_counts FROM units WHERE id=?',
                                          (unit['id'],)).fetchone()[0])

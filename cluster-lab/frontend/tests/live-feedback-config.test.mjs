@@ -97,3 +97,13 @@ test('Device pool has a guarded one-click clear action', () => {
   assert.match(drawer, /Boolean\(node\?\.active\)/)
   assert.match(drawer, /pool\.capacity \?\? capacity/)
 })
+
+test('-20970 has an operationally invalid category instead of the old unresolved label', () => {
+  const feedback = source('src/components/TaskFeedback.vue')
+  const detail = source('src/views/JobDetail.vue')
+  assert.match(feedback, /label: '已失效'/)
+  assert.match(feedback, /categories\.value\.invalid/)
+  assert.doesNotMatch(feedback, /label: '未判断'/)
+  assert.match(detail, /label: '已失效', value: 'invalid'/)
+  assert.match(detail, /label: '其他未验证', value: 'undetermined'/)
+})

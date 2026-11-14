@@ -14,8 +14,9 @@ const exportOptions = [
   { label: '密码错误', value: 'wrong_password' },
   { label: '双重验证', value: 'need_2fa' },
   { label: '锁定', value: 'locked' },
+  { label: '已失效', value: 'invalid' },
   { label: '超时', value: 'timeout' },
-  { label: '未判断', value: 'undetermined' },
+  { label: '其他未验证', value: 'undetermined' },
 ]
 function download(category: string) {
   if (!job.value) return

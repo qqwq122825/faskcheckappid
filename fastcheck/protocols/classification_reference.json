@@ -1,38 +1,171 @@
 {
   "schema_version": 1,
-  "updated_on": "2026-11-13",
+  "updated_on": "2026-11-14",
   "purpose": "Protocol/result classification reference; not an official Apple error-code dictionary",
   "loaded_by_runtime": false,
   "runtime_display_implementation": "../task_status.py",
-  "dimensions": ["protocol", "stage", "http", "apple_ec", "status", "kind", "password_verified", "user_reported_account_state"],
+  "dimensions": [
+    "protocol",
+    "stage",
+    "http",
+    "apple_ec",
+    "status",
+    "kind",
+    "password_verified",
+    "user_reported_account_state"
+  ],
   "principles": [
     "Keep user-reported frozen state separate from conclusions supported by this response",
-    "Do not equate -20970 with -20209, password failure or device ban",
+    "Do not equate -20970 with password failure or device ban; expose it as operationally invalid without guessing the cause",
     "Interpret business codes with protocol, phase and HTTP context",
     "HTTP 5xx and transport failures do not establish account state",
     "Init acceptance is not password verification or completed service login"
   ],
   "display_groups": {
-    "valid": {"label": "密正", "statuses": ["valid"], "conditional_status": {"status": "needs_setup", "password_verified": true}},
-    "wrong_password": {"label": "错误", "statuses": ["wrong_password"]},
-    "need_2fa": {"label": "双重", "statuses": ["need_2fa"], "also_count_as_valid": false},
-    "locked": {"label": "锁定", "statuses": ["security_lock", "locked"]},
-    "timeout": {"label": "超时", "kind": "timeout", "statuses": ["timeout"]},
-    "undetermined": {"label": "未判断", "default": true, "examples": ["init_refused", "credentials_rejected", "not_active", "server_error", "network_error", "interrupted"]}
+    "valid": {
+      "label": "密正",
+      "statuses": [
+        "valid"
+      ],
+      "conditional_status": {
+        "status": "needs_setup",
+        "password_verified": true
+      }
+    },
+    "wrong_password": {
+      "label": "错误",
+      "statuses": [
+        "wrong_password"
+      ]
+    },
+    "need_2fa": {
+      "label": "双重",
+      "statuses": [
+        "need_2fa"
+      ],
+      "also_count_as_valid": false
+    },
+    "locked": {
+      "label": "锁定",
+      "statuses": [
+        "security_lock",
+        "locked"
+      ]
+    },
+    "timeout": {
+      "label": "超时",
+      "kind": "timeout",
+      "statuses": [
+        "timeout"
+      ]
+    },
+    "undetermined": {
+      "label": "其他未验证",
+      "default": true,
+      "examples": [
+        "credentials_rejected",
+        "not_active",
+        "server_error",
+        "network_error",
+        "interrupted"
+      ]
+    },
+    "invalid": {
+      "label": "已失效",
+      "stage": "init",
+      "apple_ec": -20970,
+      "statuses": [
+        "init_refused"
+      ],
+      "meaning": "operationally unusable; exact password/frozen cause not asserted"
+    }
   },
   "observed_responses": [
-    {"protocol": "gsa", "stage": "init", "http": 200, "apple_ec": -20970, "category": "init_refused", "account_state_from_response": "undetermined", "password_result": "not_checked", "automatic_retry": false},
-    {"protocol": "gsa", "stage": "init", "http": 200, "apple_ec": -20209, "category": "security_lock", "password_result": "not_checked", "automatic_retry": false},
-    {"protocol": "web", "stage": "complete", "http": 403, "apple_ec": -20209, "category": "security_lock", "password_result": "undetermined", "automatic_retry": false},
-    {"protocol": "web", "stage": "complete", "http": 401, "apple_ec": -20283, "category": "credentials_rejected", "account_state_from_response": "undetermined", "password_result": "undetermined", "automatic_retry": false},
-    {"protocol": "gsa", "stage": "complete", "http": 200, "apple_ec": -22406, "category": "wrong_password", "automatic_retry": false},
-    {"protocol": "web", "stage": "init", "http": 400, "apple_ec": -900007, "category": "init_incomplete", "password_result": "not_checked", "automatic_retry": false},
-    {"protocol": "web_or_gsa", "stage": "init_or_complete", "http": 503, "apple_ec": null, "category": "server", "account_state_from_response": "undetermined", "password_result": "undetermined"}
+    {
+      "protocol": "gsa",
+      "stage": "init",
+      "http": 200,
+      "apple_ec": -20970,
+      "category": "invalid",
+      "account_state_from_response": "operationally_unusable_exact_cause_unknown",
+      "password_result": "not_checked",
+      "automatic_retry": false
+    },
+    {
+      "protocol": "gsa",
+      "stage": "init",
+      "http": 200,
+      "apple_ec": -20209,
+      "category": "security_lock",
+      "password_result": "not_checked",
+      "automatic_retry": false
+    },
+    {
+      "protocol": "web",
+      "stage": "complete",
+      "http": 403,
+      "apple_ec": -20209,
+      "category": "security_lock",
+      "password_result": "undetermined",
+      "automatic_retry": false
+    },
+    {
+      "protocol": "web",
+      "stage": "complete",
+      "http": 401,
+      "apple_ec": -20283,
+      "category": "credentials_rejected",
+      "account_state_from_response": "undetermined",
+      "password_result": "undetermined",
+      "automatic_retry": false
+    },
+    {
+      "protocol": "gsa",
+      "stage": "complete",
+      "http": 200,
+      "apple_ec": -22406,
+      "category": "wrong_password",
+      "automatic_retry": false
+    },
+    {
+      "protocol": "web",
+      "stage": "init",
+      "http": 400,
+      "apple_ec": -900007,
+      "category": "init_incomplete",
+      "password_result": "not_checked",
+      "automatic_retry": false
+    },
+    {
+      "protocol": "web_or_gsa",
+      "stage": "init_or_complete",
+      "http": 503,
+      "apple_ec": null,
+      "category": "server",
+      "account_state_from_response": "undetermined",
+      "password_result": "undetermined"
+    }
   ],
   "controlled_one_field_observations_not_universal_mappings": [
-    {"case": "u_empty", "http": 200, "apple_ec": -80002},
-    {"case": "cpd_md_corrupt", "http": 200, "apple_ec": -22409},
-    {"case": "A2k_zero", "http": 200, "apple_ec": -22402},
-    {"case": "ps_unsupported", "http": 200, "apple_ec": -22401}
+    {
+      "case": "u_empty",
+      "http": 200,
+      "apple_ec": -80002
+    },
+    {
+      "case": "cpd_md_corrupt",
+      "http": 200,
+      "apple_ec": -22409
+    },
+    {
+      "case": "A2k_zero",
+      "http": 200,
+      "apple_ec": -22402
+    },
+    {
+      "case": "ps_unsupported",
+      "http": 200,
+      "apple_ec": -22401
+    }
   ]
 }

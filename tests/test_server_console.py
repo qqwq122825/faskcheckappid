@@ -67,7 +67,7 @@ class ServerTests(unittest.TestCase):
         rows=self.client.get('/api/jobs/'+job+'/results').json['rows']
         self.assertEqual(len(rows),20)
         self.assertNotIn('demo-password',json.dumps(rows))
-        response=self.client.get('/api/jobs/'+job+'/exports/undetermined')
+        response=self.client.get('/api/jobs/'+job+'/exports/invalid')
         self.assertIn(b'demo-1@example.invalid----demo-password',response.data)
         zipped=self.client.get('/api/jobs/'+job+'/logs')
         with zipfile.ZipFile(io.BytesIO(zipped.data)) as archive:

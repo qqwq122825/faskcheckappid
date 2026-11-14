@@ -26,8 +26,9 @@ class StatusTests(unittest.TestCase):
         counts=snapshot(12,rows,active=1)
         self.assertEqual({k:counts[k] for k in ('processed','remaining','active')},
                          {'processed':10,'remaining':2,'active':1})
-        self.assertEqual([counts[k] for k in ('valid','wrong_password','need_2fa','locked','timeout','undetermined')],
-                         [1,1,1,2,1,4])
+        self.assertEqual([counts[k] for k in ('valid','wrong_password','need_2fa','locked','timeout','invalid','undetermined')],
+                         [1,1,1,2,1,1,3])
+        self.assertEqual(result_bucket({'status':'init_refused','stage':'init','apple_ec':-20970}), 'invalid')
         self.assertEqual(result_bucket({'status':'not_active'}),'undetermined')
         self.assertEqual(result_bucket({'status':'needs_setup','password_verified':True}),'valid')
         self.assertEqual(result_bucket({'status':'needs_setup'}),'undetermined')
@@ -54,7 +55,7 @@ class StatusTests(unittest.TestCase):
         with patch('fastcheck.status.shutil.get_terminal_size',return_value=os.terminal_size((60,24))):
             panel.update(snapshot(82,{}),0,'准备')
             panel.update(snapshot(82,{}),1,'已停止',final=True)
-        for label in ('总数','已运行','剩余','密正','错误','双重','锁定','超时','未判断'):
+        for label in ('总数','已运行','剩余','密正','错误','双重','锁定','超时','已失效','其他未验证'):
             self.assertIn(label,stream.getvalue())
         self.assertIn('\x1b[1A',stream.getvalue())
         self.assertEqual(panel.previous_rows,0)

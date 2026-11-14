@@ -26,7 +26,7 @@ const cells = computed<Cell[]>(() => [
   { label: '双重验证', value: categories.value.need_2fa ?? 0 },
   { label: '锁定', value: categories.value.locked ?? 0 },
   { label: '超时', value: categories.value.timeout ?? 0, tone: 'warning' },
-  { label: '未判断', value: categories.value.unknown ?? 0 },
+  { label: '已失效', value: categories.value.invalid ?? 0, tone: 'danger' },
 ])
 </script>
 <template>

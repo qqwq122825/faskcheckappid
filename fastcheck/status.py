@@ -17,11 +17,16 @@ def result_bucket(result):
         return 'wrong_password'
     if status in ('security_lock', 'locked'):
         return 'locked'
+    # -20970 在 init 阶段没有完成密码证明，不猜是密码错还是冻结；
+    # 但按业务口径该账号已不可用，单独归入“已失效”。
+    if (status == 'init_refused' or result.get('stage') == 'init') \
+            and result.get('apple_ec') == -20970:
+        return 'invalid'
     return 'undetermined'
 
 
 def snapshot(total, results, active=0):
-    counts = {key: 0 for key in ('valid','wrong_password','need_2fa','locked','timeout','undetermined')}
+    counts = {key: 0 for key in ('valid','wrong_password','need_2fa','locked','timeout','invalid','undetermined')}
     processed = 0
     for result in results.values():
         if result.get('attempts', 1) <= 0 or result.get('status') == 'not_started':
@@ -39,7 +44,8 @@ def status_tokens(counts, elapsed, phase, devices=None):
               f'剩余:{counts["remaining"]}',f'运行中:{counts["active"]}',
               f'密正:{counts["valid"]}',f'错误:{counts["wrong_password"]}',
               f'双重:{counts["need_2fa"]}',f'锁定:{counts["locked"]}',
-              f'超时:{counts["timeout"]}',f'未判断:{counts["undetermined"]}',
+              f'超时:{counts["timeout"]}',f'已失效:{counts["invalid"]}',
+              f'其他未验证:{counts["undetermined"]}',
               f'用时:{duration}',f'速度:{speed}/时']
     if devices is not None:
         if isinstance(devices,dict):

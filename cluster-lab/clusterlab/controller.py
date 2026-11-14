@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS jobs (
  unit_rows INTEGER NOT NULL, mode TEXT NOT NULL, error TEXT,
  c_valid INTEGER NOT NULL DEFAULT 0, c_wrong INTEGER NOT NULL DEFAULT 0,
  c_2fa INTEGER NOT NULL DEFAULT 0, c_locked INTEGER NOT NULL DEFAULT 0,
- c_timeout INTEGER NOT NULL DEFAULT 0, c_unknown INTEGER NOT NULL DEFAULT 0,
+ c_timeout INTEGER NOT NULL DEFAULT 0, c_invalid INTEGER NOT NULL DEFAULT 0,
+ c_unknown INTEGER NOT NULL DEFAULT 0,
  reported_rows INTEGER NOT NULL DEFAULT 0,
  req_timeout REAL NOT NULL DEFAULT 20, req_retries INTEGER NOT NULL DEFAULT 0,
  device_capacity INTEGER NOT NULL DEFAULT 30
@@ -95,7 +96,7 @@ class Controller:
     MAX_PROCESSES = 200
     MAX_THREADS = 512
     MAX_ACTIVE_UNITS = 512
-    RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked',
+    RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid',
                       'timeout', 'undetermined', 'unknown')
 
     def __init__(self, root, lease_seconds=30, offline_seconds=12, dispatch_per_second=0):
@@ -111,7 +112,7 @@ class Controller:
                 db.execute("UPDATE jobs SET queued_at=created WHERE status IN ('running','paused')")
             columns = {row['name'] for row in db.execute('PRAGMA table_info(nodes)')}
             job_columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
-            for name in ('c_valid', 'c_wrong', 'c_2fa', 'c_locked', 'c_timeout',
+            for name in ('c_valid', 'c_wrong', 'c_2fa', 'c_locked', 'c_timeout', 'c_invalid',
                          'c_unknown', 'reported_rows', 'req_timeout', 'req_retries',
                          'device_capacity'):
                 if name not in job_columns:
@@ -836,7 +837,7 @@ class Controller:
                         raise ValueError('结果编号或摘要格式无效')
                     bucket = value.get('status') or 'valid'
                     if bucket not in ('valid', 'wrong_password', 'need_2fa',
-                                      'locked', 'timeout', 'undetermined', 'unknown'):
+                                      'locked', 'invalid', 'timeout', 'undetermined', 'unknown'):
                         bucket = 'unknown'
                     buckets[bucket] += 1
                     count += 1
@@ -863,7 +864,7 @@ class Controller:
                     raise Conflict('当前工作包不接受结果')
                 final = self.results / (unit_id + '.' + hashlib.sha256(token.encode()).hexdigest()[:12] + '.jsonl')
                 os.replace(temporary, final)
-                # 六类计数与分片确认在同一个事务里累加；重复提交走上面的 completed
+                # 业务分类计数与分片确认在同一个事务里累加；重复提交走上面的 completed
                 # 分支直接返回，不会二次累加。分类取自结果行里的 status。
                 job_mode = db.execute('SELECT mode FROM jobs WHERE id=?',
                                       (unit['job_id'],)).fetchone()['mode']
@@ -871,9 +872,10 @@ class Controller:
                     # 只有账号校验才产生业务分类；摘要任务记成"密正"会误导
                     db.execute(
                         "UPDATE jobs SET c_valid=c_valid+?,c_wrong=c_wrong+?,c_2fa=c_2fa+?,"
-                        "c_locked=c_locked+?,c_timeout=c_timeout+?,c_unknown=c_unknown+?,updated=? WHERE id=?",
+                        "c_locked=c_locked+?,c_timeout=c_timeout+?,c_invalid=c_invalid+?,"
+                        "c_unknown=c_unknown+?,updated=? WHERE id=?",
                         (buckets['valid'], buckets['wrong_password'], buckets['need_2fa'],
-                         buckets['locked'], buckets['timeout'],
+                         buckets['locked'], buckets['timeout'], buckets['invalid'],
                          buckets['undetermined'] + buckets['unknown'], time.time(), unit['job_id']))
                 else:
                     db.execute("UPDATE jobs SET updated=? WHERE id=?", (time.time(), unit['job_id']))
@@ -931,6 +933,7 @@ class Controller:
                                           'need_2fa': row['c_2fa'] + live['need_2fa'],
                                           'locked': row['c_locked'] + live['locked'],
                                           'timeout': row['c_timeout'] + live['timeout'],
+                                          'invalid': row['c_invalid'] + live['invalid'],
                                           'unknown': row['c_unknown'] + live['undetermined'] + live['unknown']},
                              reported=row['reported_rows'])
                 jobs.append(value)
@@ -969,7 +972,7 @@ class Controller:
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
         categories = ('all', 'valid', 'wrong_password', 'need_2fa', 'locked',
-                      'timeout', 'undetermined', 'unknown')
+                      'invalid', 'timeout', 'undetermined', 'unknown')
         if category not in categories:
             raise ValueError('结果分类无效')
         with self.db.connect() as db:

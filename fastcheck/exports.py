@@ -8,10 +8,10 @@ from fastcheck.devices import private_directory
 from fastcheck.status import result_bucket
 
 FILES={'valid':'password_ok.txt','wrong_password':'wrong_password.txt','need_2fa':'need_2fa.txt',
-       'locked':'locked.txt','timeout':'timeout.txt','undetermined':'undetermined.txt',
+       'locked':'locked.txt','timeout':'timeout.txt','invalid':'invalid.txt','undetermined':'undetermined.txt',
        'not_started':'not_started.txt','accepted_passwords':'accepted_passwords.txt'}
 LABELS={'valid':'密正','wrong_password':'密码错误','need_2fa':'需要双重验证','locked':'锁定',
-        'timeout':'超时','undetermined':'未判断','not_started':'未开始','accepted_passwords':'密码已通过（含双重验证）'}
+        'timeout':'超时','invalid':'已失效','undetermined':'其他未验证','not_started':'未开始','accepted_passwords':'密码已通过（含双重验证）'}
 
 
 class ClassifiedExports:
@@ -34,7 +34,7 @@ class ClassifiedExports:
         if bucket in ('valid','need_2fa'):
             self.append(FILES['accepted_passwords'],pair)
             self.counts['accepted_passwords']+=1
-        if bucket in ('undetermined','timeout'):
+        if bucket in ('invalid','undetermined','timeout'):
             safe={key:result.get(key) for key in ('row','protocol','status','kind','stage','http','apple_ec','error_type','total_ms','attempts','history')}
             self.append('undetermined-details.jsonl',json.dumps(safe,ensure_ascii=False,separators=(',',':')))
 

@@ -57,7 +57,8 @@ class PortableRuntimeTests(unittest.TestCase):
             directory=root/'jobs'/job
             save_json(directory/'state.json',{'state':'completed'})
             save_json(directory/'accounts-index.json',[{'row':1,'email':'first@example.invalid'},{'row':2,'email':'second@example.invalid'}])
-            first=json.dumps({'row':1,'status':'init_refused','attempts':1})+'\n'
+            first=json.dumps({'row':1,'status':'init_refused','stage':'init',
+                              'apple_ec':-20970,'attempts':1})+'\n'
             second=json.dumps({'row':2,'status':'need_2fa','attempts':1})+'\n'
             path=directory/'results.jsonl';path.write_text(first+second[:10])
             self.assertEqual(manager.read_results(job)['total'],1)
@@ -65,6 +66,9 @@ class PortableRuntimeTests(unittest.TestCase):
             self.assertEqual(manager.read_results(job)['total'],2)
             self.assertEqual(manager.read_results(job)['total'],2)
             self.assertEqual(manager.read_results(job,'need_2fa')['total'],1)
+            invalid=manager.read_results(job,'invalid')
+            self.assertEqual(invalid['total'],1)
+            self.assertEqual(invalid['rows'][0]['category'],'invalid')
             manager.shutdown()
 
     def test_local_profile_initializes_requested_password_and_binds_to_loopback(self):
