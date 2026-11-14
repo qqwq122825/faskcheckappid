@@ -320,6 +320,23 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(snapshot['row_counts'], {'pending': 51, 'completed': 50})
         self.assertEqual(sum(snapshot['row_counts'].values()), snapshot['rows'])
 
+    def test_paused_task_exports_only_confirmed_units(self):
+        job = self.job(100)
+        self.service.job_action(job, 'start')
+        first = self.service.lease(self.node['id'], 'test-session')
+        self.confirm(first)
+        self.service.job_action(job, 'pause')
+
+        exported = b''.join(self.service.export_results(job, 'all'))
+        self.assertEqual(exported, b'hello\n' * 50)
+        self.assertEqual(self.service.snapshot()['jobs'][0]['status'], 'paused')
+
+    def test_running_task_still_requires_pause_before_partial_export(self):
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        with self.assertRaisesRegex(Conflict, '暂停'):
+            list(self.service.export_results(job, 'all'))
+
     def test_vue_page_and_hashed_assets_are_served_locally(self):
         client = create_app('controller', self.service).test_client()
         response = client.get('/')

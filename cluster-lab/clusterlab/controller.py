@@ -1080,8 +1080,8 @@ class Controller:
             job = db.execute('SELECT id,status FROM jobs WHERE id=?', (job_id,)).fetchone()
             if not job:
                 raise ValueError('任务不存在')
-            if job['status'] != 'completed':
-                raise Conflict('全部工作包确认后才可导出')
+            if job['status'] not in ('paused', 'completed'):
+                raise Conflict('任务暂停或全部完成后才可导出已确认结果')
             units = [dict(row) for row in db.execute(
                 "SELECT seq,path,byte_start,byte_end,result_path FROM units WHERE job_id=? AND status='completed' ORDER BY seq",
                 (job_id,))]

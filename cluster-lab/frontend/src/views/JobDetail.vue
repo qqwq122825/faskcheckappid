@@ -76,8 +76,10 @@ const events = computed(() => state.value?.events?.filter((e: any) => e.job_id =
                   :rate="hourlyRate" :elapsed="elapsedSeconds" :capacity="capacityText"
                   :categorized="job.categorized" :status="job.status">
       <template #actions>
-        <el-dropdown v-if="job.status === 'completed'" trigger="click" @command="download">
-          <el-button type="primary" :icon="Download">导出账号</el-button>
+        <el-dropdown v-if="['paused', 'completed'].includes(job.status)" trigger="click" @command="download">
+          <el-button type="primary" :icon="Download">
+            {{ job.status === 'paused' ? '导出已确认账号' : '导出账号' }}
+          </el-button>
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item v-for="item in exportOptions" :key="item.value" :command="item.value">
@@ -86,7 +88,9 @@ const events = computed(() => state.value?.events?.filter((e: any) => e.job_id =
             </el-dropdown-menu>
           </template>
         </el-dropdown>
-        <el-button v-else disabled :icon="Download">等待全部确认后可导出</el-button>
+        <el-button v-else disabled :icon="Download">
+          {{ job.status === 'running' ? '暂停后可导出已确认结果' : '暂停或完成后可导出' }}
+        </el-button>
       </template>
     </TaskFeedback>
 

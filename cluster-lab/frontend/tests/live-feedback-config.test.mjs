@@ -92,6 +92,16 @@ test('Task detail lists all valid rows by page and caps each other category at 1
   assert.match(results, /props\.job\?\.confirmed/)
 })
 
+test('Paused tasks can export their confirmed result subset', () => {
+  const detail = source('src/views/JobDetail.vue')
+  const actions = source('src/components/TaskActions.vue')
+  assert.match(detail, /\['paused', 'completed'\]\.includes\(job\.status\)/)
+  assert.match(detail, /导出已确认账号/)
+  assert.match(actions, /\['paused', 'completed'\]\.includes\(job\.status\)/)
+  assert.match(actions, /导出已确认结果/)
+  assert.doesNotMatch(actions, /全部确认后可导出/)
+})
+
 test('Deleting a running task explicitly stops its node work', () => {
   const table = source('src/components/JobTable.vue')
   assert.doesNotMatch(table, /const removable/)
