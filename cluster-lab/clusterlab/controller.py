@@ -138,6 +138,7 @@ class Controller:
                 db.execute('ALTER TABLE units ADD COLUMN byte_end INTEGER NOT NULL DEFAULT 0')
             if 'live_counts' not in unit_columns:
                 db.execute('ALTER TABLE units ADD COLUMN live_counts TEXT')
+        self._backfill_legacy_web_rechecks()
         self.lease_seconds, self.offline_seconds = lease_seconds, offline_seconds
         # 全局派发闸门：整个集群每秒最多放多少个新工作包。0 表示不限。
         self.dispatch_per_second = max(0, int(dispatch_per_second or 0))
@@ -154,6 +155,49 @@ class Controller:
             preparing = [r['id'] for r in db.execute("SELECT id FROM jobs WHERE status='preparing' ORDER BY created,id")]
         for job_id in preparing:
             self.preparer.submit(self.prepare, job_id)
+
+    def _backfill_legacy_web_rechecks(self):
+        """Recover dual-protocol counts for results confirmed before the counter existed.
+
+        Legacy result files already contain the protocol and per-protocol codes.  Scan only
+        completed units whose persisted result_counts has no web_recheck key, then persist the
+        recovered count so later controller restarts do not reread large result files.
+        """
+        totals = {}
+        with self.db.transaction() as db:
+            units = list(db.execute(
+                "SELECT u.id,u.job_id,u.result_path,u.result_counts FROM units u "
+                "JOIN jobs j ON j.id=u.job_id "
+                "WHERE u.status='completed' AND u.result_path IS NOT NULL "
+                "AND j.mode='auth' AND j.dual_recheck=1"))
+            for unit in units:
+                try:
+                    counts = json.loads(unit['result_counts'] or '{}')
+                except (TypeError, ValueError):
+                    counts = {}
+                if 'web_recheck' not in counts:
+                    recovered = 0
+                    try:
+                        with Path(unit['result_path']).open('rb') as source:
+                            for line in source:
+                                try:
+                                    value = json.loads(line)
+                                except (TypeError, ValueError):
+                                    continue
+                                if (value.get('protocol') == 'GSA → 网页复检'
+                                        or value.get('web_code') is not None):
+                                    recovered += 1
+                    except OSError:
+                        recovered = 0
+                    counts['web_recheck'] = recovered
+                    db.execute('UPDATE units SET result_counts=? WHERE id=?',
+                               (json.dumps(counts, separators=(',', ':')), unit['id']))
+                totals[unit['job_id']] = totals.get(unit['job_id'], 0) + int(
+                    counts.get('web_recheck', 0) or 0)
+            for job_id, recovered in totals.items():
+                db.execute(
+                    'UPDATE jobs SET c_web_recheck=MAX(c_web_recheck,?) '
+                    "WHERE id=? AND mode='auth'", (recovered, job_id))
 
     def close(self):
         self.closing.set()

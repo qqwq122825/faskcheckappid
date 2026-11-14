@@ -164,4 +164,7 @@ test('Dual-protocol task status and both protocol codes stay visible', () => {
   assert.match(results, /label="网页码"/)
   assert.match(results, /row\.gsa_code/)
   assert.match(results, /row\.web_code/)
+  assert.match(results, /labels\[row\.status\]/)
+  assert.match(results, /String\(row\.protocol \|\| ''\)\.includes\('网页复检'\)/)
+  assert.match(results, /`HTTP \$\{row\.http\}`/)
 })

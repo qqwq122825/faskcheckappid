@@ -75,6 +75,14 @@ function next() { offset.value += pageSize; load() }
 const elapsed = (value: any) => value == null ? '—' : `${Number(value).toFixed(2)}s`
 const display = (value: any) => value == null || value === '' ? '—' : value
 const gsaCode = (row: any) => display(row.gsa_code ?? (row.protocol === 'GSA' ? row.code : null))
+const statusLabel = (row: any) => labels[row.status] || labels[category.value] || '其他未验证'
+const webCode = (row: any) => {
+  if (row.web_code != null && row.web_code !== '') return row.web_code
+  if (String(row.protocol || '').includes('网页复检')) {
+    return row.http ? `HTTP ${row.http}` : '已发起'
+  }
+  return '—'
+}
 
 watch(
   () => [props.job?.id, Number(props.job?.confirmed) || 0] as const,
@@ -104,13 +112,13 @@ watch(
     <el-table v-loading="loading" :data="rows" empty-text="当前分类暂无已确认结果" stripe>
       <el-table-column prop="row" label="#" width="90" />
       <el-table-column prop="account" label="账号" min-width="260" show-overflow-tooltip />
-      <el-table-column label="状态" width="120"><template #default>{{ labels[category] }}</template></el-table-column>
+      <el-table-column label="状态" width="120"><template #default="scope">{{ statusLabel(scope.row) }}</template></el-table-column>
       <el-table-column prop="protocol" label="协议" min-width="150" show-overflow-tooltip />
       <el-table-column prop="stage" label="阶段" min-width="130" show-overflow-tooltip />
       <el-table-column prop="http" label="HTTP" width="90" />
       <el-table-column prop="code" label="结果码" min-width="140" show-overflow-tooltip />
       <el-table-column label="GSA 码" min-width="130"><template #default="scope">{{ gsaCode(scope.row) }}</template></el-table-column>
-      <el-table-column label="网页码" min-width="130"><template #default="scope">{{ display(scope.row.web_code) }}</template></el-table-column>
+      <el-table-column label="网页码" min-width="130"><template #default="scope">{{ webCode(scope.row) }}</template></el-table-column>
       <el-table-column prop="device" label="设备" width="90" />
       <el-table-column label="耗时" width="100"><template #default="scope">{{ elapsed(scope.row.elapsed) }}</template></el-table-column>
       <el-table-column prop="attempts" label="重试" width="80" />

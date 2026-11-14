@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -351,6 +352,46 @@ class ControllerTests(unittest.TestCase):
                                    io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
         state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
         self.assertEqual(state['dual_recheck_stats'], {'triggered': 1, 'confirmed': 1, 'live': 0})
+
+    def test_controller_upgrade_backfills_legacy_web_recheck_results_once(self):
+        job = self.service.create_job('legacy dual status', io.BytesIO(b'hello\n' * 50), 50,
+                                      mode='auth', dual_recheck=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
+            if state['status'] != 'preparing':
+                break
+            time.sleep(.01)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        payload = b''.join((json.dumps({
+            'row': unit['first_row'] + offset,
+            'status': 'locked' if offset == 0 else 'valid',
+            'protocol': 'GSA → 网页复检' if offset == 0 else 'GSA',
+            'gsa_code': -20970 if offset == 0 else None,
+            'web_code': None,
+            'http': 503 if offset == 0 else 200,
+            'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
+            separators=(',', ':')) + '\n').encode()
+            for offset in range(unit['rows']))
+        self.service.accept_result(self.node['id'], unit['id'], unit['token'],
+                                   io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
+        self.service.close()
+        database = Path(self.temp.name) / 'controller.sqlite3'
+        with sqlite3.connect(database) as db:
+            counts = json.loads(db.execute(
+                'SELECT result_counts FROM units WHERE id=?', (unit['id'],)).fetchone()[0])
+            counts.pop('web_recheck')
+            db.execute('UPDATE units SET result_counts=? WHERE id=?',
+                       (json.dumps(counts, separators=(',', ':')), unit['id']))
+            db.execute('UPDATE jobs SET c_web_recheck=0 WHERE id=?', (job,))
+        self.service = Controller(self.temp.name)
+        state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
+        self.assertEqual(state['dual_recheck_stats'], {'triggered': 1, 'confirmed': 1, 'live': 0})
+        with self.service.db.connect() as db:
+            stored = json.loads(db.execute(
+                'SELECT result_counts FROM units WHERE id=?', (unit['id'],)).fetchone()[0])
+        self.assertEqual(stored['web_recheck'], 1)
 
     def test_task_row_statistics_count_partial_final_unit(self):
         job = self.job(101)
