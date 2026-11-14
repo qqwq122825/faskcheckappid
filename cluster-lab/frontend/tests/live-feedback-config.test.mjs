@@ -92,6 +92,15 @@ test('Task detail lists all valid rows by page and caps each other category at 1
   assert.match(results, /props\.job\?\.confirmed/)
 })
 
+test('Live result updates refresh silently without flashing the table loading mask', () => {
+  const results = source('src/components/ResultList.vue')
+  assert.match(results, /async function load\(reset = false, showLoading = true\)/)
+  assert.match(results, /async function refreshInBackground\(\)/)
+  assert.match(results, /await load\(false, false\)/)
+  assert.match(results, /if \(showLoading\) \{[\s\S]*loading\.value = true/)
+  assert.doesNotMatch(results, /\[props\.job\?\.id, props\.job\?\.confirmed\], \(\) => load\(\)/)
+})
+
 test('Paused tasks can export their confirmed result subset', () => {
   const detail = source('src/views/JobDetail.vue')
   const actions = source('src/components/TaskActions.vue')

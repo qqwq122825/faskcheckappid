@@ -11,6 +11,9 @@ const total = ref(0)
 const loading = ref(false)
 const error = ref('')
 let generation = 0
+let foregroundRequests = 0
+let backgroundPending = false
+let backgroundQueued = false
 
 const options = [
   { label: '密正', value: 'valid' },
@@ -27,12 +30,15 @@ const visibleTotal = computed(() => valid.value ? total.value : Math.min(total.v
 const page = computed(() => Math.floor(offset.value / pageSize) + 1)
 const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 
-async function load(reset = false) {
+async function load(reset = false, showLoading = true) {
   if (!props.job?.id) return
   if (reset || !valid.value) offset.value = 0
   const current = ++generation
-  loading.value = true
-  error.value = ''
+  if (showLoading) {
+    foregroundRequests += 1
+    loading.value = true
+    error.value = ''
+  }
   try {
     const result = await api(`/api/jobs/${props.job.id}/rows?category=${category.value}&offset=${offset.value}&limit=${pageSize}`)
     if (current !== generation) return
@@ -41,7 +47,25 @@ async function load(reset = false) {
   } catch (exc: any) {
     if (current === generation) error.value = exc?.message || '结果加载失败'
   } finally {
-    if (current === generation) loading.value = false
+    if (showLoading) {
+      foregroundRequests = Math.max(0, foregroundRequests - 1)
+      loading.value = foregroundRequests > 0
+    }
+  }
+}
+async function refreshInBackground() {
+  if (backgroundPending) {
+    backgroundQueued = true
+    return
+  }
+  backgroundPending = true
+  try {
+    do {
+      backgroundQueued = false
+      await load(false, false)
+    } while (backgroundQueued)
+  } finally {
+    backgroundPending = false
   }
 }
 function changeCategory() { load(true) }
@@ -49,7 +73,18 @@ function previous() { offset.value = Math.max(0, offset.value - pageSize); load(
 function next() { offset.value += pageSize; load() }
 const elapsed = (value: any) => value == null ? '—' : `${Number(value).toFixed(2)}s`
 
-watch(() => [props.job?.id, props.job?.confirmed], () => load(), { immediate: true })
+watch(
+  () => [props.job?.id, Number(props.job?.confirmed) || 0] as const,
+  ([jobId, confirmed], previous) => {
+    if (!jobId) return
+    if (!previous || previous[0] !== jobId) {
+      void load(true, true)
+      return
+    }
+    if (confirmed !== previous[1]) void refreshInBackground()
+  },
+  { immediate: true },
+)
 </script>
 
 <template>
