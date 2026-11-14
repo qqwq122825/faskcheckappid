@@ -323,6 +323,74 @@ class ControllerTests(unittest.TestCase):
             self.assertIsNone(db.execute('SELECT live_counts FROM units WHERE id=?',
                                          (unit['id'],)).fetchone()[0])
 
+    def test_node_heartbeat_streams_rows_idempotently_and_completes_package(self):
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        lines = [json.dumps({
+            'row': unit['first_row'] + offset, 'account': f'user{offset}@example.com',
+            'status': 'valid', 'sha256': hashlib.sha256(b'hello').hexdigest(),
+            'bytes': 5}, separators=(',', ':')) for offset in range(50)]
+
+        first = self.service.heartbeat(self.node['id'], {
+            'session': 'test-session', 'version': '0.3.34',
+            'max_processes': 1, 'max_threads': 2, 'interrupted': [],
+            'active': [{'id': unit['id'], 'token': unit['token'],
+                        'processed': 10, 'counts': {'valid': 10},
+                        'records': lines[:10]}]})
+        self.assertEqual(first['reported'][unit['id']], 10)
+        state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
+        self.assertEqual((state['confirmed'], state['reported'], state['status']),
+                         (10, 10, 'running'))
+        page = self.service.read_rows(job, 0, 100, 'all')
+        self.assertEqual((page['total'], len(page['rows']), page['rows'][0]['account']),
+                         (10, 10, 'user0@example.com'))
+
+        # Lost heartbeat responses replay the same lines; the PK makes the ACK
+        # stable instead of counting them twice.
+        replay = self.service.heartbeat(self.node['id'], {
+            'session': 'test-session', 'version': '0.3.34',
+            'max_processes': 1, 'max_threads': 2, 'interrupted': [],
+            'active': [{'id': unit['id'], 'token': unit['token'],
+                        'processed': 10, 'counts': {'valid': 10},
+                        'records': lines[:10]}]})
+        self.assertEqual(replay['reported'][unit['id']], 10)
+
+        final = self.service.heartbeat(self.node['id'], {
+            'session': 'test-session', 'version': '0.3.34',
+            'max_processes': 1, 'max_threads': 2, 'interrupted': [],
+            'active': [{'id': unit['id'], 'token': unit['token'],
+                        'processed': 50, 'counts': {'valid': 50},
+                        'records': lines[10:]}]})
+        self.assertIn(unit['id'], final['confirmed'])
+        state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
+        self.assertEqual((state['confirmed'], state['reported'], state['status']),
+                         (50, 0, 'completed'))
+        self.assertEqual(self.service.read_rows(job, 0, 100, 'valid')['total'], 50)
+        payload = ('\n'.join(lines) + '\n').encode()
+        duplicate = self.service.accept_result(
+            self.node['id'], unit['id'], unit['token'], io.BytesIO(payload),
+            hashlib.sha256(payload).hexdigest())
+        self.assertTrue(duplicate['duplicate'])
+
+    def test_paused_export_includes_heartbeat_confirmed_partial_rows(self):
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        lines = [json.dumps({
+            'row': unit['first_row'] + offset, 'status': 'valid',
+            'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
+            separators=(',', ':')) for offset in range(10)]
+        self.service.heartbeat(self.node['id'], {
+            'session': 'test-session', 'version': '0.3.34',
+            'max_processes': 1, 'max_threads': 2, 'interrupted': [],
+            'active': [{'id': unit['id'], 'token': unit['token'],
+                        'processed': 10, 'counts': {'valid': 10},
+                        'records': lines}]})
+        self.service.job_action(job, 'pause')
+        self.assertEqual(b''.join(self.service.export_results(job, 'all')), b'hello\n' * 10)
+        self.assertEqual(b''.join(self.service.export_results(job, 'valid')), b'hello\n' * 10)
+
     def test_result_codes_override_legacy_node_statuses(self):
         job = self.service.create_job('result code mapping', io.BytesIO(b'hello\n' * 50), 50,
                                       mode='auth')

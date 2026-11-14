@@ -47,11 +47,19 @@ CREATE TABLE IF NOT EXISTS units (
  result_counts TEXT,
  classification_version INTEGER NOT NULL DEFAULT 0,
  live_counts TEXT,
+ reported_rows INTEGER NOT NULL DEFAULT 0,
  updated REAL NOT NULL, UNIQUE(job_id,seq)
 );
 CREATE INDEX IF NOT EXISTS units_queue ON units(status,job_id,seq);
 CREATE INDEX IF NOT EXISTS units_node ON units(node_id,status);
 CREATE INDEX IF NOT EXISTS units_rows ON units(job_id,status,first_row);
+CREATE TABLE IF NOT EXISTS live_result_rows (
+ unit_id TEXT NOT NULL, job_id TEXT NOT NULL, row INTEGER NOT NULL,
+ category TEXT NOT NULL, payload TEXT NOT NULL,
+ PRIMARY KEY(unit_id,row)
+);
+CREATE INDEX IF NOT EXISTS live_result_job ON live_result_rows(job_id,unit_id,row);
+CREATE INDEX IF NOT EXISTS live_result_category ON live_result_rows(job_id,category,row);
 CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, code TEXT NOT NULL,
  message TEXT NOT NULL, job_id TEXT, node_id TEXT
@@ -167,6 +175,8 @@ class Controller:
                 db.execute('ALTER TABLE units ADD COLUMN live_counts TEXT')
             if 'classification_version' not in unit_columns:
                 db.execute('ALTER TABLE units ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 0')
+            if 'reported_rows' not in unit_columns:
+                db.execute('ALTER TABLE units ADD COLUMN reported_rows INTEGER NOT NULL DEFAULT 0')
         self.lease_seconds, self.offline_seconds = lease_seconds, offline_seconds
         # 全局派发闸门：整个集群每秒最多放多少个新工作包。0 表示不限。
         self.dispatch_per_second = max(0, int(dispatch_per_second or 0))
@@ -535,6 +545,151 @@ class Controller:
             raise ValueError('实时分类数超过已处理数')
         return result
 
+    @classmethod
+    def clean_live_records(cls, value, unit):
+        """Validate one node-level heartbeat batch without trusting workers.
+
+        Workers only append local JSONL files.  The node agent reads those files
+        once per heartbeat and sends at most 1,000 complete lines here.  Keeping
+        this validation identical to the final-result path means a live row can
+        never bypass the package row range or the 1 KiB record limit.
+        """
+        if value is None:
+            return []
+        if not isinstance(value, list) or len(value) > 1000:
+            raise ValueError('实时结果批次无效')
+        first = int(unit['first_row'])
+        last = first + int(unit['rows'])
+        seen, result = set(), []
+        for item in value:
+            if isinstance(item, str):
+                encoded = item
+                try:
+                    record = json.loads(encoded)
+                except ValueError as exc:
+                    raise ValueError('实时结果 JSON 无效') from exc
+            elif isinstance(item, dict):
+                # Backward-compatible with an early development node build.
+                record = item
+                encoded = json.dumps(record, separators=(',', ':'))
+            else:
+                raise ValueError('实时结果记录无效')
+            if not isinstance(record, dict):
+                raise ValueError('实时结果记录无效')
+            row = record.get('row')
+            size = record.get('bytes')
+            digest = record.get('sha256')
+            if (type(row) is not int or row < first or row >= last or row in seen
+                    or type(size) is not int or size < 0
+                    or not isinstance(digest, str)
+                    or not re.fullmatch('[0-9a-f]{64}', digest)):
+                raise ValueError('实时结果编号或摘要无效')
+            if len(encoded.encode('utf-8')) + 1 > 1024:
+                raise ValueError('实时结果记录过长')
+            seen.add(row)
+            result.append((row, result_record_bucket(record), encoded))
+        return result
+
+    def _accept_live_records(self, db, unit, records):
+        """Persist an idempotent heartbeat batch and return the unit ACK count."""
+        inserted = 0
+        for row, category, payload in self.clean_live_records(records, unit):
+            existing = db.execute(
+                'SELECT payload FROM live_result_rows WHERE unit_id=? AND row=?',
+                (unit['id'], row)).fetchone()
+            if existing:
+                if existing['payload'] != payload:
+                    raise Conflict('同一记录的实时结果不一致')
+                continue
+            db.execute(
+                'INSERT INTO live_result_rows(unit_id,job_id,row,category,payload) VALUES(?,?,?,?,?)',
+                (unit['id'], unit['job_id'], row, category, payload))
+            inserted += 1
+        if inserted:
+            db.execute('UPDATE units SET reported_rows=reported_rows+? WHERE id=?',
+                       (inserted, unit['id']))
+            db.execute('UPDATE jobs SET reported_rows=reported_rows+?,updated=? WHERE id=?',
+                       (inserted, time.time(), unit['job_id']))
+        current = db.execute('SELECT reported_rows FROM units WHERE id=?',
+                             (unit['id'],)).fetchone()
+        return int(current['reported_rows'] or 0)
+
+    def _complete_live_unit(self, db, unit):
+        """Promote a fully streamed package without waiting for a second upload."""
+        records = db.execute(
+            'SELECT row,category,payload FROM live_result_rows WHERE unit_id=? ORDER BY row',
+            (unit['id'],)).fetchall()
+        if len(records) != int(unit['rows']):
+            return False
+        temporary = self.results / (secrets.token_hex(16) + '.live')
+        digest, buckets = hashlib.sha256(), Counter()
+        expected = int(unit['first_row'])
+        try:
+            with temporary.open('xb') as output:
+                temporary.chmod(0o600)
+                for record in records:
+                    if int(record['row']) != expected:
+                        return False
+                    line = (record['payload'] + '\n').encode('utf-8')
+                    output.write(line)
+                    digest.update(line)
+                    buckets[record['category']] += 1
+                    expected += 1
+                output.flush()
+                os.fsync(output.fileno())
+            final = self.results / (unit['id'] + '.' + hashlib.sha256(
+                str(unit['lease_token']).encode()).hexdigest()[:12] + '.jsonl')
+            os.replace(temporary, final)
+            job_mode = db.execute('SELECT mode FROM jobs WHERE id=?',
+                                  (unit['job_id'],)).fetchone()['mode']
+            self._clear_live_unit(db, unit['id'])
+            if job_mode == 'auth':
+                db.execute(
+                    "UPDATE jobs SET c_valid=c_valid+?,c_wrong=c_wrong+?,c_2fa=c_2fa+?,"
+                    "c_locked=c_locked+?,c_timeout=c_timeout+?,c_invalid=c_invalid+?,"
+                    "c_unknown=c_unknown+?,updated=? WHERE id=?",
+                    (buckets['valid'], buckets['wrong_password'], buckets['need_2fa'],
+                     buckets['locked'], buckets['timeout'], buckets['invalid'],
+                     buckets['undetermined'] + buckets['unknown'], time.time(), unit['job_id']))
+            else:
+                db.execute('UPDATE jobs SET updated=? WHERE id=?',
+                           (time.time(), unit['job_id']))
+            db.execute(
+                "UPDATE units SET status='completed',processed=rows,result_path=?,result_checksum=?,"
+                "result_counts=?,classification_version=?,live_counts=NULL,reported_rows=0,"
+                "lease_until=NULL,updated=? WHERE id=?",
+                (str(final), digest.hexdigest(),
+                 json.dumps(dict(buckets), separators=(',', ':')),
+                 self.RESULT_CLASSIFICATION_VERSION, time.time(), unit['id']))
+            event(db, 'result_stream_confirmed',
+                  f'工作包 #{unit["seq"]} 已通过节点心跳实时确认（{int(unit["rows"]):,} 条）',
+                  unit['job_id'], unit['node_id'])
+            unfinished = db.execute(
+                "SELECT COUNT(*) FROM units WHERE job_id=? AND status!='completed'",
+                (unit['job_id'],)).fetchone()[0]
+            if not unfinished:
+                db.execute("UPDATE jobs SET status='completed',updated=? WHERE id=?",
+                           (time.time(), unit['job_id']))
+                event(db, 'job_completed', '全部工作包已确认，任务完成', unit['job_id'])
+            self._advance_queue(db)
+            return True
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _clear_live_unit(db, unit_id):
+        unit = db.execute('SELECT job_id,reported_rows FROM units WHERE id=?',
+                          (unit_id,)).fetchone()
+        if not unit:
+            return 0
+        count = int(unit['reported_rows'] or 0)
+        db.execute('DELETE FROM live_result_rows WHERE unit_id=?', (unit_id,))
+        db.execute('UPDATE units SET reported_rows=0 WHERE id=?', (unit_id,))
+        if count:
+            db.execute('UPDATE jobs SET reported_rows=MAX(0,reported_rows-?) WHERE id=?',
+                       (count, unit['job_id']))
+        return count
+
     def files(self):
         """列出上传过的源文件，供新建任务时复用，避免重复上传大文件。"""
         with self.db.connect() as db:
@@ -698,13 +853,21 @@ class Controller:
             elif action == 'stop' and job['status'] in ('queued', 'running', 'paused', 'ready'):
                 db.execute("UPDATE jobs SET status='stopped',queued_at=NULL,updated=? WHERE id=?",
                            (time.time(), job_id))
+                for unit in db.execute(
+                        "SELECT id FROM units WHERE job_id=? AND status IN ('leased','running','unknown')",
+                        (job_id,)).fetchall():
+                    self._clear_live_unit(db, unit['id'])
                 db.execute("UPDATE units SET status='pending',node_id=NULL,lease_token=NULL,"
-                           "lease_until=NULL,processed=0,live_counts=NULL,updated=? WHERE job_id=? "
+                           "lease_until=NULL,processed=0,live_counts=NULL,reported_rows=0,updated=? WHERE job_id=? "
                            "AND status IN ('leased','running','unknown')", (time.time(), job_id))
                 event(db, 'job_stopped', '任务已停止，在途工作包退回待分配', job_id=job_id)
                 self._advance_queue(db)
             elif action == 'retry_unknown' and job['status'] in ('running', 'paused', 'ready'):
-                count = db.execute("UPDATE units SET status='pending',node_id=NULL,lease_token=NULL,lease_until=NULL,processed=0,live_counts=NULL,updated=? WHERE job_id=? AND status='unknown'",
+                unknown = db.execute("SELECT id FROM units WHERE job_id=? AND status='unknown'",
+                                     (job_id,)).fetchall()
+                for unit in unknown:
+                    self._clear_live_unit(db, unit['id'])
+                count = db.execute("UPDATE units SET status='pending',node_id=NULL,lease_token=NULL,lease_until=NULL,processed=0,live_counts=NULL,reported_rows=0,updated=? WHERE job_id=? AND status='unknown'",
                                    (time.time(), job_id)).rowcount
                 event(db, 'units_requeued', f'人工重新排队 {count} 个待确认工作包（仅离线可重复任务）', job_id=job_id)
             else:
@@ -732,6 +895,14 @@ class Controller:
             raise ValueError('节点工作包列表无效')
         if not isinstance(interrupted, list) or len(interrupted) > self.MAX_ACTIVE_UNITS:
             raise ValueError('节点中断工作包列表无效')
+        record_total = 0
+        for value in active:
+            records = value.get('records', []) if isinstance(value, dict) else None
+            if not isinstance(records, list) or len(records) > 1000:
+                raise ValueError('节点实时结果批次无效')
+            record_total += len(records)
+        if record_total > 2000:
+            raise ValueError('单次心跳实时结果过多')
         with self.db.transaction() as db:
             self._expire(db)
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
@@ -747,13 +918,15 @@ class Controller:
                 db.execute('UPDATE nodes SET desired_threads=? WHERE id=?', (desired_threads, node_id))
                 event(db, 'node_config', '已将旧版 32 线程上限升级为本机 100 线程；下一工作包生效',
                       node_id=node_id)
-            reject, confirmed, interrupted_ack = [], [], []
+            reject, confirmed, interrupted_ack, reported_ack = [], [], [], {}
             for value in interrupted:
                 unit = db.execute('SELECT * FROM units WHERE id=? AND node_id=?', (value.get('id'), node_id)).fetchone()
-                if not unit or unit['lease_token'] != value.get('token') or unit['status'] not in ('leased', 'running'):
+                if (not unit or unit['lease_token'] != value.get('token')
+                        or unit['status'] not in ('leased', 'running', 'unknown')):
                     reject.append(value.get('id'))
                     continue
                 count = integer(value.get('processed', 0), '中断记录数', 0, unit['rows'])
+                self._clear_live_unit(db, unit['id'])
                 db.execute("UPDATE units SET status='unknown',processed=?,live_counts=NULL,lease_token=NULL,lease_until=NULL,updated=? WHERE id=?",
                            (count, now, unit['id']))
                 interrupted_ack.append(unit['id'])
@@ -766,12 +939,19 @@ class Controller:
                 if unit and unit['lease_token'] == value.get('token') and unit['status'] == 'completed':
                     confirmed.append(unit['id'])
                     continue
-                if not unit or unit['lease_token'] != value.get('token') or unit['status'] not in ('leased', 'running'):
+                if (not unit or unit['lease_token'] != value.get('token')
+                        or unit['status'] not in ('leased', 'running', 'unknown')):
                     reject.append(value.get('id'))
                     continue
                 count = integer(value.get('processed', 0), '已处理数量', 0, unit['rows'])
                 live_counts = self.clean_live_counts(value.get('counts'), count, unit['rows'])
-                if count >= unit['processed']:
+                reported_ack[unit['id']] = self._accept_live_records(
+                    db, unit, value.get('records', []))
+                if (reported_ack[unit['id']] == int(unit['rows'])
+                        and count == int(unit['rows'])
+                        and self._complete_live_unit(db, unit)):
+                    confirmed.append(unit['id'])
+                elif count >= unit['processed']:
                     db.execute("UPDATE units SET status='running',processed=?,live_counts=?,lease_until=?,updated=? WHERE id=?",
                                (count, json.dumps(live_counts, separators=(',', ':')),
                                 now + self.lease_seconds, now, unit['id']))
@@ -802,6 +982,7 @@ class Controller:
                     'processes': min(desired_processes, max_p), 'threads': min(desired_threads, max_t),
                     'desired_processes': desired_processes, 'desired_threads': desired_threads,
                     'rejected': reject, 'confirmed': confirmed, 'interrupted_ack': interrupted_ack,
+                    'reported': reported_ack,
                     'device_request': node['device_request'],
                     'device_clear_version': node['device_clear_version'],
                     'device_rotate_after': self.settings().get('device_rotate_after', 0),
@@ -844,8 +1025,11 @@ class Controller:
             unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries,j.device_capacity FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
             if not unit:
                 return None
+            # A manually retried package must not inherit rows accepted under
+            # its previous lease token.
+            self._clear_live_unit(db, unit['id'])
             token = secrets.token_urlsafe(24)
-            db.execute("UPDATE units SET status='leased',node_id=?,lease_token=?,lease_until=?,attempt=attempt+1,processed=0,live_counts=NULL,updated=? WHERE id=?",
+            db.execute("UPDATE units SET status='leased',node_id=?,lease_token=?,lease_until=?,attempt=attempt+1,processed=0,live_counts=NULL,reported_rows=0,updated=? WHERE id=?",
                        (node_id, token, time.time() + self.lease_seconds, time.time(), unit['id']))
             event(db, 'unit_leased', f'工作包 #{unit["seq"]} 已分配（{unit["rows"]:,} 条）', unit['job_id'], node_id)
             self._rate_record()
@@ -973,6 +1157,11 @@ class Controller:
                 # 分支直接返回，不会二次累加。分类取自结果行里的 status。
                 job_mode = db.execute('SELECT mode FROM jobs WHERE id=?',
                                       (unit['job_id'],)).fetchone()['mode']
+                # Live rows were already accepted one heartbeat at a time.
+                # Replace that temporary index with the authoritative complete
+                # package in the same transaction so confirmed totals never
+                # jump backwards or count a row twice.
+                self._clear_live_unit(db, unit_id)
                 if job_mode == 'auth':
                     # 只有账号校验才产生业务分类；摘要任务记成"密正"会误导
                     db.execute(
@@ -985,7 +1174,7 @@ class Controller:
                 else:
                     db.execute("UPDATE jobs SET updated=? WHERE id=?", (time.time(), unit['job_id']))
                 db.execute("UPDATE units SET status='completed',processed=rows,result_path=?,result_checksum=?,"
-                           "result_counts=?,classification_version=?,live_counts=NULL,lease_until=NULL,updated=? WHERE id=?",
+                           "result_counts=?,classification_version=?,live_counts=NULL,reported_rows=0,lease_until=NULL,updated=? WHERE id=?",
                            (str(final), expected_digest,
                             json.dumps(dict(buckets), separators=(',', ':')),
                             self.RESULT_CLASSIFICATION_VERSION, time.time(), unit_id))
@@ -1033,7 +1222,8 @@ class Controller:
                         for key in self.RESULT_BUCKETS:
                             live[key] += int(unit_counts.get(key, 0) or 0)
                 value.update(units=sum(counts.values()), unit_counts=counts, row_counts=row_counts,
-                             confirmed=sums[0], processed=sums[1],
+                             confirmed=min(int(row['rows']), int(sums[0]) + int(row['reported_rows'] or 0)),
+                             processed=sums[1],
                              categorized={'valid': row['c_valid'] + live['valid'],
                                           'wrong_password': row['c_wrong'] + live['wrong_password'],
                                           'need_2fa': row['c_2fa'] + live['need_2fa'],
@@ -1047,7 +1237,7 @@ class Controller:
             for row in db.execute('SELECT * FROM nodes ORDER BY created'):
                 value = {k: row[k] for k in ('id', 'name', 'last_seen', 'hostname', 'enabled', 'desired_processes', 'desired_threads', 'max_processes', 'max_threads', 'version', 'last_error')}
                 online = bool(row['last_seen'] and now - row['last_seen'] < self.offline_seconds)
-                stats = db.execute("SELECT COALESCE(SUM(CASE WHEN status IN ('leased','running') THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN status='completed' THEN rows ELSE 0 END),0), COALESCE(SUM(CASE WHEN status IN ('leased','running') THEN processed ELSE 0 END),0) FROM units WHERE node_id=?", (row['id'],)).fetchone()
+                stats = db.execute("SELECT COALESCE(SUM(CASE WHEN status IN ('leased','running') THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN status='completed' THEN rows ELSE reported_rows END),0), COALESCE(SUM(CASE WHEN status IN ('leased','running') THEN processed ELSE 0 END),0) FROM units WHERE node_id=?", (row['id'],)).fetchone()
                 value.update(status='offline' if not online else 'draining' if not row['enabled'] else 'busy' if stats[0] else 'idle',
                              active=stats[0], confirmed=stats[1], in_progress=stats[2], rate=round(row['rate'], 1) if online and stats[0] else 0)
                 if online and (row['stop_version'] > row['ack_stop_version'] or
@@ -1059,7 +1249,7 @@ class Controller:
                 nodes.append(value)
             events = [dict(r) for r in db.execute('SELECT * FROM events ORDER BY id DESC LIMIT 40')]
             aggregate = db.execute('SELECT COALESCE(SUM(rows),0),COUNT(*) FROM jobs').fetchone()
-            counts = db.execute("SELECT COALESCE(SUM(CASE WHEN status='completed' THEN rows ELSE 0 END),0),COALESCE(SUM(CASE WHEN status IN ('running','leased','completed') THEN processed ELSE 0 END),0) FROM units").fetchone()
+            counts = db.execute("SELECT COALESCE(SUM(CASE WHEN status='completed' THEN rows ELSE reported_rows END),0),COALESCE(SUM(CASE WHEN status IN ('running','leased','completed') THEN processed ELSE 0 END),0) FROM units").fetchone()
             maximum = db.execute("SELECT value FROM controller_settings WHERE key='max_unit_rows'").fetchone()[0]
             return {'jobs': jobs, 'nodes': nodes, 'events': events, 'server_time': now,
                     'current_job_id': current['id'] if current else None, 'queue': queue,
@@ -1068,6 +1258,92 @@ class Controller:
                                'processed': counts[1], 'online': sum(n['status'] != 'offline' for n in nodes),
                                'nodes': len(nodes), 'busy': sum(n['status'] != 'offline' and n['active'] > 0 for n in nodes),
                                'queued': waiting_count, 'rate': round(sum(n['rate'] for n in nodes), 1)}}
+
+    def _read_rows_with_live(self, db, job_id, offset, limit, category):
+        """Merge completed package files with heartbeat-confirmed live rows.
+
+        Only active packages occupy ``live_result_rows`` (normally one per
+        node, at most 10,000 rows each).  Completed packages keep using the
+        scalable file/index path.  Iterating package metadata preserves row
+        order without retaining an unbounded per-account database table.
+        """
+        units = list(db.execute(
+            "SELECT id,seq,status,first_row,rows,result_path,result_counts,reported_rows "
+            "FROM units WHERE job_id=? AND (status='completed' OR reported_rows>0) ORDER BY seq",
+            (job_id,)))
+        result, skipped, total = [], 0, 0
+        for unit in units:
+            count = 0
+            counts = None
+            if unit['status'] == 'completed':
+                if category == 'all':
+                    count = int(unit['rows'])
+                else:
+                    try:
+                        counts = json.loads(unit['result_counts'] or '{}')
+                    except (TypeError, ValueError):
+                        counts = None
+                    if counts is not None:
+                        count = int(counts.get(category, 0) or 0)
+                    else:
+                        # Legacy files without counts are uncommon and small;
+                        # let the scan below determine their contribution.
+                        count = 0
+            else:
+                if category == 'all':
+                    count = int(unit['reported_rows'] or 0)
+                else:
+                    count = int(db.execute(
+                        'SELECT COUNT(*) FROM live_result_rows WHERE unit_id=? AND category=?',
+                        (unit['id'], category)).fetchone()[0])
+            total += count
+            if count and skipped + count <= offset:
+                skipped += count
+                continue
+            if len(result) >= limit:
+                continue
+
+            if unit['status'] == 'completed':
+                path = unit['result_path']
+                if not path or not Path(path).exists():
+                    continue
+                try:
+                    with Path(path).open('r', encoding='utf-8') as stream:
+                        for line in stream:
+                            try:
+                                record = json.loads(line)
+                            except ValueError:
+                                continue
+                            record['status'] = result_record_bucket(record)
+                            if category != 'all' and record['status'] != category:
+                                continue
+                            if counts is None and category != 'all':
+                                total += 1
+                            if skipped < offset:
+                                skipped += 1
+                                continue
+                            if len(result) < limit:
+                                result.append(record)
+                except OSError:
+                    continue
+            else:
+                sql = ('SELECT payload FROM live_result_rows WHERE unit_id=? '
+                       + ('' if category == 'all' else 'AND category=? ')
+                       + 'ORDER BY row')
+                params = ((unit['id'],) if category == 'all'
+                          else (unit['id'], category))
+                for live in db.execute(sql, params):
+                    try:
+                        record = json.loads(live['payload'])
+                    except (TypeError, ValueError):
+                        continue
+                    record['status'] = result_record_bucket(record)
+                    if skipped < offset:
+                        skipped += 1
+                        continue
+                    if len(result) < limit:
+                        result.append(record)
+        return {'rows': result, 'total': total, 'offset': offset}
 
     def read_rows(self, job_id, offset=0, limit=100, category='all'):
         """按行号窗口读取结果，供页面表格分页。
@@ -1082,9 +1358,15 @@ class Controller:
         if category not in categories:
             raise ValueError('结果分类无效')
         with self.db.connect() as db:
-            job = db.execute('SELECT rows,rows AS total FROM jobs WHERE id=?', (job_id,)).fetchone()
+            job = db.execute(
+                "SELECT rows,(SELECT COALESCE(SUM(rows),0) FROM units "
+                "WHERE job_id=? AND status='completed') AS total FROM jobs WHERE id=?",
+                (job_id, job_id)).fetchone()
             if not job:
                 raise ValueError('任务不存在')
+            if db.execute('SELECT 1 FROM live_result_rows WHERE job_id=? LIMIT 1',
+                          (job_id,)).fetchone():
+                return self._read_rows_with_live(db, job_id, offset, limit, category)
             if category == 'all':
                 # offset 是全局零基行号，利用分片的连续行号范围直接定位。
                 first, last = offset + 1, offset + limit
@@ -1160,6 +1442,7 @@ class Controller:
             active = db.execute("SELECT COUNT(*) FROM units WHERE job_id=? "
                                 "AND status IN ('leased','running','unknown')",
                                 (job_id,)).fetchone()[0]
+            db.execute('DELETE FROM live_result_rows WHERE job_id=?', (job_id,))
             db.execute('DELETE FROM units WHERE job_id=?', (job_id,))
             db.execute('DELETE FROM jobs WHERE id=?', (job_id,))
             event(db, 'job_deleted',
@@ -1188,12 +1471,33 @@ class Controller:
             if job['status'] not in ('paused', 'completed'):
                 raise Conflict('任务暂停或全部完成后才可导出已确认结果')
             units = [dict(row) for row in db.execute(
-                "SELECT seq,path,byte_start,byte_end,result_path FROM units WHERE job_id=? AND status='completed' ORDER BY seq",
+                "SELECT id,seq,status,first_row,path,byte_start,byte_end,result_path "
+                "FROM units WHERE job_id=? AND (status='completed' OR reported_rows>0) ORDER BY seq",
                 (job_id,))]
+            for unit in units:
+                if unit['status'] != 'completed':
+                    unit['live_categories'] = {
+                        int(row['row']): row['category'] for row in db.execute(
+                            'SELECT row,category FROM live_result_rows WHERE unit_id=?',
+                            (unit['id'],))}
 
         def rows():
             for unit in units:
                 source, result = Path(unit['path']), unit['result_path']
+                if unit['status'] != 'completed':
+                    if not source.exists():
+                        continue
+                    live = unit.get('live_categories') or {}
+                    try:
+                        for row_number, original in enumerate(
+                                self.unit_lines(unit), int(unit['first_row'])):
+                            bucket = live.get(row_number)
+                            if bucket is None or category != 'all' and bucket != category:
+                                continue
+                            yield original
+                    except OSError:
+                        pass
+                    continue
                 if not result or not Path(result).exists() or not source.exists():
                     continue
                 try:

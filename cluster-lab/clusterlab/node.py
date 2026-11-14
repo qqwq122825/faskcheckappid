@@ -29,6 +29,7 @@ class Node:
     # 必须 >= 总控的 unit_byte_limit（controller.settings 里是 32 MiB）。
     # 两处不一致时总控切得出、节点收不下，大包会一直重试到租约过期。
     UNIT_BYTE_LIMIT = 34 * 1024 * 1024
+    LIVE_RESULT_LIMIT = 1000
 
     def __init__(self, root, max_processes=2, max_threads=8, allow_http=False, interval=1.0):
         self.root = private_dir(root)
@@ -199,6 +200,63 @@ class Node:
                 ('running', 'capacity', 'ready', 'built', 'failed',
                  'current', 'attempted', 'slots')}
 
+    def _live_result_paths(self, unit_id):
+        """Return worker outputs, never the later merged duplicate file."""
+        directory = self.spool / unit_id
+        workers = directory / 'workers'
+        if workers.is_dir():
+            return sorted(workers.glob('*/results.jsonl'))
+        result = directory / 'results.jsonl'
+        return [result] if result.exists() else []
+
+    def _collect_live_records(self, unit_id):
+        """Read newly flushed complete JSONL lines for the next 1 Hz heartbeat.
+
+        The cursor advances only after the controller explicitly acknowledges
+        the batch.  A lost response therefore causes an idempotent replay,
+        while a partial line remains for the next heartbeat.
+        """
+        directory = self.spool / unit_id
+        state_path = directory / 'report-state.json'
+        state = read_json(state_path, {'files': {}})
+        offsets = dict(state.get('files') or {})
+        records = []
+        for path in self._live_result_paths(unit_id):
+            key = str(path.relative_to(directory))
+            offset = max(0, int(offsets.get(key) or 0))
+            try:
+                with path.open('rb') as stream:
+                    if offset > path.stat().st_size:
+                        offset = 0
+                    stream.seek(offset)
+                    while len(records) < self.LIVE_RESULT_LIMIT:
+                        start = stream.tell()
+                        line = stream.readline(1025)
+                        if not line:
+                            break
+                        if len(line) > 1024:
+                            raise ValueError('实时结果记录过长')
+                        if not line.endswith(b'\n'):
+                            stream.seek(start)
+                            break
+                        try:
+                            record = json.loads(line)
+                        except ValueError as exc:
+                            raise ValueError('实时结果 JSON 无效') from exc
+                        if not isinstance(record, dict):
+                            raise ValueError('实时结果记录无效')
+                        # Send the exact JSON text.  The controller can then
+                        # promote the streamed rows into the authoritative file
+                        # with the same checksum as the later full-file replay.
+                        records.append(line[:-1].decode('utf-8'))
+                        offset = stream.tell()
+            except FileNotFoundError:
+                continue
+            offsets[key] = offset
+            if len(records) >= self.LIVE_RESULT_LIMIT:
+                break
+        return records, {'files': offsets, 'updated': time.time()}
+
     def apply_config(self, config):
         """总控下发的出口配置；只在内存里保存，不落盘。
 
@@ -211,6 +269,7 @@ class Node:
 
     def _heartbeat(self):
         self._refresh_progress()
+        report_states = {}
         with self.db.connect() as db:
             values, interrupted = [], []
             for task in db.execute("SELECT * FROM tasks WHERE status IN ('running','outbox','interrupted')"):
@@ -224,6 +283,10 @@ class Node:
                 # 失败原因一并上报，否则总控只能看到"待确认"，看不到为什么
                 if task['error']:
                     item['error'] = str(task['error'])[:180]
+                records, next_state = self._collect_live_records(task['id'])
+                if records:
+                    item['records'] = records
+                    report_states[task['id']] = next_state
                 collection.append(item)
         with self._request('POST', '/agent/heartbeat', json={'session': self.instance, 'hostname': socket.gethostname(),
                            'version': VERSION, 'max_processes': self.max_processes, 'max_threads': self.max_threads,
@@ -235,6 +298,10 @@ class Node:
                            'devices': self._device_status(),
                            'error': ''}) as response:
             value = response.json()
+        reported = value.get('reported') if isinstance(value.get('reported'), dict) else {}
+        for unit_id, next_state in report_states.items():
+            if unit_id in reported:
+                atomic_json(self.spool / unit_id / 'report-state.json', next_state)
         with self.lock:
             self.settings = value
             self.connected, self.error, self.last_success = True, '', time.time()
@@ -359,6 +426,7 @@ class Node:
         # A retried unit gets a new token; old completion markers must not be reused.
         (directory / 'done.json').unlink(missing_ok=True)
         (directory / 'progress.json').unlink(missing_ok=True)
+        (directory / 'report-state.json').unlink(missing_ok=True)
         # 认证模式需要本地设备目录；节点自己决定路径，不接受总控指定。
         if descriptor.get('mode') == 'auth':
             descriptor.setdefault('device_root', str(private_dir(self.root / 'device-pool')))

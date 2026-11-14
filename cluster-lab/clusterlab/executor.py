@@ -244,6 +244,10 @@ def execute_unit(directory, descriptor, stop):
                         output_digest.update(result)
                         processed += 1
                     if time.monotonic() - last_progress > 0.25:
+                        # Make complete JSONL lines visible to the node agent.
+                        # Only the node heartbeat reports them; worker processes
+                        # never contact the controller directly.
+                        output.flush()
                         atomic_json(directory / 'progress.json',
                                     {'processed': processed, 'started': started,
                                      'counts': {'valid': processed}})
@@ -776,6 +780,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 usage_counts[device] += 1
                 now = time.monotonic()
                 if now - last_progress >= 0.25:
+                    # The node agent tails this local file once per second and
+                    # sends one bounded batch.  Flush here without any network
+                    # work in the worker process.
+                    output.flush()
                     atomic_json(directory / 'progress.json',
                                 {'processed': processed, 'started': started,
                                  'counts': dict(counters)})

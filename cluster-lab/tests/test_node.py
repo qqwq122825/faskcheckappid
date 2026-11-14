@@ -31,7 +31,11 @@ class NodeRecoveryTests(unittest.TestCase):
         self.unit = 'a' * 32
         directory = self.node.spool / self.unit
         directory.mkdir()
-        (directory / 'results.jsonl').write_text('{"row":1}\n')
+        self.result_line = json.dumps({
+            'row': 1, 'account': 'user@example.com', 'status': 'valid',
+            'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
+            separators=(',', ':'))
+        (directory / 'results.jsonl').write_text(self.result_line + '\n')
         with self.node.db.transaction() as db:
             db.execute('INSERT INTO tasks(id,job_id,seq,descriptor,status,processed,checksum,created,updated) VALUES(?,?,?,?,?,?,?,?,?)',
                        (self.unit, 'b'*32, 1, json.dumps({'token':'test-lease','rows':1,'threads':1}), 'outbox', 1, 'digest', 1, 1))
@@ -73,6 +77,24 @@ class NodeRecoveryTests(unittest.TestCase):
             self.node._heartbeat()
         self.assertEqual(captured['active'][0]['processed'], 1)
         self.assertEqual(captured['active'][0]['counts'], {'wrong_password': 1})
+
+    def test_heartbeat_reports_result_lines_once_per_controller_ack(self):
+        captured = []
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': [],
+                 'reported': {self.unit: 1}}
+
+        def request(*_args, **kwargs):
+            captured.append(kwargs['json'])
+            return Response(value)
+
+        with patch.object(self.node, '_request', side_effect=request):
+            self.node._heartbeat()
+            self.node._heartbeat()
+        self.assertEqual(captured[0]['active'][0]['records'], [self.result_line])
+        self.assertNotIn('records', captured[1]['active'][0])
+        state = json.loads((self.node.spool / self.unit / 'report-state.json').read_text())
+        self.assertGreater(state['files']['results.jsonl'], 0)
 
     def test_pending_results_block_controller_switch(self):
         with self.assertRaisesRegex(ValueError, '结果待上传'):
