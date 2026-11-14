@@ -742,10 +742,19 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             http = int(result.get('http'))
         except (TypeError, ValueError):
             http = None
-        kind = result.get('kind') or ''
-        return (http in (0, 407, 429, 500, 502, 503, 504) or
-                kind in ('network', 'tls', 'proxy', 'proxy_auth', 'server',
-                         'ratelimit', 'endpoint'))
+        # 只有没拿到 HTTP 响应（0）或服务不可用（503）才换出口重试。
+        return http in (0, 503)
+
+    def auth_result_bucket(result):
+        try:
+            http = int(result.get('http'))
+        except (TypeError, ValueError):
+            http = None
+        if http in (0, 503):
+            return 'timeout'
+        bucket = result_bucket(result)
+        # 认证核心不保留模糊分类：已知业务结果照常展示，其余异常归失效。
+        return 'invalid' if bucket in ('undetermined', 'unknown') else bucket
 
     def one(row, index, line):
         if stop.is_set():
@@ -834,7 +843,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     continue
                 future = pending.popleft()
                 row, line, result = future.result()
-                status = result_bucket(result)
+                status = auth_result_bucket(result)
                 counters[status] += 1
                 processed += 1
                 # sha256/bytes 是总控的必需字段（结果完整性校验），认证模式同样补齐
