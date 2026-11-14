@@ -38,8 +38,9 @@ const rows = computed(() => {
 
 function show(value: any) {
   nodeId.value = value?.id || ''
-  autoRotate.value = Boolean(value?.telemetry?.device_auto_rotate ?? false)
-  rotateAfter.value = Number(value?.telemetry?.device_rotate_after ?? 20) || 20
+  const settings = state.value?.settings || {}
+  autoRotate.value = Boolean(settings.device_auto_rotate ?? false)
+  rotateAfter.value = Number(settings.device_rotate_after ?? 20) || 20
   capacity.value = Math.max(1, Number(value?.telemetry?.device_pool?.capacity) || 2)
   error.value = ''
   visible.value = true
@@ -63,8 +64,9 @@ async function initialize() {
 async function toggleAuto(next: boolean) {
   savingAuto.value = true
   try {
-    await api('/api/settings/rotation', { device_rotate_after: rotateAfter.value || 20,
-                                           device_auto_rotate: next }, 'POST')
+    const saved = await api('/api/settings/rotation', { device_rotate_after: rotateAfter.value || 20,
+                                                        device_auto_rotate: next }, 'POST')
+    if (state.value) state.value.settings = { ...(state.value.settings || {}), ...saved }
     ElMessage.success(next ? '已开启自动补充：任务运行中持续换新设备' : '已关闭自动补充')
   } catch (exc: any) {
     autoRotate.value = !next
@@ -115,7 +117,7 @@ async function clearPool() {
           </span>
         </el-form-item>
         <div class="actions">
-          <el-button type="primary" native-type="submit" :loading="busy" :disabled="building">保存并应用</el-button>
+          <el-button type="primary" native-type="submit" :loading="busy" :disabled="building || savingAuto">保存并应用</el-button>
           <el-button v-if="building" @click="cancelBuild">停止</el-button>
           <el-tooltip :disabled="!node?.active" content="节点仍有工作包在执行，请先停止任务" placement="top">
             <span><el-button type="danger" plain :loading="clearing"

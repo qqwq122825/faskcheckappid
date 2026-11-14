@@ -157,3 +157,22 @@ test('Result list keeps one result-code column without web recheck fields', () =
   assert.doesNotMatch(results, /GSA 码|网页码|gsa_code|web_code|网页复检/)
   assert.match(results, /labels\[row\.status\]/)
 })
+
+
+test('Device refill switch reopens from persisted settings and publishes save immediately', () => {
+  const drawer = source('src/components/DevicePoolDrawer.vue')
+  assert.match(drawer, /const settings = state\.value\?\.settings/)
+  assert.match(drawer, /Boolean\(settings\.device_auto_rotate/)
+  assert.doesNotMatch(drawer, /telemetry\?\.device_auto_rotate/)
+  assert.match(drawer, /const saved = await api\('\/api\/settings\/rotation'/)
+  assert.match(drawer, /state\.value\.settings =/)
+  assert.match(drawer, /:disabled="building \|\| savingAuto"/)
+})
+
+test('Task summary omits the in-flight-record card and keeps its other ten metrics', () => {
+  const feedback = source('src/components/TaskFeedback.vue')
+  assert.doesNotMatch(feedback, /在途记录/)
+  for (const label of ['总数', '已确认', '剩余', '密正', '密码错误', '双重验证', '锁定', '超时', '已失效', '其他异常']) {
+    assert.ok(feedback.includes(`label: '${label}'`))
+  }
+})

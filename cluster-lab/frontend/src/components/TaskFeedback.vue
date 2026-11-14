@@ -20,7 +20,6 @@ const cells = computed<Cell[]>(() => [
   { label: '已确认', value: props.completed,
     tone: props.total && props.completed >= props.total ? 'success' : undefined },
   { label: '剩余', value: Math.max(0, props.total - (reportedProcessed.value ?? props.completed)) },
-  { label: '在途记录', value: props.active },
   { label: '密正', value: categories.value.valid ?? 0, tone: 'success' },
   { label: '密码错误', value: categories.value.wrong_password ?? 0 },
   { label: '双重验证', value: categories.value.need_2fa ?? 0 },
@@ -46,7 +45,6 @@ const cells = computed<Cell[]>(() => [
         <span>总控已确认 {{ fmt(completed) }} 条</span>
         <span>已处理待确认 {{ awaitingConfirmation == null ? '—' : fmt(awaitingConfirmation) + ' 条' }}</span>
       </div>
-      <p v-if="!preview && active > 0 && !reportedProcessed">等待节点上报中间进度；在途记录数不代表同时执行数量。</p>
       <div class="feedback-meta"><span v-if="capacity">工作进程 {{ capacity }}</span><span>用时 {{ elapsed == null ? '—' : fmt(elapsed) }} 秒 · {{ fmt(rate) }} 条/小时</span></div>
       <p>{{ preview ? '进度和分类按当前任务数据计算。' : '进度和分类按节点每秒上报实时更新；运行中的分类尚待确认，完成状态仍以总控确认全部结果为准。' }}</p>
     </div>

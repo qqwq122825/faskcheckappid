@@ -23,6 +23,26 @@ class ControllerTests(unittest.TestCase):
         self.service.close()
         self.temp.cleanup()
 
+    def test_rotation_partial_updates_preserve_switch_and_restart(self):
+        self.service.configure_rotation({'device_rotate_after': 20, 'device_auto_rotate': True})
+        result = self.service.configure_rotation({'device_rotate_after': 37})
+        self.assertTrue(result['device_auto_rotate'])
+        self.service.close()
+        self.service = Controller(self.temp.name)
+        self.assertTrue(self.service.settings()['device_auto_rotate'])
+        self.assertEqual(self.service.settings()['device_rotate_after'], 37)
+        for enabled in (False, True):
+            result = self.service.configure_rotation({'device_auto_rotate': enabled})
+            self.assertIs(result['device_auto_rotate'], enabled)
+            self.assertEqual(result['device_rotate_after'], 37)
+
+    def test_rotation_rejects_string_switch_without_changing_saved_state(self):
+        self.service.configure_rotation({'device_rotate_after': 20, 'device_auto_rotate': True})
+        with self.assertRaisesRegex(ValueError, '布尔'):
+            self.service.configure_rotation({'device_auto_rotate': 'false'})
+        self.assertTrue(self.service.settings()['device_auto_rotate'])
+        self.assertEqual(self.service.settings()['device_rotate_after'], 20)
+
     def heartbeat(self, **extra):
         return self.service.heartbeat(self.node['id'], dict(session='test-session', max_processes=1,
                                       max_threads=2, active=[], **extra))

@@ -402,9 +402,20 @@ class Controller:
         return self.settings()
 
     def configure_rotation(self, data):
-        limit = integer(int(data.get('device_rotate_after') or 0), '设备轮换阈值', 0, 100000)
-        auto = '1' if data.get('device_auto_rotate') else '0'
         with self.db.transaction() as db:
+            current = {row['key']: row['value'] for row in db.execute(
+                "SELECT key,value FROM controller_settings "
+                "WHERE key IN ('device_rotate_after','device_auto_rotate')")}
+            # This endpoint accepts partial updates. Saving a threshold must
+            # not implicitly disable the separately saved refill switch.
+            limit_value = data.get('device_rotate_after', current.get('device_rotate_after', 0))
+            limit = integer(int(limit_value or 0), '设备轮换阈值', 0, 100000)
+            if 'device_auto_rotate' in data:
+                if type(data['device_auto_rotate']) is not bool:
+                    raise ValueError('设备自动补充开关应为布尔值')
+                auto = '1' if data['device_auto_rotate'] else '0'
+            else:
+                auto = '1' if str(current.get('device_auto_rotate', '0')) in ('1', 'True', 'true') else '0'
             for key_name, key_value in (('device_rotate_after', str(limit)),
                                         ('device_auto_rotate', auto)):
                 db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
