@@ -46,3 +46,18 @@ test('Proxy settings add, list, delete, and explain node distribution', () => {
   assert.doesNotMatch(settings, /内置任务/)
   assert.doesNotMatch(settings, /离线行摘要、合成模拟任务/)
 })
+
+test('Executive-facing pages omit test, demo, preview, and unfinished feature copy', () => {
+  const files = [
+    'src/views/Settings.vue', 'src/views/JobDetail.vue',
+    'src/components/JobTable.vue', 'src/components/TaskFeedback.vue',
+    'src/components/TaskActions.vue', 'src/components/NodeDialogs.vue',
+    '../clusterlab/static/index.html', '../clusterlab/static/app.js',
+  ]
+  const visible = files.map(source).join('\n')
+  for (const label of [
+    '数据保留策略、传输限速和设备服务尚未接入',
+    '本地预览', '离线演示', '合成演示', '推荐演示',
+    '预留配置', '未接入', 'OFFLINE TASK PLATFORM', 'ClusterLab',
+  ]) assert.doesNotMatch(visible, new RegExp(label))
+})

@@ -36,7 +36,7 @@ defineExpose({ configure })
   </el-dialog>
   <el-dialog v-model="configOpen" :title="`${node?.name || ''} · 节点设置`" width="620px" :close-on-click-modal="false" :show-close="!busy">
     <el-form label-position="top"><div class="form-grid"><el-form-item label="工作进程数"><el-input-number v-model="config.processes" :min="1" :max="node?.max_processes || 10" /></el-form-item><el-form-item label="每进程线程数"><el-input-number v-model="config.threads" :min="1" :max="node?.max_threads || 100" /></el-form-item></div><p class="muted">本机硬上限 {{ node?.max_processes || '—' }} 进程 × {{ node?.max_threads || '—' }} 线程。节点下次领包时就按保存的进程和线程数执行。</p><el-button plain @click="useMaximum">使用本机上限</el-button><el-form-item><el-switch v-model="config.enabled" aria-label="允许领取新工作包" active-text="允许领取新工作包" /></el-form-item>
-    <el-divider content-position="left">预留配置</el-divider><el-form-item label="任务传输限速（未启用）"><div class="form-grid"><el-input disabled placeholder="上传上限" /><el-input disabled placeholder="下载上限" /></div></el-form-item><el-alert v-if="configError" :title="configError" type="error" :closable="false" /></el-form>
+    <el-alert v-if="configError" :title="configError" type="error" :closable="false" /></el-form>
     <template #footer><el-button :disabled="busy" @click="configOpen = false">取消</el-button><el-button type="primary" :loading="busy" @click="save">保存配置</el-button></template>
   </el-dialog>
 </template>

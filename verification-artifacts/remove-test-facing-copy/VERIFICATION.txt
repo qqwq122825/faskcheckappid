@@ -1,0 +1,80 @@
+BRANCH/FIELD: main / executive-facing Vue and legacy UI copy cleanup + unfinished controls removal / VERSION 0.3.14
+
+CHANGED RESULT
+- Removed the Settings notice about data retention, transfer throttling, and device service not being connected.
+- Replaced local-preview wording with production login status.
+- Removed demo/simulation/test-facing labels from task pages and the legacy UI.
+- Removed unfinished transfer-limit controls from node settings.
+- Removed the legacy demo button and its browser handler.
+- Rebuilt production static UI and advanced version to 0.3.14.
+
+FOUR ARTIFACT PATHS
+MODIFIED_FILE=/Users/xxx/Documents/并发/verification-artifacts/remove-test-facing-copy/MODIFIED_FILE
+DIFF_FILE=/Users/xxx/Documents/并发/verification-artifacts/remove-test-facing-copy/DIFF_FILE
+VERIFICATION.txt=/Users/xxx/Documents/并发/verification-artifacts/remove-test-facing-copy/VERIFICATION.txt
+ROLLBACK.sh=/Users/xxx/Documents/并发/verification-artifacts/remove-test-facing-copy/ROLLBACK.sh
+
+ORIGINAL INPUT
+Git HEAD=cb3649a422d5a57ed390ec5584e1d2c5b407135d
+Original SHA256 values are recorded in /Users/xxx/Documents/并发/verification-artifacts/remove-test-facing-copy/original-sha256.txt.
+
+BASELINE
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/remove-test-facing-copy/baseline-check/cluster-lab/frontend && npm test
+Input: unmodified Git HEAD cb3649a422d5a57ed390ec5584e1d2c5b407135d, package 0.3.13
+Literal output/result: tests 12; pass 12; fail 0; duration_ms 40.704583; BASELINE_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm test
+Input: cleaned executive-facing UI copy and package 0.3.14
+Literal output/result: tests 13; pass 13; fail 0; duration_ms 50.214167; MODIFIED_TEST_EXIT=0
+Exit status: 0
+
+MODIFIED FRONTEND BUILD
+Command: cd /Users/xxx/Documents/并发/cluster-lab/frontend && npm run build
+Input: cleaned Vue UI source
+Literal output/result: 1652 modules transformed; built in 5.71s; FRONTEND_BUILD_EXIT=0
+Exit status: 0
+
+LEGACY JAVASCRIPT CHECK
+Command: cd /Users/xxx/Documents/并发/cluster-lab && node --check clusterlab/static/app.js
+Input: legacy UI after removing demo and unfinished controls
+Literal output/result: LEGACY_JS_CHECK_EXIT=0
+Exit status: 0
+
+MODIFIED CLUSTER TEST
+Command: cd /Users/xxx/Documents/并发/cluster-lab && .venv/bin/python -m unittest discover -s tests
+Input: rebuilt static UI and VERSION 0.3.14
+Literal output/result:
+..........................................
+----------------------------------------------------------------------
+Ran 42 tests in 3.726s
+
+OK
+CLUSTER_TEST_EXIT=0
+Exit status: 0
+
+PRESENTATION SCAN
+Command: grep source/generated UI/legacy UI for forbidden test, demo, preview, unfinished-feature, technology and old-brand copy
+Input: cluster-lab/frontend/src, cluster-lab/clusterlab/static/ui, static/index.html, static/app.js
+Literal output/result: RESULT=no test/demo/preview/unfinished/technology presentation copy found; VERSION = '0.3.14'; PRESENTATION_SCAN_EXIT=0
+Exit status: 0
+
+ROLLBACK
+Command: /Users/xxx/Documents/并发/verification-artifacts/remove-test-facing-copy/ROLLBACK.sh /Users/xxx/Documents/并发/verification-artifacts/remove-test-facing-copy/rollback-test-verified
+Input: second clean Git HEAD copy after applying DIFF_FILE
+Literal output/result: ROLLBACK_RESULT=restored test-facing copy, unfinished controls, legacy demo UI, and VERSION 0.3.13; ROLLBACK_COMMAND_EXIT=0
+Exit status: 0
+
+ROLLBACK COMPARISON
+Command: diff -qr /Users/xxx/Documents/并发/verification-artifacts/remove-test-facing-copy/rollback-original-verified /Users/xxx/Documents/并发/verification-artifacts/remove-test-facing-copy/rollback-test-verified
+Input: original HEAD copy and rolled-back second copy
+Literal output/result: ROLLBACK_DIFF_EXIT=0
+Exit status: 0
+
+ROLLBACK TEST
+Command: cd /Users/xxx/Documents/并发/verification-artifacts/remove-test-facing-copy/rollback-test-verified/cluster-lab/frontend && npm test
+Input: rolled-back second copy, package 0.3.13
+Literal output/result: tests 12; pass 12; fail 0; duration_ms 41.902334; ROLLBACK_TEST_EXIT=0
+Exit status: 0
+Restored behavior/status: the removed unfinished/test-facing copy and controls return, VERSION returns to 0.3.13, and all 12 original frontend tests pass.

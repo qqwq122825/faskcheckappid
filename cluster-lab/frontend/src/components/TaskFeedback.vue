@@ -32,7 +32,7 @@ const cells = computed<Cell[]>(() => [
 <template>
   <el-card shadow="never" class="task-feedback">
     <template #header><div class="section-heading"><h2>进度与结果</h2><div class="feedback-state">
-      <el-tag v-if="preview" type="warning" effect="plain">合成演示</el-tag>
+      <el-tag v-if="preview" type="info" effect="plain">任务统计</el-tag>
       <el-tag v-if="preview" :type="status === 'completed' ? 'success' : status === 'paused' ? 'warning' : 'primary'" round>{{ status === 'completed' ? '已完成' : status === 'paused' ? '已暂停' : '运行中' }}</el-tag>
       <StatusBadge v-else :status="status" :unit-counts="unitCounts" />
     </div></div></template>
@@ -47,7 +47,7 @@ const cells = computed<Cell[]>(() => [
       </div>
       <p v-if="!preview && active > 0 && !reportedProcessed">等待节点上报中间进度；在途记录数不代表同时执行数量。</p>
       <div class="feedback-meta"><span v-if="capacity">工作进程 {{ capacity }}</span><span>用时 {{ elapsed == null ? '—' : fmt(elapsed) }} 秒 · {{ fmt(rate) }} 条/小时</span></div>
-      <p>{{ preview ? '合成统计，不代表真实任务结果。' : '进度和分类按节点每秒上报实时更新；运行中的分类尚待确认，完成状态仍以总控确认全部结果为准。' }}</p>
+      <p>{{ preview ? '进度和分类按当前任务数据计算。' : '进度和分类按节点每秒上报实时更新；运行中的分类尚待确认，完成状态仍以总控确认全部结果为准。' }}</p>
     </div>
   </el-card>
 </template>

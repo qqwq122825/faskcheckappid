@@ -7,8 +7,8 @@
 </head>
 <body>
   <aside class="sidebar">
-    <a class="brand" href="/"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span>Cluster<span class="brand-light">Lab</span><small>OFFLINE TASK PLATFORM</small></span></a>
-    <div class="workspace"><span class="workspace-icon">C</span><div><strong id="workspace-name">本地工作空间</strong></div><span class="workspace-arrow">⌄</span></div>
+    <a class="brand" href="/"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span>苹果集群系统<small>集群管理后台</small></span></a>
+    <div class="workspace"><span class="workspace-icon">C</span><div><strong id="workspace-name">管理工作空间</strong></div><span class="workspace-arrow">⌄</span></div>
     <div class="nav-label">工作空间</div>
     <nav id="navigation">
       <button class="nav-item selected" data-view="overview"><span>◫</span>运行总览<span class="nav-dot"></span></button>
@@ -16,13 +16,13 @@
       <button class="nav-item" data-view="nodes"><span>▦</span><b id="node-nav-label">执行节点</b><span id="node-count" class="nav-count">0</span></button>
       <button class="nav-item" data-view="events"><span>◷</span>通信与事件</button>
     </nav>
-    <div class="sidebar-note"><span class="note-icon">↗</span><strong id="role-note-title">控制与执行，各司其职</strong><p id="role-note">总控负责派发与结果确认，工作节点负责离线执行。</p><span class="mini-label">仅内置离线任务</span></div>
-    <footer class="sidebar-footer"><span class="avatar">CL</span><div><strong>本地预览</strong><small id="version">v0.1.0</small></div><button id="logout" class="icon-button hidden" title="退出登录">↗</button></footer>
+    <div class="sidebar-note"><span class="note-icon">↗</span><strong id="role-note-title">控制与执行，各司其职</strong><p id="role-note">总控负责派发与结果确认，工作节点负责任务执行。</p></div>
+    <footer class="sidebar-footer"><span class="avatar">CL</span><div><strong>苹果id校验集群系统</strong><small id="version">v0.1.0</small></div><button id="logout" class="icon-button hidden" title="退出登录">↗</button></footer>
   </aside>
   <main>
-    <header class="topbar"><a class="simple-brand" href="/">Cluster<span>Lab</span></a><nav class="simple-nav" aria-label="主要导航"><button class="nav-item selected" data-view="overview">控制台</button><button class="nav-item" data-view="jobs">任务历史</button><button class="nav-item" data-view="events">通信日志</button></nav><div class="breadcrumbs"><strong id="breadcrumb">运行总览</strong></div><div class="topbar-right"><span id="connection" class="connection"><i></i>正在连接</span><span class="topbar-separator"></span><span id="clock">--:--:--</span></div></header>
+    <header class="topbar"><a class="simple-brand" href="/">苹果集群系统</a><nav class="simple-nav" aria-label="主要导航"><button class="nav-item selected" data-view="overview">控制台</button><button class="nav-item" data-view="jobs">任务历史</button><button class="nav-item" data-view="events">通信日志</button></nav><div class="breadcrumbs"><strong id="breadcrumb">运行总览</strong></div><div class="topbar-right"><span id="connection" class="connection"><i></i>正在连接</span><span class="topbar-separator"></span><span id="clock">--:--:--</span></div></header>
     <div class="page">
-      <section class="page-heading"><div><div class="eyebrow" id="eyebrow">CONTROL CENTER</div><h1 id="page-title">集群控制台</h1><p id="page-subtitle">统一开始任务、调整节点、核对执行结果。</p></div><div id="heading-actions" class="actions"><button class="button secondary" id="demo">离线演示</button><button class="button secondary" id="add-node">添加节点</button><button class="button primary" id="upload-main">上传任务文件</button></div></section>
+      <section class="page-heading"><div><div class="eyebrow" id="eyebrow">CONTROL CENTER</div><h1 id="page-title">集群控制台</h1><p id="page-subtitle">统一开始任务、调整节点、核对执行结果。</p></div><div id="heading-actions" class="actions"><button class="button secondary" id="add-node">添加节点</button><button class="button primary" id="upload-main">上传任务文件</button></div></section>
       <div id="notice" class="notice hidden" role="status"></div>
       <section id="login-panel" class="login-card hidden"><div class="eyebrow">WORKSPACE ACCESS</div><h2>登录管理页面</h2><p>使用部署时设置的管理密码。</p><form id="login-form"><label>用户名<input name="username" value="admin" autocomplete="username" required></label><label>管理密码<input name="password" type="password" autocomplete="current-password" required></label><button class="button primary">登录</button></form></section>
       <div id="dashboard" class="hidden">
