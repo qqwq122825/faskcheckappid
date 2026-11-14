@@ -7,13 +7,15 @@ const router = useRouter()
 const name = ref(''), unitRows = ref(10000), file = ref<File>(), error = ref('')
 const files = ref<any[]>([]), chosen = ref(''), mode = ref<'new' | 'reuse'>('new')
 const timeout = ref(20), retries = ref(0), deviceCapacity = ref(30)
+const dualRecheck = ref(false)
 const uploadPercent = ref<number | null>(null)
 const maxUnitRows = computed(() => state.value?.settings?.max_unit_rows || 10000)
 watch(createTaskOpen, open => {
   if (open) {
     error.value = ''; file.value = undefined; name.value = ''
     unitRows.value = Math.min(10000, maxUnitRows.value)
-    timeout.value = 20; retries.value = 0; deviceCapacity.value = 30; uploadPercent.value = null
+    timeout.value = 20; retries.value = 0; deviceCapacity.value = 30
+    dualRecheck.value = false; uploadPercent.value = null
     chosen.value = ''; mode.value = 'new'
     loadFiles()
   }
@@ -37,7 +39,8 @@ function sizeText(bytes: number) {
 function uploadStream(selected: File): Promise<any> {
   const query = new URLSearchParams({ name: name.value.trim() || selected.name,
     unit_rows: String(unitRows.value), mode: 'auth', timeout: String(timeout.value),
-    retries: String(retries.value), device_capacity: String(deviceCapacity.value), enqueue: 'true' })
+    retries: String(retries.value), device_capacity: String(deviceCapacity.value),
+    dual_recheck: String(dualRecheck.value), enqueue: 'true' })
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `/api/jobs/stream?${query}`)
@@ -68,7 +71,8 @@ async function submit() {
       await api('/api/jobs/from-file', { source: chosen.value, name: name.value.trim(),
                                          unit_rows: unitRows.value, mode: 'auth', enqueue: 'true',
                                          timeout: timeout.value, retries: retries.value,
-                                         device_capacity: deviceCapacity.value }, 'POST')
+                                         device_capacity: deviceCapacity.value,
+                                         dual_recheck: dualRecheck.value }, 'POST')
       createTaskOpen.value = false
       await refresh()
       await router.push('/jobs')
@@ -123,6 +127,14 @@ async function submit() {
         <el-input-number v-model="retries" :min="0" :max="5" :step="1" :precision="0" :disabled="busy" />
         <span class="field-note">0 表示不重试；只对超时、TLS 和 5xx 等可重试错误生效，密码错误、锁定等明确结论不重试。</span>
       </el-form-item>
+      <el-form-item label="校验协议">
+        <div class="protocol-option"><strong>GSA（默认）</strong>
+          <el-checkbox v-model="dualRecheck" :disabled="busy">
+            GSA 返回 -20970 时使用网页协议复检
+          </el-checkbox>
+        </div>
+        <span class="field-note">网页复检明确返回 -20209 时归为“锁定”；HTTP 503/5xx 是服务临时异常，按上方重试次数处理，耗尽后保留为“其他未验证”。</span>
+      </el-form-item>
       <el-form-item label="预计设备池数量">
         <el-input-number v-model="deviceCapacity" :min="1" :max="200" :step="1" :precision="0" :disabled="busy" />
         <span class="field-note">默认 30 台。任务开始后立即运行，同时在节点后台注册并补齐设备池；不同工作包轮换使用池内设备。</span>
@@ -134,3 +146,7 @@ async function submit() {
     <template #footer><el-button :disabled="busy" @click="createTaskOpen = false">取消</el-button><el-button type="primary" :loading="busy" @click="submit">{{ busy ? `正在上传${uploadPercent == null ? '' : ` ${uploadPercent}%`}` : '创建并加入队列' }}</el-button></template>
   </el-dialog>
 </template>
+
+<style scoped>
+.protocol-option { display: flex; flex-direction: column; gap: 10px; width: 100%; }
+</style>

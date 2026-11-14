@@ -67,6 +67,7 @@ watch(() => [props.job?.id, props.job?.confirmed], () => load(), { immediate: tr
       <el-table-column prop="row" label="#" width="90" />
       <el-table-column prop="account" label="账号" min-width="260" show-overflow-tooltip />
       <el-table-column label="状态" width="120"><template #default>{{ labels[category] }}</template></el-table-column>
+      <el-table-column prop="protocol" label="协议" min-width="150" show-overflow-tooltip />
       <el-table-column prop="stage" label="阶段" min-width="130" show-overflow-tooltip />
       <el-table-column prop="http" label="HTTP" width="90" />
       <el-table-column prop="code" label="业务码" min-width="160" show-overflow-tooltip />

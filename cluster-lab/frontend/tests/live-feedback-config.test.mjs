@@ -121,7 +121,7 @@ test('Device pool has a guarded one-click clear action', () => {
   assert.match(drawer, /pool\.capacity \?\? capacity/)
 })
 
-test('-20970 has an operationally invalid category instead of the old unresolved label', () => {
+test('Legacy categories remain visible while new -20970 tasks can be rechecked', () => {
   const feedback = source('src/components/TaskFeedback.vue')
   const detail = source('src/views/JobDetail.vue')
   assert.match(feedback, /label: '已失效'/)
@@ -129,4 +129,15 @@ test('-20970 has an operationally invalid category instead of the old unresolved
   assert.doesNotMatch(feedback, /label: '未判断'/)
   assert.match(detail, /label: '已失效', value: 'invalid'/)
   assert.match(detail, /label: '其他未验证', value: 'undetermined'/)
+})
+
+test('Task creation exposes opt-in GSA to web dual-protocol recheck', () => {
+  const dialog = source('src/components/CreateTaskDialog.vue')
+  const detail = source('src/views/JobDetail.vue')
+  assert.match(dialog, /const dualRecheck = ref\(false\)/)
+  assert.match(dialog, /dual_recheck: String\(dualRecheck\.value\)/)
+  assert.match(dialog, /dual_recheck: dualRecheck\.value/)
+  assert.match(dialog, /GSA 返回 -20970 时使用网页协议复检/)
+  assert.match(dialog, /HTTP 503\/5xx 是服务临时异常/)
+  assert.match(detail, /GSA \+ 网页复检/)
 })

@@ -66,9 +66,9 @@ class PortableRuntimeTests(unittest.TestCase):
             self.assertEqual(manager.read_results(job)['total'],2)
             self.assertEqual(manager.read_results(job)['total'],2)
             self.assertEqual(manager.read_results(job,'need_2fa')['total'],1)
-            invalid=manager.read_results(job,'invalid')
-            self.assertEqual(invalid['total'],1)
-            self.assertEqual(invalid['rows'][0]['category'],'invalid')
+            unresolved=manager.read_results(job,'undetermined')
+            self.assertEqual(unresolved['total'],1)
+            self.assertEqual(unresolved['rows'][0]['category'],'undetermined')
             manager.shutdown()
 
     def test_local_profile_initializes_requested_password_and_binds_to_loopback(self):

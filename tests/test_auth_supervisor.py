@@ -272,6 +272,35 @@ class WebAdapterTests(unittest.TestCase):
 
 
 class GSAAdapterTests(unittest.TestCase):
+    def test_enabled_gsa_20970_recheck_returns_web_lock_verdict(self):
+        identity={'X-Apple-I-MD':'otp','X-Apple-I-MD-M':'machine','X-Apple-I-MD-LU':'user',
+                  'X-Apple-I-MD-RINFO':'17106176','X-Mme-Device-Id':'device',
+                  'X-Mme-Client-Info':'client','User-Agent':'agent'}
+        with tempfile.TemporaryDirectory() as directory:
+            pool=DevicePool(directory,'https://new.ani.sidestore.io')
+            store=pool.store(1);state=store.load();state['adi_pb']=base64.b64encode(b'existing').decode();store.save(state)
+            payload={'protocol':'gsa','row':1,'slot':1,'attempt':1,
+                     'email':'account@example.invalid','password':'synthetic-password',
+                     'proxy':None,'timeout':1,'debug':False,'prepare_timeout':1,
+                     'device_root':directory,'origin':pool.origin,'device_capacity':2,
+                     'dual_recheck':True}
+
+            def web_check(*_args, **kwargs):
+                kwargs['trace']({'stage':'init','http':200,'service_error_codes':[]})
+                kwargs['trace']({'stage':'complete','http':403,
+                                 'service_error_codes':['-20209']})
+                return {'status':'security_lock','stage':'complete','kind':'',
+                        'detail':'locked','ms':10}
+
+            with patch.object(DevicePool,'info',return_value={}), \
+                 patch.object(DevicePool,'fetch_headers',return_value=identity), \
+                 patch.object(gsa,'_session_for',return_value=SyntheticServer(init_ec=-20970)), \
+                 patch('fastcheck.protocols.dual_auth.idmsa.check',side_effect=web_check):
+                result=protocol_attempt(payload,None,threading.Event())
+            self.assertEqual(result['status'],'security_lock')
+            self.assertEqual((result['gsa_apple_ec'],result['apple_ec']),(-20970,-20209))
+            self.assertTrue(result['fallback_used'])
+
     def test_concurrent_srp_server_proofs_remain_bound_to_each_task(self):
         identity={'X-Apple-I-MD':'otp','X-Apple-I-MD-M':'machine','X-Apple-I-MD-LU':'user',
                   'X-Apple-I-MD-RINFO':'17106176','X-Mme-Device-Id':'device',

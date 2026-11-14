@@ -59,7 +59,9 @@ const events = computed(() => state.value?.events?.filter((e: any) => e.job_id =
       <div class="section-heading">
         <div>
           <div class="task-name"><h2>{{ job.name }}</h2><StatusBadge :status="job.status" :unit-counts="job.unit_counts" /></div>
-          <p>{{ date(job.created) }} 创建 · {{ job.mode === 'auth' ? '账号校验' : '数据任务' }}</p>
+          <p>{{ date(job.created) }} 创建 · {{ job.mode === 'auth' ? '账号校验' : '数据任务' }}
+            <template v-if="job.mode === 'auth'"> · {{ job.dual_recheck ? 'GSA + 网页复检' : 'GSA' }}</template>
+          </p>
         </div>
         <TaskActions :job="job" />
       </div>

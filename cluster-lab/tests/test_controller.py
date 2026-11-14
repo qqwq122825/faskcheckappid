@@ -232,6 +232,19 @@ class ControllerTests(unittest.TestCase):
         unit = self.service.lease(self.node['id'], 'test-session')
         self.assertEqual(unit['device_capacity'], 30)
 
+    def test_dual_protocol_choice_is_persisted_and_leased_to_node(self):
+        job = self.service.create_job('dual', io.BytesIO(b'hello\n' * 50), 50,
+                                      enqueue=True, dual_recheck=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = next(item for item in self.service.snapshot()['jobs'] if item['id'] == job)
+            if state['status'] == 'running':
+                break
+            time.sleep(.01)
+        self.assertTrue(state['dual_recheck'])
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertTrue(unit['dual_recheck'])
+
     def test_late_result_after_lease_expiry_is_still_accepted(self):
         """P0：租约过期后迟到的结果仍要接受，否则节点白算一遍。"""
         self.service.lease_seconds = 1
@@ -657,6 +670,19 @@ class ControllerTests(unittest.TestCase):
                                headers={'X-CSRF-Token': csrf, 'Content-Length': '300'})
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json['bytes'], 300)
+
+    def test_raw_stream_upload_accepts_dual_protocol_recheck_choice(self):
+        client = create_app('controller', self.service).test_client()
+        csrf = client.get('/api/session').json['csrf']
+        response = client.post('/api/jobs/stream?name=dual.txt&unit_rows=50&mode=auth&enqueue=true&dual_recheck=true',
+                               data=b'account----password\n' * 50,
+                               content_type='application/octet-stream',
+                               headers={'X-CSRF-Token': csrf, 'Content-Length': '1000'})
+        self.assertEqual(response.status_code, 202)
+        with self.service.db.connect() as db:
+            enabled = db.execute('SELECT dual_recheck FROM jobs WHERE id=?',
+                                 (response.json['id'],)).fetchone()[0]
+        self.assertEqual(enabled, 1)
 
     def test_host_metrics_are_finite_and_do_not_accept_arbitrary_fields(self):
         value = self.service.clean_telemetry({'cpu_percent':25.2,'memory_percent':float('nan'),

@@ -15,12 +15,12 @@ class ExportTests(unittest.TestCase):
             export.write(account,{'row':1,'protocol':'gsa','status':'need_2fa','attempts':1})
             export.write(account,{'row':2,'protocol':'gsa','status':'init_refused','stage':'init','apple_ec':-20970,'attempts':1})
             self.assertEqual((export.directory/'accepted_passwords.txt').read_text(),'owned@example.invalid----private-password\n')
-            self.assertIn('private-password',(export.directory/'invalid.txt').read_text())
+            self.assertIn('private-password',(export.directory/'undetermined.txt').read_text())
             details=(export.directory/'undetermined-details.jsonl').read_text()
             self.assertIn('-20970',details)
             self.assertNotIn('private-password',details)
             self.assertNotIn('owned@example.invalid',details)
-            self.assertEqual(stat.S_IMODE((export.directory/'invalid.txt').stat().st_mode),0o600)
+            self.assertEqual(stat.S_IMODE((export.directory/'undetermined.txt').stat().st_mode),0o600)
 
     def test_gsa_http_503_and_timeout_type_survive_redaction(self):
         result=safe_result({'status':'error','stage':'init','kind':'server','detail':'init HTTP 503; Content-Type=text/html'})

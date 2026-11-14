@@ -17,11 +17,11 @@ def result_bucket(result):
         return 'wrong_password'
     if status in ('security_lock', 'locked'):
         return 'locked'
-    # -20970 在 init 阶段没有完成密码证明，不猜是密码错还是冻结；
-    # 但按业务口径该账号已不可用，单独归入“已失效”。
+    # -20970 在 init 阶段没有完成密码证明。新任务可开启网页协议
+    # 复检；未开启或复检未得到明确结果时，不得猜测为已失效。
     if (status == 'init_refused' or result.get('stage') == 'init') \
             and result.get('apple_ec') == -20970:
-        return 'invalid'
+        return 'undetermined'
     return 'undetermined'
 
 

@@ -16,7 +16,7 @@
   ],
   "principles": [
     "Keep user-reported frozen state separate from conclusions supported by this response",
-    "Do not equate -20970 with password failure or device ban; expose it as operationally invalid without guessing the cause",
+    "Do not equate GSA init -20970 with password failure or device ban; optionally recheck it through the web protocol",
     "Interpret business codes with protocol, phase and HTTP context",
     "HTTP 5xx and transport failures do not establish account state",
     "Init acceptance is not password verification or completed service login"
@@ -72,12 +72,10 @@
     },
     "invalid": {
       "label": "已失效",
-      "stage": "init",
-      "apple_ec": -20970,
       "statuses": [
-        "init_refused"
+        "invalid"
       ],
-      "meaning": "operationally unusable; exact password/frozen cause not asserted"
+      "meaning": "reserved for explicit invalid-account verdicts and historical exports"
     }
   },
   "observed_responses": [
@@ -86,10 +84,11 @@
       "stage": "init",
       "http": 200,
       "apple_ec": -20970,
-      "category": "invalid",
-      "account_state_from_response": "operationally_unusable_exact_cause_unknown",
+      "category": "undetermined_pending_optional_web_recheck",
+      "account_state_from_response": "unknown",
       "password_result": "not_checked",
-      "automatic_retry": false
+      "automatic_retry": false,
+      "dual_protocol_action": "run one web recheck when the task option is enabled"
     },
     {
       "protocol": "gsa",
