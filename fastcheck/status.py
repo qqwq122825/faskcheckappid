@@ -13,6 +13,14 @@ def result_bucket(result):
         apple_ec = None
     if result.get('kind') == 'timeout' or status == 'timeout':
         return 'timeout'
+    # 请求没有拿到任何 HTTP 响应时，协议层统一记录 http=0。它不是业务
+    # 返回，也不应该落入“其他未验证”；按用户可理解的口径归为超时。
+    try:
+        explicit_http_zero = 'http' in result and result.get('http') is not None and int(result['http']) == 0
+    except (TypeError, ValueError):
+        explicit_http_zero = False
+    if explicit_http_zero:
+        return 'timeout'
     # 业务展示口径：GSA -20970 归入“已失效”，-20209 归入“锁定”。
     # 结果码优先于旧版执行器给出的 status，便于新总控兼容旧节点。
     if apple_ec == -20970:

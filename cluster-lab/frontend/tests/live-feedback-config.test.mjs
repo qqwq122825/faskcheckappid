@@ -137,6 +137,8 @@ test('GSA result categories expose invalid and locked business states', () => {
   assert.match(feedback, /categories\.value\.invalid/)
   assert.match(detail, /label: '已失效', value: 'invalid'/)
   assert.match(detail, /label: '锁定', value: 'locked'/)
+  assert.match(feedback, /label: '其他异常'/)
+  assert.match(feedback, /categories\.value\.unknown/)
 })
 
 test('Task creation and detail use GSA only', () => {

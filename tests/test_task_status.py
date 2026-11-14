@@ -78,6 +78,10 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(safe_result({'status':'error','kind':'server','detail':'HTTP 503'})['kind'],'server')
         self.assertEqual(safe_result({'status':'error','kind':'network','detail':'ConnectionError'})['kind'],'network')
 
+    def test_explicit_http_zero_is_timeout_but_missing_http_is_not(self):
+        self.assertEqual(result_bucket({'status':'undetermined','kind':'network','http':0}), 'timeout')
+        self.assertEqual(result_bucket({'status':'undetermined','kind':'network'}), 'undetermined')
+
 
 if __name__=='__main__':
     unittest.main()

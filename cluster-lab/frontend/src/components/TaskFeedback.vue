@@ -27,6 +27,7 @@ const cells = computed<Cell[]>(() => [
   { label: '锁定', value: categories.value.locked ?? 0 },
   { label: '超时', value: categories.value.timeout ?? 0, tone: 'warning' },
   { label: '已失效', value: categories.value.invalid ?? 0, tone: 'danger' },
+  { label: '其他异常', value: categories.value.unknown ?? 0 },
 ])
 </script>
 <template>

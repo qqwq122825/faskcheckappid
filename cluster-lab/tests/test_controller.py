@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from clusterlab.controller import Conflict, Controller
+from clusterlab.controller import Conflict, Controller, result_record_bucket
 from clusterlab.web import create_app
 
 
@@ -355,6 +355,26 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual((locked['total'], locked['rows'][0]['status'], locked['rows'][0]['code']),
                          (1, 'locked', -20209))
         self.assertEqual(b''.join(self.service.export_results(job, 'invalid')), b'hello\n')
+
+    def test_http_zero_is_timeout_and_legacy_counts_are_reconciled(self):
+        self.assertEqual(result_record_bucket({'status': 'undetermined', 'http': 0}), 'timeout')
+        self.assertEqual(result_record_bucket({'status': 'undetermined'}), 'undetermined')
+        job = self.job(50)
+        result = Path(self.temp.name) / 'legacy-http-zero.jsonl'
+        with result.open('w', encoding='utf-8') as stream:
+            for row in range(1, 51):
+                stream.write(json.dumps({'row': row, 'status': 'undetermined', 'http': 0}) + '\n')
+        with self.service.db.transaction() as db:
+            db.execute("UPDATE units SET status='completed',processed=rows,result_path=?,"
+                       "result_counts=?,classification_version=0 WHERE job_id=?",
+                       (str(result), '{\"undetermined\":50}', job))
+            db.execute("UPDATE jobs SET status='completed',c_unknown=50,c_timeout=0 WHERE id=?", (job,))
+        self.service._reclassify_legacy_results()
+        state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
+        self.assertEqual((state['categorized']['timeout'], state['categorized']['unknown']), (50, 0))
+        page = self.service.read_rows(job, 0, 100, 'timeout')
+        self.assertEqual((page['total'], len(page['rows']), page['rows'][0]['status']),
+                         (50, 50, 'timeout'))
 
     def test_task_row_statistics_count_partial_final_unit(self):
         job = self.job(101)

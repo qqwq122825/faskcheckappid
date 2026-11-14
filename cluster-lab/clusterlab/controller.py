@@ -1,4 +1,4 @@
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS units (
  lease_token TEXT, lease_until REAL, attempt INTEGER NOT NULL DEFAULT 0,
  processed INTEGER NOT NULL DEFAULT 0, result_path TEXT, result_checksum TEXT,
  result_counts TEXT,
+ classification_version INTEGER NOT NULL DEFAULT 0,
  live_counts TEXT,
  updated REAL NOT NULL, UNIQUE(job_id,seq)
 );
@@ -95,6 +96,13 @@ def mask_api(value):
 
 def result_record_bucket(value):
     """Normalize result codes from current and older nodes to the active UI categories."""
+    try:
+        explicit_http_zero = ('http' in value and value.get('http') is not None
+                              and int(value['http']) == 0)
+    except (TypeError, ValueError):
+        explicit_http_zero = False
+    if explicit_http_zero:
+        return 'timeout'
     codes = []
     for key in ('code', 'apple_ec', 'gsa_code'):
         try:
@@ -118,6 +126,7 @@ class Controller:
     MAX_ACTIVE_UNITS = 512
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid',
                       'timeout', 'undetermined', 'unknown')
+    RESULT_CLASSIFICATION_VERSION = 2
 
     def __init__(self, root, lease_seconds=30, offline_seconds=12, dispatch_per_second=0):
         self.root = private_dir(root)
@@ -156,6 +165,8 @@ class Controller:
                 db.execute('ALTER TABLE units ADD COLUMN byte_end INTEGER NOT NULL DEFAULT 0')
             if 'live_counts' not in unit_columns:
                 db.execute('ALTER TABLE units ADD COLUMN live_counts TEXT')
+            if 'classification_version' not in unit_columns:
+                db.execute('ALTER TABLE units ADD COLUMN classification_version INTEGER NOT NULL DEFAULT 0')
         self.lease_seconds, self.offline_seconds = lease_seconds, offline_seconds
         # 全局派发闸门：整个集群每秒最多放多少个新工作包。0 表示不限。
         self.dispatch_per_second = max(0, int(dispatch_per_second or 0))
@@ -172,10 +183,80 @@ class Controller:
             preparing = [r['id'] for r in db.execute("SELECT id FROM jobs WHERE status='preparing' ORDER BY created,id")]
         for job_id in preparing:
             self.preparer.submit(self.prepare, job_id)
+        # 旧结果中的 HTTP=0 曾被算进“其他未验证”。后台从最新结果开始修复，
+        # 不阻塞服务启动；每个工作包只扫描一次，适合已有大任务的数据目录。
+        self.classifier = threading.Thread(target=self._reclassify_legacy_results,
+                                           name='result-reclassification', daemon=True)
+        self.classifier.start()
 
     def close(self):
         self.closing.set()
         self.preparer.shutdown(wait=True, cancel_futures=True)
+        if getattr(self, 'classifier', None) and self.classifier is not threading.current_thread():
+            self.classifier.join()
+
+    def _classify_result_file(self, path):
+        counts = Counter()
+        try:
+            with Path(path).open('r', encoding='utf-8') as stream:
+                for index, line in enumerate(stream, 1):
+                    if index % 1000 == 0 and self.closing.is_set():
+                        return None
+                    try:
+                        record = json.loads(line)
+                    except (TypeError, ValueError):
+                        return None
+                    counts[result_record_bucket(record)] += 1
+        except OSError:
+            return None
+        return counts
+
+    def _reclassify_legacy_results(self):
+        """One-pass repair for completed result files created before HTTP=0 meant timeout."""
+        with self.db.connect() as db:
+            units = [dict(row) for row in db.execute(
+                "SELECT u.id,u.job_id,u.rows,u.result_path,u.result_counts,j.mode "
+                "FROM units u JOIN jobs j ON j.id=u.job_id "
+                "WHERE u.status='completed' AND COALESCE(u.classification_version,0)<? "
+                "ORDER BY u.updated DESC", (self.RESULT_CLASSIFICATION_VERSION,))]
+        for unit in units:
+            if self.closing.is_set():
+                return
+            if unit['mode'] != 'auth':
+                with self.db.transaction() as db:
+                    db.execute('UPDATE units SET classification_version=? WHERE id=?',
+                               (self.RESULT_CLASSIFICATION_VERSION, unit['id']))
+                continue
+            counts = self._classify_result_file(unit['result_path'])
+            if counts is None or sum(counts.values()) != unit['rows']:
+                continue
+            try:
+                previous = json.loads(unit['result_counts'] or '{}')
+            except (TypeError, ValueError):
+                previous = {}
+            columns = {'valid': 'c_valid', 'wrong_password': 'c_wrong',
+                       'need_2fa': 'c_2fa', 'locked': 'c_locked',
+                       'timeout': 'c_timeout', 'invalid': 'c_invalid'}
+            deltas = {key: int(counts.get(key, 0)) - int(previous.get(key, 0) or 0)
+                      for key in columns}
+            old_unknown = int(previous.get('undetermined', 0) or 0) + int(previous.get('unknown', 0) or 0)
+            new_unknown = int(counts.get('undetermined', 0)) + int(counts.get('unknown', 0))
+            with self.db.transaction() as db:
+                current = db.execute('SELECT status,classification_version FROM units WHERE id=?',
+                                     (unit['id'],)).fetchone()
+                if not current or current['status'] != 'completed' or current['classification_version'] >= self.RESULT_CLASSIFICATION_VERSION:
+                    continue
+                db.execute(
+                    "UPDATE jobs SET c_valid=MAX(0,c_valid+?),c_wrong=MAX(0,c_wrong+?),"
+                    "c_2fa=MAX(0,c_2fa+?),c_locked=MAX(0,c_locked+?),"
+                    "c_timeout=MAX(0,c_timeout+?),c_invalid=MAX(0,c_invalid+?),"
+                    "c_unknown=MAX(0,c_unknown+?),updated=? WHERE id=?",
+                    (deltas['valid'], deltas['wrong_password'], deltas['need_2fa'],
+                     deltas['locked'], deltas['timeout'], deltas['invalid'],
+                     new_unknown - old_unknown, time.time(), unit['job_id']))
+                db.execute('UPDATE units SET result_counts=?,classification_version=? WHERE id=?',
+                           (json.dumps(dict(counts), separators=(',', ':')),
+                            self.RESULT_CLASSIFICATION_VERSION, unit['id']))
 
     def add_node(self, name, processes=10, threads=100):
         name = str(name).strip()[:80]
@@ -904,9 +985,10 @@ class Controller:
                 else:
                     db.execute("UPDATE jobs SET updated=? WHERE id=?", (time.time(), unit['job_id']))
                 db.execute("UPDATE units SET status='completed',processed=rows,result_path=?,result_checksum=?,"
-                           "result_counts=?,live_counts=NULL,lease_until=NULL,updated=? WHERE id=?",
+                           "result_counts=?,classification_version=?,live_counts=NULL,lease_until=NULL,updated=? WHERE id=?",
                            (str(final), expected_digest,
-                            json.dumps(dict(buckets), separators=(',', ':')), time.time(), unit_id))
+                            json.dumps(dict(buckets), separators=(',', ':')),
+                            self.RESULT_CLASSIFICATION_VERSION, time.time(), unit_id))
                 event(db, 'result_confirmed', f'工作包 #{unit["seq"]} 结果已确认（{count:,} 条）', unit['job_id'], node_id)
                 unfinished = db.execute("SELECT COUNT(*) FROM units WHERE job_id=? AND status!='completed'", (unit['job_id'],)).fetchone()[0]
                 if not unfinished:
