@@ -125,6 +125,10 @@ def create_app(role, service, password=None):
             data = request.get_json() or {}
             return jsonify(service.request_devices(node_id, data.get('capacity') or 0))
 
+        @app.delete('/api/nodes/<node_id>/devices')
+        def clear_devices(node_id):
+            return jsonify(service.clear_devices(node_id))
+
         @app.post('/api/nodes/<node_id>/config')
         def configure_node(node_id):
             service.configure_node(node_id, request.get_json() or {})

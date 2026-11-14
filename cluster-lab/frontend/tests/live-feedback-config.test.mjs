@@ -87,3 +87,13 @@ test('Deleting a running task explicitly stops its node work', () => {
   assert.match(table, /:disabled="row\.status === 'preparing'"/)
   assert.match(table, /已通知节点停止/)
 })
+
+test('Device pool has a guarded one-click clear action', () => {
+  const drawer = source('src/components/DevicePoolDrawer.vue')
+  assert.match(drawer, /ElMessageBox/)
+  assert.match(drawer, /一键清空设备/)
+  assert.match(drawer, /'DELETE'/)
+  assert.match(drawer, /所有设备身份、注册记录和使用计数都会删除/)
+  assert.match(drawer, /Boolean\(node\?\.active\)/)
+  assert.match(drawer, /pool\.capacity \?\? capacity/)
+})

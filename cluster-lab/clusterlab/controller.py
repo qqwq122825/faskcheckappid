@@ -120,8 +120,10 @@ class Controller:
                     db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {column_type} NOT NULL DEFAULT {default}')
             for name, definition in {'telemetry_json': "TEXT NOT NULL DEFAULT '{}'",
                                      'device_request': 'INTEGER NOT NULL DEFAULT 0',
-             'stop_version': 'INTEGER NOT NULL DEFAULT 0',
-                                     'ack_stop_version': 'INTEGER NOT NULL DEFAULT 0'}.items():
+                                     'stop_version': 'INTEGER NOT NULL DEFAULT 0',
+                                     'ack_stop_version': 'INTEGER NOT NULL DEFAULT 0',
+                                     'device_clear_version': 'INTEGER NOT NULL DEFAULT 0',
+                                     'ack_device_clear_version': 'INTEGER NOT NULL DEFAULT 0'}.items():
                 if name not in columns:
                     db.execute(f'ALTER TABLE nodes ADD COLUMN {name} {definition}')
             unit_columns = {row['name'] for row in db.execute('PRAGMA table_info(units)')}
@@ -358,6 +360,23 @@ class Controller:
             db.execute('UPDATE nodes SET device_request=? WHERE id=?', (capacity, node_id))
             event(db, 'device_build_requested', f'已请求节点初始化 {capacity} 台设备', node_id=node_id)
         return {'requested': capacity}
+
+    def clear_devices(self, node_id):
+        """下发持久化清空指令；节点离线后重连也会执行。"""
+        with self.db.transaction() as db:
+            node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
+            if not node:
+                raise ValueError('节点不存在')
+            active = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? "
+                                "AND status IN ('leased','running','unknown')", (node_id,)).fetchone()[0]
+            if active:
+                raise Conflict(f'节点仍有 {active} 个工作包在执行，请先停止任务')
+            version = int(node['device_clear_version'] or 0) + 1
+            db.execute('UPDATE nodes SET device_request=0,device_clear_version=? WHERE id=?',
+                       (version, node_id))
+            event(db, 'device_pool_clear_requested', '已请求节点清空全部设备',
+                  node_id=node_id)
+        return {'requested': True, 'version': version}
 
     def stop_node(self, node_id):
         with self.db.transaction() as db:
@@ -659,11 +678,15 @@ class Controller:
                         max_p, max_t, total, rate, str(data.get('error', ''))[:200], node_id))
             ack_stop = data.get('ack_stop_version', 0)
             ack_stop = max(0, min(ack_stop, node['stop_version'])) if type(ack_stop) is int else 0
+            ack_device_clear = data.get('ack_device_clear_version', 0)
+            ack_device_clear = (max(0, min(ack_device_clear, node['device_clear_version']))
+                                if type(ack_device_clear) is int else 0)
             merged = dict(data.get('telemetry') or {})
             if isinstance(data.get('devices'), dict):
                 merged['device_pool'] = data['devices']
-            db.execute('UPDATE nodes SET telemetry_json=?,ack_stop_version=? WHERE id=?',
-                       (json.dumps(self.clean_telemetry(merged)), ack_stop, node_id))
+            db.execute('UPDATE nodes SET telemetry_json=?,ack_stop_version=?,ack_device_clear_version=? WHERE id=?',
+                       (json.dumps(self.clean_telemetry(merged)), ack_stop,
+                        ack_device_clear, node_id))
             if not node['last_seen'] or now - node['last_seen'] > self.offline_seconds:
                 event(db, 'node_online', f'节点已连接：{node["name"]}', node_id=node_id)
             return {'node_id': node_id, 'name': node['name'], 'enabled': bool(node['enabled']),
@@ -671,6 +694,7 @@ class Controller:
                     'desired_processes': desired_processes, 'desired_threads': desired_threads,
                     'rejected': reject, 'confirmed': confirmed, 'interrupted_ack': interrupted_ack,
                     'device_request': node['device_request'],
+                    'device_clear_version': node['device_clear_version'],
                     'device_rotate_after': self.settings().get('device_rotate_after', 0),
                     'device_auto_rotate': bool(self.settings().get('device_auto_rotate')),
                     'proxy_ttl': int(self.settings().get('proxy_ttl') or 50),

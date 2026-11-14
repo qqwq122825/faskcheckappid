@@ -534,6 +534,27 @@ class ControllerTests(unittest.TestCase):
             self.service.accept_result(self.node['id'], unit['id'], unit['token'],
                                        io.BytesIO(payload), checksum)
 
+    def test_clear_device_pool_is_persistent_and_requires_an_idle_node(self):
+        self.service.request_devices(self.node['id'], 30)
+        requested = self.service.clear_devices(self.node['id'])
+        self.assertEqual(requested, {'requested': True, 'version': 1})
+        response = self.service.heartbeat(self.node['id'], {
+            'session': 'test-session', 'max_processes': 1, 'max_threads': 2,
+            'active': [], 'ack_device_clear_version': 1})
+        self.assertEqual(response['device_request'], 0)
+        self.assertEqual(response['device_clear_version'], 1)
+        with self.service.db.connect() as db:
+            node = db.execute('SELECT device_request,device_clear_version,'
+                              'ack_device_clear_version FROM nodes WHERE id=?',
+                              (self.node['id'],)).fetchone()
+        self.assertEqual(tuple(node), (0, 1, 1))
+
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        self.service.lease(self.node['id'], 'test-session')
+        with self.assertRaisesRegex(Conflict, '仍有 1 个工作包'):
+            self.service.clear_devices(self.node['id'])
+
     def test_10002_records_keep_the_final_two_record_package(self):
         source = b''.join(f'account-{index:05d}\n'.encode() for index in range(10000)) + b'\n\n'
         job = self.service.create_job('10002 records', io.BytesIO(source), 10000)

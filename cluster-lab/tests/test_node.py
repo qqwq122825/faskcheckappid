@@ -164,6 +164,26 @@ class NodeRecoveryTests(unittest.TestCase):
         finally:
             self.node.active.clear()
 
+    def test_clear_device_command_removes_pool_and_persists_ack(self):
+        pool = self.node.root / 'device-pool'
+        (pool / 'registrations').mkdir(parents=True)
+        (pool / 'registrations' / '001.json').write_text('{"slot":1}')
+        (pool / 'usage.json').write_text('{"1":99}')
+        self.node.builder.state.update(capacity=1, ready=1)
+        self.node.device_target = 1
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': [],
+                 'device_request': 0, 'device_clear_version': 1}
+        with patch.object(self.node, '_request', return_value=Response(value)):
+            self.node._heartbeat()
+        self.assertEqual(list(pool.iterdir()), [])
+        self.assertEqual(self.node.builder.state['capacity'], 0)
+        self.assertEqual(self.node.builder.state['ready'], 0)
+        self.assertEqual(self.node.device_target, 0)
+        self.assertEqual(self.node.device_clear_version, 1)
+        control = json.loads((self.node.root / 'control.json').read_text())
+        self.assertEqual(control['device_clear_version'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

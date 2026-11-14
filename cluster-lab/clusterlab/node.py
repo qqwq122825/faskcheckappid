@@ -51,7 +51,9 @@ class Node:
         self.client.trust_env = False
         self.thread = None
         self.generation = 0
-        self.stop_version = read_json(self.root / 'control.json', {}).get('stop_version', 0)
+        control = read_json(self.root / 'control.json', {})
+        self.stop_version = control.get('stop_version', 0)
+        self.device_clear_version = control.get('device_clear_version', 0)
         self.telemetry = HostTelemetry()
         self.proxy_api, self.proxy_scheme = '', 'socks5h'
         self.origin = 'https://new.ani.sidestore.io'
@@ -106,7 +108,9 @@ class Node:
                 raise ValueError('更换总控时需填写新的节点凭证')
             if self.config.get('url') != url or self.config.get('token') != secret:
                 self.stop_version = 0
-                atomic_json(self.root / 'control.json', {'stop_version': 0})
+                self.device_clear_version = 0
+                atomic_json(self.root / 'control.json',
+                            {'stop_version': 0, 'device_clear_version': 0})
             self.config = {'url': url, 'token': secret}
             self.generation += 1
             atomic_json(self.root / 'connection.json', self.config)
@@ -222,7 +226,9 @@ class Node:
                 collection.append(item)
         with self._request('POST', '/agent/heartbeat', json={'session': self.instance, 'hostname': socket.gethostname(),
                            'version': VERSION, 'max_processes': self.max_processes, 'max_threads': self.max_threads,
-                           'active': values, 'interrupted': interrupted, 'ack_stop_version': self.stop_version,
+                           'active': values, 'interrupted': interrupted,
+                           'ack_stop_version': self.stop_version,
+                           'ack_device_clear_version': self.device_clear_version,
                            'telemetry': dict(self.telemetry.latest,
                                              worker_processes=self._active_worker_count()),
                            'devices': self._device_status(),
@@ -235,7 +241,9 @@ class Node:
                 for process, stop in self.active.values():
                     stop.set()
                 self.stop_version = value['stop_version']
-                atomic_json(self.root / 'control.json', {'stop_version': self.stop_version})
+                atomic_json(self.root / 'control.json',
+                            {'stop_version': self.stop_version,
+                             'device_clear_version': self.device_clear_version})
             for unit_id in value.get('interrupted_ack', []):
                 with self.db.transaction() as db:
                     db.execute("UPDATE tasks SET status='interrupted_reported',error='已按总控指令中止；等待总控重新安排',updated=? WHERE id=? AND status='interrupted'",
@@ -246,6 +254,16 @@ class Node:
             # 总控下发的出口配置与设备初始化请求都在心跳响应里
             if 'config' in value:
                 self.apply_config(value['config'])
+            clear_version = int(value.get('device_clear_version') or 0)
+            if clear_version > self.device_clear_version:
+                self.builder.cancel()
+                if not self.builder.state['running']:
+                    self.builder.clear()
+                    self.device_target = 0
+                    self.device_clear_version = clear_version
+                    atomic_json(self.root / 'control.json',
+                                {'stop_version': self.stop_version,
+                                 'device_clear_version': self.device_clear_version})
             requested = value.get('device_request') or 0
             if requested and not self.builder.state['running']:
                 try:

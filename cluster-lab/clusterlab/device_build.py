@@ -5,6 +5,7 @@ import json
 import multiprocessing as mp
 from pathlib import Path
 import queue
+import shutil
 import threading
 import time
 
@@ -90,6 +91,20 @@ class DeviceBuilder:
 
     def cancel(self):
         self.stop.set()
+
+    def clear(self):
+        """清空节点本地设备身份、注册记录和使用计数。"""
+        with self.lock:
+            if self.state['running']:
+                raise RuntimeError('设备正在注册，请先等待停止')
+            root = self.node.root / 'device-pool'
+            shutil.rmtree(root, ignore_errors=True)
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.reserved.clear()
+            self.state.update(running=False, capacity=0, ready=0, built=0,
+                              failed=0, current=0, message='设备池已清空',
+                              started_at=None)
+        return True
 
     def reserve(self, slots):
         """任务进程占用的槽位由执行器注册，后台构建设备时主动避开。"""

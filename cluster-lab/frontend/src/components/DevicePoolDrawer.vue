@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, fmt, state } from '../composables/useCluster'
 
 const visible = ref(false), nodeId = ref(''), capacity = ref(2), error = ref('')
 const autoRotate = ref(false), savingAuto = ref(false), rotateAfter = ref(20)
 // 每次刷新都从全局状态里取最新节点，设备池进度才会跟着心跳走
 const node = computed(() => state.value?.nodes?.find((n: any) => n.id === nodeId.value))
-const busy = ref(false), timer = 0 as any
+const busy = ref(false), clearing = ref(false), timer = 0 as any
 
 // 设备池状态来自节点的心跳上报，总控只是展示
 const pool = computed(() => node.value?.telemetry?.device_pool || {})
@@ -26,6 +26,7 @@ const rows = computed(() => {
       recorded: Boolean(item.recorded),
     }))
   }
+  if (Number(pool.value.capacity) === 0 && !building.value) return []
   const total = Math.max(pool.value.capacity || 0, capacity.value)
   return Array.from({ length: total }, (_, index) => ({
     slot: index + 1,
@@ -73,6 +74,21 @@ async function cancelBuild() {
   try { await api(`/api/nodes/${node.value.id}/devices`, { capacity: 0 }, 'POST'); ElMessage.success('已请求停止') }
   catch (exc: any) { error.value = exc?.message || '请求失败' }
 }
+async function clearPool() {
+  if (!node.value?.id) { error.value = '节点不可用'; return }
+  try {
+    await ElMessageBox.confirm(
+      '清空后，该节点的所有设备身份、注册记录和使用计数都会删除，不能恢复。',
+      '清空设备池', { type: 'warning', confirmButtonText: '一键清空', cancelButtonText: '取消' })
+  } catch { return }
+  clearing.value = true
+  error.value = ''
+  try {
+    await api(`/api/nodes/${node.value.id}/devices`, undefined, 'DELETE')
+    ElMessage.success('已通知节点清空设备池')
+  } catch (exc: any) { error.value = exc?.message || '清空失败' }
+  finally { clearing.value = false }
+}
 </script>
 
 <template>
@@ -100,12 +116,16 @@ async function cancelBuild() {
         <div class="actions">
           <el-button type="primary" native-type="submit" :loading="busy" :disabled="building">保存并应用</el-button>
           <el-button v-if="building" @click="cancelBuild">停止</el-button>
+          <el-tooltip :disabled="!node?.active" content="节点仍有工作包在执行，请先停止任务" placement="top">
+            <span><el-button type="danger" plain :loading="clearing"
+              :disabled="building || clearing || Boolean(node?.active)" @click="clearPool">一键清空设备</el-button></span>
+          </el-tooltip>
         </div>
         <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
       </el-form>
     </section>
     <div class="device-pool-summary">
-      <div><span>目标数量</span><strong>{{ fmt(pool.capacity || capacity) }}</strong></div>
+      <div><span>目标数量</span><strong>{{ fmt(pool.capacity ?? capacity) }}</strong></div>
       <div><span>已尝试</span><strong>{{ fmt(actual) }}</strong></div>
       <div><span>就绪设备</span><strong>{{ fmt(ready) }}</strong></div>
     </div>
