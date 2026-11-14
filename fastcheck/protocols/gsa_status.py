@@ -760,17 +760,19 @@ def _once(email: str, password: str, proxy: str | None, timeout: float,
         if not isinstance(proof, bytes) or not srp.verify_M2(proof):
             return _result("error", "缺少或无法验证 GSA 服务器证明，未确认密码", started,
                            kind="protocol", stage="complete")
-        auth_type = status2.get("au")
-        if auth_type in ("trustedDeviceSecondaryAuth", "secondaryAuth"):
-            verdict, detail = "need_2fa", "密码证明通过，需要二次验证"
-        elif auth_type:
-            verdict, detail = "needs_setup", "密码证明通过，但服务要求进一步验证；尚不能归类为双重验证"
+        raw_auth_type = status2.get("au")
+        auth_type = raw_auth_type.strip() if isinstance(raw_auth_type, str) else ""
+        if auth_type:
+            # GSA 只有在密码证明已通过后需要继续身份验证时才返回 au。
+            # Apple 会按账号/地区返回不同名称（例如手机验证码挑战），
+            # 所以不再只匹配两个固定字符串；有 au 就归入“双重验证”。
+            verdict, detail = "need_2fa", "密码证明通过，服务要求二次验证"
         else:
             detail = "密码证明通过；未确认业务服务登录状态"
         result = _result(verdict, detail, started, stage="complete")
         result.update(password_verified=True,
                       two_factor_status="required" if verdict == "need_2fa" else "unknown",
-                      auth_type=auth_type if auth_type in ("trustedDeviceSecondaryAuth", "secondaryAuth") else "other" if auth_type else "none")
+                      auth_type=(auth_type[:80] if auth_type else "none"))
         return result
     result = _result(verdict, detail, started, stage="complete")
     return _with_apple_message(result, status2, email, password, proxy, ident)

@@ -114,6 +114,18 @@ class ProtocolTests(unittest.TestCase):
         bad = self.authenticate(SyntheticServer(auth="trustedDeviceSecondaryAuth", proof="tampered"))
         self.assertEqual(bad["status"], "error")
 
+    def test_any_post_password_auth_challenge_is_two_factor(self):
+        for auth_type in ("smsSecondaryAuth", "phoneVerification", " regionalChallenge "):
+            with self.subTest(auth_type=auth_type):
+                result = self.authenticate(SyntheticServer(auth=auth_type))
+                self.assertEqual(result["status"], "need_2fa")
+                self.assertEqual(result["two_factor_status"], "required")
+                self.assertEqual(result["auth_type"], auth_type.strip())
+
+        result = self.authenticate(SyntheticServer(auth="   "))
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual(result["auth_type"], "none")
+
     def test_init_error_is_not_a_password_conclusion(self):
         server = SyntheticServer(init_ec=-22406)
         result = self.authenticate(server)
