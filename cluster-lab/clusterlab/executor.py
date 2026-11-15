@@ -10,6 +10,7 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import queue
+import re
 import threading
 import time
 from urllib.parse import urlsplit
@@ -19,6 +20,60 @@ from .common import atomic_json
 
 PROXY_TTL_SECONDS = 50.0
 PROXY_FETCH_LIMIT = 1000
+PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
+
+
+def _proxy_debug_enabled(descriptor=None):
+    value = os.environ.get(PROXY_DEBUG_ENV, '')
+    return (str(value).strip().lower() in ('1', 'true', 'yes', 'on') or
+            bool((descriptor or {}).get('_proxy_debug')))
+
+
+def _proxy_identity(value):
+    """Return a credential-free endpoint identity for diagnostics."""
+    if not value:
+        return {'endpoint': '', 'host': '', 'port': None}
+    try:
+        parsed = urlsplit(str(value))
+        host, port = (parsed.hostname or ''), parsed.port
+    except (TypeError, ValueError):
+        host, port = '', None
+    endpoint = f'{host}:{port}' if host and port is not None else host
+    return {'endpoint': endpoint[:160], 'host': host[:128], 'port': port}
+
+
+def _proxy_pool_snapshot(pool):
+    if pool is None:
+        return {}
+    try:
+        return pool.snapshot()
+    except Exception:                                               # noqa: BLE001
+        return {}
+
+
+def _proxy_debug_detail(value):
+    text = str(value or '')
+    text = re.sub(r'(?i)((?:https?|socks5h?)://)[^/@\s]+@', r'\1***@', text)
+    text = re.sub(r'(?i)(password|passwd|pwd|token|key)=([^&\s]+)', r'\1=***', text)
+    return text[:240]
+
+
+def _write_proxy_debug(path, event, **fields):
+    """Append one bounded JSONL event without ever persisting proxy credentials."""
+    if not path:
+        return
+    payload = {'at': round(time.time(), 6), 'event': str(event),
+               'pid': os.getpid(), 'thread': threading.current_thread().name}
+    payload.update(fields)
+    raw = (json.dumps(payload, ensure_ascii=False, separators=(',', ':'),
+                      default=str) + '\n').encode('utf-8')
+    # One O_APPEND write keeps concurrent worker lines intact.  Truncate large
+    # exception details before this helper so a single event remains bounded.
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, raw)
+    finally:
+        os.close(fd)
 
 
 class NodeProxyPool:
@@ -224,7 +279,7 @@ class NodeProxyPool:
                 pass
 
 
-def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None):
+def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=None):
     """Fetch every second, rotate when full; workers use queued exits first."""
     if fetcher is None:
         from fastcheck.proxy_pool import fetch_proxies
@@ -250,15 +305,30 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None):
             # filled in bounded batches, not by blocking authentication work.
             count = min(PROXY_FETCH_LIMIT, max(1, needed))
             started = time.monotonic()
+            before = _proxy_pool_snapshot(pool) if debug_path else {}
             try:
-                values = fetcher(api_url, count,
-                                 scheme=None if scheme == 'http' else scheme)
+                values = list(fetcher(api_url, count,
+                                      scheme=None if scheme == 'http' else scheme))
                 if stop.is_set():
                     return
-                pool.add_fresh(values, fetched_at=started)
-                pool.note_fetch((time.monotonic() - started) * 1000)
-            except Exception:                                      # noqa: BLE001
-                pool.note_fetch((time.monotonic() - started) * 1000, error=True)
+                added = pool.add_fresh(values, fetched_at=started)
+                milliseconds = (time.monotonic() - started) * 1000
+                pool.note_fetch(milliseconds)
+                if debug_path:
+                    _write_proxy_debug(
+                        debug_path, 'supplier_fetch', requested=count,
+                        returned=len(values), added=added,
+                        latency_ms=round(milliseconds, 2), pool_before=before,
+                        pool_after=_proxy_pool_snapshot(pool))
+            except Exception as exc:                               # noqa: BLE001
+                milliseconds = (time.monotonic() - started) * 1000
+                pool.note_fetch(milliseconds, error=True)
+                if debug_path:
+                    _write_proxy_debug(
+                        debug_path, 'supplier_error', requested=count,
+                        latency_ms=round(milliseconds, 2),
+                        error_type=type(exc).__name__, detail=_proxy_debug_detail(exc),
+                        pool_before=before, pool_after=_proxy_pool_snapshot(pool))
             next_tick += 1.0
             now = time.monotonic()
             if next_tick < now:
@@ -364,6 +434,20 @@ def execute_unit_group(directory, descriptor, stop):
     still uses all of its process and thread capacity.
     """
     directory = Path(directory)
+    descriptor = dict(descriptor)
+    debug_path = None
+    if _proxy_debug_enabled(descriptor):
+        debug_path = directory / 'proxy-debug.jsonl'
+        descriptor['_proxy_debug'] = True
+        descriptor['_proxy_debug_path'] = str(debug_path)
+        _write_proxy_debug(
+            debug_path, 'debug_start', job_id=str(descriptor.get('job_id') or ''),
+            unit_id=str(descriptor.get('id') or ''), rows=int(descriptor.get('rows') or 0),
+            processes=int(descriptor.get('processes') or 1),
+            threads=int(descriptor.get('threads') or 1),
+            retries=int(descriptor.get('retries') or 0),
+            timeout=float(descriptor.get('timeout') or 20),
+            mode='timeout_full_trace', credentials_recorded=False)
     started = time.time()
     rows = max(0, int(descriptor.get('rows') or 0))
     process_limit = max(1, int(descriptor.get('processes') or 1))
@@ -381,7 +465,8 @@ def execute_unit_group(directory, descriptor, stop):
         supplier_thread = threading.Thread(
             target=proxy_supplier_loop,
             args=(proxy_pool, descriptor['proxy_api'],
-                  descriptor.get('proxy_scheme') or 'socks5h', supplier_stop),
+                  descriptor.get('proxy_scheme') or 'socks5h', supplier_stop,
+                  None, debug_path),
             name='node-proxy-supplier', daemon=True)
         supplier_thread.start()
     if process_count == 1:
@@ -408,6 +493,9 @@ def execute_unit_group(directory, descriptor, stop):
                 done['proxy_pool'] = proxy_pool.snapshot()
             atomic_json(directory / 'done.json', done)
         finally:
+            if proxy_pool is not None and debug_path:
+                _write_proxy_debug(debug_path, 'debug_stop', ok=True,
+                                   pool=_proxy_pool_snapshot(proxy_pool))
             if proxy_pool is not None:
                 proxy_pool.close()
         return
@@ -565,6 +653,10 @@ def execute_unit_group(directory, descriptor, stop):
             supplier_thread.join(2)
         for process, _, _ in children:
             process.close()
+        if proxy_pool is not None and debug_path:
+            _write_proxy_debug(debug_path, 'debug_stop',
+                               ok=bool((directory / 'done.json').exists()),
+                               pool=_proxy_pool_snapshot(proxy_pool))
         if proxy_pool is not None:
             proxy_pool.close()
 
@@ -696,19 +788,37 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     timeout = float(descriptor.get('timeout') or 20)
     retries = max(0, int(descriptor.get('retries') or 0))
     workers = max(1, int(descriptor.get('threads') or 1))
+    debug_enabled = _proxy_debug_enabled(descriptor)
+    debug_path = (descriptor.get('_proxy_debug_path') or
+                  str(directory / 'proxy-debug.jsonl')) if debug_enabled else None
     counters = Counter()
     processed = 0
     last_progress = time.monotonic()
 
     pool = DevicePool(device_root, origin, max_devices=capacity)
     from fastcheck.workers import device_profile
+    if debug_enabled:
+        _write_proxy_debug(debug_path, 'worker_start',
+                           rows=int(descriptor.get('rows') or 0),
+                           first_row=int(descriptor.get('first_row') or 1),
+                           threads=workers, retries=retries, timeout=timeout,
+                           slots=slot_ids, credentials_recorded=False)
 
     # 一个包内把账号摊到所有设备上：一台设备只承担 rows/capacity 条，
     # 比固定用 1 号设备更分散，明显降低单设备被风控的概率。
     identities, infos = {}, {}
     for index in slot_ids:
+        bootstrap_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
+        bootstrap_started = time.monotonic() if debug_enabled else None
         bootstrap_lease = proxy_pool.acquire(wait=2.0) if proxy_pool is not None else None
         bootstrap_proxy = bootstrap_lease[0] if bootstrap_lease is not None else proxy
+        bootstrap_identity = (_proxy_identity(bootstrap_proxy) if debug_enabled else
+                              {'endpoint': '', 'host': '', 'port': None})
+        if debug_enabled and proxy_pool is not None and bootstrap_lease is None:
+            _write_proxy_debug(
+                debug_path, 'bootstrap_pool_empty', slot=index,
+                wait_ms=round((time.monotonic() - bootstrap_started) * 1000, 2),
+                pool_before=bootstrap_before, pool_after=_proxy_pool_snapshot(proxy_pool))
         try:
             base_info = pool.info(timeout, proxy=bootstrap_proxy, provider_direct=True)
             profile = device_profile(pool, index)
@@ -728,6 +838,15 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             identities[index] = None
             if proxy_pool is not None:
                 proxy_pool.release(bootstrap_lease, healthy=False)
+            if debug_enabled:
+                _write_proxy_debug(
+                    debug_path, 'bootstrap_error', slot=index,
+                    wait_ms=round((time.monotonic() - bootstrap_started) * 1000, 2),
+                    endpoint=bootstrap_identity['endpoint'],
+                    host=bootstrap_identity['host'], port=bootstrap_identity['port'],
+                    error_type=type(exc).__name__, detail=_proxy_debug_detail(exc),
+                    pool_before=bootstrap_before,
+                    pool_after=_proxy_pool_snapshot(proxy_pool))
 
     def proxy_for(index):
         if proxy_pool is not None:
@@ -769,15 +888,41 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                                'slot': slot_id, 'elapsed': 0}
         identity = identities.get(slot_id)
         result = None
+        previous_proxy = {'endpoint': '', 'host': '', 'port': None}
+        had_timeout = False
         # 用户设置的重试次数仍是唯一上限；节点池只负责每次重试换出口，
         # 不会在“0 次重试”时暗中多发请求。
         attempt_limit = retries + 1
         for attempt in range(attempt_limit):
+            acquire_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
+            acquire_started = time.monotonic() if debug_enabled else None
             account_proxy, lease = proxy_for(index + attempt)
+            acquire_ms = (round((time.monotonic() - acquire_started) * 1000, 2)
+                          if debug_enabled else None)
+            current_proxy = (_proxy_identity(account_proxy) if debug_enabled else
+                             {'endpoint': '', 'host': '', 'port': None})
+            switch = {
+                'previous_endpoint': previous_proxy['endpoint'],
+                'host_changed': (previous_proxy['host'] != current_proxy['host']
+                                 if previous_proxy['host'] else None),
+                'port_changed': (previous_proxy['port'] != current_proxy['port']
+                                 if previous_proxy['port'] is not None else None),
+                'pair_changed': (previous_proxy['endpoint'] != current_proxy['endpoint']
+                                 if previous_proxy['endpoint'] else None),
+            }
             if proxy_pool is not None and lease is None:
                 result = {'status': 'error', 'kind': 'proxy', 'http': 0,
                           'stage': 'init', 'detail': '代理池暂时无可用出口'}
+                had_timeout = True
+                if debug_enabled:
+                    _write_proxy_debug(
+                        debug_path, 'pool_empty', row=row, slot=slot_id,
+                        attempt=attempt, attempt_limit=attempt_limit,
+                        request_sent=False, acquire_ms=acquire_ms, **switch,
+                        pool_before=acquire_before,
+                        pool_after=_proxy_pool_snapshot(proxy_pool))
                 continue
+            request_started = time.monotonic() if debug_enabled else None
             try:
                 if identity is None:
                     # 预取失败的槽位在这里补一次
@@ -799,13 +944,33 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             except Exception as exc:                               # noqa: BLE001
                 result = {'status': 'error', 'kind': type(exc).__name__, 'http': 0,
                           'stage': 'init', 'detail': str(exc)[:180]}
+            request_ms = (round((time.monotonic() - request_started) * 1000, 2)
+                          if debug_enabled else None)
             transport_failed = retryable_transport(result)
+            try:
+                result_http = int(result.get('http'))
+            except (TypeError, ValueError):
+                result_http = None
+            healthy_exit = result_http == 200
             if proxy_pool is not None:
-                try:
-                    healthy_exit = int(result.get('http')) == 200
-                except (TypeError, ValueError):
-                    healthy_exit = False
                 proxy_pool.release(lease, healthy=healthy_exit)
+            if debug_enabled and (transport_failed or had_timeout):
+                _write_proxy_debug(
+                    debug_path, 'timeout_attempt' if transport_failed else 'timeout_recovered',
+                    row=row, slot=slot_id, attempt=attempt, attempt_limit=attempt_limit,
+                    request_sent=True, acquire_ms=acquire_ms, request_ms=request_ms,
+                    endpoint=current_proxy['endpoint'], host=current_proxy['host'],
+                    port=current_proxy['port'], **switch, http=result_http,
+                    status=str(result.get('status') or ''), kind=str(result.get('kind') or ''),
+                    stage=str(result.get('stage') or ''),
+                    detail=_proxy_debug_detail(result.get('detail')),
+                    retryable=transport_failed,
+                    lease_reused=bool(lease and int(lease[2]) > 0),
+                    release='reusable' if healthy_exit else 'discarded',
+                    pool_before=acquire_before, pool_after=_proxy_pool_snapshot(proxy_pool))
+            if transport_failed:
+                had_timeout = True
+            previous_proxy = current_proxy
             if not transport_failed or attempt + 1 >= attempt_limit:
                 result['_proxy_retries'] = attempt
                 break
@@ -814,6 +979,15 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                       'stage': 'init', 'detail': '代理池未返回结果', '_proxy_retries': 0}
         result['elapsed'] = round(time.time() - account_started, 2)
         result['slot'] = slot_id
+        if debug_enabled and auth_result_bucket(result) == 'timeout':
+            _write_proxy_debug(
+                debug_path, 'final_timeout', row=row, slot=slot_id,
+                recorded_retries=int(result.get('_proxy_retries') or 0),
+                configured_retries=retries, http=result.get('http'),
+                kind=str(result.get('kind') or ''), stage=str(result.get('stage') or ''),
+                detail=_proxy_debug_detail(result.get('detail')),
+                last_endpoint=previous_proxy['endpoint'],
+                pool=_proxy_pool_snapshot(proxy_pool))
         return row, line, result
 
     stop_flag = stop
@@ -886,3 +1060,6 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 {'ok': True, 'processed': processed, 'counts': dict(counters),
                  'checksum': output_digest.hexdigest(),
                  'elapsed': time.time() - started})
+    if debug_enabled:
+        _write_proxy_debug(debug_path, 'worker_stop', ok=True, processed=processed,
+                           counts=dict(counters), pool=_proxy_pool_snapshot(proxy_pool))
