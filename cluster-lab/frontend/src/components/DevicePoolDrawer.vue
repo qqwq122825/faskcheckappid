@@ -162,11 +162,11 @@ async function clearPool() {
         <el-table-column prop="label" label="设备标识" width="145" />
         <el-table-column prop="state" label="状态" width="100" />
         <el-table-column prop="model" label="设备型号" min-width="150" show-overflow-tooltip />
+        <el-table-column prop="proxy" label="注册出口 IP" width="170" show-overflow-tooltip />
         <el-table-column prop="error" label="注册结果" min-width="180" show-overflow-tooltip />
         <el-table-column prop="used" label="已用账号" width="110">
           <template #default="scope">{{ fmt(scope.row.used) }}</template>
         </el-table-column>
-        <el-table-column prop="proxy" label="注册出口 IP" min-width="150" show-overflow-tooltip />
         <el-table-column prop="at" label="注册时间" width="172" />
       </el-table>
     </section>
