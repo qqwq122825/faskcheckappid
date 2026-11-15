@@ -53,10 +53,19 @@ class DeviceBuilder:
         with self.lock:
             data = dict(self.state)
             data['slot_errors'] = dict(data.get('slot_errors') or {})
+        persisted_capacity = 0
         try:
             DevicePool, _, _ = _load_fastcheck()
-            pool = DevicePool(str(root), self.node.origin, max_devices=max(1, self.state['capacity'] or 1))
-            limit = self.state['capacity'] or 1
+            # The in-memory builder state resets on a service restart. Discover
+            # the persisted slots so a task can still use the node's complete
+            # device pool before any new initialization request is made.
+            pool = DevicePool(str(root), self.node.origin, max_devices=200)
+            device_root = Path(getattr(pool, 'base', root)) / 'devices'
+            existing = [int(path.name) for path in device_root.iterdir()
+                        if path.is_dir() and path.name.isdigit()
+                        and 1 <= int(path.name) <= 200] if device_root.is_dir() else []
+            persisted_capacity = max(existing, default=0)
+            limit = max(1, int(data.get('capacity') or 0), persisted_capacity)
             for slot in range(1, limit + 1):
                 inspected = pool.inspect(slot)
                 state = inspected['state']
@@ -84,7 +93,7 @@ class DeviceBuilder:
             entry['recorded'] = bool(info)
         attempted = sum(entry['state'] != 'missing' for entry in slots)
         data.update(ready=ready, attempted=attempted, slots=slots,
-                    capacity=max(data['capacity'], ready))
+                    capacity=max(int(data.get('capacity') or 0), persisted_capacity, ready))
         return data
 
     @staticmethod

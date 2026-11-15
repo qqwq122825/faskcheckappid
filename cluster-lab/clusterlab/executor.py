@@ -754,9 +754,8 @@ def execute_unit_group(directory, descriptor, stop):
                 assigned = descriptor.get('device_slots') or []
                 child['device_slots'] = _partition_device_slots(
                     assigned or range(1, process_count + 1), process_count, index)
-                child['device_pool_capacity'] = max(
-                    process_count, int(descriptor.get('device_pool_capacity') or
-                                       descriptor.get('device_capacity') or process_count))
+                child['device_pool_capacity'] = int(
+                    descriptor.get('device_pool_capacity') or max(assigned))
             atomic_json(child_dir / 'manifest.json', child)
             child_descriptors.append((child_dir, child))
             current_row += count

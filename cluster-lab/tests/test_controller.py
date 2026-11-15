@@ -334,7 +334,7 @@ class ControllerTests(unittest.TestCase):
             paths = {row['path'] for row in db.execute('SELECT path FROM units WHERE job_id=?', (job,))}
         self.assertEqual(len(paths), 1, 'all packages should reference the one uploaded source file')
 
-    def test_lease_carries_task_device_pool_target(self):
+    def test_lease_does_not_carry_a_task_device_pool_target(self):
         job = self.service.create_job('devices', io.BytesIO(b'hello\n' * 50), 50,
                                       enqueue=True, device_capacity=30)
         deadline = time.monotonic() + 5
@@ -344,7 +344,10 @@ class ControllerTests(unittest.TestCase):
                 break
             time.sleep(.01)
         unit = self.service.lease(self.node['id'], 'test-session')
-        self.assertEqual(unit['device_capacity'], 30)
+        self.assertNotIn('device_capacity', unit)
+        with self.service.db.connect() as db:
+            self.assertEqual(db.execute('SELECT device_capacity FROM jobs WHERE id=?',
+                                        (job,)).fetchone()[0], 0)
 
     def test_legacy_dual_option_is_ignored_and_not_leased_to_node(self):
         job = self.service.create_job('single protocol', io.BytesIO(b'hello\n' * 50), 50,

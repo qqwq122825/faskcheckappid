@@ -165,8 +165,7 @@ def create_app(role, service, password=None):
                                                   unit_rows, data.get('mode') or 'auth',
                                                   str(enqueue) == 'true',
                                                   float(data.get('timeout') or 20),
-                                                  int(data.get('retries') or 0),
-                                                  int(data.get('device_capacity') or 30))
+                                                  int(data.get('retries') or 0))
             return jsonify(id=job_id), 202
 
         @app.post('/api/jobs/stream')
@@ -186,9 +185,8 @@ def create_app(role, service, password=None):
             mode = request.args.get('mode', 'auth')
             timeout = float(request.args.get('timeout') or 20)
             retries = int(request.args.get('retries') or 0)
-            device_capacity = int(request.args.get('device_capacity') or 30)
             job_id = service.create_job(name or '未命名任务', request.stream, unit_rows,
-                                        mode, enqueue == 'true', timeout, retries, device_capacity)
+                                        mode, enqueue == 'true', timeout, retries)
             return jsonify(id=job_id, bytes=request.content_length), 202
 
         @app.post('/api/jobs')
@@ -203,10 +201,8 @@ def create_app(role, service, password=None):
             mode = request.form.get('mode', 'auth')
             timeout = float(request.form.get('timeout') or 20)
             retries = int(request.form.get('retries') or 0)
-            device_capacity = int(request.form.get('device_capacity') or 30)
             job_id = service.create_job(request.form.get('name') or uploaded.filename, uploaded.stream,
-                                        unit_rows, mode, enqueue == 'true', timeout, retries,
-                                        device_capacity)
+                                        unit_rows, mode, enqueue == 'true', timeout, retries)
             return jsonify(id=job_id), 202
 
         @app.post('/api/demo')

@@ -177,16 +177,27 @@ class NodeRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '结果待上传'):
             self.node.connect('http://127.0.0.1:18772','x'*32)
 
-    def test_auth_task_starts_background_pool_build_and_rotates_slots(self):
+    def test_auth_task_uses_only_this_nodes_ready_devices(self):
         descriptor = {'mode': 'auth', 'rows': 10000, 'seq': 2,
                       'processes': 10, 'device_capacity': 30}
-        with patch.object(self.node.builder, 'start') as start:
+        ready = {'slots': [
+            {'slot': 2, 'state': 'ready'}, {'slot': 4, 'state': 'failed'},
+            {'slot': 7, 'state': 'ready'}, {'slot': 9, 'state': 'ready'}]}
+        with patch.object(self.node.builder, 'snapshot', return_value=ready), \
+             patch.object(self.node.builder, 'start') as start:
             self.node._prepare_auth_devices(descriptor)
-        self.assertEqual(descriptor['device_pool_capacity'], 30)
-        self.assertEqual(descriptor['device_slots'], list(range(1, 31)))
-        start.assert_called_once_with(30)
-        self.assertEqual(self.node.builder.reserved, set(range(1, 31)))
+        self.assertEqual(descriptor['device_pool_capacity'], 9)
+        self.assertEqual(descriptor['device_slots'], [2, 7, 9])
+        self.assertEqual(descriptor['processes'], 3)
+        self.assertNotIn('device_capacity', descriptor)
+        start.assert_not_called()
+        self.assertEqual(self.node.builder.reserved, {2, 7, 9})
         self.node.builder.release(descriptor['device_slots'])
+
+    def test_auth_task_refuses_to_run_without_ready_devices(self):
+        with patch.object(self.node.builder, 'snapshot', return_value={'slots': []}):
+            with self.assertRaisesRegex(RuntimeError, '没有已就绪设备'):
+                self.node._prepare_auth_devices({'mode': 'auth', 'rows': 50, 'processes': 10})
 
     def test_background_builder_never_registers_without_a_proxy(self):
         class Pool:
@@ -256,7 +267,32 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertFalse(snapshot['slots'][0]['recorded'])
         self.assertEqual(snapshot['slots'][0]['used'], 123)
 
-    def test_completed_device_target_does_not_restart_each_heartbeat(self):
+    def test_snapshot_rediscovers_all_persisted_devices_after_restart(self):
+        class Pool:
+            key = 'origin-key'
+
+            def __init__(inner, root, _origin, max_devices):
+                inner.base = Path(root) / 'pool'
+                inner.max_devices = max_devices
+
+            def slot_directory(inner, slot):
+                return inner.base / 'devices' / f'{slot:02d}'
+
+            def inspect(inner, slot):
+                state = 'ready' if slot in (1, 3) else 'pending'
+                return {'state': state, 'device_id': f'device-{slot}'}
+
+        for slot in range(1, 4):
+            (self.node.root / 'device-pool' / 'pool' / 'devices' /
+             f'{slot:02d}').mkdir(parents=True)
+        self.node.builder.state['capacity'] = 0
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)):
+            snapshot = self.node.builder.snapshot()
+        self.assertEqual(snapshot['capacity'], 3)
+        self.assertEqual(snapshot['ready'], 2)
+        self.assertEqual([row['slot'] for row in snapshot['slots']], [1, 2, 3])
+
+    def test_completed_manual_device_request_does_not_restart_each_heartbeat(self):
         value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
                  'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 1}
         complete = {'running': False, 'capacity': 1, 'ready': 1, 'built': 0,
@@ -308,7 +344,6 @@ class NodeRecoveryTests(unittest.TestCase):
         (pool / 'registrations' / '001.json').write_text('{"slot":1}')
         (pool / 'usage.json').write_text('{"1":99}')
         self.node.builder.state.update(capacity=1, ready=1)
-        self.node.device_target = 1
         value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
                  'enabled': True, 'rejected': [], 'confirmed': [],
                  'device_request': 0, 'device_clear_version': 1}
@@ -317,7 +352,6 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(list(pool.iterdir()), [])
         self.assertEqual(self.node.builder.state['capacity'], 0)
         self.assertEqual(self.node.builder.state['ready'], 0)
-        self.assertEqual(self.node.device_target, 0)
         self.assertEqual(self.node.device_clear_version, 1)
         control = json.loads((self.node.root / 'control.json').read_text())
         self.assertEqual(control['device_clear_version'], 1)

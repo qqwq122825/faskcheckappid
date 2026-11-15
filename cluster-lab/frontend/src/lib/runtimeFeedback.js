@@ -79,7 +79,7 @@ export function buildRuntimeFeedback(job, nodes = [], now = Date.now() / 1000) {
     return {
       ...base, phase: '启动执行器', type: 'info', step: 2,
       title: '工作包已领取，节点正在启动执行器',
-      description: `${activeNodes} 个节点已领取 ${active} 个工作包，正在初始化进程、线程、设备池和代理；收到首批结果后这里会立即显示。`,
+      description: `${activeNodes} 个节点已领取 ${active} 个工作包，正在初始化进程、线程和代理；收到首批结果后这里会立即显示。`,
     }
   }
   if (!accepting.length) return {

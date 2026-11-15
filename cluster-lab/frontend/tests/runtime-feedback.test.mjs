@@ -27,7 +27,8 @@ test('a leased package reports executor startup before the first row', () => {
   const value = buildRuntimeFeedback(job({ unit_counts: { pending: 1, leased: 1 } }), [node({ status: 'busy', active: 1 })], 120)
   assert.equal(value.step, 2)
   assert.match(value.title, /工作包已领取/)
-  assert.match(value.description, /进程、线程、设备池和代理/)
+  assert.match(value.description, /进程、线程和代理/)
+  assert.doesNotMatch(value.description, /设备池/)
 })
 
 test('live progress reports processed and confirmed rows', () => {

@@ -67,7 +67,6 @@ class Node:
         self.origin = 'https://new.ani.sidestore.io'
         from .device_build import DeviceBuilder
         self.builder = DeviceBuilder(self)
-        self.device_target = 0
         # Unfinished tasks never get silently executed again after restart.
         with self.db.transaction() as db:
             for task in db.execute("SELECT id FROM tasks WHERE status IN ('downloading','running')").fetchall():
@@ -401,7 +400,6 @@ class Node:
                 self.builder.cancel()
                 if not self.builder.state['running']:
                     self.builder.clear()
-                    self.device_target = 0
                     self.device_clear_version = clear_version
                     self._save_control()
             requested = value.get('device_request') or 0
@@ -416,19 +414,6 @@ class Node:
                 except (RuntimeError, ValueError) as exc:
                     # 不能静默吞：面板上看不到原因会以为节点没响应
                     self.builder._update(message=str(exc))
-            # 任务触发的目标池独立于“自动轮换”开关：即使任务开始时手动
-            # 初始化尚未结束，当前轮结束后也会继续补到任务要求的数量。
-            target = int(self.device_target or 0)
-            if target and not self.builder.state['running']:
-                snapshot = self.builder.snapshot()
-                ready_slots = {int(item['slot']) for item in snapshot.get('slots') or []
-                               if item.get('state') == 'ready'}
-                pending_reserved = len(self.builder.reserved_slots() - ready_slots)
-                if int(snapshot.get('ready') or 0) + pending_reserved < target:
-                    try:
-                        self.builder.start(target)
-                    except (RuntimeError, ValueError) as exc:
-                        self.builder._update(capacity=target, message=f'后台补充未启动：{exc}')
             # 自动补充：任务跑着也维护设备池——淘汰用满次数的，把空槽位补满
             auto = bool(value.get('device_auto_rotate'))
             limit = int(value.get('device_rotate_after') or 0)
@@ -516,23 +501,20 @@ class Node:
         return True
 
     def _prepare_auth_devices(self, descriptor):
-        """任务立即开跑；它占用一组槽位，后台同时把设备池补到目标数量。"""
+        """Use exactly the ready devices owned by this node; tasks do not resize the pool."""
+        snapshot = self.builder.snapshot()
+        slots = [int(item['slot']) for item in snapshot.get('slots') or []
+                 if item.get('state') == 'ready']
+        if not slots:
+            raise RuntimeError('节点没有已就绪设备，请先初始化设备池')
         processes = max(1, min(int(descriptor.get('processes') or 1),
-                               int(descriptor.get('rows') or 1)))
-        requested = max(1, min(200, int(descriptor.get('device_capacity') or 30)))
-        capacity = max(processes, requested)
-        slots = list(range(1, capacity + 1))
-        descriptor['device_capacity'] = capacity
+                               int(descriptor.get('rows') or 1), len(slots)))
+        capacity = max(slots)
+        descriptor.pop('device_capacity', None)
+        descriptor['processes'] = processes
         descriptor['device_pool_capacity'] = capacity
         descriptor['device_slots'] = slots
-        self.device_target = max(self.device_target, capacity)
         self.builder.reserve(slots)
-        if not self.builder.state['running']:
-            try:
-                self.builder.start(capacity)
-            except (RuntimeError, ValueError) as exc:
-                # 不阻塞任务：任务进程仍会初始化自己占用的槽位。
-                self.builder._update(capacity=capacity, message=f'后台注册未启动：{exc}')
 
     def start(self):
         self.thread = threading.Thread(target=self.loop, daemon=True, name='node-agent')

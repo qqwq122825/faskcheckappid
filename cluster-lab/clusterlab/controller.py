@@ -445,7 +445,9 @@ class Controller:
         if mode not in ('digest', 'simulate', 'auth'):
             raise ValueError('执行模式应为 digest / simulate / auth')
         timeout, retries = self._check_exec(timeout, retries)
-        device_capacity = integer(int(device_capacity), '预计设备池', 1, 200)
+        # 兼容旧调用参数，但任务不再决定节点设备数量。
+        _ = device_capacity
+        device_capacity = 0
         # 兼容旧调用签名；双协议复检已撤回，所有新任务固定使用 GSA。
         _ = dual_recheck
         job_id = uuid.uuid4().hex
@@ -859,7 +861,9 @@ class Controller:
         if mode not in ('digest', 'simulate', 'auth'):
             raise ValueError('执行模式应为 digest / simulate / auth')
         timeout, retries = self._check_exec(timeout, retries)
-        device_capacity = integer(int(device_capacity), '预计设备池', 1, 200)
+        # 兼容旧调用参数，但任务不再决定节点设备数量。
+        _ = device_capacity
+        device_capacity = 0
         # 兼容旧调用签名；双协议复检已撤回，所有新任务固定使用 GSA。
         _ = dual_recheck
         path = Path(str(source))
@@ -1224,7 +1228,7 @@ class Controller:
             # process/thread ceiling and recreate the old overload bug.
             if not node['enabled'] or active >= 1:
                 return None
-            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries,j.device_capacity FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
+            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
             if not unit:
                 return None
             # A manually retried package must not inherit rows accepted under
@@ -1244,7 +1248,6 @@ class Controller:
                        'processes': min(node['desired_processes'], node['max_processes'] or 1,
                                         unit['rows']),
                        'threads': min(node['desired_threads'], node['max_threads'] or 1),
-                       'device_capacity': int(unit['device_capacity'] or 30),
                        'lease_seconds': self.lease_seconds}
             if unit['mode'] == 'auth':
                 # 认证任务额外带设备与出口配置；代理地址取服务端保存的原文。
