@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from clusterlab.node import Node
+from clusterlab.device_build import REGISTRATION_TIMEOUT
 
 
 class Response:
@@ -25,6 +26,9 @@ class Response:
 
 
 class NodeRecoveryTests(unittest.TestCase):
+    def test_device_registration_allows_realistic_provisioning_time(self):
+        self.assertGreaterEqual(REGISTRATION_TIMEOUT, 90)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.node = Node(self.temp.name)

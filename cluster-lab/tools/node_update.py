@@ -27,9 +27,11 @@ def run(command, cwd=None, timeout=300):
 
 
 def resolve_commit(repo, target_ref):
-    candidates = [target_ref]
-    if not target_ref.startswith('origin/'):
-        candidates.append('origin/' + target_ref)
+    # After fetch, a plain branch name must prefer origin/<branch>.  Nodes are
+    # normally detached, so their stale local "main" must never win over the
+    # freshly fetched remote branch.
+    candidates = ([target_ref] if target_ref.startswith('origin/')
+                  else ['origin/' + target_ref, target_ref])
     for candidate in candidates:
         try:
             return run(['git', 'rev-parse', '--verify', candidate + '^{commit}'], repo, 30)

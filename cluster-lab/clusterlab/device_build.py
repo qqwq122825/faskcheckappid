@@ -13,6 +13,8 @@ import time
 
 from .executor import _load_fastcheck, record_device_registration
 
+REGISTRATION_TIMEOUT = 90
+
 
 def device_label(device_id):
     """Return a short, non-secret Base64 prefix for one persisted device."""
@@ -189,14 +191,17 @@ class DeviceBuilder:
                 self._update(proxy_status='ok', proxy_ip=proxy_endpoint(proxy))
                 payload = {'slot': slot, 'capacity': capacity, 'proxy': proxy,
                            'device_root': str(root), 'origin': self.node.origin,
-                           'timeout': 40}
+                           'timeout': REGISTRATION_TIMEOUT}
                 output = context.Queue(maxsize=8)
                 process = context.Process(target=_register, args=(payload, output),
                                           name=f'device-{slot}')
                 result = None
                 try:
                     process.start()
-                    deadline = time.monotonic() + 60
+                    # Residential exits can need 40–60 seconds for the first
+                    # complete Apple provisioning exchange.  The old 40/60
+                    # limits killed healthy registrations just before success.
+                    deadline = time.monotonic() + payload['timeout'] + 30
                     while time.monotonic() < deadline:
                         try:
                             result = output.get(timeout=.2)
