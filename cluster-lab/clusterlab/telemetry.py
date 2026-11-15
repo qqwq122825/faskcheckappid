@@ -35,6 +35,7 @@ class HostTelemetry:
                            'memory_percent': round(psutil.virtual_memory().percent, 1),
                            'upload_bps': round(upload, 1) if upload is not None else None,
                            'download_bps': round(download, 1) if download is not None else None,
+                           'network_bytes': sent + received,
                            'sampled_at': time.time(), 'scope': 'host_non_loopback'}
             self.primed = True
             self.previous = (now, sent, received)

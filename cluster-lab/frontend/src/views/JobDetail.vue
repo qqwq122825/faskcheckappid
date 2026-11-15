@@ -85,7 +85,8 @@ const runtimeFeedback = computed(() => buildRuntimeFeedback(
                   :success="job.confirmed" :failed="null" :timeout="null"
                   :unconfirmed="count('unknown') + waiting" :pending="count('pending')"
                   :rate="hourlyRate" :elapsed="elapsedSeconds" :capacity="capacityText"
-                  :categorized="job.categorized" :status="job.status">
+                  :categorized="job.categorized" :status="job.status"
+                  :traffic-bytes="job.traffic_bytes">
       <template #actions>
         <el-dropdown v-if="['paused', 'completed'].includes(job.status)" trigger="click" @command="download">
           <el-button type="primary" :icon="Download">

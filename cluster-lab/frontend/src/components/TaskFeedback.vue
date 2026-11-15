@@ -8,8 +8,10 @@ const props = defineProps<{
   pending: number, rate: number, status: string, preview?: boolean, skipped?: number,
   elapsed?: number | null, categorized?: Record<string, number> | null,
   capacity?: string,
-  processed?: number, unitCounts?: Record<string, number>,
+  processed?: number, unitCounts?: Record<string, number>, trafficBytes?: number,
 }>()
+const trafficGb = computed(() => Math.max(0, props.trafficBytes || 0) / 1_000_000_000)
+const trafficAccounts = computed(() => Math.round(trafficGb.value * 50_000))
 const reportedProcessed = computed(() => props.processed == null ? null : Math.max(props.completed, Math.min(props.total, props.processed)))
 const percentage = computed(() => props.total ? Math.min(100, (reportedProcessed.value ?? props.completed) / props.total * 100) : 0)
 const awaitingConfirmation = computed(() => reportedProcessed.value == null ? null : Math.max(0, reportedProcessed.value - props.completed))
@@ -27,6 +29,7 @@ const cells = computed<Cell[]>(() => [
   { label: '超时', value: categories.value.timeout ?? 0, tone: 'warning' },
   { label: '已失效', value: categories.value.invalid ?? 0, tone: 'danger' },
   { label: '其他异常', value: categories.value.unknown ?? 0 },
+  ...(props.trafficBytes == null ? [] : [{ label: '任务流量', value: Number(trafficGb.value.toFixed(3)), suffix: ' GB' }]),
 ])
 </script>
 <template>
@@ -46,6 +49,7 @@ const cells = computed<Cell[]>(() => [
         <span>已处理待确认 {{ awaitingConfirmation == null ? '—' : fmt(awaitingConfirmation) + ' 条' }}</span>
       </div>
       <div class="feedback-meta"><span v-if="capacity">工作进程 {{ capacity }}</span><span>用时 {{ elapsed == null ? '—' : fmt(elapsed) }} 秒 · {{ fmt(rate) }} 条/小时</span></div>
+      <p v-if="trafficBytes != null">任务流量按执行节点上报的本机上下行累计差值统计；按 1 GB ≈ 5 万账号，约可校验 {{ fmt(trafficAccounts) }} 个账号。</p>
       <p>{{ preview ? '进度和分类按当前任务数据计算。' : '进度和分类按节点每秒上报实时更新；运行中的分类尚待确认，完成状态仍以总控确认全部结果为准。' }}</p>
     </div>
   </el-card>

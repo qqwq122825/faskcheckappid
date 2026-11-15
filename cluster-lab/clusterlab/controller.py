@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS jobs (
  c_timeout INTEGER NOT NULL DEFAULT 0, c_invalid INTEGER NOT NULL DEFAULT 0,
  c_unknown INTEGER NOT NULL DEFAULT 0, c_web_recheck INTEGER NOT NULL DEFAULT 0,
  reported_rows INTEGER NOT NULL DEFAULT 0,
+ traffic_bytes INTEGER NOT NULL DEFAULT 0,
  req_timeout REAL NOT NULL DEFAULT 20, req_retries INTEGER NOT NULL DEFAULT 0,
  device_capacity INTEGER NOT NULL DEFAULT 30,
  dual_recheck INTEGER NOT NULL DEFAULT 0
@@ -151,8 +152,8 @@ class Controller:
             columns = {row['name'] for row in db.execute('PRAGMA table_info(nodes)')}
             job_columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
             for name in ('c_valid', 'c_wrong', 'c_2fa', 'c_locked', 'c_timeout', 'c_invalid',
-                         'c_unknown', 'c_web_recheck', 'reported_rows', 'req_timeout', 'req_retries',
-                         'device_capacity', 'dual_recheck'):
+                         'c_unknown', 'c_web_recheck', 'reported_rows', 'traffic_bytes',
+                         'req_timeout', 'req_retries', 'device_capacity', 'dual_recheck'):
                 if name not in job_columns:
                     default = '20' if name == 'req_timeout' else ('30' if name == 'device_capacity' else '0')
                     column_type = 'REAL' if name == 'req_timeout' else 'INTEGER'
@@ -535,6 +536,9 @@ class Controller:
                              'upload_bps': 10**15, 'download_bps': 10**15}.items():
             number = value.get(key)
             result[key] = round(float(number), 1) if type(number) in (int, float) and math.isfinite(number) and 0 <= number <= maximum else None
+        network_bytes = value.get('network_bytes')
+        result['network_bytes'] = (network_bytes if type(network_bytes) is int
+                                   and 0 <= network_bytes <= 10**18 else None)
         result.update(received_at=time.time(), scope='host_non_loopback')
         processes = value.get('worker_processes')
         result['worker_processes'] = processes if type(processes) is int and 0 <= processes <= 200 else None
@@ -946,6 +950,7 @@ class Controller:
                 event(db, 'node_config', '已将旧版 32 线程上限升级为本机 100 线程；下一工作包生效',
                       node_id=node_id)
             reject, confirmed, interrupted_ack, reported_ack = [], [], [], {}
+            traffic_jobs = set()
             for value in interrupted:
                 unit = db.execute('SELECT * FROM units WHERE id=? AND node_id=?', (value.get('id'), node_id)).fetchone()
                 if (not unit or unit['lease_token'] != value.get('token')
@@ -964,12 +969,14 @@ class Controller:
             for value in active:
                 unit = db.execute('SELECT * FROM units WHERE id=? AND node_id=?', (value.get('id'), node_id)).fetchone()
                 if unit and unit['lease_token'] == value.get('token') and unit['status'] == 'completed':
+                    traffic_jobs.add(unit['job_id'])
                     confirmed.append(unit['id'])
                     continue
                 if (not unit or unit['lease_token'] != value.get('token')
                         or unit['status'] not in ('leased', 'running', 'unknown')):
                     reject.append(value.get('id'))
                     continue
+                traffic_jobs.add(unit['job_id'])
                 count = integer(value.get('processed', 0), '已处理数量', 0, unit['rows'])
                 live_counts = self.clean_live_counts(value.get('counts'), count, unit['rows'])
                 reported_ack[unit['id']] = self._accept_live_records(
@@ -1000,8 +1007,25 @@ class Controller:
             merged = dict(data.get('telemetry') or {})
             if isinstance(data.get('devices'), dict):
                 merged['device_pool'] = data['devices']
+            cleaned_telemetry = self.clean_telemetry(merged)
+            try:
+                previous_telemetry = json.loads(node['telemetry_json'] or '{}')
+            except (TypeError, ValueError):
+                previous_telemetry = {}
+            current_bytes = cleaned_telemetry.get('network_bytes')
+            previous_bytes = previous_telemetry.get('network_bytes')
+            current_job_id = next(iter(traffic_jobs)) if len(traffic_jobs) == 1 else None
+            # Keep the last active task for one trailing heartbeat so result-upload
+            # bytes are included even when the node confirms the package between ticks.
+            traffic_job_id = current_job_id or (previous_telemetry.get('_traffic_job_id')
+                                                if not traffic_jobs else None)
+            if (traffic_job_id and type(current_bytes) is int and type(previous_bytes) is int
+                    and current_bytes >= previous_bytes):
+                db.execute('UPDATE jobs SET traffic_bytes=traffic_bytes+? WHERE id=?',
+                           (current_bytes - previous_bytes, traffic_job_id))
+            cleaned_telemetry['_traffic_job_id'] = current_job_id
             db.execute('UPDATE nodes SET telemetry_json=?,ack_stop_version=?,ack_device_clear_version=? WHERE id=?',
-                       (json.dumps(self.clean_telemetry(merged)), ack_stop,
+                       (json.dumps(cleaned_telemetry), ack_stop,
                         ack_device_clear, node_id))
             if not node['last_seen'] or now - node['last_seen'] > self.offline_seconds:
                 event(db, 'node_online', f'节点已连接：{node["name"]}', node_id=node_id)
@@ -1233,7 +1257,7 @@ class Controller:
                 "SELECT id FROM jobs WHERE status IN ('running','paused') "
                 "ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END, queued_at, created, id LIMIT 1").fetchone()
             for row in db.execute("SELECT * FROM jobs ORDER BY CASE WHEN status IN ('running','paused') THEN 0 WHEN status='queued' OR (status='preparing' AND queued_at IS NOT NULL) THEN 1 ELSE 2 END,CASE WHEN status IN ('queued','running','paused') OR (status='preparing' AND queued_at IS NOT NULL) THEN queued_at END,created DESC,id LIMIT 50"):
-                value = {k: row[k] for k in ('id', 'name', 'status', 'created', 'updated', 'bytes', 'rows', 'unit_rows', 'mode', 'error', 'queued_at')}
+                value = {k: row[k] for k in ('id', 'name', 'status', 'created', 'updated', 'bytes', 'rows', 'unit_rows', 'mode', 'error', 'queued_at', 'traffic_bytes')}
                 value['queue_position'] = (db.execute(f'SELECT COUNT(*) FROM jobs WHERE {queue_filter} AND (queued_at<? OR (queued_at=? AND id<=?))', (row['queued_at'], row['queued_at'], row['id'])).fetchone()[0]
                                            if row['status'] in ('queued', 'preparing') and row['queued_at'] is not None else None)
                 groups = db.execute('SELECT status,COUNT(*) AS n,SUM(rows) AS rows FROM units WHERE job_id=? GROUP BY status', (row['id'],)).fetchall()

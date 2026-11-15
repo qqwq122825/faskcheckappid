@@ -49,6 +49,129 @@ git clone https://github.com/qqwq122825/faskcheckappid.git faskcheckappid
 
 同机启动多个节点时，使用不同端口，并分别指定 `--data-dir /独立目录`。
 
+## 新节点快速上线（宝塔）
+
+下面的清单用于把一台全新的 Linux 服务器接入现有总控。示例总控地址是
+`http://104.160.36.118:8766`；新节点的 IP、宝塔入口、用户名、密码和节点接入凭证
+都只保存在密码管理器或部署记录中，**不要提交到 Git**。
+
+### 1. 安装宝塔
+
+以 `root` 登录新服务器，运行约定的安装器：
+
+```bash
+url='https://download.miku.ci/install/install_panel.sh'
+if [ -f /usr/bin/curl ]; then
+  curl -sSO "$url"
+else
+  wget -O install_panel.sh "$url"
+fi
+bash install_panel.sh
+```
+
+安装结束后立即保存安装器输出的面板地址、安全入口、用户名和密码，并确认云防火墙与
+本机防火墙允许该面板端口。首次登录后修改随机密码；不要把登录资料写进本文档。
+
+### 2. 拉取统一仓库
+
+在宝塔终端执行：
+
+```bash
+if command -v dnf >/dev/null 2>&1; then
+  dnf install -y git
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y git
+else
+  apt-get update
+  apt-get install -y git
+fi
+mkdir -p /www/wwwroot
+cd /www/wwwroot
+if [ -d faskcheckappid/.git ]; then
+  git -C faskcheckappid pull --ff-only origin main
+else
+  git clone https://github.com/qqwq122825/faskcheckappid.git faskcheckappid
+fi
+git -C faskcheckappid rev-parse HEAD
+```
+
+若最后一条命令不是当前已发布提交，先停止配置项目并检查拉取错误。不要用
+`reset --hard` 掩盖服务器工作区问题。
+
+### 3. 创建 Python 节点项目
+
+1. 在宝塔“软件商店”安装 Python 项目管理器。
+2. 在“Python 环境管理”创建 Python 3.11 或更高版本环境。
+3. 添加 Python 项目，项目名填 `cluster-node`。
+4. 项目路径填 `/www/wwwroot/faskcheckappid/cluster-lab`。
+5. 使用该项目的虚拟环境安装 `requirements.txt`。
+6. 启动用户选 `www`，并保证 `www` 可读代码、可写 `cluster-lab/runtime/`。
+7. 启动命令固定为：
+
+   ```bash
+   python node.py --host 0.0.0.0 --port 18771 --max-processes 10 --max-threads 100 --allow-http
+   ```
+
+8. 环境变量至少设置本机独立的 `CLUSTER_LAB_ADMIN_PASSWORD`（不少于 8 位）。
+   代理调试由总控“系统设置”控制；通常不需要在节点上设置
+   `CLUSTER_PROXY_DEBUG`。
+9. 在宝塔与云防火墙开放 TCP `18771`；节点还需要能主动访问总控和代理服务。
+10. 启动项目，确认宝塔显示“运行中”。
+
+总控改为 HTTPS 后，应删除启动参数 `--allow-http`，并在节点连接页填写 HTTPS 地址。
+
+### 4. 创建接入凭证并连接
+
+1. 打开总控“节点配置”，点“添加节点”。
+2. 节点名使用能识别机器的名称；默认设置 `10` 进程、`100` 线程。
+3. 创建后立刻复制一次性节点接入凭证并安全保存。
+4. 打开 `http://<NEW_NODE_IP>:18771`，使用该节点自己的管理员密码登录。
+5. 在“连接总控”填写 `http://104.160.36.118:8766` 和刚生成的凭证，点“保存并连接”。
+6. 返回总控，确认节点显示在线、可接单，且最近心跳持续更新。
+
+### 5. 上线验收
+
+在新节点执行：
+
+```bash
+cd /www/wwwroot/faskcheckappid
+git status --short
+git rev-parse HEAD
+curl -fsS http://127.0.0.1:18771/api/session
+```
+
+同时检查：
+
+- `git status --short` 没有输出；
+- `/api/session` 返回节点角色和当前版本；
+- 宝塔项目状态为“运行中”；
+- 总控显示节点在线、可接单，心跳时间持续变化；
+- 用一个小任务验证领取、执行、回传和结果确认完整闭环；
+- 调试开关关闭时，新工作包不创建 `proxy-debug.jsonl`。
+
+### 6. 后续更新
+
+```bash
+cd /www/wwwroot/faskcheckappid
+bash cluster-lab/tools/update.sh
+```
+
+更新成功后在宝塔 Python 项目页面图形化重启 `cluster-node`，再核对提交号、PID、
+HTTP 200 和总控心跳。依赖发生变化时，按 `tools/update.sh` 的说明传入项目虚拟环境
+Python 的绝对路径。
+
+### 7. 五分钟复用清单
+
+- [ ] root 登录成功，记录新节点 IP 与 SSH 端口
+- [ ] 安装宝塔并保存面板安全入口
+- [ ] 克隆统一仓库并核对提交号
+- [ ] 创建 Python 3.11+ 环境并安装依赖
+- [ ] 创建 `cluster-node`，使用固定启动命令
+- [ ] 开放节点管理端口 `18771`
+- [ ] 在总控创建 10×100 节点并保存一次性凭证
+- [ ] 节点连接总控，心跳与可接单状态正常
+- [ ] 小任务闭环通过，调试日志开关符合预期
+
 ## 日常更新
 
 开发机改完 Python 后提交推送；改前端时，先在 `cluster-lab/frontend` 执行 `npm ci && npm run build`，把源码和 `clusterlab/static/ui` 构建产物一起提交推送。

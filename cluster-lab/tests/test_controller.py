@@ -851,14 +851,43 @@ class ControllerTests(unittest.TestCase):
                                  (response.json['id'],)).fetchone()[0]
         self.assertEqual(enabled, 0)
 
+    def test_active_task_accumulates_node_reported_network_deltas(self):
+        self.heartbeat(telemetry={'network_bytes': 1_000})
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        active = [{'id': unit['id'], 'token': unit['token'], 'processed': 0}]
+        self.service.heartbeat(self.node['id'], {'session': 'test-session', 'max_processes': 1,
+                                               'max_threads': 2, 'active': active,
+                                               'telemetry': {'network_bytes': 1_600}})
+        self.service.heartbeat(self.node['id'], {'session': 'test-session', 'max_processes': 1,
+                                               'max_threads': 2, 'active': active,
+                                               'telemetry': {'network_bytes': 2_000}})
+        state = next(item for item in self.service.snapshot()['jobs'] if item['id'] == job)
+        self.assertEqual(state['traffic_bytes'], 1_000)
+        # The first idle heartbeat includes upload bytes, then clears attribution.
+        self.heartbeat(telemetry={'network_bytes': 2_500})
+        self.heartbeat(telemetry={'network_bytes': 2_800})
+        state = next(item for item in self.service.snapshot()['jobs'] if item['id'] == job)
+        self.assertEqual(state['traffic_bytes'], 1_500)
+        # Counter resets after a reboot must not create a negative or enormous delta.
+        self.service.heartbeat(self.node['id'], {'session': 'test-session', 'max_processes': 1,
+                                               'max_threads': 2, 'active': active,
+                                               'telemetry': {'network_bytes': 100}})
+        state = next(item for item in self.service.snapshot()['jobs'] if item['id'] == job)
+        self.assertEqual(state['traffic_bytes'], 1_500)
+
     def test_host_metrics_are_finite_and_do_not_accept_arbitrary_fields(self):
         value = self.service.clean_telemetry({'cpu_percent':25.2,'memory_percent':float('nan'),
-                                             'upload_bps':1024,'download_bps':-1,'worker_processes':2,'secret':'private',
+                                             'upload_bps':1024,'download_bps':-1,'network_bytes':123456,
+                                             'worker_processes':2,'secret':'private',
                                              'device_pool': {'slots': [{'slot': 1, 'used': 987,
                                                                         'proxy': 'user:pass@1.2.3.4:80'}]}})
         self.assertEqual(value['cpu_percent'], 25.2)
         self.assertIsNone(value['memory_percent'])
         self.assertIsNone(value['download_bps'])
+        self.assertEqual(value['network_bytes'], 123456)
+        self.assertIsNone(self.service.clean_telemetry({'network_bytes': -1})['network_bytes'])
         self.assertEqual(value['worker_processes'], 2)
         self.assertNotIn('secret', value)
         self.assertEqual(value['device_pool']['slots'][0]['used'], 987)

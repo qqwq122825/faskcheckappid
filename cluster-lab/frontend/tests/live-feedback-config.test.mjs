@@ -178,6 +178,15 @@ test('Device refill switch reopens from persisted settings and publishes save im
   assert.match(drawer, /:disabled="building \|\| savingAuto"/)
 })
 
+test('Task detail shows one node-reported traffic card with the 1 GB estimate', () => {
+  const detail = source('src/views/JobDetail.vue')
+  const feedback = source('src/components/TaskFeedback.vue')
+  assert.match(detail, /:traffic-bytes="job\.traffic_bytes"/)
+  assert.equal((feedback.match(/label: '任务流量'/g) || []).length, 1)
+  assert.match(feedback, /1 GB ≈ 5 万账号/)
+  assert.match(feedback, /本机上下行累计差值/)
+})
+
 test('Task summary omits the in-flight-record card and keeps its other ten metrics', () => {
   const feedback = source('src/components/TaskFeedback.vue')
   assert.doesNotMatch(feedback, /在途记录/)
