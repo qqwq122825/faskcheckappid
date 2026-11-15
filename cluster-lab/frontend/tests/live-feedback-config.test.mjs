@@ -106,10 +106,12 @@ test('Large task totals use a non-overlapping responsive feedback grid', () => {
   assert.match(styles, /@media\(max-width:600px\)\{\.feedback-grid\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)/)
 })
 
-test('Device pool explicitly saves target and shows persisted registration history', () => {
+test('Device pool starts initialization only from its explicit action and shows persisted registration history', () => {
   const drawer = source('src/components/DevicePoolDrawer.vue')
-  assert.match(drawer, /保存并应用/)
-  assert.match(drawer, /节点收到后会自动补齐新设备/)
+  assert.match(drawer, /开始初始化设备池/)
+  assert.match(drawer, /点击“开始初始化设备池”才会注册设备/)
+  assert.match(drawer, /@submit\.prevent="initialize"/)
+  assert.match(drawer, /api\(`\/api\/nodes\/\$\{node\.value\.id\}\/devices`, \{ capacity: capacity\.value \}, 'POST'\)/)
   assert.match(drawer, /pool\.value\.attempted/)
   assert.match(drawer, /注册出口 IP/)
   assert.match(drawer, /注册时间/)

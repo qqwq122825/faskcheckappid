@@ -58,7 +58,7 @@ async function initialize() {
   busy.value = true
   try {
     await api(`/api/nodes/${node.value.id}/devices`, { capacity: capacity.value }, 'POST')
-    ElMessage.success(`已请求节点初始化 ${capacity.value} 台设备`)
+    ElMessage.success(`已通知节点开始初始化设备池，共 ${capacity.value} 台`)
   } catch (exc: any) {
     error.value = exc?.message || '请求失败'
   } finally { busy.value = false }
@@ -108,7 +108,7 @@ async function clearPool() {
       <el-form label-position="top" @submit.prevent="initialize">
         <el-form-item label="设备数量">
           <el-input-number v-model="capacity" :min="1" :max="200" :step="1" :precision="0" :disabled="building || busy" />
-          <span class="field-note">修改数量后点击“保存并应用”，节点收到后会自动补齐新设备。</span>
+          <span class="field-note">选择数量后，点击“开始初始化设备池”才会注册设备。</span>
         </el-form-item>
         <el-form-item label="自动补充">
           <el-switch v-model="autoRotate" :loading="savingAuto" :disabled="savingAuto"
@@ -119,7 +119,7 @@ async function clearPool() {
           </span>
         </el-form-item>
         <div class="actions">
-          <el-button type="primary" native-type="submit" :loading="busy" :disabled="building || savingAuto">保存并应用</el-button>
+          <el-button type="primary" native-type="submit" :loading="busy" :disabled="building || savingAuto">开始初始化设备池</el-button>
           <el-button v-if="building" @click="cancelBuild">停止</el-button>
           <el-tooltip :disabled="!node?.active" content="节点仍有工作包在执行，请先停止任务" placement="top">
             <span><el-button type="danger" plain :loading="clearing"
