@@ -279,10 +279,10 @@ class Controller:
         integer(threads, '线程数', 1, self.MAX_THREADS)
         node_id, token = uuid.uuid4().hex, secrets.token_urlsafe(32)
         with self.db.transaction() as db:
-            db.execute('INSERT INTO nodes(id,name,token_hash,created,desired_processes,desired_threads,device_request) '
-                       'VALUES(?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO nodes(id,name,token_hash,created,enabled,desired_processes,desired_threads,device_request) '
+                       'VALUES(?,?,?,?,?,?,?,?)',
                        (node_id, name, hashlib.sha256(token.encode()).hexdigest(), time.time(),
-                        processes, threads, self.DEFAULT_DEVICE_REQUEST))
+                        0, processes, threads, self.DEFAULT_DEVICE_REQUEST))
             event(db, 'node_added', f'已添加节点：{name}', node_id=node_id)
         return {'id': node_id, 'name': name, 'token': token}
 
@@ -303,6 +303,10 @@ class Controller:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:
                 raise ValueError('节点不存在')
+            initialization = self._device_initialization(node)
+            if data['enabled'] and not node['enabled'] and not initialization['complete']:
+                raise Conflict(f'设备初始化完成后才能开始接单（'
+                               f'{initialization["ready"]}/{initialization["requested"]}）')
             active = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? AND status IN ('leased','running')", (node_id,)).fetchone()[0]
             if data['enabled'] and (node['stop_version'] > node['ack_stop_version'] or
                                     not node['enabled'] and node['stop_version'] > 0 and active):
@@ -310,6 +314,23 @@ class Controller:
             db.execute('UPDATE nodes SET desired_processes=?,desired_threads=?,enabled=? WHERE id=?',
                        (processes, threads, int(data['enabled']), node_id))
             event(db, 'node_config', '节点执行配置已更新，下一次心跳下发；在途工作包保持原配置', node_id=node_id)
+
+    @staticmethod
+    def _device_initialization(node):
+        requested = max(0, int(node['device_request'] or 0))
+        try:
+            telemetry = json.loads(node['telemetry_json'] or '{}')
+        except (TypeError, ValueError):
+            telemetry = {}
+        pool = telemetry.get('device_pool') if isinstance(telemetry, dict) else {}
+        pool = pool if isinstance(pool, dict) else {}
+        capacity = max(0, int(pool.get('capacity') or 0))
+        ready = max(0, int(pool.get('ready') or 0))
+        running = bool(pool.get('running'))
+        return {'requested': requested, 'capacity': capacity, 'ready': ready,
+                'running': running,
+                'complete': bool(requested and capacity >= requested
+                                 and ready >= requested and not running)}
 
     def _source_path(self, name):
         """输入文件沿用用户给的名字；重名时加 -2、-3，避免覆盖已上传的文件。"""
@@ -1300,6 +1321,12 @@ class Controller:
                                not row['enabled'] and row['stop_version'] > 0 and stats[0]):
                     value['status'] = 'stopping'
                 value['telemetry'] = json.loads(row['telemetry_json']) if online else {}
+                initialization = self._device_initialization(row)
+                value.update(device_request=initialization['requested'],
+                             device_capacity=initialization['capacity'],
+                             device_ready=initialization['ready'],
+                             device_initialization_running=initialization['running'],
+                             device_initialization_complete=initialization['complete'])
                 value['effective_processes'] = min(row['desired_processes'], row['max_processes']) if row['max_processes'] else None
                 value['effective_threads'] = min(row['desired_threads'], row['max_threads']) if row['max_threads'] else None
                 nodes.append(value)

@@ -20,6 +20,16 @@ test('Task creation exposes retries and node settings allow 10 x 100', () => {
   assert.match(nodes, /使用本机上限/)
 })
 
+test('New nodes stay paused until all default devices are initialized', () => {
+  const nodes = source('src/views/Nodes.vue')
+  const dialogs = source('src/components/NodeDialogs.vue')
+  assert.match(nodes, /!node\.enabled && !node\.device_initialization_complete/)
+  assert.match(nodes, /设备初始化 \{\{ node\.device_ready \|\| 0 \}\}\/\{\{ node\.device_request \|\| 30 \}\}/)
+  assert.match(nodes, /开始接单/)
+  assert.match(dialogs, /新节点先暂停接单并自动初始化 30 台设备/)
+  assert.match(dialogs, /:disabled="!node\?\.enabled && !node\?\.device_initialization_complete"/)
+})
+
 test('Running elapsed time and speed use live processed rows', () => {
   const detail = source('src/views/JobDetail.vue')
   assert.match(detail, /state\.value\?\.server_time/)

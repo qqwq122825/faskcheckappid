@@ -17,7 +17,10 @@ class ControllerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.service = Controller(self.temp.name)
         self.node = self.service.add_node('test-node', 2, 4)
-        self.heartbeat()
+        self.heartbeat(devices={'running': False, 'capacity': 30, 'ready': 30,
+                                'built': 30, 'failed': 0, 'attempted': 30})
+        self.service.configure_node(self.node['id'], {'processes': 2, 'threads': 4,
+                                                       'enabled': True})
 
     def tearDown(self):
         self.service.close()
@@ -26,13 +29,26 @@ class ControllerTests(unittest.TestCase):
     def test_new_node_defaults_to_thirty_device_registrations(self):
         node = self.service.add_node('auto-devices', 10, 100)
         with self.service.db.connect() as db:
-            saved = db.execute('SELECT device_request FROM nodes WHERE id=?',
-                               (node['id'],)).fetchone()[0]
+            saved = db.execute('SELECT device_request,enabled FROM nodes WHERE id=?',
+                               (node['id'],)).fetchone()
         response = self.service.heartbeat(node['id'], {
             'session': 'auto-device-session', 'hostname': 'new-node', 'version': 'test',
             'max_processes': 10, 'max_threads': 100, 'active': [], 'interrupted': []})
-        self.assertEqual(saved, 30)
+        self.assertEqual(saved['device_request'], 30)
+        self.assertFalse(saved['enabled'])
         self.assertEqual(response['device_request'], 30)
+        self.assertFalse(response['enabled'])
+        with self.assertRaisesRegex(Conflict, '设备初始化完成后'):
+            self.service.configure_node(node['id'], {'processes': 10, 'threads': 100,
+                                                       'enabled': True})
+        self.service.heartbeat(node['id'], {
+            'session': 'auto-device-session', 'hostname': 'new-node', 'version': 'test',
+            'max_processes': 10, 'max_threads': 100, 'active': [], 'interrupted': [],
+            'devices': {'running': False, 'capacity': 30, 'ready': 30,
+                        'built': 30, 'failed': 0, 'attempted': 30}})
+        self.assertTrue(self.service.snapshot()['nodes'][-1]['device_initialization_complete'])
+        self.service.configure_node(node['id'], {'processes': 10, 'threads': 100,
+                                                  'enabled': True})
 
     def test_rotation_partial_updates_preserve_switch_and_restart(self):
         self.service.configure_rotation({'device_rotate_after': 20, 'device_auto_rotate': True})
@@ -235,7 +251,12 @@ class ControllerTests(unittest.TestCase):
         """P0：单节点可以要 100 进程 / 100 线程，不再被 16/32 上限卡住。"""
         node = self.service.add_node('big', 100, 100)
         self.service.heartbeat(node['id'], dict(session='big-session', max_processes=200,
-                                                max_threads=512, active=[], interrupted=[]))
+                                                max_threads=512, active=[], interrupted=[],
+                                                devices={'running': False, 'capacity': 30,
+                                                         'ready': 30, 'built': 30,
+                                                         'failed': 0, 'attempted': 30}))
+        self.service.configure_node(node['id'], {'processes': 100, 'threads': 100,
+                                                  'enabled': True})
         job = self.job()
         self.service.job_action(job, 'start')
         unit = self.service.lease(node['id'], 'big-session')
