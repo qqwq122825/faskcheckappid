@@ -13,8 +13,12 @@ const busy = ref(false), clearing = ref(false), timer = 0 as any
 const pool = computed(() => node.value?.telemetry?.device_pool || {})
 const building = computed(() => Boolean(pool.value.running))
 const ready = computed(() => pool.value.ready || 0)
-const actual = computed(() => Math.max(Number(pool.value.attempted) || 0,
-  (Number(pool.value.built) || 0) + (Number(pool.value.failed) || 0)))
+const completed = computed(() => (Number(pool.value.built) || 0) + (Number(pool.value.failed) || 0))
+// 节点扫描会提前生成 20 个 pending 身份，后端 attempted 因而可能瞬间变成 20。
+// 初始化进行中以当前槽位为准：正在注册第 9 台，代表前 8 台已经尝试。
+const actual = computed(() => building.value
+  ? Math.max(completed.value, Math.max(0, (Number(pool.value.current) || 1) - 1))
+  : Math.max(Number(pool.value.attempted) || 0, completed.value))
 const proxyState = computed(() => String(pool.value.proxy_status || 'idle'))
 const proxyType = computed(() => proxyState.value === 'ok' ? 'success'
   : proxyState.value === 'failed' ? 'error' : proxyState.value === 'checking' ? 'warning' : 'info')
