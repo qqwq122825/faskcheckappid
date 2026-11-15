@@ -73,6 +73,48 @@ class NodeRecoveryTests(unittest.TestCase):
             finally:
                 primary.close()
 
+    def test_second_top_level_instance_cannot_interrupt_live_task(self):
+        with tempfile.TemporaryDirectory() as root:
+            primary = Node(root)
+            unit = 'e' * 32
+            with primary.db.transaction() as db:
+                db.execute(
+                    'INSERT INTO tasks(id,job_id,seq,descriptor,status,processed,created,updated) '
+                    'VALUES(?,?,?,?,?,?,?,?)',
+                    (unit, 'f' * 32, 1, '{}', 'running', 73, 1, 1))
+            secondary = Node(root)
+            try:
+                self.assertTrue(primary.primary_instance)
+                self.assertFalse(secondary.primary_instance)
+                with primary.db.connect() as db:
+                    task = db.execute('SELECT status,error FROM tasks WHERE id=?',
+                                      (unit,)).fetchone()
+                self.assertEqual(task['status'], 'running')
+                self.assertIsNone(task['error'])
+            finally:
+                secondary.close()
+                primary.close()
+
+    def test_real_service_restart_still_recovers_live_task(self):
+        with tempfile.TemporaryDirectory() as root:
+            primary = Node(root)
+            unit = '1' * 32
+            with primary.db.transaction() as db:
+                db.execute(
+                    'INSERT INTO tasks(id,job_id,seq,descriptor,status,processed,created,updated) '
+                    'VALUES(?,?,?,?,?,?,?,?)',
+                    (unit, '2' * 32, 1, '{}', 'running', 9, 1, 1))
+            primary.close()
+            restarted = Node(root)
+            try:
+                with restarted.db.connect() as db:
+                    task = db.execute('SELECT status,error FROM tasks WHERE id=?',
+                                      (unit,)).fetchone()
+                self.assertEqual(task['status'], 'interrupted')
+                self.assertEqual(task['error'], '节点重启，等待总控确认')
+            finally:
+                restarted.close()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.node = Node(self.temp.name)

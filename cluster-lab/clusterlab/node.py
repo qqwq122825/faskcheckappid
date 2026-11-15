@@ -13,6 +13,7 @@ import time
 from urllib.parse import urlsplit
 import uuid
 
+import portalocker
 import requests
 
 from . import VERSION
@@ -39,6 +40,18 @@ class Node:
         self.root = private_dir(root)
         self.spool = private_dir(self.root / 'spool')
         self.db = Database(self.root / 'node.sqlite3', SCHEMA)
+        self.instance_lock_file = (self.root / 'node-service.lock').open('a+', encoding='utf-8')
+        self.primary_instance = False
+        try:
+            portalocker.lock(
+                self.instance_lock_file,
+                portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
+            )
+        except portalocker.exceptions.LockException:
+            self.instance_lock_file.close()
+            self.instance_lock_file = None
+        else:
+            self.primary_instance = True
         self.max_processes = integer(max_processes, '本机进程上限', 1, 200)
         self.max_threads = integer(max_threads, '本机线程上限', 1, 512)
         self.allow_http, self.interval = allow_http, interval
@@ -71,7 +84,7 @@ class Node:
         # Only the top-level service process is allowed to perform restart
         # recovery; a child must never turn the parent's live task into an
         # interrupted package merely because it constructed a Node object.
-        if mp.parent_process() is None:
+        if self.primary_instance and mp.parent_process() is None:
             self._recover_unfinished_tasks()
 
     def _recover_unfinished_tasks(self):
@@ -105,6 +118,10 @@ class Node:
                 process.terminate()
                 process.join(2)
         self.client.close()
+        if self.instance_lock_file is not None:
+            portalocker.unlock(self.instance_lock_file)
+            self.instance_lock_file.close()
+            self.instance_lock_file = None
 
     def _save_control(self):
         atomic_json(self.root / 'control.json',
