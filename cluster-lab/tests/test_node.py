@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import multiprocessing as mp
 from pathlib import Path
 import tempfile
 import threading
@@ -25,6 +26,11 @@ class Response:
         return self.value
 
 
+def _construct_node_in_spawned_child(root):
+    node = Node(root)
+    node.close()
+
+
 class NodeRecoveryTests(unittest.TestCase):
     def test_device_registration_allows_realistic_provisioning_time(self):
         self.assertGreaterEqual(REGISTRATION_TIMEOUT, 90)
@@ -43,6 +49,29 @@ class NodeRecoveryTests(unittest.TestCase):
             _register({}, output)
         self.assertEqual(output.value['error'],
                          'RuntimeError: password=*** endpoint failed')
+
+    def test_spawned_child_cannot_interrupt_parent_live_task(self):
+        with tempfile.TemporaryDirectory() as root:
+            primary = Node(root)
+            unit = 'c' * 32
+            with primary.db.transaction() as db:
+                db.execute(
+                    'INSERT INTO tasks(id,job_id,seq,descriptor,status,processed,created,updated) '
+                    'VALUES(?,?,?,?,?,?,?,?)',
+                    (unit, 'd' * 32, 1, '{}', 'running', 41, 1, 1))
+            try:
+                child = mp.get_context('spawn').Process(
+                    target=_construct_node_in_spawned_child, args=(root,))
+                child.start()
+                child.join(10)
+                self.assertEqual(child.exitcode, 0)
+                with primary.db.connect() as db:
+                    task = db.execute('SELECT status,error FROM tasks WHERE id=?',
+                                      (unit,)).fetchone()
+                self.assertEqual(task['status'], 'running')
+                self.assertIsNone(task['error'])
+            finally:
+                primary.close()
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

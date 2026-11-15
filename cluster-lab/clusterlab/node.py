@@ -67,15 +67,28 @@ class Node:
         self.origin = 'https://new.ani.sidestore.io'
         from .device_build import DeviceBuilder
         self.builder = DeviceBuilder(self)
-        # Unfinished tasks never get silently executed again after restart.
+        # Spawned coordinator/worker processes may import the node entrypoint.
+        # Only the top-level service process is allowed to perform restart
+        # recovery; a child must never turn the parent's live task into an
+        # interrupted package merely because it constructed a Node object.
+        if mp.parent_process() is None:
+            self._recover_unfinished_tasks()
+
+    def _recover_unfinished_tasks(self):
+        """Reconcile local work only when the real node service starts."""
         with self.db.transaction() as db:
-            for task in db.execute("SELECT id FROM tasks WHERE status IN ('downloading','running')").fetchall():
+            tasks = db.execute(
+                "SELECT id FROM tasks WHERE status IN ('downloading','running')"
+            ).fetchall()
+            for task in tasks:
                 done = read_json(self.spool / task['id'] / 'done.json')
                 if done and done.get('ok'):
                     db.execute("UPDATE tasks SET status='outbox',processed=?,checksum=? WHERE id=?",
                                (done['processed'], done['checksum'], task['id']))
                 else:
-                    db.execute("UPDATE tasks SET status='interrupted',error='节点重启，等待总控确认' WHERE id=?", (task['id'],))
+                    db.execute(
+                        "UPDATE tasks SET status='interrupted',"
+                        "error='节点重启，等待总控确认' WHERE id=?", (task['id'],))
 
     def close(self):
         if self.stop.is_set():
