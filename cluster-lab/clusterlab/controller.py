@@ -74,6 +74,7 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('origin','https://ne
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_rotate_after','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_auto_rotate','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
 '''
 
 
@@ -373,7 +374,8 @@ class Controller:
                 'device_rotate_after': int(values.get('device_rotate_after', 0) or 0),
                 # column 声明是 INTEGER，存 '1' 会读回整数 1，比较时统一转字符串
                 'device_auto_rotate': str(values.get('device_auto_rotate', '0')) in ('1', 'True', 'true'),
-                'proxy_ttl': int(values.get('proxy_ttl', 50) or 50)}
+                'proxy_ttl': int(values.get('proxy_ttl', 50) or 50),
+                'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true')}
 
     def proxy_for_node(self, node):
         """节点专属出口：按创建顺序把链接分给各节点，避免所有节点抢同一条配额。"""
@@ -399,6 +401,20 @@ class Controller:
         with self.db.transaction() as db:
             db.execute("UPDATE controller_settings SET value=? WHERE key='max_unit_rows'", (maximum,))
             event(db, 'controller_config', f'新任务单个分片最大条数已设置为 {maximum:,} 条；已有任务保持原配置')
+        return self.settings()
+
+    def configure_debug(self, data):
+        enabled = data.get('proxy_debug')
+        if type(enabled) is not bool:
+            raise ValueError('代理调试开关应为布尔值')
+        value = '1' if enabled else '0'
+        with self.db.transaction() as db:
+            db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       ('proxy_debug', value))
+            event(db, 'controller_config',
+                  '代理调试日志已开启；新工作包将记录超时出口明细' if enabled else
+                  '代理调试日志已关闭；新工作包不再写入调试日志')
         return self.settings()
 
     def configure_rotation(self, data):
@@ -1060,8 +1076,10 @@ class Controller:
                 # 必须和心跳下发使用同一个节点专属配置，不能把全部 API
                 # 串成一个地址交给执行器。
                 config = self.proxy_for_node(node)
+                settings = self.settings()
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
-                               origin=self.settings().get('origin', 'https://new.ani.sidestore.io'))
+                               origin=settings.get('origin', 'https://new.ani.sidestore.io'),
+                               _proxy_debug=bool(settings.get('proxy_debug')))
             return payload
 
     def unit_for_node(self, node_id, unit_id, token):

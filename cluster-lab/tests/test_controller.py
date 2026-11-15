@@ -43,6 +43,17 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(self.service.settings()['device_auto_rotate'])
         self.assertEqual(self.service.settings()['device_rotate_after'], 20)
 
+    def test_proxy_debug_switch_defaults_off_persists_and_rejects_non_boolean(self):
+        self.assertFalse(self.service.settings()['proxy_debug'])
+        self.assertTrue(self.service.configure_debug({'proxy_debug': True})['proxy_debug'])
+        with self.assertRaisesRegex(ValueError, '布尔'):
+            self.service.configure_debug({'proxy_debug': 'false'})
+        self.assertTrue(self.service.settings()['proxy_debug'])
+        self.service.close()
+        self.service = Controller(self.temp.name)
+        self.assertTrue(self.service.settings()['proxy_debug'])
+        self.assertFalse(self.service.configure_debug({'proxy_debug': False})['proxy_debug'])
+
     def heartbeat(self, **extra):
         return self.service.heartbeat(self.node['id'], dict(session='test-session', max_processes=1,
                                       max_threads=2, active=[], **extra))
@@ -192,11 +203,22 @@ class ControllerTests(unittest.TestCase):
             time.sleep(.01)
         unit = self.service.lease(self.node['id'], 'test-session')
         self.assertEqual(unit['proxy_api'], first)
+        self.assertIs(unit['_proxy_debug'], False)
         self.assertNotIn(second, unit['proxy_api'])
 
         settings = self.service.configure_proxy({'action': 'delete', 'index': 0})
         self.assertEqual(settings['proxy_count'], 1)
         self.assertEqual(self.service.proxy_config()['api'], second)
+
+    def test_enabled_proxy_debug_is_explicitly_leased_to_auth_job(self):
+        self.service.configure_debug({'proxy_debug': True})
+        job = self.service.create_job('auth-debug', io.BytesIO(b'a@example.com----p\n' * 50),
+                                      50, mode='auth', enqueue=True)
+        deadline = time.monotonic() + 5
+        while self.service.snapshot()['current_job_id'] != job and time.monotonic() < deadline:
+            time.sleep(.01)
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertIs(unit['_proxy_debug'], True)
 
     def test_large_node_capacity_is_accepted(self):
         """P0：单节点可以要 100 进程 / 100 线程，不再被 16/32 上限卡住。"""

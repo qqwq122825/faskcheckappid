@@ -103,6 +103,10 @@ def create_app(role, service, password=None):
         return jsonify(service.snapshot())
 
     if role == 'controller':
+        @app.post('/api/settings/debug')
+        def configure_debug():
+            return jsonify(service.configure_debug(request.get_json() or {}))
+
         @app.post('/api/settings/rotation')
         def configure_rotation():
             return jsonify(service.configure_rotation(request.get_json() or {}))

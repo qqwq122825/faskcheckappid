@@ -30,9 +30,13 @@ PROXY_EXIT_IP_MAX = 2048
 
 
 def _proxy_debug_enabled(descriptor=None):
+    # A controller-supplied value is authoritative, including explicit False.
+    # This lets the system setting turn logging off even when an older node
+    # service still has CLUSTER_PROXY_DEBUG=1 in its environment.
+    if descriptor is not None and '_proxy_debug' in descriptor:
+        return bool(descriptor.get('_proxy_debug'))
     value = os.environ.get(PROXY_DEBUG_ENV, '')
-    return (str(value).strip().lower() in ('1', 'true', 'yes', 'on') or
-            bool((descriptor or {}).get('_proxy_debug')))
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 def _proxy_identity(value):

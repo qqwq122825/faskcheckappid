@@ -47,6 +47,15 @@ test('Proxy settings add, list, delete, and explain node distribution', () => {
   assert.doesNotMatch(settings, /离线行摘要、合成模拟任务/)
 })
 
+test('Proxy debug setting is explicit, persistent, and warns about log volume', () => {
+  const settings = source('src/views/Settings.vue')
+  assert.match(settings, /\/api\/settings\/debug/)
+  assert.match(settings, /proxy_debug: enabled/)
+  assert.match(settings, /代理调试日志/)
+  assert.match(settings, /proxy-debug\.jsonl/)
+  assert.match(settings, /避免产生大量日志/)
+})
+
 test('Executive-facing pages omit test, demo, preview, and unfinished feature copy', () => {
   const files = [
     'src/views/Settings.vue', 'src/views/JobDetail.vue',

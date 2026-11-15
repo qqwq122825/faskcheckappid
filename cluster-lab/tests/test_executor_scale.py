@@ -1,6 +1,7 @@
 import hashlib
 import json
 import multiprocessing as mp
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -11,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (NodeProxyPool, _execute_auth_unit, atomic_json,
+from clusterlab.executor import (NodeProxyPool, _execute_auth_unit, _proxy_debug_enabled, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration)
 
@@ -51,6 +52,12 @@ def use_shared_proxy_pool(pool, output):
 
 
 class ExecutorScaleTests(unittest.TestCase):
+    def test_explicit_debug_setting_overrides_legacy_node_environment(self):
+        with patch.dict(os.environ, {'CLUSTER_PROXY_DEBUG': '1'}):
+            self.assertFalse(_proxy_debug_enabled({'_proxy_debug': False}))
+            self.assertTrue(_proxy_debug_enabled({'_proxy_debug': True}))
+            self.assertTrue(_proxy_debug_enabled({}))
+
     def test_node_proxy_pool_is_shared_across_spawned_processes(self):
         context = mp.get_context('spawn')
         pool = NodeProxyPool(context, concurrency=2, ttl=30)

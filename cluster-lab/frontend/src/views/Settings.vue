@@ -5,6 +5,7 @@ import { session, isNode, state, busy, mutate } from '../composables/useCluster'
 const maxUnitRows = ref(10000), error = ref('')
 const proxyApi = ref(''), proxyScheme = ref('socks5h'), proxyError = ref(''), proxyBusy = ref(false)
 const rotateAfter = ref(0), rotateBusy = ref(false)
+const proxyDebug = ref(false), proxyDebugBusy = ref(false)
 watch(() => state.value?.settings?.device_rotate_after, value => {
   if (value != null) rotateAfter.value = value
 }, { immediate: true })
@@ -13,6 +14,9 @@ watch(() => state.value?.settings?.max_unit_rows, value => {
 }, { immediate: true })
 watch(() => state.value?.settings?.proxy_scheme, value => {
   if (value) proxyScheme.value = value
+}, { immediate: true })
+watch(() => state.value?.settings?.proxy_debug, value => {
+  if (value != null) proxyDebug.value = Boolean(value)
 }, { immediate: true })
 async function save() {
   error.value = ''
@@ -47,6 +51,17 @@ async function removeProxy(index: number) {
   try { await mutate('/api/settings/proxy', { action: 'delete', index }, '代理配置已删除') }
   catch (e) { proxyError.value = (e as Error).message; ElMessage.error(proxyError.value) }
   finally { proxyBusy.value = false }
+}
+async function saveProxyDebug(value: string | number | boolean) {
+  const enabled = Boolean(value)
+  proxyDebugBusy.value = true
+  try {
+    await mutate('/api/settings/debug', { proxy_debug: enabled },
+                 enabled ? '代理调试日志已开启，将对新工作包生效' : '代理调试日志已关闭，新工作包不再记录')
+  } catch (e) {
+    proxyDebug.value = !enabled
+    ElMessage.error((e as Error).message)
+  } finally { proxyDebugBusy.value = false }
 }
 </script>
 <template>
@@ -110,6 +125,24 @@ async function removeProxy(index: number) {
       </el-table>
       <el-alert v-if="proxyError" :title="proxyError" type="error" :closable="false" show-icon />
       <el-button type="primary" native-type="submit" :loading="proxyBusy">添加代理配置</el-button>
+    </el-form>
+  </el-card>
+  <el-card v-if="!isNode" shadow="never" class="section-card">
+    <template #header><h2>代理调试日志</h2></template>
+    <el-form label-position="top">
+      <el-form-item label="记录超时代理与实际出口 IP">
+        <el-switch v-model="proxyDebug" :loading="proxyDebugBusy" :disabled="proxyDebugBusy"
+                   active-text="开启调试日志" inactive-text="关闭调试日志"
+                   @change="saveProxyDebug" />
+        <span class="field-note">
+          关闭后，新领取的工作包不会创建 proxy-debug.jsonl；已有日志不会自动删除。
+          仅排查代理问题时开启，避免产生大量日志。
+        </span>
+      </el-form-item>
+      <el-descriptions :column="1" border>
+        <el-descriptions-item label="当前状态">{{ proxyDebug ? '已开启' : '已关闭' }}</el-descriptions-item>
+        <el-descriptions-item label="生效范围">新领取的工作包</el-descriptions-item>
+      </el-descriptions>
     </el-form>
   </el-card>
   <el-card shadow="never" class="section-card"><template #header><h2>当前部署</h2></template><el-descriptions :column="1" border><el-descriptions-item label="版本">{{ session?.version }}</el-descriptions-item><el-descriptions-item label="服务角色">{{ isNode ? '执行节点' : '集群总控' }}</el-descriptions-item><el-descriptions-item label="管理登录">{{ session?.password_required ? '已启用密码登录' : '未启用密码登录' }}</el-descriptions-item><el-descriptions-item label="任务导出">TXT 原始记录，一行一条，保持原顺序</el-descriptions-item></el-descriptions></el-card>
