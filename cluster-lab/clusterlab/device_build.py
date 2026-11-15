@@ -364,6 +364,6 @@ def _register(payload, output):
         output.put({'ok': True, 'model': profile['model']})
     except Exception as exc:                                       # noqa: BLE001
         detail = re.sub(r'(?i)\b(?:https?|socks5h?)://\S+', '[endpoint]', str(exc))
-        detail = re.sub(r'(?i)(?:token|password|passwd|secret|key)=\S+', r'\1=***', detail)
+        detail = re.sub(r'(?i)(token|password|passwd|secret|key)=\S+', r'\1=***', detail)
         error = type(exc).__name__ + (f': {detail[:96]}' if detail else '')
         output.put({'ok': False, 'error': error})

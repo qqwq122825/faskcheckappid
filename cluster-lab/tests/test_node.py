@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from clusterlab.node import Node
-from clusterlab.device_build import REGISTRATION_TIMEOUT
+from clusterlab.device_build import REGISTRATION_TIMEOUT, _register
 
 
 class Response:
@@ -28,6 +28,21 @@ class Response:
 class NodeRecoveryTests(unittest.TestCase):
     def test_device_registration_allows_realistic_provisioning_time(self):
         self.assertGreaterEqual(REGISTRATION_TIMEOUT, 90)
+
+    def test_registration_error_sanitizer_never_masks_original_failure(self):
+        class Sink:
+            value = None
+
+            def put(inner, value):
+                inner.value = value
+
+        output = Sink()
+        with patch('clusterlab.device_build._load_fastcheck',
+                   side_effect=RuntimeError('password=hunter2 endpoint failed')), \
+             patch('signal.signal'):
+            _register({}, output)
+        self.assertEqual(output.value['error'],
+                         'RuntimeError: password=*** endpoint failed')
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
