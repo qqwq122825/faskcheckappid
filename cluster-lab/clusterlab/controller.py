@@ -653,6 +653,11 @@ class Controller:
             result['device_pool'] = {key: pool.get(key) for key in
                                      ('running', 'capacity', 'ready', 'built', 'failed',
                                       'current', 'attempted')}
+            proxy_status = str(pool.get('proxy_status') or 'idle')
+            result['device_pool']['proxy_status'] = (proxy_status if proxy_status in
+                                                      ('idle', 'checking', 'ok', 'failed') else 'idle')
+            result['device_pool']['proxy_ip'] = mask_proxy(str(pool.get('proxy_ip') or ''))[:96]
+            result['device_pool']['message'] = str(pool.get('message') or '')[:160]
             slots = pool.get('slots')
             if isinstance(slots, list):
                 result['device_pool']['slots'] = [

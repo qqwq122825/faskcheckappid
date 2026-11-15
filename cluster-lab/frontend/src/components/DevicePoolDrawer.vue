@@ -13,7 +13,17 @@ const busy = ref(false), clearing = ref(false), timer = 0 as any
 const pool = computed(() => node.value?.telemetry?.device_pool || {})
 const building = computed(() => Boolean(pool.value.running))
 const ready = computed(() => pool.value.ready || 0)
-const actual = computed(() => pool.value.attempted ?? ((pool.value.built || 0) + (pool.value.failed || 0)))
+const actual = computed(() => Math.max(Number(pool.value.attempted) || 0,
+  (Number(pool.value.built) || 0) + (Number(pool.value.failed) || 0)))
+const proxyState = computed(() => String(pool.value.proxy_status || 'idle'))
+const proxyType = computed(() => proxyState.value === 'ok' ? 'success'
+  : proxyState.value === 'failed' ? 'error' : proxyState.value === 'checking' ? 'warning' : 'info')
+const proxyTitle = computed(() => {
+  if (proxyState.value === 'ok') return `代理正常${pool.value.proxy_ip ? ` · ${pool.value.proxy_ip}` : ''}`
+  if (proxyState.value === 'failed') return '代理异常：未获取到可用代理，请确认新节点出口 IP 已加入白名单'
+  if (proxyState.value === 'checking') return '正在检测代理是否可用'
+  return '等待初始化后检测代理'
+})
 const rows = computed(() => {
   const reported = pool.value.slots
   if (Array.isArray(reported) && reported.length) {
@@ -126,6 +136,8 @@ async function clearPool() {
               :disabled="building || clearing || Boolean(node?.active)" @click="clearPool">一键清空设备</el-button></span>
           </el-tooltip>
         </div>
+        <el-alert class="proxy-health" :type="proxyType" :title="proxyTitle"
+                  :description="pool.message || ''" :closable="false" show-icon />
         <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
       </el-form>
     </section>
@@ -136,7 +148,7 @@ async function clearPool() {
     </div>
     <section>
       <div class="section-heading device-list-heading"><h2>设备列表</h2>
-        <span class="muted">{{ building ? `正在注册第 ${pool.built + pool.failed + 1} 台` : '等待中' }}</span>
+        <span class="muted">{{ building && pool.current ? `正在注册第 ${pool.current} 台` : '等待中' }}</span>
       </div>
       <el-table :data="rows" empty-text="尚未初始化设备" stripe max-height="360">
         <el-table-column prop="label" label="设备标识" width="145" />

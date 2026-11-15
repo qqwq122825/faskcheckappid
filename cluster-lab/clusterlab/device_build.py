@@ -21,6 +21,16 @@ def device_label(device_id):
     return 'B64:' + base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')[:8]
 
 
+def proxy_endpoint(value):
+    """Return a credential-free proxy endpoint suitable for status displays."""
+    text = str(value or '').strip()
+    if '://' in text:
+        text = text.split('://', 1)[1]
+    if '@' in text:
+        text = text.rsplit('@', 1)[1]
+    return text[:96]
+
+
 class DeviceBuilder:
     def __init__(self, node):
         self.node = node
@@ -29,7 +39,8 @@ class DeviceBuilder:
         self.stop = threading.Event()
         self.reserved = set()
         self.state = {'running': False, 'capacity': 0, 'ready': 0, 'built': 0,
-                      'failed': 0, 'current': 0, 'message': '', 'started_at': None}
+                      'failed': 0, 'current': 0, 'message': '', 'started_at': None,
+                      'proxy_status': 'idle', 'proxy_ip': ''}
 
     def snapshot(self):
         root = self.node.root / 'device-pool'
@@ -97,6 +108,7 @@ class DeviceBuilder:
             self.stop.clear()
             self.state.update(running=True, capacity=int(capacity), ready=0, built=0,
                               failed=0, current=0, message='准备中',
+                              proxy_status='checking', proxy_ip='',
                               started_at=time.strftime('%H:%M:%S'))
             self.thread = threading.Thread(target=self._run, args=(int(capacity),),
                                            name='device-builder', daemon=True)
@@ -116,7 +128,7 @@ class DeviceBuilder:
             self.reserved.clear()
             self.state.update(running=False, capacity=0, ready=0, built=0,
                               failed=0, current=0, message='设备池已清空',
-                              started_at=None)
+                              started_at=None, proxy_status='idle', proxy_ip='')
         return True
 
     def reserve(self, slots):
@@ -161,8 +173,10 @@ class DeviceBuilder:
                 proxy = self._proxy()
                 if not proxy:
                     self._update(failed=self.state['failed'] + 1,
+                                 proxy_status='failed', proxy_ip='',
                                  message=f'第 {slot} 台代理获取失败，已禁止直连注册')
                     continue
+                self._update(proxy_status='ok', proxy_ip=proxy_endpoint(proxy))
                 payload = {'slot': slot, 'capacity': capacity, 'proxy': proxy,
                            'device_root': str(root), 'origin': self.node.origin,
                            'timeout': 40}

@@ -164,6 +164,8 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(self.node.builder.state['ready'], 0)
         self.assertEqual(self.node.builder.state['failed'], 1)
         self.assertIn('禁止直连注册', self.node.builder.state['message'])
+        self.assertEqual(self.node.builder.state['proxy_status'], 'failed')
+        self.assertEqual(self.node.builder.state['proxy_ip'], '')
         self.assertFalse((self.node.root / 'device-pool' / 'registrations').exists())
 
     def test_ready_legacy_device_recovers_model_and_registration_time(self):

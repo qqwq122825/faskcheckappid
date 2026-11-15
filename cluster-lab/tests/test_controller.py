@@ -952,7 +952,10 @@ class ControllerTests(unittest.TestCase):
         value = self.service.clean_telemetry({'cpu_percent':25.2,'memory_percent':float('nan'),
                                              'upload_bps':1024,'download_bps':-1,'network_bytes':123456,
                                              'worker_processes':2,'secret':'private',
-                                             'device_pool': {'slots': [{'slot': 1, 'used': 987,
+                                             'device_pool': {'proxy_status': 'failed',
+                                                             'proxy_ip': 'user:pass@1.2.3.4:80',
+                                                             'message': '代理获取失败，请检查白名单',
+                                                             'slots': [{'slot': 1, 'used': 987,
                                                                         'label': 'B64:AbCdEf12',
                                                                         'proxy': 'user:pass@1.2.3.4:80'}]}})
         self.assertEqual(value['cpu_percent'], 25.2)
@@ -965,6 +968,9 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(value['device_pool']['slots'][0]['used'], 987)
         self.assertEqual(value['device_pool']['slots'][0]['label'], 'B64:AbCdEf12')
         self.assertEqual(value['device_pool']['slots'][0]['proxy'], '1.2.3.4:80')
+        self.assertEqual(value['device_pool']['proxy_status'], 'failed')
+        self.assertEqual(value['device_pool']['proxy_ip'], '1.2.3.4:80')
+        self.assertEqual(value['device_pool']['message'], '代理获取失败，请检查白名单')
 
 
 if __name__ == '__main__':
