@@ -392,6 +392,13 @@ class NodeProxyPool:
     def acquire(self, wait=1.0):
         # Never wait for a new API response while a healthy queued exit exists.
         lease = self._take(self.fresh, self.fresh_count)
+        # multiprocessing.Queue publishes through a feeder thread.  Its shared
+        # count can therefore become visible a few milliseconds before get()
+        # can see the item.  Preserve fresh-first ordering instead of falling
+        # through to an already reusable exit during that short window.
+        if lease is None and self._value(self.fresh_count) > 0:
+            lease = self._take(self.fresh, self.fresh_count,
+                               min(0.02, max(0.0, float(wait))))
         if lease is not None:
             if self._value(self.fresh_count) < self.low_water:
                 self.refill.set()
