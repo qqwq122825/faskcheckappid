@@ -186,7 +186,24 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertIn('禁止直连注册', self.node.builder.state['message'])
         self.assertEqual(self.node.builder.state['proxy_status'], 'failed')
         self.assertEqual(self.node.builder.state['proxy_ip'], '')
+        self.assertEqual(self.node.builder.state['slot_errors']['1'], '代理获取失败')
         self.assertFalse((self.node.root / 'device-pool' / 'registrations').exists())
+
+    def test_snapshot_distinguishes_registering_failed_and_pending_slots(self):
+        class Pool:
+            def __init__(inner, *_args, **_kwargs):
+                pass
+
+            def inspect(inner, slot):
+                return {'state': 'pending', 'device_id': f'device-{slot}'}
+
+        self.node.builder.state.update(running=True, capacity=3, current=2,
+                                       slot_errors={'1': 'AnisetteError: HTTP 503'})
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)):
+            snapshot = self.node.builder.snapshot()
+        self.assertEqual([row['state'] for row in snapshot['slots']],
+                         ['failed', 'registering', 'pending'])
+        self.assertEqual(snapshot['slots'][0]['error'], 'AnisetteError: HTTP 503')
 
     def test_ready_legacy_device_recovers_model_and_registration_time(self):
         class Pool:

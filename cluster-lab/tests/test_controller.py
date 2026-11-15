@@ -957,6 +957,7 @@ class ControllerTests(unittest.TestCase):
                                                              'message': '代理获取失败，请检查白名单',
                                                              'slots': [{'slot': 1, 'used': 987,
                                                                         'label': 'B64:AbCdEf12',
+                                                                        'error': 'AnisetteError: HTTP 503',
                                                                         'proxy': 'user:pass@1.2.3.4:80'}]}})
         self.assertEqual(value['cpu_percent'], 25.2)
         self.assertIsNone(value['memory_percent'])
@@ -968,6 +969,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(value['device_pool']['slots'][0]['used'], 987)
         self.assertEqual(value['device_pool']['slots'][0]['label'], 'B64:AbCdEf12')
         self.assertEqual(value['device_pool']['slots'][0]['proxy'], '1.2.3.4:80')
+        self.assertEqual(value['device_pool']['slots'][0]['error'], 'AnisetteError: HTTP 503')
         self.assertEqual(value['device_pool']['proxy_status'], 'failed')
         self.assertEqual(value['device_pool']['proxy_ip'], '1.2.3.4:80')
         self.assertEqual(value['device_pool']['message'], '代理获取失败，请检查白名单')

@@ -664,6 +664,7 @@ class Controller:
                     {'slot': int(item.get('slot') or 0),
                      'state': str(item.get('state') or '')[:20],
                      'label': str(item.get('label') or '')[:20],
+                     'error': str(item.get('error') or '')[:120],
                      'model': str(item.get('model') or '')[:32],
                      'proxy': mask_proxy(str(item.get('proxy') or '')),
                      'at': str(item.get('at') or '')[:19],

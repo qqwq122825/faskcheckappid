@@ -6,6 +6,7 @@ import json
 import multiprocessing as mp
 from pathlib import Path
 import queue
+import re
 import shutil
 import threading
 import time
@@ -40,13 +41,16 @@ class DeviceBuilder:
         self.reserved = set()
         self.state = {'running': False, 'capacity': 0, 'ready': 0, 'built': 0,
                       'failed': 0, 'current': 0, 'message': '', 'started_at': None,
-                      'proxy_status': 'idle', 'proxy_ip': ''}
+                      'proxy_status': 'idle', 'proxy_ip': '', 'slot_errors': {}}
 
     def snapshot(self):
         root = self.node.root / 'device-pool'
         ready = 0
         slots = []
         usage = self.usage()
+        with self.lock:
+            data = dict(self.state)
+            data['slot_errors'] = dict(data.get('slot_errors') or {})
         try:
             DevicePool, _, _ = _load_fastcheck()
             pool = DevicePool(str(root), self.node.origin, max_devices=max(1, self.state['capacity'] or 1))
@@ -56,15 +60,18 @@ class DeviceBuilder:
                 state = inspected['state']
                 if state == 'ready':
                     ready += 1
+                elif data.get('running') and slot == data.get('current'):
+                    state = 'registering'
+                elif str(slot) in data['slot_errors']:
+                    state = 'failed'
                 used = usage.get(str(slot), 0)
                 slots.append({'slot': slot, 'state': state,
                               'device_id': inspected.get('device_id', ''),
                               'label': device_label(inspected.get('device_id')),
+                              'error': data['slot_errors'].get(str(slot), ''),
                               'used': used if type(used) is int and used >= 0 else 0})
         except Exception:                                          # noqa: BLE001
             pass
-        with self.lock:
-            data = dict(self.state)
         registry = self.registry()
         for entry in slots:
             info = registry.get(str(entry['slot'])) or {}
@@ -109,6 +116,7 @@ class DeviceBuilder:
             self.state.update(running=True, capacity=int(capacity), ready=0, built=0,
                               failed=0, current=0, message='准备中',
                               proxy_status='checking', proxy_ip='',
+                              slot_errors={},
                               started_at=time.strftime('%H:%M:%S'))
             self.thread = threading.Thread(target=self._run, args=(int(capacity),),
                                            name='device-builder', daemon=True)
@@ -128,7 +136,8 @@ class DeviceBuilder:
             self.reserved.clear()
             self.state.update(running=False, capacity=0, ready=0, built=0,
                               failed=0, current=0, message='设备池已清空',
-                              started_at=None, proxy_status='idle', proxy_ip='')
+                              started_at=None, proxy_status='idle', proxy_ip='',
+                              slot_errors={})
         return True
 
     def reserve(self, slots):
@@ -172,6 +181,7 @@ class DeviceBuilder:
                 self._update(current=slot, message=f'正在注册第 {slot} 台')
                 proxy = self._proxy()
                 if not proxy:
+                    self._fail_slot(slot, '代理获取失败')
                     self._update(failed=self.state['failed'] + 1,
                                  proxy_status='failed', proxy_ip='',
                                  message=f'第 {slot} 台代理获取失败，已禁止直连注册')
@@ -203,12 +213,15 @@ class DeviceBuilder:
                 ok = bool(result and result.get('ok')) and pool.inspect(slot)['state'] == 'ready'
                 if ok:
                     self._record(slot, proxy, (result or {}).get('model'))
+                    self._clear_slot_error(slot)
                     self._update(built=self.state['built'] + 1,
                                  ready=self.state['ready'] + 1,
                                  message=f'第 {slot} 台已就绪')
                 else:
+                    reason = (result or {}).get('error') or '超时'
+                    self._fail_slot(slot, reason)
                     self._update(failed=self.state['failed'] + 1,
-                                 message=f'第 {slot} 台失败（{(result or {}).get("error") or "超时"}）')
+                                 message=f'第 {slot} 台失败（{reason}）')
             else:
                 if not self.state['failed']:
                     self._update(message='全部完成')
@@ -219,6 +232,18 @@ class DeviceBuilder:
 
     def _registry_path(self):
         return self.node.root / 'device-pool' / 'registry.json'
+
+    def _fail_slot(self, slot, reason):
+        with self.lock:
+            errors = dict(self.state.get('slot_errors') or {})
+            errors[str(int(slot))] = str(reason or '注册失败')[:120]
+            self.state['slot_errors'] = errors
+
+    def _clear_slot_error(self, slot):
+        with self.lock:
+            errors = dict(self.state.get('slot_errors') or {})
+            errors.pop(str(int(slot)), None)
+            self.state['slot_errors'] = errors
 
     def _record(self, slot, proxy, model=''):
         """记下每台设备注册时用的出口，供界面核对设备"出生地"。"""
@@ -333,4 +358,7 @@ def _register(payload, output):
                                proxy=payload['proxy'], provider_direct=True)
         output.put({'ok': True, 'model': profile['model']})
     except Exception as exc:                                       # noqa: BLE001
-        output.put({'ok': False, 'error': type(exc).__name__})
+        detail = re.sub(r'(?i)\b(?:https?|socks5h?)://\S+', '[endpoint]', str(exc))
+        detail = re.sub(r'(?i)(?:token|password|passwd|secret|key)=\S+', r'\1=***', detail)
+        error = type(exc).__name__ + (f': {detail[:96]}' if detail else '')
+        output.put({'ok': False, 'error': error})
