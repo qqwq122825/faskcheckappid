@@ -5,6 +5,7 @@ No plugin loading, account authentication, shell commands or target URLs.
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import ipaddress
 import json
 import math
 import multiprocessing as mp
@@ -23,6 +24,9 @@ PROXY_TTL_SECONDS = 50.0
 PROXY_FETCH_LIMIT = 1000
 PROXY_POOL_LIMIT = 1000
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
+PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
+PROXY_EXIT_IP_TIMEOUT = 4.0
+PROXY_EXIT_IP_MAX = 64
 
 
 def _proxy_debug_enabled(descriptor=None):
@@ -76,6 +80,136 @@ def _write_proxy_debug(path, event, **fields):
         os.write(fd, raw)
     finally:
         os.close(fd)
+
+
+def _probe_proxy_exit_ip(proxy, timeout=PROXY_EXIT_IP_TIMEOUT, url=None):
+    """Return the public exit IP observed through one proxy endpoint."""
+    import requests
+
+    value = str(proxy or '')
+    if not value:
+        raise ValueError('missing proxy endpoint')
+    response = requests.get(
+        url or os.environ.get('CLUSTER_PROXY_DEBUG_IP_URL') or PROXY_EXIT_IP_URL,
+        proxies={'http': value, 'https': value},
+        timeout=max(0.5, float(timeout)), allow_redirects=False,
+        headers={'User-Agent': 'clusterlab-proxy-debug/1'},
+    )
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except ValueError:
+        candidate = response.text.strip()
+    else:
+        candidate = str(payload.get('ip') or '').strip() if isinstance(payload, dict) else ''
+    if not candidate:
+        raise ValueError('exit IP response is empty')
+    return str(ipaddress.ip_address(candidate))
+
+
+class _ProxyExitIpDebug:
+    """Bounded asynchronous exit-IP sampler used only by debug-mode workers."""
+
+    def __init__(self, path, probe=None, limit=None, workers=2):
+        configured = os.environ.get('CLUSTER_PROXY_DEBUG_IP_MAX')
+        try:
+            requested = int(configured if limit is None and configured else
+                            (PROXY_EXIT_IP_MAX if limit is None else limit))
+        except (TypeError, ValueError):
+            requested = PROXY_EXIT_IP_MAX
+        self.path = path
+        self.limit = max(1, min(256, requested))
+        self.probe = probe or _probe_proxy_exit_ip
+        self.queue = queue.Queue(maxsize=self.limit)
+        self.lock = threading.Lock()
+        self.seen = set()
+        self.submitted = 0
+        self.completed = 0
+        self.errors = 0
+        self.skipped = 0
+        self.closed = False
+        self.threads = []
+        for index in range(max(1, min(4, int(workers or 1)))):
+            thread = threading.Thread(target=self._run,
+                                      name=f'proxy-exit-ip-{index}', daemon=True)
+            thread.start()
+            self.threads.append(thread)
+
+    def submit(self, proxy, trigger, **fields):
+        identity = _proxy_identity(proxy)
+        endpoint = identity['endpoint']
+        if not endpoint:
+            return False
+        with self.lock:
+            if self.closed or endpoint in self.seen:
+                return False
+            if len(self.seen) >= self.limit:
+                self.skipped += 1
+                return False
+            self.seen.add(endpoint)
+            self.submitted += 1
+        item = (str(proxy), identity, {'trigger': str(trigger), **fields})
+        try:
+            self.queue.put_nowait(item)
+        except queue.Full:
+            with self.lock:
+                self.skipped += 1
+            _write_proxy_debug(self.path, 'exit_ip_probe_skipped',
+                               endpoint=identity['endpoint'], host=identity['host'],
+                               port=identity['port'], reason='queue_full')
+            return False
+        return True
+
+    def _run(self):
+        while True:
+            item = self.queue.get()
+            try:
+                if item is None:
+                    return
+                proxy, identity, fields = item
+                started = time.monotonic()
+                try:
+                    exit_ip = self.probe(proxy)
+                    elapsed = round((time.monotonic() - started) * 1000, 2)
+                    _write_proxy_debug(
+                        self.path, 'exit_ip_probe', probe_status='ok',
+                        exit_ip=exit_ip, probe_ms=elapsed,
+                        endpoint=identity['endpoint'], host=identity['host'],
+                        port=identity['port'], **fields)
+                    with self.lock:
+                        self.completed += 1
+                except Exception as exc:                          # noqa: BLE001
+                    elapsed = round((time.monotonic() - started) * 1000, 2)
+                    _write_proxy_debug(
+                        self.path, 'exit_ip_probe', probe_status='error',
+                        exit_ip='', probe_ms=elapsed,
+                        endpoint=identity['endpoint'], host=identity['host'],
+                        port=identity['port'], error_type=type(exc).__name__,
+                        detail=_proxy_debug_detail(exc), **fields)
+                    with self.lock:
+                        self.errors += 1
+            finally:
+                self.queue.task_done()
+
+    def snapshot(self):
+        with self.lock:
+            return {'limit': self.limit, 'submitted': self.submitted,
+                    'completed': self.completed, 'errors': self.errors,
+                    'skipped': self.skipped, 'pending': self.queue.unfinished_tasks}
+
+    def close(self, timeout=2.0):
+        with self.lock:
+            self.closed = True
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while self.queue.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.02)
+        for _thread in self.threads:
+            try:
+                self.queue.put_nowait(None)
+            except queue.Full:
+                break
+        for thread in self.threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
 
 
 class NodeProxyPool:
@@ -816,6 +950,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     debug_enabled = _proxy_debug_enabled(descriptor)
     debug_path = (descriptor.get('_proxy_debug_path') or
                   str(directory / 'proxy-debug.jsonl')) if debug_enabled else None
+    exit_ip_debug = _ProxyExitIpDebug(debug_path) if debug_enabled else None
     counters = Counter()
     processed = 0
     last_progress = time.monotonic()
@@ -856,6 +991,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             if not ready and pool.inspect(index)['state'] == 'ready':
                 record_device_registration(device_root, index, bootstrap_proxy,
                                            profile.get('model', ''))
+            if exit_ip_debug is not None:
+                exit_ip_debug.submit(bootstrap_proxy, 'bootstrap', slot=index)
             if proxy_pool is not None:
                 proxy_pool.release(bootstrap_lease, healthy=True)
         except Exception as exc:                                   # noqa: BLE001
@@ -947,6 +1084,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                         pool_before=acquire_before,
                         pool_after=_proxy_pool_snapshot(proxy_pool))
                 continue
+            if exit_ip_debug is not None:
+                exit_ip_debug.submit(account_proxy, 'request', row=row, slot=slot_id,
+                                     attempt=attempt)
             request_started = time.monotonic() if debug_enabled else None
             try:
                 if identity is None:
@@ -1086,5 +1226,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                  'checksum': output_digest.hexdigest(),
                  'elapsed': time.time() - started})
     if debug_enabled:
+        exit_ip_debug.close()
         _write_proxy_debug(debug_path, 'worker_stop', ok=True, processed=processed,
-                           counts=dict(counters), pool=_proxy_pool_snapshot(proxy_pool))
+                           counts=dict(counters), pool=_proxy_pool_snapshot(proxy_pool),
+                           exit_ip_probe=exit_ip_debug.snapshot())
