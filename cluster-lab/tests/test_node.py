@@ -78,6 +78,26 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(captured['active'][0]['processed'], 1)
         self.assertEqual(captured['active'][0]['counts'], {'wrong_password': 1})
 
+    def test_heartbeat_includes_device_proxy_health(self):
+        captured = {}
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': []}
+        snapshot = {'running': True, 'capacity': 20, 'ready': 0, 'built': 0,
+                    'failed': 3, 'current': 4, 'attempted': 3,
+                    'proxy_status': 'ok', 'proxy_ip': '1.2.3.4:80',
+                    'message': '正在注册第 4 台', 'slots': []}
+
+        def request(*_args, **kwargs):
+            captured.update(kwargs['json'])
+            return Response(value)
+
+        with patch.object(self.node.builder, 'snapshot', return_value=snapshot), \
+             patch.object(self.node, '_request', side_effect=request):
+            self.node._heartbeat()
+        self.assertEqual(captured['devices']['proxy_status'], 'ok')
+        self.assertEqual(captured['devices']['proxy_ip'], '1.2.3.4:80')
+        self.assertEqual(captured['devices']['message'], '正在注册第 4 台')
+
     def test_heartbeat_reports_update_status_and_schedules_new_generation(self):
         with self.node.db.transaction() as db:
             db.execute("UPDATE tasks SET status='confirmed'")

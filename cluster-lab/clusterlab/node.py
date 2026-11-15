@@ -267,7 +267,8 @@ class Node:
             snapshot['slots'] = []
         return {key: snapshot.get(key) for key in
                 ('running', 'capacity', 'ready', 'built', 'failed',
-                 'current', 'attempted', 'slots')}
+                 'current', 'attempted', 'proxy_status', 'proxy_ip',
+                 'message', 'slots')}
 
     def _live_result_paths(self, unit_id):
         """Return worker outputs, never the later merged duplicate file."""
