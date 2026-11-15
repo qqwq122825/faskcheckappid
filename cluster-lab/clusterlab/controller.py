@@ -899,50 +899,34 @@ class Controller:
             # 字节预算必须提到循环外：每行调一次 settings() 就是每行一次数据库查询，
             # 10 万行会被这种写法拖到 30 秒以上。
             byte_limit = self.settings()['unit_byte_limit']
-            # The source stays as one file.  A unit stores only byte offsets and
-            # a range digest, so a 4 GB upload is not copied into thousands of
-            # package files and preparation memory is independent of file size.
-            seq, rows, first_row = 0, 0, 1
-            unit_start, unit_rows, unit_bytes = 0, 0, 0
-            unit_digest = hashlib.sha256()
-            with Path(job['source']).open('rb') as source:
-                while True:
-                    if self.closing.is_set():
-                        return
-                    line_start = source.tell()
-                    line = source.readline(65537)
-                    if not line:
-                        break
-                    if len(line) > 65536:
-                        raise ValueError('单行超过 64 KiB；请将超长记录拆分后重试')
-                    line.decode('utf-8-sig' if rows == 0 else 'utf-8')
-                    # 每一行都是输入文件中的一条记录，空白行也必须保留。
-                    # 这样文件末尾的剩余记录仍会形成正常的小包，不会被静默丢弃。
-                    # 不补换行：分包内容与上传文件逐字节一致，导出才能原样还原
-                    if unit_rows and unit_bytes + len(line) > byte_limit:
-                        seq += 1
-                        self._save_unit(job_id, seq, first_row, unit_rows, job['source'],
-                                        unit_start, line_start, unit_digest.hexdigest(), rows)
-                        first_row, unit_start = rows + 1, line_start
-                        unit_rows, unit_bytes = 0, 0
-                        unit_digest = hashlib.sha256()
-                    unit_digest.update(line)
-                    unit_rows += 1
-                    unit_bytes += len(line)
-                    rows += 1
-                    if unit_rows == job['unit_rows'] or unit_bytes >= byte_limit:
-                        seq += 1
-                        self._save_unit(job_id, seq, first_row, unit_rows, job['source'],
-                                        unit_start, source.tell(), unit_digest.hexdigest(), rows)
-                        first_row, unit_start = rows + 1, source.tell()
-                        unit_rows, unit_bytes = 0, 0
-                        unit_digest = hashlib.sha256()
-                if unit_rows:
-                    self._save_unit(job_id, seq + 1, first_row, unit_rows, job['source'],
-                                    unit_start, source.tell(), unit_digest.hexdigest(), rows)
+            # First respect the configured maximum.  If that creates lopsided
+            # work (for example 10,000 + 2), rebuild the byte index once with a
+            # balanced row limit derived from the currently accepting nodes.
+            built = self._build_units(job, int(job['unit_rows']), byte_limit)
+            if built is None:
+                return
+            rows, unit_count = built
+            with self.db.connect() as db:
+                accepting = int(db.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE enabled=1 AND last_seen>? "
+                    "AND update_state NOT IN ('dispatched','scheduled','fetching',"
+                    "'installing','restarting','verifying')",
+                    (time.time() - self.offline_seconds,)).fetchone()[0])
+            target_units = max(1, unit_count, accepting)
+            balanced_limit = max(50, math.ceil(rows / target_units))
+            if balanced_limit < int(job['unit_rows']):
+                with self.db.transaction() as db:
+                    db.execute('DELETE FROM units WHERE job_id=?', (job_id,))
+                    db.execute('UPDATE jobs SET rows=0 WHERE id=?', (job_id,))
+                rebuilt = self._build_units(job, balanced_limit, byte_limit)
+                if rebuilt is None:
+                    return
+                rows, unit_count = rebuilt
             with self.db.transaction() as db:
                 db.execute("UPDATE jobs SET status=CASE WHEN queued_at IS NOT NULL THEN 'queued' ELSE 'ready' END,rows=?,updated=? WHERE id=?", (rows, time.time(), job_id))
-                event(db, 'job_ready', f'文件准备完成，共 {rows:,} 条记录', job_id=job_id)
+                event(db, 'job_ready',
+                      f'文件准备完成，共 {rows:,} 条记录，均衡为 {unit_count} 个工作包',
+                      job_id=job_id)
                 self._advance_queue(db)
         except Exception as exc:
             message = str(exc) if isinstance(exc, (ValueError, UnicodeError)) else type(exc).__name__
@@ -950,6 +934,47 @@ class Controller:
                 db.execute("UPDATE jobs SET status='failed',queued_at=NULL,error=?,updated=? WHERE id=?", (message, time.time(), job_id))
                 event(db, 'prepare_failed', message, job_id=job_id)
                 self._advance_queue(db)
+
+    def _build_units(self, job, row_limit, byte_limit):
+        """Index one source file into bounded, nearly equal byte ranges."""
+        seq, rows, first_row = 0, 0, 1
+        unit_start, unit_rows, unit_bytes = 0, 0, 0
+        unit_digest = hashlib.sha256()
+        with Path(job['source']).open('rb') as source:
+            while True:
+                if self.closing.is_set():
+                    return None
+                line_start = source.tell()
+                line = source.readline(65537)
+                if not line:
+                    break
+                if len(line) > 65536:
+                    raise ValueError('单行超过 64 KiB；请将超长记录拆分后重试')
+                line.decode('utf-8-sig' if rows == 0 else 'utf-8')
+                # Every source line remains a record, including blank lines.
+                if unit_rows and unit_bytes + len(line) > byte_limit:
+                    seq += 1
+                    self._save_unit(job['id'], seq, first_row, unit_rows, job['source'],
+                                    unit_start, line_start, unit_digest.hexdigest(), rows)
+                    first_row, unit_start = rows + 1, line_start
+                    unit_rows, unit_bytes = 0, 0
+                    unit_digest = hashlib.sha256()
+                unit_digest.update(line)
+                unit_rows += 1
+                unit_bytes += len(line)
+                rows += 1
+                if unit_rows == row_limit or unit_bytes >= byte_limit:
+                    seq += 1
+                    self._save_unit(job['id'], seq, first_row, unit_rows, job['source'],
+                                    unit_start, source.tell(), unit_digest.hexdigest(), rows)
+                    first_row, unit_start = rows + 1, source.tell()
+                    unit_rows, unit_bytes = 0, 0
+                    unit_digest = hashlib.sha256()
+            if unit_rows:
+                seq += 1
+                self._save_unit(job['id'], seq, first_row, unit_rows, job['source'],
+                                unit_start, source.tell(), unit_digest.hexdigest(), rows)
+        return rows, seq
 
     def _advance_queue(self, db):
         # paused 不挡队列：暂停等于让出执行位，下一个任务立刻开始；

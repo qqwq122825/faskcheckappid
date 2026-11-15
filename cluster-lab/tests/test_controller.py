@@ -593,6 +593,29 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(snapshot['row_counts'], {'pending': 51, 'completed': 50})
         self.assertEqual(sum(snapshot['row_counts'].values()), snapshot['rows'])
 
+    def test_two_accepting_nodes_balance_10002_rows_as_5001_each(self):
+        other = self.service.add_node('second-balanced-node', 2, 4)
+        self.service.heartbeat(other['id'], {
+            'session': 'second-balanced-session', 'hostname': 'second', 'version': 'test',
+            'max_processes': 2, 'max_threads': 4, 'active': [], 'interrupted': [],
+            'devices': {'running': False, 'capacity': 30, 'ready': 30,
+                        'built': 30, 'failed': 0, 'attempted': 30}})
+        self.service.configure_node(other['id'], {'processes': 2, 'threads': 4,
+                                                   'enabled': True})
+        job = self.service.create_job('balanced-10002', io.BytesIO(b'x\n' * 10002),
+                                      10000, mode='auth')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
+            if state['status'] != 'preparing':
+                break
+            time.sleep(.01)
+        with self.service.db.connect() as db:
+            units = list(db.execute('SELECT seq,first_row,rows FROM units '
+                                    'WHERE job_id=? ORDER BY seq', (job,)))
+        self.assertEqual([(row['seq'], row['first_row'], row['rows']) for row in units],
+                         [(1, 1, 5001), (2, 5002, 5001)])
+
     def test_paused_task_exports_only_confirmed_units(self):
         job = self.job(100)
         self.service.job_action(job, 'start')
@@ -845,7 +868,7 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(Conflict, '仍有 1 个工作包'):
             self.service.clear_devices(self.node['id'])
 
-    def test_10002_records_keep_the_final_two_record_package(self):
+    def test_10002_records_balance_packages_and_keep_final_blank_records(self):
         source = b''.join(f'account-{index:05d}\n'.encode() for index in range(10000)) + b'\n\n'
         job = self.service.create_job('10002 records', io.BytesIO(source), 10000)
         deadline = time.monotonic() + 5
@@ -860,16 +883,17 @@ class ControllerTests(unittest.TestCase):
             units = [dict(row) for row in db.execute(
                 'SELECT first_row,rows,path,byte_start,byte_end FROM units WHERE job_id=? ORDER BY seq',
                 (job,))]
-        self.assertEqual([(unit['first_row'], unit['rows']) for unit in units], [(1, 10000), (10001, 2)])
-        self.assertEqual(b''.join(self.service.unit_lines(units[1])), b'\n\n')
+        self.assertEqual([(unit['first_row'], unit['rows']) for unit in units],
+                         [(1, 5001), (5002, 5001)])
+        self.assertTrue(b''.join(self.service.unit_lines(units[1])).endswith(b'\n\n'))
 
         self.service.job_action(job, 'start')
         first = self.service.lease(self.node['id'], 'test-session')
-        self.assertEqual(first['rows'], 10000)
+        self.assertEqual(first['rows'], 5001)
         self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
         self.confirm(first)
         second = self.service.lease(self.node['id'], 'test-session')
-        self.assertEqual((second['first_row'], second['rows']), (10001, 2))
+        self.assertEqual((second['first_row'], second['rows']), (5002, 5001))
         self.confirm(second)
         self.assertEqual(self.service.snapshot()['jobs'][0]['status'], 'completed')
 
