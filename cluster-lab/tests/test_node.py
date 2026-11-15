@@ -78,6 +78,44 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(captured['active'][0]['processed'], 1)
         self.assertEqual(captured['active'][0]['counts'], {'wrong_password': 1})
 
+    def test_heartbeat_reports_update_status_and_schedules_new_generation(self):
+        with self.node.db.transaction() as db:
+            db.execute("UPDATE tasks SET status='confirmed'")
+        self.node.update_generation = 4
+        self.node._save_control()
+        self.node.update_status_path.write_text(json.dumps({
+            'generation': 4, 'state': 'verifying', 'message': '正在验证节点健康状态'}), 'utf-8')
+        captured = {}
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': False, 'rejected': [], 'confirmed': [],
+                 'update': {'generation': 5, 'ref': 'abc1234', 'service': 'cluster-node'}}
+
+        def request(*_args, **kwargs):
+            captured.update(kwargs['json'])
+            return Response(value)
+
+        with patch.object(self.node, '_request', side_effect=request), \
+             patch.object(self.node, '_schedule_update', return_value=True) as schedule:
+            self.node._heartbeat()
+        self.assertEqual(captured['ack_update_generation'], 4)
+        self.assertEqual(captured['update_status']['state'], 'verifying')
+        schedule.assert_called_once_with(value['update'])
+
+    def test_schedule_update_uses_detached_systemd_unit(self):
+        with self.node.db.transaction() as db:
+            db.execute("UPDATE tasks SET status='confirmed'")
+        with patch('clusterlab.node.shutil.which', return_value='/usr/bin/systemd-run'), \
+             patch('clusterlab.node.subprocess.Popen') as popen:
+            self.assertTrue(self.node._schedule_update({
+                'generation': 2, 'ref': 'abc1234', 'service': 'cluster-node'}))
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:4], ['/usr/bin/systemd-run', '--unit',
+                                      'cluster-node-update-2', '--collect'])
+        self.assertIn('--service', command)
+        self.assertIn('cluster-node', command)
+        self.assertEqual(self.node.update_generation, 2)
+        self.assertEqual(json.loads(self.node.update_status_path.read_text())['state'], 'scheduled')
+
     def test_heartbeat_reports_result_lines_once_per_controller_ack(self):
         captured = []
         value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,

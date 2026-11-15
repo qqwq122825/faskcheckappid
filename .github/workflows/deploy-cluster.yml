@@ -1,0 +1,66 @@
+name: Deploy controller and roll nodes
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: production-cluster
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check production deployment configuration
+        id: preflight
+        env:
+          SSH_HOST: ${{ secrets.CONTROLLER_HOST }}
+          SSH_USER: ${{ secrets.CONTROLLER_USER }}
+          SSH_KEY: ${{ secrets.CONTROLLER_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.CONTROLLER_KNOWN_HOSTS }}
+        run: |
+          if [[ -n "$SSH_HOST" && -n "$SSH_USER" && -n "$SSH_KEY" && -n "$KNOWN_HOSTS" ]]; then
+            echo 'configured=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'configured=false' >> "$GITHUB_OUTPUT"
+            echo 'Production SSH secrets are not configured; deployment was skipped.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Configure controller SSH key
+        if: steps.preflight.outputs.configured == 'true'
+        env:
+          SSH_KEY: ${{ secrets.CONTROLLER_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.CONTROLLER_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Update controller, then roll execution nodes
+        if: steps.preflight.outputs.configured == 'true'
+        env:
+          SSH_HOST: ${{ secrets.CONTROLLER_HOST }}
+          SSH_USER: ${{ secrets.CONTROLLER_USER }}
+          REPO: ${{ vars.CONTROLLER_REPO }}
+          PYTHON: ${{ vars.CONTROLLER_PYTHON }}
+          SERVICE: ${{ vars.CONTROLLER_SERVICE }}
+          RUNTIME: ${{ vars.CONTROLLER_RUNTIME }}
+          PARALLEL: ${{ vars.NODE_UPDATE_PARALLEL }}
+        run: |
+          repo=${REPO:-/www/wwwroot/faskcheckappid}
+          python=${PYTHON:-/www/server/pyporject_evn/cluster-controller-env/bin/python}
+          service=${SERVICE:-cluster-controller}
+          runtime=${RUNTIME:-/www/wwwroot/cluster-controller}
+          parallel=${PARALLEL:-2}
+          printf -v command '%q ' \
+            "$repo/cluster-lab/tools/deploy_controller.sh" "$GITHUB_SHA" \
+            "$repo" "$python" "$service" "$runtime" "$parallel"
+          ssh -o BatchMode=yes "$SSH_USER@$SSH_HOST" "$command"

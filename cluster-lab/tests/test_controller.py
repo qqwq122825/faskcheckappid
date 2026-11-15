@@ -50,6 +50,45 @@ class ControllerTests(unittest.TestCase):
         self.service.configure_node(node['id'], {'processes': 10, 'threads': 100,
                                                   'enabled': True})
 
+    def test_rolling_update_drains_limits_parallelism_and_resumes_after_health(self):
+        other = self.service.add_node('second-update-node', 2, 4)
+        self.service.heartbeat(other['id'], {
+            'session': 'second-update-session', 'hostname': 'second', 'version': '0.3.37',
+            'max_processes': 2, 'max_threads': 4, 'active': [], 'interrupted': [],
+            'devices': {'running': False, 'capacity': 30, 'ready': 30,
+                        'built': 30, 'failed': 0, 'attempted': 30}})
+        self.service.configure_node(other['id'], {'processes': 2, 'threads': 4,
+                                                   'enabled': True})
+        queued = self.service.request_updates([self.node['id'], other['id']], 'abc1234', 1)
+        self.assertEqual(queued, {'queued': 2, 'ref': 'abc1234', 'parallel': 1})
+        nodes = {node['id']: node for node in self.service.snapshot()['nodes']}
+        self.assertFalse(nodes[self.node['id']]['enabled'])
+        self.assertFalse(nodes[other['id']]['enabled'])
+        self.assertEqual(nodes[self.node['id']]['update_state'], 'dispatched')
+        self.assertEqual(nodes[other['id']]['update_state'], 'queued')
+        first_generation = nodes[self.node['id']]['update_generation']
+        directive = self.heartbeat(ack_update_generation=0)['update']
+        self.assertEqual(directive, {'generation': first_generation,
+                                    'ref': 'abc1234', 'service': 'cluster-node'})
+        response = self.heartbeat(
+            ack_update_generation=first_generation,
+            update_status={'generation': first_generation, 'state': 'success',
+                           'message': '更新完成，节点已恢复心跳'},
+            devices={'running': False, 'capacity': 30, 'ready': 30,
+                     'built': 30, 'failed': 0, 'attempted': 30})
+        self.assertIsNone(response['update'])
+        nodes = {node['id']: node for node in self.service.snapshot()['nodes']}
+        self.assertTrue(nodes[self.node['id']]['enabled'])
+        self.assertEqual(nodes[self.node['id']]['update_state'], 'success')
+        self.assertEqual(nodes[other['id']]['update_state'], 'dispatched')
+
+    def test_rolling_update_rejects_offline_node_and_unsafe_ref(self):
+        offline = self.service.add_node('offline-update-node', 2, 4)
+        with self.assertRaisesRegex(Conflict, '节点离线'):
+            self.service.request_updates([offline['id']], 'main', 1)
+        with self.assertRaisesRegex(ValueError, '合法'):
+            self.service.request_updates([self.node['id']], '../main', 1)
+
     def test_rotation_partial_updates_preserve_switch_and_restart(self):
         self.service.configure_rotation({'device_rotate_after': 20, 'device_auto_rotate': True})
         result = self.service.configure_rotation({'device_rotate_after': 37})

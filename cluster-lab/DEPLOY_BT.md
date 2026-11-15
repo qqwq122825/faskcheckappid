@@ -151,14 +151,10 @@ curl -fsS http://127.0.0.1:18771/api/session
 
 ### 6. 后续更新
 
-```bash
-cd /www/wwwroot/faskcheckappid
-bash cluster-lab/tools/update.sh
-```
-
-更新成功后在宝塔 Python 项目页面图形化重启 `cluster-node`，再核对提交号、PID、
-HTTP 200 和总控心跳。依赖发生变化时，按 `tools/update.sh` 的说明传入项目虚拟环境
-Python 的绝对路径。
+0.3.38 起节点必须作为 `cluster-node.service` 运行。总控下发目标提交后会自动排空
+在途工作、拉取代码、安装依赖、用 systemd 重启并执行健康检查；失败会自动退回旧提交，
+不再需要到宝塔页面逐台点“重启”。首次启用自动更新前仍需人工把旧的宝塔进程迁移为
+systemd 服务，并确认代码目录是完整 Git 仓库。
 
 ### 7. 五分钟复用清单
 
@@ -176,11 +172,32 @@ Python 的绝对路径。
 
 开发机改完 Python 后提交推送；改前端时，先在 `cluster-lab/frontend` 执行 `npm ci && npm run build`，把源码和 `clusterlab/static/ui` 构建产物一起提交推送。
 
-服务器在仓库根目录更新，然后在宝塔重启对应项目：
+### 推送后自动发布
+
+仓库包含 `.github/workflows/deploy-cluster.yml`。完成下面的一次性配置后，向 `main`
+推送涉及 `cluster-lab` 的提交即可：GitHub Actions 先通过 SSH 更新总控；总控健康检查
+通过后，再把**同一个 commit SHA**按并发上限通知在线节点。离线节点会跳过并在输出中
+列出，更新失败的节点保持暂停且自动回滚。
+
+GitHub Environment `production` 需要配置：
+
+- Secrets：`CONTROLLER_HOST`、`CONTROLLER_USER`、`CONTROLLER_SSH_KEY`、
+  `CONTROLLER_KNOWN_HOSTS`（预先核对过的服务器主机公钥行，禁止在流水线里临时信任）；
+- Variables（可省略并使用默认值）：`CONTROLLER_REPO`、`CONTROLLER_PYTHON`、
+  `CONTROLLER_SERVICE`、`CONTROLLER_RUNTIME`、`NODE_UPDATE_PARALLEL`。
+
+默认值分别是 `/www/wwwroot/faskcheckappid`、
+`/www/server/pyporject_evn/cluster-controller-env/bin/python`、`cluster-controller`、
+`/www/wwwroot/cluster-controller` 和 `2`。总控和节点服务账户必须能读取仓库、写入各自
+runtime；用于部署的 SSH 账户必须能执行对应 `systemctl restart`。
+
+### 手动备用发布
+
+若 Actions 不可用，可在总控运行同一发布脚本；它同样会先验证总控，再通知节点：
 
 ```bash
 cd /www/wwwroot/faskcheckappid
-git pull --ff-only origin main
+bash cluster-lab/tools/deploy_controller.sh <完整提交SHA>
 ```
 
 也可以执行带工作区检查的脚本：
@@ -191,9 +208,13 @@ bash /www/wwwroot/faskcheckappid/cluster-lab/tools/update.sh
 
 若依赖有变化，可把宝塔对应虚拟环境的 Python **绝对路径**作为唯一参数传给脚本，更新后会安装集群依赖。脚本不会自动重启项目，不执行 `reset --hard` 或删除本地文件；工作区有未提交文件会停止更新。
 
-在宝塔“计划任务”里可保存以上命令作为**停用状态的手动维护任务**，需要更新时点“执行”，检查日志成功后到 Python 项目点“重启”。不要设置自动定时更新。用 root 更新后，需要确保服务用户 `www` 能读取代码、读写本机 `runtime/`，并确认项目使用的环境变量文件仍可被 `www` 读取。
+不要再为每台节点建立定时 `git pull`，也不要让节点自行跟随 `main`；总控只下发本次已
+验证的精确提交号。用 root 更新后，需要确保服务用户 `www` 能读取代码、读写本机
+`runtime/`，并确认项目使用的环境变量文件仍可被 `www` 读取。
 
-只改总控页面时更新总控；改节点执行代码时更新节点；通信协议变化应按版本说明更新两端。`git pull` 更新磁盘文件，正在运行的 Python 服务需要重启才会加载新代码。
+只改总控页面时也会完成一次无害的节点版本对齐；通信协议变化由“总控先更新、节点后
+滚动”的顺序保证兼容窗口。节点使用 `systemctl restart cluster-node` 加载新代码，不依赖
+宝塔图形界面。
 
 ## 已部署服务迁移
 

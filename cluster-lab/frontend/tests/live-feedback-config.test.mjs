@@ -30,6 +30,17 @@ test('New nodes stay paused until all default devices are initialized', () => {
   assert.match(dialogs, /:disabled="!node\?\.enabled && !node\?\.device_initialization_complete"/)
 })
 
+test('Controller exposes guarded rolling Git updates with visible node phases', () => {
+  const nodes = source('src/views/Nodes.vue')
+  assert.match(nodes, /滚动更新/)
+  assert.match(nodes, /\/api\/nodes\/update/)
+  assert.match(nodes, /node_ids: updateNodes\.value/)
+  assert.match(nodes, /parallel: updateParallel\.value/)
+  assert.match(nodes, /暂停接单 → 等待在途包结束 → git fetch\/checkout → 安装依赖 → systemd 重启 → 健康检查/)
+  assert.match(nodes, /updateLabels\[node\.update_state\]/)
+  assert.match(nodes, /版本 \{\{ node\.version \|\| '—' \}\}/)
+})
+
 test('Device rows use short Base64 labels instead of reusable slot numbers', () => {
   const drawer = source('src/components/DevicePoolDrawer.vue')
   assert.match(drawer, /label: item\.label \|\| `#\$\{item\.slot\}`/)

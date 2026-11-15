@@ -3,7 +3,11 @@ import hashlib
 import json
 import multiprocessing as mp
 from pathlib import Path
+import re
+import shutil
 import socket
+import subprocess
+import sys
 import threading
 import time
 from urllib.parse import urlsplit
@@ -55,6 +59,8 @@ class Node:
         control = read_json(self.root / 'control.json', {})
         self.stop_version = control.get('stop_version', 0)
         self.device_clear_version = control.get('device_clear_version', 0)
+        self.update_generation = control.get('update_generation', 0)
+        self.update_status_path = self.root / 'update-status.json'
         self.telemetry = HostTelemetry()
         self.proxy_api, self.proxy_scheme = '', 'socks5h'
         self.proxy_ttl = 50
@@ -88,6 +94,69 @@ class Node:
                 process.join(2)
         self.client.close()
 
+    def _save_control(self):
+        atomic_json(self.root / 'control.json',
+                    {'stop_version': self.stop_version,
+                     'device_clear_version': self.device_clear_version,
+                     'update_generation': self.update_generation})
+
+    def _update_status(self):
+        value = read_json(self.update_status_path, {})
+        return value if isinstance(value, dict) else {}
+
+    def _schedule_update(self, directive):
+        """在独立 systemd transient unit 中拉取代码并重启。
+
+        更新器不能留在 cluster-node.service 的 cgroup 里，否则服务
+        重启时它也会被 systemd 一起终止。
+        """
+        if not isinstance(directive, dict):
+            return False
+        generation = directive.get('generation')
+        target_ref = str(directive.get('ref') or '').strip()
+        service = str(directive.get('service') or 'cluster-node').strip()
+        if (type(generation) is not int or generation <= self.update_generation
+                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,119}', target_ref)
+                or '..' in target_ref or not re.fullmatch(r'[A-Za-z0-9_.@-]{1,80}', service)):
+            return False
+        with self.lock:
+            if self.active:
+                return False
+        with self.db.connect() as db:
+            pending = db.execute("SELECT COUNT(*) FROM tasks WHERE status IN ('downloading','running','outbox')").fetchone()[0]
+        if pending:
+            return False
+        repo = Path(__file__).resolve().parents[2]
+        updater = repo / 'cluster-lab' / 'tools' / 'node_update.py'
+        requirements = repo / 'cluster-lab' / 'requirements.txt'
+        systemd_run = shutil.which('systemd-run')
+        if not systemd_run or not updater.is_file() or not (repo / '.git').is_dir():
+            atomic_json(self.update_status_path, {'generation': generation, 'state': 'failed',
+                        'message': '节点未使用标准 Git + systemd 部署，无法自动更新'})
+            self.update_generation = generation
+            self._save_control()
+            return False
+        self.update_generation = generation
+        self._save_control()
+        atomic_json(self.update_status_path, {'generation': generation, 'state': 'scheduled',
+                    'message': f'已排队更新到 {target_ref}'})
+        unit = f'cluster-node-update-{generation}'
+        command = [systemd_run, '--unit', unit, '--collect', '--property=Type=oneshot',
+                   sys.executable, str(updater), '--repo', str(repo), '--ref', target_ref,
+                   '--service', service, '--python', sys.executable,
+                   '--requirements', str(requirements), '--status', str(self.update_status_path),
+                   '--generation', str(generation)]
+        log_path = self.root / 'node-update.log'
+        try:
+            with log_path.open('ab', buffering=0) as log:
+                subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as exc:
+            atomic_json(self.update_status_path, {'generation': generation, 'state': 'failed',
+                        'message': f'启动更新器失败：{type(exc).__name__}'})
+            return False
+        return True
+
     def connect(self, url, token):
         url = str(url).strip().rstrip('/')
         parsed = urlsplit(url)
@@ -111,8 +180,8 @@ class Node:
             if self.config.get('url') != url or self.config.get('token') != secret:
                 self.stop_version = 0
                 self.device_clear_version = 0
-                atomic_json(self.root / 'control.json',
-                            {'stop_version': 0, 'device_clear_version': 0})
+                self.update_generation = 0
+                self._save_control()
             self.config = {'url': url, 'token': secret}
             self.generation += 1
             atomic_json(self.root / 'connection.json', self.config)
@@ -293,6 +362,8 @@ class Node:
                            'active': values, 'interrupted': interrupted,
                            'ack_stop_version': self.stop_version,
                            'ack_device_clear_version': self.device_clear_version,
+                           'ack_update_generation': self.update_generation,
+                           'update_status': self._update_status(),
                            'telemetry': dict(self.telemetry.latest,
                                              worker_processes=self._active_worker_count()),
                            'devices': self._device_status(),
@@ -309,9 +380,7 @@ class Node:
                 for process, stop in self.active.values():
                     stop.set()
                 self.stop_version = value['stop_version']
-                atomic_json(self.root / 'control.json',
-                            {'stop_version': self.stop_version,
-                             'device_clear_version': self.device_clear_version})
+                self._save_control()
             for unit_id in value.get('interrupted_ack', []):
                 with self.db.transaction() as db:
                     db.execute("UPDATE tasks SET status='interrupted_reported',error='已按总控指令中止；等待总控重新安排',updated=? WHERE id=? AND status='interrupted'",
@@ -333,9 +402,7 @@ class Node:
                     self.builder.clear()
                     self.device_target = 0
                     self.device_clear_version = clear_version
-                    atomic_json(self.root / 'control.json',
-                                {'stop_version': self.stop_version,
-                                 'device_clear_version': self.device_clear_version})
+                    self._save_control()
             requested = value.get('device_request') or 0
             if requested and not self.builder.state['running']:
                 try:
@@ -381,6 +448,7 @@ class Node:
                     self.active[unit_id][1].set()
                 with self.db.transaction() as db:
                     db.execute("UPDATE tasks SET status='rejected',error='总控已删除任务或撤销租约；节点已停止执行' WHERE id=?", (unit_id,))
+        self._schedule_update(value.get('update'))
         return value
 
     def _upload_one(self):

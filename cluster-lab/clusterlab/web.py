@@ -143,6 +143,12 @@ def create_app(role, service, password=None):
             service.stop_node(node_id)
             return jsonify(ok=True, message='停止请求已发送，等待节点确认')
 
+        @app.post('/api/nodes/update')
+        def update_nodes():
+            data = request.get_json() or {}
+            return jsonify(service.request_updates(data.get('node_ids'), data.get('ref'),
+                                                   data.get('parallel', 2))), 202
+
         @app.get('/api/files')
         def list_files():
             return jsonify(files=service.files())

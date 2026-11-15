@@ -36,7 +36,12 @@ CREATE TABLE IF NOT EXISTS nodes (
  enabled INTEGER NOT NULL DEFAULT 1, desired_processes INTEGER NOT NULL DEFAULT 10,
  desired_threads INTEGER NOT NULL DEFAULT 100, max_processes INTEGER,
  max_threads INTEGER, version TEXT, last_total INTEGER NOT NULL DEFAULT 0,
- rate REAL NOT NULL DEFAULT 0, last_error TEXT
+ rate REAL NOT NULL DEFAULT 0, last_error TEXT,
+ update_generation INTEGER NOT NULL DEFAULT 0,
+ ack_update_generation INTEGER NOT NULL DEFAULT 0,
+ update_ref TEXT NOT NULL DEFAULT '', update_state TEXT NOT NULL DEFAULT '',
+ update_message TEXT NOT NULL DEFAULT '', update_resume_enabled INTEGER NOT NULL DEFAULT 0,
+ update_started REAL, update_finished REAL
 );
 CREATE TABLE IF NOT EXISTS units (
  id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), seq INTEGER NOT NULL,
@@ -76,6 +81,7 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_rotate_after
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_auto_rotate','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('update_parallel','2');
 '''
 
 
@@ -138,6 +144,9 @@ class Controller:
                       'timeout', 'undetermined', 'unknown')
     RESULT_CLASSIFICATION_VERSION = 2
     DEFAULT_DEVICE_REQUEST = 30
+    UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
+    UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')
+    UPDATE_REF_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$')
 
     def __init__(self, root, lease_seconds=30, offline_seconds=12, dispatch_per_second=0):
         self.root = private_dir(root)
@@ -164,9 +173,18 @@ class Controller:
                                      'stop_version': 'INTEGER NOT NULL DEFAULT 0',
                                      'ack_stop_version': 'INTEGER NOT NULL DEFAULT 0',
                                      'device_clear_version': 'INTEGER NOT NULL DEFAULT 0',
-                                     'ack_device_clear_version': 'INTEGER NOT NULL DEFAULT 0'}.items():
+                                     'ack_device_clear_version': 'INTEGER NOT NULL DEFAULT 0',
+                                     'update_generation': 'INTEGER NOT NULL DEFAULT 0',
+                                     'ack_update_generation': 'INTEGER NOT NULL DEFAULT 0',
+                                     'update_ref': "TEXT NOT NULL DEFAULT ''",
+                                     'update_state': "TEXT NOT NULL DEFAULT ''",
+                                     'update_message': "TEXT NOT NULL DEFAULT ''",
+                                     'update_resume_enabled': 'INTEGER NOT NULL DEFAULT 0',
+                                     'update_started': 'REAL',
+                                     'update_finished': 'REAL'}.items():
                 if name not in columns:
                     db.execute(f'ALTER TABLE nodes ADD COLUMN {name} {definition}')
+            db.execute("INSERT OR IGNORE INTO controller_settings(key,value) VALUES('update_parallel','2')")
             unit_columns = {row['name'] for row in db.execute('PRAGMA table_info(units)')}
             if 'result_counts' not in unit_columns:
                 db.execute('ALTER TABLE units ADD COLUMN result_counts TEXT')
@@ -314,6 +332,70 @@ class Controller:
             db.execute('UPDATE nodes SET desired_processes=?,desired_threads=?,enabled=? WHERE id=?',
                        (processes, threads, int(data['enabled']), node_id))
             event(db, 'node_config', '节点执行配置已更新，下一次心跳下发；在途工作包保持原配置', node_id=node_id)
+
+    def request_updates(self, node_ids, target_ref, parallel=2):
+        """将节点放入滚动更新队列：先停止接新包，在途包完成后再下发更新指令。"""
+        target_ref = str(target_ref or '').strip()
+        if not self.UPDATE_REF_PATTERN.fullmatch(target_ref) or '..' in target_ref:
+            raise ValueError('请填写合法的 Git commit、tag 或分支')
+        parallel = integer(int(parallel or 2), '并行更新节点数', 1, 5)
+        if node_ids is None:
+            node_ids = []
+        if not isinstance(node_ids, list) or len(node_ids) > 200:
+            raise ValueError('节点列表无效')
+        node_ids = list(dict.fromkeys(str(value) for value in node_ids if value))
+        now = time.time()
+        with self.db.transaction() as db:
+            rows = list(db.execute(
+                'SELECT * FROM nodes' +
+                (f" WHERE id IN ({','.join('?' for _ in node_ids)})" if node_ids else '') +
+                ' ORDER BY created', node_ids))
+            if not rows:
+                raise ValueError('没有可更新的节点')
+            if node_ids and len(rows) != len(node_ids):
+                raise ValueError('部分节点不存在')
+            offline = [row['name'] for row in rows
+                       if not row['last_seen'] or now - row['last_seen'] >= self.offline_seconds]
+            if offline:
+                raise Conflict('节点离线，暂不能更新：' + '、'.join(offline[:5]))
+            db.execute("INSERT INTO controller_settings(key,value) VALUES('update_parallel',?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(parallel),))
+            for row in rows:
+                resume = int(bool(row['enabled']) or bool(row['update_resume_enabled']))
+                db.execute(
+                    "UPDATE nodes SET enabled=0,update_generation=update_generation+1,"
+                    "update_ref=?,update_state='queued',update_message=?,update_resume_enabled=?,"
+                    "update_started=NULL,update_finished=NULL WHERE id=?",
+                    (target_ref, '已暂停接新包，等待在途工作完成', resume, row['id']))
+                event(db, 'node_update_queued',
+                      f'已加入更新队列：{target_ref}', node_id=row['id'])
+            self._advance_updates(db, now)
+        return {'queued': len(rows), 'ref': target_ref, 'parallel': parallel}
+
+    def _advance_updates(self, db, now=None):
+        """按并发上限将已排空在途工作的节点从 queued 推进为 dispatched。"""
+        now = now or time.time()
+        saved = db.execute("SELECT value FROM controller_settings WHERE key='update_parallel'").fetchone()
+        parallel = max(1, min(5, int(saved[0] if saved else 2)))
+        placeholders = ','.join('?' for _ in self.UPDATE_ACTIVE_STATES)
+        active = db.execute(f"SELECT COUNT(*) FROM nodes WHERE update_state IN ({placeholders})",
+                            self.UPDATE_ACTIVE_STATES).fetchone()[0]
+        for row in db.execute("SELECT * FROM nodes WHERE update_state='queued' ORDER BY created").fetchall():
+            if active >= parallel:
+                break
+            if not row['last_seen'] or now - row['last_seen'] >= self.offline_seconds:
+                continue
+            working = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? "
+                                 "AND status IN ('leased','running','unknown')", (row['id'],)).fetchone()[0]
+            if working:
+                db.execute("UPDATE nodes SET update_message=? WHERE id=?",
+                           (f'等待 {working} 个在途工作包完成', row['id']))
+                continue
+            db.execute("UPDATE nodes SET update_state='dispatched',update_message=?,update_started=? WHERE id=?",
+                       ('已下发更新指令', now, row['id']))
+            event(db, 'node_update_dispatched',
+                  f'已下发更新：{row["update_ref"]}', node_id=row['id'])
+            active += 1
 
     @staticmethod
     def _device_initialization(node):
@@ -962,6 +1044,7 @@ class Controller:
         with self.db.transaction() as db:
             self._expire(db)
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
+            was_online = bool(node['last_seen'] and now - node['last_seen'] < self.offline_seconds)
             if (node['session'] and node['session'] != session and node['last_seen']
                     and now - node['last_seen'] < self.offline_seconds):
                 raise Conflict('同一节点身份已有另一个实例在线；请等待旧实例离线或使用独立接入凭证')
@@ -1029,6 +1112,17 @@ class Controller:
             ack_device_clear = data.get('ack_device_clear_version', 0)
             ack_device_clear = (max(0, min(ack_device_clear, node['device_clear_version']))
                                 if type(ack_device_clear) is int else 0)
+            ack_update = data.get('ack_update_generation', 0)
+            ack_update = (max(0, min(ack_update, node['update_generation']))
+                          if type(ack_update) is int else 0)
+            update_status = data.get('update_status')
+            if not isinstance(update_status, dict):
+                update_status = {}
+            update_state = str(update_status.get('state') or '')[:24]
+            update_message = str(update_status.get('message') or '')[:240]
+            status_generation = update_status.get('generation', 0)
+            if type(status_generation) is not int:
+                status_generation = 0
             merged = dict(data.get('telemetry') or {})
             if isinstance(data.get('devices'), dict):
                 merged['device_pool'] = data['devices']
@@ -1049,11 +1143,36 @@ class Controller:
                 db.execute('UPDATE jobs SET traffic_bytes=traffic_bytes+? WHERE id=?',
                            (current_bytes - previous_bytes, traffic_job_id))
             cleaned_telemetry['_traffic_job_id'] = current_job_id
-            db.execute('UPDATE nodes SET telemetry_json=?,ack_stop_version=?,ack_device_clear_version=? WHERE id=?',
+            db.execute('UPDATE nodes SET telemetry_json=?,ack_stop_version=?,ack_device_clear_version=?,ack_update_generation=? WHERE id=?',
                        (json.dumps(cleaned_telemetry), ack_stop,
-                        ack_device_clear, node_id))
-            if not node['last_seen'] or now - node['last_seen'] > self.offline_seconds:
+                        ack_device_clear, ack_update, node_id))
+            if (status_generation == node['update_generation'] and update_state
+                    and update_state != node['update_state']):
+                allowed = {'scheduled', 'fetching', 'installing', 'restarting',
+                           'verifying', 'success', 'failed', 'rolled_back'}
+                if update_state in allowed:
+                    final = update_state in self.UPDATE_FINAL_STATES
+                    db.execute('UPDATE nodes SET update_state=?,update_message=?,update_finished=? WHERE id=?',
+                               (update_state, update_message,
+                                now if final else None, node_id))
+                    if update_state == 'success':
+                        current = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
+                        if current['update_resume_enabled'] and self._device_initialization(current)['complete']:
+                            db.execute('UPDATE nodes SET enabled=1 WHERE id=?', (node_id,))
+                        event(db, 'node_update_success',
+                              f'节点更新成功：{current["update_ref"]}', node_id=node_id)
+                    elif update_state in ('failed', 'rolled_back'):
+                        event(db, 'node_update_failed',
+                              update_message or '节点更新失败', node_id=node_id)
+            self._advance_updates(db, now)
+            node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
+            if not was_online:
                 event(db, 'node_online', f'节点已连接：{node["name"]}', node_id=node_id)
+            update = None
+            if (node['update_state'] == 'dispatched'
+                    and int(node['ack_update_generation'] or 0) < int(node['update_generation'] or 0)):
+                update = {'generation': int(node['update_generation']),
+                          'ref': node['update_ref'], 'service': 'cluster-node'}
             return {'node_id': node_id, 'name': node['name'], 'enabled': bool(node['enabled']),
                     'processes': min(desired_processes, max_p), 'threads': min(desired_threads, max_t),
                     'desired_processes': desired_processes, 'desired_threads': desired_threads,
@@ -1065,6 +1184,7 @@ class Controller:
                     'device_auto_rotate': bool(self.settings().get('device_auto_rotate')),
                     'proxy_ttl': int(self.settings().get('proxy_ttl') or 50),
                     'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds,
+                    'update': update,
                     'server_time': now,
                     'config': {**self.proxy_for_node(node),
                                'origin': self.settings().get('origin') or 'https://new.ani.sidestore.io'}}
@@ -1313,7 +1433,11 @@ class Controller:
                 jobs.append(value)
             nodes = []
             for row in db.execute('SELECT * FROM nodes ORDER BY created'):
-                value = {k: row[k] for k in ('id', 'name', 'last_seen', 'hostname', 'enabled', 'desired_processes', 'desired_threads', 'max_processes', 'max_threads', 'version', 'last_error')}
+                value = {k: row[k] for k in ('id', 'name', 'last_seen', 'hostname', 'enabled',
+                                             'desired_processes', 'desired_threads', 'max_processes',
+                                             'max_threads', 'version', 'last_error', 'update_generation',
+                                             'update_ref', 'update_state', 'update_message',
+                                             'update_started', 'update_finished')}
                 online = bool(row['last_seen'] and now - row['last_seen'] < self.offline_seconds)
                 stats = db.execute("SELECT COALESCE(SUM(CASE WHEN status IN ('leased','running') THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN status='completed' THEN rows ELSE reported_rows END),0), COALESCE(SUM(CASE WHEN status IN ('leased','running') THEN processed ELSE 0 END),0) FROM units WHERE node_id=?", (row['id'],)).fetchone()
                 value.update(status='offline' if not online else 'draining' if not row['enabled'] else 'busy' if stats[0] else 'idle',
