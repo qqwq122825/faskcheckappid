@@ -23,6 +23,17 @@ class ControllerTests(unittest.TestCase):
         self.service.close()
         self.temp.cleanup()
 
+    def test_new_node_defaults_to_thirty_device_registrations(self):
+        node = self.service.add_node('auto-devices', 10, 100)
+        with self.service.db.connect() as db:
+            saved = db.execute('SELECT device_request FROM nodes WHERE id=?',
+                               (node['id'],)).fetchone()[0]
+        response = self.service.heartbeat(node['id'], {
+            'session': 'auto-device-session', 'hostname': 'new-node', 'version': 'test',
+            'max_processes': 10, 'max_threads': 100, 'active': [], 'interrupted': []})
+        self.assertEqual(saved, 30)
+        self.assertEqual(response['device_request'], 30)
+
     def test_rotation_partial_updates_preserve_switch_and_restart(self):
         self.service.configure_rotation({'device_rotate_after': 20, 'device_auto_rotate': True})
         result = self.service.configure_rotation({'device_rotate_after': 37})

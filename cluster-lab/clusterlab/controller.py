@@ -137,6 +137,7 @@ class Controller:
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid',
                       'timeout', 'undetermined', 'unknown')
     RESULT_CLASSIFICATION_VERSION = 2
+    DEFAULT_DEVICE_REQUEST = 30
 
     def __init__(self, root, lease_seconds=30, offline_seconds=12, dispatch_per_second=0):
         self.root = private_dir(root)
@@ -278,8 +279,10 @@ class Controller:
         integer(threads, '线程数', 1, self.MAX_THREADS)
         node_id, token = uuid.uuid4().hex, secrets.token_urlsafe(32)
         with self.db.transaction() as db:
-            db.execute('INSERT INTO nodes(id,name,token_hash,created,desired_processes,desired_threads) VALUES(?,?,?,?,?,?)',
-                       (node_id, name, hashlib.sha256(token.encode()).hexdigest(), time.time(), processes, threads))
+            db.execute('INSERT INTO nodes(id,name,token_hash,created,desired_processes,desired_threads,device_request) '
+                       'VALUES(?,?,?,?,?,?,?)',
+                       (node_id, name, hashlib.sha256(token.encode()).hexdigest(), time.time(),
+                        processes, threads, self.DEFAULT_DEVICE_REQUEST))
             event(db, 'node_added', f'已添加节点：{name}', node_id=node_id)
         return {'id': node_id, 'name': name, 'token': token}
 
