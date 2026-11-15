@@ -19,6 +19,7 @@ const rows = computed(() => {
   if (Array.isArray(reported) && reported.length) {
     return reported.map((item: any) => ({
       slot: item.slot,
+      label: item.label || `#${item.slot}`,
       state: item.state === 'ready' ? '已就绪' : item.state === 'pending' ? '待注册' : '未开始',
       proxy: item.proxy || '—',
       model: item.model || '—',
@@ -31,6 +32,7 @@ const rows = computed(() => {
   const total = Math.max(pool.value.capacity || 0, capacity.value)
   return Array.from({ length: total }, (_, index) => ({
     slot: index + 1,
+    label: `#${index + 1}`,
     state: index < ready.value ? '已就绪' : index < actual.value ? '已尝试' : '未开始',
     proxy: '—', model: '—', at: '—', used: 0, recorded: false,
   }))
@@ -137,7 +139,7 @@ async function clearPool() {
         <span class="muted">{{ building ? `正在注册第 ${pool.built + pool.failed + 1} 台` : '等待中' }}</span>
       </div>
       <el-table :data="rows" empty-text="尚未初始化设备" stripe max-height="360">
-        <el-table-column prop="slot" label="设备编号" width="100" />
+        <el-table-column prop="label" label="设备标识" width="145" />
         <el-table-column prop="state" label="状态" width="100" />
         <el-table-column prop="model" label="设备型号" min-width="150" show-overflow-tooltip />
         <el-table-column prop="used" label="已用账号" width="110">

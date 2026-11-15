@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (NodeProxyPool, _execute_auth_unit, _proxy_debug_enabled, atomic_json,
+from clusterlab.executor import (NodeProxyPool, _execute_auth_unit, _partition_device_slots,
+                                 _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration)
 
@@ -52,6 +53,45 @@ def use_shared_proxy_pool(pool, output):
 
 
 class ExecutorScaleTests(unittest.TestCase):
+    def test_full_device_pool_is_partitioned_without_overlap(self):
+        groups = [_partition_device_slots(range(1, 31), 10, index)
+                  for index in range(10)]
+        self.assertEqual(groups[0], [1, 11, 21])
+        self.assertEqual(groups[9], [10, 20, 30])
+        self.assertEqual(sorted(slot for group in groups for slot in group),
+                         list(range(1, 31)))
+
+    def test_account_hash_balances_and_exposes_base64_prefix(self):
+        slots = list(range(1, 31))
+        assignments = [_slot_for_account(f'user-{index:05d}@example.com', slots)
+                       for index in range(3000)]
+        counts = {slot: 0 for slot in slots}
+        for slot, prefix in assignments:
+            counts[slot] += 1
+            self.assertRegex(prefix, r'^B64:[A-Za-z0-9_-]{8}$')
+        self.assertLess(max(counts.values()) - min(counts.values()), 50)
+
+    def test_auth_unit_does_not_bootstrap_or_request_without_proxy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text('account----password\n', encoding='utf-8')
+            descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 0,
+                          'proxy_api': 'http://proxy.invalid/list'}
+            shared = ScriptedProxyPool([])
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool, lambda *_args, **_kwargs: self.fail('request used direct connection'),
+                    lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+            record = json.loads((root / 'results.jsonl').read_text())
+            self.assertEqual(record['status'], 'timeout')
+            self.assertEqual(record['device_key'][:4], 'B64:')
+            self.assertFalse((root / 'devices' / 'registrations').exists())
+
     def test_explicit_debug_setting_overrides_legacy_node_environment(self):
         with patch.dict(os.environ, {'CLUSTER_PROXY_DEBUG': '1'}):
             self.assertFalse(_proxy_debug_enabled({'_proxy_debug': False}))
@@ -237,7 +277,8 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(json.loads((root / 'progress.json').read_text('utf-8'))['counts'],
                              {'valid': 500})
             self.assertEqual(done['checksum'], hashlib.sha256(payload).hexdigest())
-            self.assertEqual(usage_calls, [{1: 250, 2: 250}])
+            self.assertEqual(sum(usage_calls[0].values()), 500)
+            self.assertLess(abs(usage_calls[0][1] - usage_calls[0][2]), 50)
             self.assertEqual(len(payload.splitlines()), 500)
 
     def test_auth_progress_is_time_based_instead_of_waiting_for_ten_results(self):

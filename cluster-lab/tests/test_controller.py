@@ -914,6 +914,7 @@ class ControllerTests(unittest.TestCase):
                                              'upload_bps':1024,'download_bps':-1,'network_bytes':123456,
                                              'worker_processes':2,'secret':'private',
                                              'device_pool': {'slots': [{'slot': 1, 'used': 987,
+                                                                        'label': 'B64:AbCdEf12',
                                                                         'proxy': 'user:pass@1.2.3.4:80'}]}})
         self.assertEqual(value['cpu_percent'], 25.2)
         self.assertIsNone(value['memory_percent'])
@@ -923,6 +924,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(value['worker_processes'], 2)
         self.assertNotIn('secret', value)
         self.assertEqual(value['device_pool']['slots'][0]['used'], 987)
+        self.assertEqual(value['device_pool']['slots'][0]['label'], 'B64:AbCdEf12')
         self.assertEqual(value['device_pool']['slots'][0]['proxy'], '1.2.3.4:80')
 
 

@@ -30,6 +30,12 @@ test('New nodes stay paused until all default devices are initialized', () => {
   assert.match(dialogs, /:disabled="!node\?\.enabled && !node\?\.device_initialization_complete"/)
 })
 
+test('Device rows use short Base64 labels instead of reusable slot numbers', () => {
+  const drawer = source('src/components/DevicePoolDrawer.vue')
+  assert.match(drawer, /label: item\.label \|\| `#\$\{item\.slot\}`/)
+  assert.match(drawer, /prop="label" label="设备标识"/)
+})
+
 test('Running elapsed time and speed use live processed rows', () => {
   const detail = source('src/views/JobDetail.vue')
   assert.match(detail, /state\.value\?\.server_time/)

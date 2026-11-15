@@ -4,6 +4,7 @@ No plugin loading, account authentication, shell commands or target URLs.
 """
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import base64
 import hashlib
 import ipaddress
 import json
@@ -27,6 +28,24 @@ PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
 PROXY_EXIT_IP_TIMEOUT = 4.0
 PROXY_EXIT_IP_MAX = 2048
+
+
+def _partition_device_slots(slot_ids, process_count, process_index):
+    """Give every process a disjoint share of the full device pool."""
+    slots = [int(value) for value in slot_ids]
+    count = max(1, int(process_count))
+    index = max(0, int(process_index))
+    return slots[index::count] or [index + 1]
+
+
+def _slot_for_account(account, slot_ids):
+    """Map one account to a stable, evenly distributed device slot."""
+    slots = [int(value) for value in slot_ids]
+    if not slots:
+        raise ValueError('device slot list is empty')
+    digest = hashlib.sha256(str(account or '').strip().casefold().encode('utf-8')).digest()
+    prefix = base64.urlsafe_b64encode(digest).decode('ascii').rstrip('=')[:8]
+    return slots[int.from_bytes(digest[:8], 'big') % len(slots)], 'B64:' + prefix
 
 
 def _proxy_debug_enabled(descriptor=None):
@@ -730,11 +749,11 @@ def execute_unit_group(directory, descriptor, stop):
                     output.write(line)
             child = dict(descriptor, first_row=current_row, rows=count, processes=1)
             if descriptor.get('mode') == 'auth':
-                # 每个进程稳定占用一个槽位。节点可以把连续工作包轮流分配到
-                # 30 台等更大的池子，后台注册器同时补齐其余未占用槽位。
+                # 每个进程分到一组不重叠槽位；30 台 / 10 进程时每进程 3 台，
+                # 避免整个子包的账号都累计到同一台设备。
                 assigned = descriptor.get('device_slots') or []
-                child['device_slots'] = [int(assigned[index]) if index < len(assigned)
-                                         else index + 1]
+                child['device_slots'] = _partition_device_slots(
+                    assigned or range(1, process_count + 1), process_count, index)
                 child['device_pool_capacity'] = max(
                     process_count, int(descriptor.get('device_pool_capacity') or
                                        descriptor.get('device_capacity') or process_count))
@@ -1026,6 +1045,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 debug_path, 'bootstrap_pool_empty', slot=index,
                 wait_ms=round((time.monotonic() - bootstrap_started) * 1000, 2),
                 pool_before=bootstrap_before, pool_after=_proxy_pool_snapshot(proxy_pool))
+        if descriptor.get('proxy_api') and not bootstrap_proxy:
+            infos[index] = None
+            identities[index] = None
+            continue
         try:
             base_info = pool.info(timeout, proxy=bootstrap_proxy, provider_direct=True)
             profile = device_profile(pool, index)
@@ -1087,12 +1110,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             return row, line, {'status': 'unknown', 'kind': 'stopped'}
         account, password = _split_account(line)
         account_started = time.time()
-        slot_id = slot_ids[index % len(slot_ids)]
+        slot_id, account_prefix = _slot_for_account(account, slot_ids)
         # 空白行仍是输入文件中的一条记录，但不应触发真实认证请求。
         # 作为未判断结果落盘，保证小包按描述的 rows 正常完成。
         if not line.strip():
             return row, line, {'status': 'undetermined', 'kind': 'blank_record',
-                               'slot': slot_id, 'elapsed': 0}
+                               'slot': slot_id, 'device_key': account_prefix, 'elapsed': 0}
         identity = identities.get(slot_id)
         result = None
         previous_proxy = {'endpoint': '', 'host': '', 'port': None}
@@ -1117,7 +1140,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 'pair_changed': (previous_proxy['endpoint'] != current_proxy['endpoint']
                                  if previous_proxy['endpoint'] else None),
             }
-            if proxy_pool is not None and lease is None:
+            if descriptor.get('proxy_api') and not account_proxy:
                 result = {'status': 'error', 'kind': 'proxy', 'http': 0,
                           'stage': 'init', 'detail': '代理池暂时无可用出口'}
                 had_timeout = True
@@ -1193,6 +1216,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                       'stage': 'init', 'detail': '代理池未返回结果', '_proxy_retries': 0}
         result['elapsed'] = round(time.time() - account_started, 2)
         result['slot'] = slot_id
+        result['device_key'] = account_prefix
         if debug_enabled and auth_result_bucket(result) == 'timeout':
             _write_proxy_debug(
                 debug_path, 'final_timeout', row=row, slot=slot_id,
@@ -1247,6 +1271,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'code': str(business_code)[:180],
                           'protocol': 'GSA',
                           'device': device,
+                          'device_key': result.get('device_key') or '',
                           'elapsed': result.get('elapsed'),
                           'attempts': int(result.get('_proxy_retries') or 0)}
                 encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()

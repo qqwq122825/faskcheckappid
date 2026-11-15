@@ -106,10 +106,27 @@ class NodeRecoveryTests(unittest.TestCase):
         with patch.object(self.node.builder, 'start') as start:
             self.node._prepare_auth_devices(descriptor)
         self.assertEqual(descriptor['device_pool_capacity'], 30)
-        self.assertEqual(descriptor['device_slots'], list(range(11, 21)))
+        self.assertEqual(descriptor['device_slots'], list(range(1, 31)))
         start.assert_called_once_with(30)
-        self.assertTrue(set(range(11, 21)).issubset(self.node.builder.reserved))
+        self.assertEqual(self.node.builder.reserved, set(range(1, 31)))
         self.node.builder.release(descriptor['device_slots'])
+
+    def test_background_builder_never_registers_without_a_proxy(self):
+        class Pool:
+            def __init__(inner, *_args, **_kwargs):
+                pass
+
+            def inspect(inner, _slot):
+                return {'state': 'missing'}
+
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)), \
+             patch('clusterlab.device_build.mp.get_context', return_value=object()), \
+             patch.object(self.node.builder, '_proxy', return_value=None):
+            self.node.builder._run(1)
+        self.assertEqual(self.node.builder.state['ready'], 0)
+        self.assertEqual(self.node.builder.state['failed'], 1)
+        self.assertIn('禁止直连注册', self.node.builder.state['message'])
+        self.assertFalse((self.node.root / 'device-pool' / 'registrations').exists())
 
     def test_ready_legacy_device_recovers_model_and_registration_time(self):
         class Pool:
@@ -136,6 +153,7 @@ class NodeRecoveryTests(unittest.TestCase):
             snapshot = self.node.builder.snapshot()
         self.assertEqual(snapshot['attempted'], 1)
         self.assertEqual(snapshot['ready'], 1)
+        self.assertEqual(snapshot['slots'][0]['label'], 'B64:ZGV2aWNl')
         self.assertEqual(snapshot['slots'][0]['model'], 'MacBookPro14,3')
         self.assertEqual(snapshot['slots'][0]['proxy'], '历史未记录')
         self.assertRegex(snapshot['slots'][0]['at'], r'^\d{4}-\d{2}-\d{2} ')

@@ -452,9 +452,7 @@ class Node:
                                int(descriptor.get('rows') or 1)))
         requested = max(1, min(200, int(descriptor.get('device_capacity') or 30)))
         capacity = max(processes, requested)
-        sequence = max(1, int(descriptor.get('seq') or 1))
-        offset = ((sequence - 1) * processes) % capacity
-        slots = [((offset + index) % capacity) + 1 for index in range(processes)]
+        slots = list(range(1, capacity + 1))
         descriptor['device_capacity'] = capacity
         descriptor['device_pool_capacity'] = capacity
         descriptor['device_slots'] = slots

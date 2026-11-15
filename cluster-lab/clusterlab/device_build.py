@@ -1,6 +1,7 @@
 """节点侧身份池初始化：不跑任务也能把设备注册好。"""
 from __future__ import annotations
 
+import base64
 import json
 import multiprocessing as mp
 from pathlib import Path
@@ -10,6 +11,14 @@ import threading
 import time
 
 from .executor import _load_fastcheck, record_device_registration
+
+
+def device_label(device_id):
+    """Return a short, non-secret Base64 prefix for one persisted device."""
+    raw = str(device_id or '').encode('utf-8')
+    if not raw:
+        return ''
+    return 'B64:' + base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')[:8]
 
 
 class DeviceBuilder:
@@ -39,6 +48,7 @@ class DeviceBuilder:
                 used = usage.get(str(slot), 0)
                 slots.append({'slot': slot, 'state': state,
                               'device_id': inspected.get('device_id', ''),
+                              'label': device_label(inspected.get('device_id')),
                               'used': used if type(used) is int and used >= 0 else 0})
         except Exception:                                          # noqa: BLE001
             pass
@@ -149,6 +159,10 @@ class DeviceBuilder:
                     continue
                 self._update(current=slot, message=f'正在注册第 {slot} 台')
                 proxy = self._proxy()
+                if not proxy:
+                    self._update(failed=self.state['failed'] + 1,
+                                 message=f'第 {slot} 台代理获取失败，已禁止直连注册')
+                    continue
                 payload = {'slot': slot, 'capacity': capacity, 'proxy': proxy,
                            'device_root': str(root), 'origin': self.node.origin,
                            'timeout': 40}
@@ -182,7 +196,8 @@ class DeviceBuilder:
                     self._update(failed=self.state['failed'] + 1,
                                  message=f'第 {slot} 台失败（{(result or {}).get("error") or "超时"}）')
             else:
-                self._update(message='全部完成')
+                if not self.state['failed']:
+                    self._update(message='全部完成')
         except Exception as exc:                                   # noqa: BLE001
             self._update(message=f'异常：{type(exc).__name__}')
         finally:
