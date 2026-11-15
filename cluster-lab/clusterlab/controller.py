@@ -1476,7 +1476,46 @@ class Controller:
                                'nodes': len(nodes), 'busy': sum(n['status'] != 'offline' and n['active'] > 0 for n in nodes),
                                'queued': waiting_count, 'rate': round(sum(n['rate'] for n in nodes), 1)}}
 
-    def _read_rows_with_live(self, db, job_id, offset, limit, category):
+    @staticmethod
+    def _result_device_context(db):
+        """Map node/slot pairs to stable short labels for result-table display."""
+        numbers, labels = {}, {}
+        for number, node in enumerate(db.execute(
+                'SELECT id,telemetry_json FROM nodes ORDER BY created,id'), 1):
+            numbers[node['id']] = number
+            try:
+                telemetry = json.loads(node['telemetry_json'] or '{}')
+            except (TypeError, ValueError):
+                telemetry = {}
+            pool = telemetry.get('device_pool') if isinstance(telemetry, dict) else {}
+            for item in (pool.get('slots') if isinstance(pool, dict) else []) or []:
+                try:
+                    slot = int(item.get('slot'))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                label = str(item.get('label') or '').strip()
+                if label:
+                    labels[(node['id'], slot)] = label[:32]
+        return numbers, labels
+
+    @staticmethod
+    def _decorate_result_device(record, unit, context):
+        numbers, labels = context
+        node_id = unit['node_id']
+        number = numbers.get(node_id)
+        try:
+            slot = int(record.get('device'))
+        except (TypeError, ValueError):
+            slot = 0
+        label = str(record.get('device_label') or '').strip()
+        if not label and node_id and slot:
+            label = labels.get((node_id, slot), '')
+        node_text = f'节点{number:02d}' if number else '节点—'
+        device_text = label[:32] if label else (f'#{slot}' if slot else '—')
+        record['device_display'] = f'{node_text} · {device_text}'
+        return record
+
+    def _read_rows_with_live(self, db, job_id, offset, limit, category, device_context):
         """Merge completed package files with heartbeat-confirmed live rows.
 
         Only active packages occupy ``live_result_rows`` (normally one per
@@ -1485,7 +1524,7 @@ class Controller:
         order without retaining an unbounded per-account database table.
         """
         units = list(db.execute(
-            "SELECT id,seq,status,first_row,rows,result_path,result_counts,reported_rows "
+            "SELECT id,seq,status,first_row,rows,result_path,result_counts,reported_rows,node_id "
             "FROM units WHERE job_id=? AND (status='completed' OR reported_rows>0) ORDER BY seq",
             (job_id,)))
         result, skipped, total = [], 0, 0
@@ -1532,6 +1571,7 @@ class Controller:
                             except ValueError:
                                 continue
                             record['status'] = result_record_bucket(record)
+                            self._decorate_result_device(record, unit, device_context)
                             if category != 'all' and record['status'] != category:
                                 continue
                             if counts is None and category != 'all':
@@ -1555,6 +1595,7 @@ class Controller:
                     except (TypeError, ValueError):
                         continue
                     record['status'] = result_record_bucket(record)
+                    self._decorate_result_device(record, unit, device_context)
                     if skipped < offset:
                         skipped += 1
                         continue
@@ -1575,6 +1616,7 @@ class Controller:
         if category not in categories:
             raise ValueError('结果分类无效')
         with self.db.connect() as db:
+            device_context = self._result_device_context(db)
             job = db.execute(
                 "SELECT rows,(SELECT COALESCE(SUM(rows),0) FROM units "
                 "WHERE job_id=? AND status='completed') AS total FROM jobs WHERE id=?",
@@ -1583,18 +1625,19 @@ class Controller:
                 raise ValueError('任务不存在')
             if db.execute('SELECT 1 FROM live_result_rows WHERE job_id=? LIMIT 1',
                           (job_id,)).fetchone():
-                return self._read_rows_with_live(db, job_id, offset, limit, category)
+                return self._read_rows_with_live(db, job_id, offset, limit, category,
+                                                 device_context)
             if category == 'all':
                 # offset 是全局零基行号，利用分片的连续行号范围直接定位。
                 first, last = offset + 1, offset + limit
                 units = list(db.execute(
-                    "SELECT seq,first_row,rows,result_path,result_counts FROM units "
+                    "SELECT seq,first_row,rows,result_path,result_counts,node_id FROM units "
                     "WHERE job_id=? AND status='completed' AND first_row<=? "
                     "AND first_row+rows>? ORDER BY seq", (job_id, last, first)))
             else:
                 # 分类偏移不能由全局行号推导，但可用分片计数跳过整个结果文件。
                 units = list(db.execute(
-                    "SELECT seq,first_row,rows,result_path,result_counts FROM units "
+                    "SELECT seq,first_row,rows,result_path,result_counts,node_id FROM units "
                     "WHERE job_id=? AND status='completed' ORDER BY seq", (job_id,)))
 
             rows, skipped, total = [], 0, 0
@@ -1629,6 +1672,7 @@ class Controller:
                             except ValueError:
                                 continue
                             record['status'] = result_record_bucket(record)
+                            self._decorate_result_device(record, unit, device_context)
                             if category != 'all' and record['status'] != category:
                                 continue
                             if category == 'all':

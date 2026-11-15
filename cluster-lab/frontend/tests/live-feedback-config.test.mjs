@@ -43,8 +43,11 @@ test('Controller exposes guarded rolling Git updates with visible node phases', 
 
 test('Device rows use short Base64 labels instead of reusable slot numbers', () => {
   const drawer = source('src/components/DevicePoolDrawer.vue')
+  const results = source('src/components/ResultList.vue')
   assert.match(drawer, /label: item\.label \|\| `#\$\{item\.slot\}`/)
   assert.match(drawer, /prop="label" label="设备标识"/)
+  assert.match(results, /prop="device_display" label="设备"/)
+  assert.doesNotMatch(results, /prop="device" label="设备"/)
 })
 
 test('Running elapsed time and speed use live processed rows', () => {

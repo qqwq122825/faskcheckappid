@@ -489,6 +489,25 @@ class ControllerTests(unittest.TestCase):
             hashlib.sha256(payload).hexdigest())
         self.assertTrue(duplicate['duplicate'])
 
+    def test_result_rows_show_node_number_and_device_base64_label(self):
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        payload = b''.join((json.dumps({
+            'row': unit['first_row'] + offset, 'account': f'user{offset}@example.com',
+            'status': 'valid', 'device': 1,
+            'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
+            separators=(',', ':')) + '\n').encode() for offset in range(50))
+        with self.service.db.transaction() as db:
+            telemetry = {'device_pool': {'slots': [
+                {'slot': 1, 'label': 'B64:ZGV2aWNl', 'state': 'ready'}]}}
+            db.execute('UPDATE nodes SET telemetry_json=? WHERE id=?',
+                       (json.dumps(telemetry), self.node['id']))
+        self.service.accept_result(self.node['id'], unit['id'], unit['token'],
+                                   io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
+        row = self.service.read_rows(job, 0, 1, 'all')['rows'][0]
+        self.assertEqual(row['device_display'], '节点01 · B64:ZGV2aWNl')
+
     def test_paused_export_includes_heartbeat_confirmed_partial_rows(self):
         job = self.job(50)
         self.service.job_action(job, 'start')

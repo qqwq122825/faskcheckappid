@@ -48,6 +48,13 @@ def _slot_for_account(account, slot_ids):
     return slots[int.from_bytes(digest[:8], 'big') % len(slots)], 'B64:' + prefix
 
 
+def _device_id_label(device_id):
+    """Return the same short, non-secret device identifier used by the node UI."""
+    raw = str(device_id or '').encode('utf-8')
+    return ('B64:' + base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')[:8]
+            if raw else '')
+
+
 def _proxy_debug_enabled(descriptor=None):
     # A controller-supplied value is authoritative, including explicit False.
     # This lets the system setting turn logging off even when an older node
@@ -1031,7 +1038,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     # 一个包内把账号摊到所有设备上：一台设备只承担 rows/capacity 条，
     # 比固定用 1 号设备更分散，明显降低单设备被风控的概率。
-    identities, infos = {}, {}
+    identities, infos, device_labels = {}, {}, {}
     for index in slot_ids:
         bootstrap_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
         bootstrap_started = time.monotonic() if debug_enabled else None
@@ -1053,11 +1060,16 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             profile = device_profile(pool, index)
             infos[index] = dict(base_info, client_info=profile['client_info'],
                                 user_agent=profile['user_agent'])
-            ready = pool.inspect(index)['state'] == 'ready'
+            inspected = pool.inspect(index)
+            ready = inspected['state'] == 'ready'
+            device_labels[index] = _device_id_label(inspected.get('device_id'))
             identities[index] = pool.fetch_headers(index, infos[index], max(timeout, 40),
                                                    registered=ready, proxy=bootstrap_proxy,
                                                    provider_direct=True)
-            if not ready and pool.inspect(index)['state'] == 'ready':
+            refreshed = pool.inspect(index)
+            device_labels[index] = (_device_id_label(refreshed.get('device_id')) or
+                                    device_labels[index])
+            if not ready and refreshed['state'] == 'ready':
                 record_device_registration(device_root, index, bootstrap_proxy,
                                            profile.get('model', ''))
             if proxy_pool is not None:
@@ -1271,6 +1283,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'protocol': 'GSA',
                           'device': device,
                           'device_key': result.get('device_key') or '',
+                          'device_label': device_labels.get(device, ''),
                           'elapsed': result.get('elapsed'),
                           'attempts': int(result.get('_proxy_retries') or 0)}
                 encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
