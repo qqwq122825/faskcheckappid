@@ -38,7 +38,7 @@ const rows = computed(() => {
         : item.state === 'registering' ? '正在注册'
           : item.state === 'failed' ? '注册失败'
             : item.state === 'pending' ? '待注册' : '未开始',
-      error: item.error || '—',
+      result: item.state === 'ready' ? '成功' : item.error || '—',
       proxy: item.proxy || '—',
       model: item.model || '—',
       at: item.at || '—',
@@ -52,7 +52,7 @@ const rows = computed(() => {
     slot: index + 1,
     label: `#${index + 1}`,
     state: index < ready.value ? '已就绪' : index < actual.value ? '已尝试' : '未开始',
-    proxy: '—', model: '—', at: '—', error: '—', used: 0, recorded: false,
+    proxy: '—', model: '—', at: '—', result: '—', used: 0, recorded: false,
   }))
 })
 
@@ -163,7 +163,7 @@ async function clearPool() {
         <el-table-column prop="state" label="状态" width="100" />
         <el-table-column prop="model" label="设备型号" min-width="150" show-overflow-tooltip />
         <el-table-column prop="proxy" label="注册出口 IP" width="170" show-overflow-tooltip />
-        <el-table-column prop="error" label="注册结果" min-width="180" show-overflow-tooltip />
+        <el-table-column prop="result" label="注册结果" min-width="180" show-overflow-tooltip />
         <el-table-column prop="used" label="已用账号" width="110">
           <template #default="scope">{{ fmt(scope.row.used) }}</template>
         </el-table-column>

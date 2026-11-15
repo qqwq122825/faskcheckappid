@@ -122,6 +122,7 @@ test('Device pool starts initialization only from its explicit action and shows 
   assert.match(drawer, /注册出口 IP/)
   assert.ok(drawer.indexOf('label="注册出口 IP"') < drawer.indexOf('label="注册结果"'),
     '注册出口 IP 应放在注册结果前，窄抽屉无需横向滚动即可看到')
+  assert.match(drawer, /item\.state === 'ready' \? '成功' : item\.error \|\| '—'/)
   assert.match(drawer, /注册时间/)
   assert.match(drawer, /已用账号/)
   assert.match(drawer, /item\.used/)
