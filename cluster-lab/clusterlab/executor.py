@@ -6,6 +6,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import math
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ from .common import atomic_json
 
 PROXY_TTL_SECONDS = 50.0
 PROXY_FETCH_LIMIT = 1000
+PROXY_POOL_LIMIT = 1000
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
 
 
@@ -79,9 +81,10 @@ def _write_proxy_debug(path, event, **fields):
 class NodeProxyPool:
     """Fresh-first proxy pool shared by every process in one node package."""
 
-    def __init__(self, context, concurrency, ttl=PROXY_TTL_SECONDS):
+    def __init__(self, context, concurrency, ttl=PROXY_TTL_SECONDS, target=None):
         concurrency = max(1, int(concurrency or 1))
-        self.target = max(20, min(5000, (concurrency * 3 + 1) // 2))
+        requested_target = concurrency if target is None else max(1, int(target))
+        self.target = min(PROXY_POOL_LIMIT, requested_target)
         self.low_water = max(1, min(self.target, concurrency // 2 or 1))
         self.ttl = max(1.0, float(ttl))
         self.fresh = context.Queue(maxsize=self.target)
@@ -101,6 +104,7 @@ class NodeProxyPool:
         self.last_fetch_ms = context.Value('d', 0.0)
         self.refill = context.Event()
         self.refill.set()
+        self.ready = context.Event()
 
     @staticmethod
     def _add(counter, delta):
@@ -161,6 +165,9 @@ class NodeProxyPool:
             self._recent_exits[key] = expires_at
             added += 1
         self._add(self.fetched, added)
+        if (self._value(self.fresh_count) + self._value(self.reusable_count) >=
+                self.target):
+            self.ready.set()
         return added
 
     def _take(self, channel, counter, timeout=0.0):
@@ -266,6 +273,7 @@ class NodeProxyPool:
             'refreshed': self._value(self.refreshed),
             'last_fetch_ms': round(last_fetch_ms, 1),
             'ttl_seconds': self.ttl,
+            'ready': self.ready.is_set(),
         }
 
     def close(self):
@@ -301,9 +309,11 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
                 return
             pool.refill.clear()
             needed = pool.target - pool.snapshot()['fresh']
-            # Full pools still request one new exit per tick. Deficits are
-            # filled in bounded batches, not by blocking authentication work.
-            count = min(PROXY_FETCH_LIMIT, max(1, needed))
+            # Replace one TTL-window of inventory gradually instead of letting
+            # the initial batch expire at once. The supplier API accepts at
+            # most 1,000 exits per request, which is also the node pool limit.
+            refresh_batch = max(1, math.ceil(pool.target / pool.ttl))
+            count = min(PROXY_FETCH_LIMIT, max(refresh_batch, needed))
             started = time.monotonic()
             before = _proxy_pool_snapshot(pool) if debug_path else {}
             try:
@@ -311,7 +321,9 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
                                       scheme=None if scheme == 'http' else scheme))
                 if stop.is_set():
                     return
-                added = pool.add_fresh(values, fetched_at=started)
+                # A proxy gets its full TTL when it actually enters the node
+                # pool; slow supplier responses must not consume lease life.
+                added = pool.add_fresh(values)
                 milliseconds = (time.monotonic() - started) * 1000
                 pool.note_fetch(milliseconds)
                 if debug_path:
@@ -460,7 +472,8 @@ def execute_unit_group(directory, descriptor, stop):
         concurrency = process_count * max(1, int(descriptor.get('threads') or 1))
         proxy_pool = NodeProxyPool(
             context, concurrency,
-            ttl=float(descriptor.get('proxy_ttl') or PROXY_TTL_SECONDS))
+            ttl=float(descriptor.get('proxy_ttl') or PROXY_TTL_SECONDS),
+            target=min(PROXY_POOL_LIMIT, max(1, min(rows, concurrency))))
         supplier_stop = threading.Event()
         supplier_thread = threading.Thread(
             target=proxy_supplier_loop,
@@ -469,6 +482,18 @@ def execute_unit_group(directory, descriptor, stop):
                   None, debug_path),
             name='node-proxy-supplier', daemon=True)
         supplier_thread.start()
+        # Start workers only after the node has begun filling its own pool.
+        # Bound the wait so a broken supplier cannot block task cancellation.
+        prefill_started = time.monotonic()
+        prefill_deadline = prefill_started + min(30.0, proxy_pool.ttl)
+        while (not stop.is_set() and not proxy_pool.ready.is_set() and
+               time.monotonic() < prefill_deadline):
+            proxy_pool.ready.wait(0.1)
+        if debug_path:
+            _write_proxy_debug(
+                debug_path, 'pool_prefill', ready=proxy_pool.ready.is_set(),
+                wait_ms=round((time.monotonic() - prefill_started) * 1000, 2),
+                pool=_proxy_pool_snapshot(proxy_pool))
     if process_count == 1:
         try:
             _group_child(directory, descriptor, stop, proxy_pool)
