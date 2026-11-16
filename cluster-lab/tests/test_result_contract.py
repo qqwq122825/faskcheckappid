@@ -114,7 +114,7 @@ class ResultContractTests(unittest.TestCase):
             self.controller.configure_debug({'proxy_debug': enabled})
             rows = self.controller.read_rows(job, limit=2)['rows']
             self.assertEqual(rows[0]['reason'], original)
-            self.assertEqual(rows[0]['reason_cn'], '其他错误')
+            self.assertEqual(rows[0]['reason_cn'], original[:2048])
             if enabled:
                 self.assertEqual(rows[0]['detail'], original)
                 self.assertEqual(rows[0]['code'], 'SyntheticError: full diagnostic text')

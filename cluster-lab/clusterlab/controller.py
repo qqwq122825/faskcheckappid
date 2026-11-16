@@ -182,7 +182,9 @@ def result_reason_cn(value, bucket=None):
         return '密码正确'
     if resolved == 'timeout':
         return '请求超时或服务暂时不可用'
-    return '其他错误'
+    # 未绑定到内置分类的 Apple 原因不翻译、不覆盖，直接展示服务器
+    # 返回的英文。旧记录若从未保存 reason，则只能保留“其他错误”。
+    return raw[:2048] if raw else '其他错误'
 
 
 class Controller:

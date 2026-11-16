@@ -588,7 +588,9 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result_record_bucket({
             'status': 'undetermined', 'reason': 'A new Apple English reason.'}), 'undetermined')
         self.assertEqual(result_reason_cn({
-            'status': 'undetermined', 'reason': 'A new Apple English reason.'}), '其他错误')
+            'status': 'undetermined', 'reason': 'A new Apple English reason.'}),
+            'A new Apple English reason.')
+        self.assertEqual(result_reason_cn({'status': 'undetermined'}), '其他错误')
         self.assertEqual(result_reason_cn({
             'status': 'need_2fa', 'reason': 'au=trustedDeviceSecondaryAuth'}),
             '密码已通过，需要双重验证（au=trustedDeviceSecondaryAuth）')
