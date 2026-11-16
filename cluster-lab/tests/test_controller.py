@@ -584,6 +584,11 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result_record_bucket(dict(shared, reason=locked_with_iforgot)), 'locked')
         self.assertEqual(result_reason_cn(dict(shared, reason=locked_with_iforgot)),
                          '账号因安全原因被锁定')
+        fuzzy_locked = ('This Apple Account has been lockd for security reasons. '
+                        'Visit iForgot to reset your account.')
+        self.assertEqual(result_record_bucket(dict(shared, reason=fuzzy_locked)), 'locked')
+        self.assertEqual(result_reason_cn(dict(shared, reason=fuzzy_locked)),
+                         '账号因安全原因被锁定')
         self.assertEqual(result_record_bucket(dict(
             shared, reason='Enter the correct password for this Apple Account.')), 'wrong_password')
         self.assertEqual(result_record_bucket(dict(

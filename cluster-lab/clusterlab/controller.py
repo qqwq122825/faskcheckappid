@@ -1,5 +1,6 @@
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
+from difflib import SequenceMatcher
 import hashlib
 import json
 import math
@@ -128,12 +129,20 @@ def normalized_apple_reason(*values):
     return ' '.join(unicodedata.normalize('NFKC', text).split()).casefold()
 
 
+def apple_reason_matches(text, phrase, threshold=0.90):
+    if phrase in text:
+        return True
+    candidate = text[:len(phrase)]
+    return bool(candidate and SequenceMatcher(
+        None, phrase, candidate, autojunk=False).ratio() >= threshold)
+
+
 def apple_reason_bucket(value):
     """Return a business bucket only for explicit English Apple reasons."""
     fields = (value.get('reason'), value.get('apple_message'), value.get('detail'))
-    text = normalized_apple_reason(*fields)
+    texts = [normalized_apple_reason(field) for field in fields if field]
     for phrase, bucket in _APPLE_REASON_BUCKETS:
-        if phrase in text:
+        if any(apple_reason_matches(text, phrase) for text in texts):
             return bucket
     return None
 
@@ -178,7 +187,7 @@ def result_reason_cn(value, bucket=None):
         ('your account information was entered incorrectly', '账号不存在'),
     )
     for phrase, translated in translations:
-        if phrase in low:
+        if apple_reason_matches(low, phrase):
             return translated
     resolved = bucket or result_record_bucket(value)
     if resolved == 'need_2fa':

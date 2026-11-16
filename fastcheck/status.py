@@ -1,4 +1,5 @@
 """Mutually exclusive result counts and a one-second terminal status panel."""
+from difflib import SequenceMatcher
 import shutil
 import sys
 import time
@@ -20,12 +21,22 @@ def _normalized_apple_reason(*values):
     return ' '.join(unicodedata.normalize('NFKC', text).split()).casefold()
 
 
+def _apple_reason_matches(text, phrase, threshold=0.90):
+    if phrase in text:
+        return True
+    # Apple reasons start the field; compare the phrase-sized prefix so an
+    # official help suffix (for example iForgot) cannot dilute similarity.
+    candidate = text[:len(phrase)]
+    return bool(candidate and SequenceMatcher(
+        None, phrase, candidate, autojunk=False).ratio() >= threshold)
+
+
 def apple_reason_bucket(result):
     """Classify only explicit English account reasons returned by Apple."""
     values = (result.get('apple_message'), result.get('reason'), result.get('detail'))
-    text = _normalized_apple_reason(*values)
+    texts = [_normalized_apple_reason(value) for value in values if value]
     for phrase, bucket in _APPLE_REASON_BUCKETS:
-        if phrase in text:
+        if any(_apple_reason_matches(text, phrase) for text in texts):
             return bucket
     return None
 

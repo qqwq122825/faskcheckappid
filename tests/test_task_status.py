@@ -47,10 +47,13 @@ class StatusTests(unittest.TestCase):
             'Enter the correct password for this Apple Account.': 'wrong_password',
             'This Apple Account is not active.': 'invalid',
             'Your account information was entered incorrectly.': 'not_found',
+            'This Apple Account has been lockd for security reasons. Visit iForgot to reset your account.': 'locked',
         }
         for reason, expected in samples.items():
             with self.subTest(reason=reason):
                 self.assertEqual(result_bucket(dict(shared, apple_message=reason)), expected)
+        self.assertEqual(result_bucket(dict(
+            shared, apple_message='This Apple Account is ready for use.')), 'undetermined')
 
     def test_updates_once_per_second_and_forces_final_snapshot(self):
         stream=io.StringIO()
