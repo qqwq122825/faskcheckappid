@@ -77,6 +77,7 @@ class Node:
         self.telemetry = HostTelemetry()
         self.proxy_api, self.proxy_scheme = '', 'socks5h'
         self.proxy_ttl = 50
+        self.proxy_pool_size = 1000
         self.origin = 'https://new.ani.sidestore.io'
         from .device_build import DeviceBuilder
         self.builder = DeviceBuilder(self)
@@ -425,6 +426,11 @@ class Node:
                 self.proxy_ttl = max(5, min(3600, int(value.get('proxy_ttl') or 50)))
             except (TypeError, ValueError):
                 self.proxy_ttl = 50
+            try:
+                self.proxy_pool_size = max(1, min(10000, int(
+                    value.get('proxy_pool_size') or 1000)))
+            except (TypeError, ValueError):
+                self.proxy_pool_size = 1000
             clear_version = int(value.get('device_clear_version') or 0)
             if clear_version > self.device_clear_version:
                 self.builder.cancel()
@@ -517,6 +523,7 @@ class Node:
             descriptor.setdefault('timeout', 20)
             descriptor.setdefault('retries', 0)
             descriptor.setdefault('proxy_ttl', self.proxy_ttl)
+            descriptor.setdefault('proxy_pool_size', self.proxy_pool_size)
             self._prepare_auth_devices(descriptor)
         atomic_json(directory / 'manifest.json', descriptor)
         stop = self.context.Event()

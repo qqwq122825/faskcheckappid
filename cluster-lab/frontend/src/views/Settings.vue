@@ -4,6 +4,7 @@ import { ElMessage } from 'element-plus'
 import { session, isNode, state, busy, mutate } from '../composables/useCluster'
 const maxUnitRows = ref(10000), error = ref('')
 const proxyApi = ref(''), proxyScheme = ref('socks5h'), proxyError = ref(''), proxyBusy = ref(false)
+const proxyPoolSize = ref(1000), proxyPoolBusy = ref(false)
 const rotateAfter = ref(0), rotateBusy = ref(false)
 const proxyDebug = ref(false), proxyDebugBusy = ref(false)
 watch(() => state.value?.settings?.device_rotate_after, value => {
@@ -17,6 +18,9 @@ watch(() => state.value?.settings?.proxy_scheme, value => {
 }, { immediate: true })
 watch(() => state.value?.settings?.proxy_debug, value => {
   if (value != null) proxyDebug.value = Boolean(value)
+}, { immediate: true })
+watch(() => state.value?.settings?.proxy_pool_size, value => {
+  if (value != null) proxyPoolSize.value = Number(value)
 }, { immediate: true })
 async function save() {
   error.value = ''
@@ -51,6 +55,17 @@ async function removeProxy(index: number) {
   try { await mutate('/api/settings/proxy', { action: 'delete', index }, '代理配置已删除') }
   catch (e) { proxyError.value = (e as Error).message; ElMessage.error(proxyError.value) }
   finally { proxyBusy.value = false }
+}
+async function saveProxyPoolSize() {
+  if (!Number.isInteger(proxyPoolSize.value) || proxyPoolSize.value < 1 || proxyPoolSize.value > 10000) {
+    proxyError.value = '单节点代理池容量应为 1–10,000 的整数'; return
+  }
+  proxyPoolBusy.value = true
+  try {
+    await mutate('/api/settings/proxy', { action: 'resize', proxy_pool_size: proxyPoolSize.value },
+                 `单节点代理池容量已设置为 ${proxyPoolSize.value.toLocaleString()}`)
+  } catch (e) { proxyError.value = (e as Error).message; ElMessage.error(proxyError.value) }
+  finally { proxyPoolBusy.value = false }
 }
 async function saveProxyDebug(value: string | number | boolean) {
   const enabled = Boolean(value)
@@ -110,6 +125,15 @@ async function saveProxyDebug(value: string | number | boolean) {
           <el-option label="https" value="https" />
         </el-select>
       </el-form-item>
+      <el-form-item label="单节点代理池容量">
+        <el-input-number v-model="proxyPoolSize" :min="1" :max="10000" :step="1000"
+                         :precision="0" :disabled="proxyPoolBusy" />
+        <span class="field-note">
+          每个节点只维护自己的代理池；单次最多从该节点的 API 提取 1,000 条，库存不足时分批补齐。
+          代理明细不会每秒传回总控。
+        </span>
+      </el-form-item>
+      <el-button :loading="proxyPoolBusy" :disabled="proxyBusy" @click="saveProxyPoolSize">保存代理池容量</el-button>
       <el-descriptions :column="1" border>
         <el-descriptions-item label="当前状态">
           {{ state?.settings?.proxy_configured ? `已配置 ${state.settings.proxy_count} 个` : '未配置' }}

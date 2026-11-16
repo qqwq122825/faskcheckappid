@@ -144,7 +144,46 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(reused[2], 1)
             self.assertEqual(pool.snapshot()['reused'], 1)
             pool.release(second, healthy=False)
-            self.assertEqual(pool.snapshot()['discarded'], 1)
+            self.assertEqual(pool.snapshot()['discarded'], 0)
+            self.assertEqual(pool.snapshot()['soft_failures'], 1)
+            pool.release(reused, healthy=True)
+        finally:
+            pool.close()
+
+    def test_node_proxy_pool_counts_busy_inventory_and_retires_after_three_failures(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=1, ttl=30, target=1)
+        try:
+            pool.add_fresh(['socks5h://unstable'])
+            for failure in range(1, 4):
+                lease = pool.acquire(wait=.5)
+                self.assertIsNotNone(lease)
+                busy = pool.snapshot()
+                self.assertEqual(busy['available'], 0)
+                self.assertEqual(busy['in_use'], 1)
+                self.assertEqual(busy['known'], 1)
+                pool.release(lease, healthy=False)
+                state = pool.snapshot()
+                self.assertEqual(state['soft_failures'], failure)
+                self.assertEqual(state['discarded'], int(failure == 3))
+            self.assertEqual(pool.snapshot()['known'], 0)
+        finally:
+            pool.close()
+
+    def test_node_proxy_pool_never_exceeds_configured_logical_capacity(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=2, ttl=30, target=2)
+        try:
+            pool.add_fresh(['socks5h://one', 'socks5h://two'])
+            first = pool.acquire(wait=.5)
+            second = pool.acquire(wait=.5)
+            self.assertEqual(pool.add_fresh(['socks5h://three']), 0)
+            self.assertEqual(pool.snapshot()['known'], 2)
+            pool.release(first, healthy=True)
+            pool.release(second, healthy=True)
+            self.assertEqual(pool.add_fresh(['socks5h://three']), 1)
+            self.assertEqual(pool.snapshot()['known'], 2)
+            self.assertEqual(pool.snapshot()['refreshed'], 1)
         finally:
             pool.close()
 
@@ -218,6 +257,32 @@ class ExecutorScaleTests(unittest.TestCase):
                 ('socks5h://bootstrap', True),
                 ('socks5h://dead-exit', False),
                 ('socks5h://good-exit', True),
+            ])
+
+    def test_auth_unit_keeps_proxy_reusable_after_http_503(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text('account----password\n', encoding='utf-8')
+            descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 0,
+                          'proxy_api': 'http://proxy.invalid/list'}
+            shared = ScriptedProxyPool(['socks5h://bootstrap', 'socks5h://service-busy'])
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool, lambda *_args, **_kwargs: {
+                        'status': 'error', 'kind': 'service', 'http': 503},
+                    lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+
+            record = json.loads((root / 'results.jsonl').read_text())
+            self.assertEqual(record['status'], 'timeout')
+            self.assertEqual(shared.releases, [
+                ('socks5h://bootstrap', True),
+                ('socks5h://service-busy', True),
             ])
 
     def test_registration_history_keeps_the_first_time_and_proxy_per_slot(self):

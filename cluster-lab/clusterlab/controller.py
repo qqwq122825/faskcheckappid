@@ -80,6 +80,7 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('origin','https://ne
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_rotate_after','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_auto_rotate','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_pool_size','1000');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('update_parallel','2');
 '''
@@ -484,6 +485,7 @@ class Controller:
                 # column 声明是 INTEGER，存 '1' 会读回整数 1，比较时统一转字符串
                 'device_auto_rotate': str(values.get('device_auto_rotate', '0')) in ('1', 'True', 'true'),
                 'proxy_ttl': int(values.get('proxy_ttl', 50) or 50),
+                'proxy_pool_size': int(values.get('proxy_pool_size', 1000) or 1000),
                 'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true')}
 
     def proxy_for_node(self, node):
@@ -556,14 +558,21 @@ class Controller:
 
     def configure_proxy(self, data):
         action = str(data.get('action') or 'replace').strip()
-        if action not in ('add', 'delete', 'clear', 'replace'):
+        if action not in ('add', 'delete', 'clear', 'replace', 'resize'):
             raise ValueError('代理配置操作无效')
         with self.db.connect() as db:
             current = {row['key']: row['value'] for row in db.execute(
-                "SELECT key,value FROM controller_settings WHERE key IN ('proxy_api','proxy_scheme')")}
+                "SELECT key,value FROM controller_settings "
+                "WHERE key IN ('proxy_api','proxy_scheme','proxy_pool_size')")}
         scheme = str(data.get('proxy_scheme') or current.get('proxy_scheme') or 'socks5h').strip()
         if scheme not in ('socks5h', 'socks5', 'http', 'https'):
             raise ValueError('代理协议应为 socks5h / socks5 / http / https')
+        try:
+            pool_value = int(data.get('proxy_pool_size') or
+                             current.get('proxy_pool_size') or 1000)
+        except (TypeError, ValueError):
+            raise ValueError('单节点代理池容量应为 1–10000 的整数') from None
+        pool_size = integer(pool_value, '单节点代理池容量', 1, 10000)
         existing = [part for part in str(current.get('proxy_api') or '').split() if part]
         submitted = [part for part in str(data.get('proxy_api') or '').split() if part]
         if action == 'add':
@@ -580,6 +589,8 @@ class Controller:
             parts = existing[:index] + existing[index + 1:]
         elif action == 'clear':
             parts = []
+        elif action == 'resize':
+            parts = existing
         else:
             parts = list(dict.fromkeys(submitted))
         if len(parts) > 16:
@@ -593,9 +604,15 @@ class Controller:
         with self.db.transaction() as db:
             db.execute("UPDATE controller_settings SET value=? WHERE key='proxy_api'", (api,))
             db.execute("UPDATE controller_settings SET value=? WHERE key='proxy_scheme'", (scheme,))
-            event(db, 'controller_config',
-                  f'代理 API 配置已更新，当前 {len(parts)} 个，按节点轮询分配'
-                  if parts else '代理 API 配置已清空')
+            db.execute("INSERT INTO controller_settings(key,value) VALUES('proxy_pool_size',?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(pool_size),))
+            if action == 'resize':
+                event(db, 'controller_config',
+                      f'单节点代理池容量已设置为 {pool_size:,}；每次最多提取 1,000 条并在节点本地补齐')
+            else:
+                event(db, 'controller_config',
+                      f'代理 API 配置已更新，当前 {len(parts)} 个，按节点轮询分配'
+                      if parts else '代理 API 配置已清空')
         return self.settings()
 
     def request_devices(self, node_id, capacity):
@@ -1218,6 +1235,7 @@ class Controller:
                     'device_rotate_after': self.settings().get('device_rotate_after', 0),
                     'device_auto_rotate': bool(self.settings().get('device_auto_rotate')),
                     'proxy_ttl': int(self.settings().get('proxy_ttl') or 50),
+                    'proxy_pool_size': int(self.settings().get('proxy_pool_size') or 1000),
                     'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds,
                     'update': update,
                     'server_time': now,
@@ -1281,6 +1299,7 @@ class Controller:
                 config = self.proxy_for_node(node)
                 settings = self.settings()
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
+                               proxy_pool_size=int(settings.get('proxy_pool_size') or 1000),
                                origin=settings.get('origin', 'https://new.ani.sidestore.io'),
                                _proxy_debug=bool(settings.get('proxy_debug')))
             return payload

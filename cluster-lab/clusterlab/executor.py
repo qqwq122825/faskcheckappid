@@ -23,7 +23,9 @@ from .common import atomic_json
 
 PROXY_TTL_SECONDS = 50.0
 PROXY_FETCH_LIMIT = 1000
-PROXY_POOL_LIMIT = 1000
+PROXY_POOL_LIMIT = 10000
+PROXY_FAILURE_LIMIT = 3
+PROXY_ACQUIRE_WAIT_SECONDS = 5.0
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
 PROXY_EXIT_IP_TIMEOUT = 4.0
@@ -298,11 +300,13 @@ class NodeProxyPool:
         self.reusable = context.Queue(maxsize=self.target)
         self.fresh_count = context.Value('i', 0)
         self.reusable_count = context.Value('i', 0)
+        self.in_use_count = context.Value('i', 0)
         self.fetched = context.Value('q', 0)
         self.fetch_calls = context.Value('q', 0)
         self.fetch_errors = context.Value('q', 0)
         self.reused = context.Value('q', 0)
         self.discarded = context.Value('q', 0)
+        self.soft_failures = context.Value('q', 0)
         self.waits = context.Value('q', 0)
         self.duplicates = context.Value('q', 0)
         self.refreshed = context.Value('q', 0)
@@ -352,9 +356,20 @@ class NodeProxyPool:
             if key in self._recent_exits:
                 self._add(self.duplicates, 1)
                 continue
+            # The two physical queues share one logical capacity. Without this
+            # guard, a full reusable queue plus scheduled fresh rotation could
+            # silently grow a target=10,000 pool toward 20,000 entries.
+            if self.snapshot()['known'] >= self.target:
+                oldest = self._take(self.fresh, self.fresh_count, 0.02)
+                if oldest is None:
+                    oldest = self._take(self.reusable, self.reusable_count, 0.02)
+                if oldest is None:  # every known exit is currently leased
+                    continue
+                self._add(self.discarded, 1)
+                self._add(self.refreshed, 1)
             self._add(self.fresh_count, 1)
             try:
-                self.fresh.put_nowait((str(value), expires_at, 0))
+                self.fresh.put_nowait((str(value), expires_at, 0, 0))
             except queue.Full:
                 self._add(self.fresh_count, -1)
                 # Keep acquiring independent of the API: rotate one old queued
@@ -365,7 +380,7 @@ class NodeProxyPool:
                     self._add(self.refreshed, 1)
                 self._add(self.fresh_count, 1)
                 try:
-                    self.fresh.put_nowait((str(value), expires_at, 0))
+                    self.fresh.put_nowait((str(value), expires_at, 0, 0))
                 except queue.Full:
                     self._add(self.fresh_count, -1)
                     continue
@@ -402,12 +417,15 @@ class NodeProxyPool:
         if lease is not None:
             if self._value(self.fresh_count) < self.low_water:
                 self.refill.set()
+            self._add(self.in_use_count, 1)
             return lease
         self.refill.set()
         lease = self._take(self.reusable, self.reusable_count)
         if lease is not None:
             self._add(self.reused, 1)
-            return (lease[0], lease[1], int(lease[2]) + 1)
+            self._add(self.in_use_count, 1)
+            return (lease[0], lease[1], int(lease[2]) + 1,
+                    int(lease[3]) if len(lease) > 3 else 0)
         # Queue feeder visibility can lag its published count. Only when both
         # queues are empty do we allow the caller's bounded resource wait.
         self._add(self.waits, 1)
@@ -416,22 +434,37 @@ class NodeProxyPool:
             lease = self._take(self.fresh, self.fresh_count,
                                min(0.01, max(0.0, deadline - time.monotonic())))
             if lease is not None:
+                self._add(self.in_use_count, 1)
                 return lease
             lease = self._take(self.reusable, self.reusable_count)
             if lease is not None:
                 self._add(self.reused, 1)
-                return (lease[0], lease[1], int(lease[2]) + 1)
+                self._add(self.in_use_count, 1)
+                return (lease[0], lease[1], int(lease[2]) + 1,
+                        int(lease[3]) if len(lease) > 3 else 0)
         return None
 
     def release(self, lease, healthy):
         if lease is None:
             return
-        if not healthy or float(lease[1]) <= time.monotonic():
+        self._add(self.in_use_count, -1)
+        if float(lease[1]) <= time.monotonic():
             self._add(self.discarded, 1)
             return
+        failures = int(lease[3]) if len(lease) > 3 else 0
+        if not healthy:
+            failures += 1
+            self._add(self.soft_failures, 1)
+            if failures >= PROXY_FAILURE_LIMIT:
+                self._add(self.discarded, 1)
+                self.refill.set()
+                return
+        else:
+            failures = 0
+        reusable = (lease[0], lease[1], int(lease[2]), failures)
         self._add(self.reusable_count, 1)
         try:
-            self.reusable.put_nowait(lease)
+            self.reusable.put_nowait(reusable)
         except queue.Full:
             self._add(self.reusable_count, -1)
             self._add(self.discarded, 1)
@@ -471,8 +504,12 @@ class NodeProxyPool:
     def snapshot(self):
         with self.last_fetch_ms.get_lock():
             last_fetch_ms = self.last_fetch_ms.value
+        available = self._value(self.fresh_count) + self._value(self.reusable_count)
+        in_use = self._value(self.in_use_count)
         return {
-            'available': self._value(self.fresh_count) + self._value(self.reusable_count),
+            'available': available,
+            'in_use': in_use,
+            'known': available + in_use,
             'fresh': self._value(self.fresh_count),
             'reusable': self._value(self.reusable_count),
             'target': self.target,
@@ -482,6 +519,8 @@ class NodeProxyPool:
             'fetch_errors': self._value(self.fetch_errors),
             'reused': self._value(self.reused),
             'discarded': self._value(self.discarded),
+            'soft_failures': self._value(self.soft_failures),
+            'failure_limit': PROXY_FAILURE_LIMIT,
             'waits': self._value(self.waits),
             'duplicates': self._value(self.duplicates),
             'refreshed': self._value(self.refreshed),
@@ -522,10 +561,13 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
             if stop.wait(max(0.0, next_tick - time.monotonic())):
                 return
             pool.refill.clear()
-            needed = pool.target - pool.snapshot()['fresh']
+            # Busy leases are still valid inventory and will return to the
+            # reusable queue. Counting only queued exits made 1,000 workers
+            # look like 1,000 missing proxies and triggered needless refills.
+            needed = max(0, pool.target - pool.snapshot()['known'])
             # Replace one TTL-window of inventory gradually instead of letting
             # the initial batch expire at once. The supplier API accepts at
-            # most 1,000 exits per request, which is also the node pool limit.
+            # most 1,000 exits per call; larger node pools fill incrementally.
             refresh_batch = max(1, math.ceil(pool.target / pool.ttl))
             count = min(PROXY_FETCH_LIMIT, max(refresh_batch, needed))
             started = time.monotonic()
@@ -684,10 +726,11 @@ def execute_unit_group(directory, descriptor, stop):
     supplier_thread = None
     if descriptor.get('mode') == 'auth' and descriptor.get('proxy_api'):
         concurrency = process_count * max(1, int(descriptor.get('threads') or 1))
+        configured_target = max(1, int(descriptor.get('proxy_pool_size') or concurrency))
         proxy_pool = NodeProxyPool(
             context, concurrency,
             ttl=float(descriptor.get('proxy_ttl') or PROXY_TTL_SECONDS),
-            target=min(PROXY_POOL_LIMIT, max(1, min(rows, concurrency))))
+            target=min(PROXY_POOL_LIMIT, max(1, min(rows, configured_target))))
         supplier_stop = threading.Event()
         supplier_thread = threading.Thread(
             target=proxy_supplier_loop,
@@ -1098,7 +1141,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     def proxy_for(index):
         if proxy_pool is not None:
-            lease = proxy_pool.acquire(wait=1.0)
+            lease = proxy_pool.acquire(wait=PROXY_ACQUIRE_WAIT_SECONDS)
             return (lease[0] if lease is not None else None), lease
         if not proxies:
             return proxy, None
@@ -1199,7 +1242,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 result_http = int(result.get('http'))
             except (TypeError, ValueError):
                 result_http = None
-            healthy_exit = result_http == 200
+            # Any real upstream HTTP response proves that the proxy tunnel is
+            # alive. In particular, 503 is a service-side retry signal, not a
+            # reason to destroy the exit. HTTP 0 and proxy-auth 407 count as
+            # transport failures; the pool retires them only after 3 strikes.
+            healthy_exit = result_http not in (None, 0, 407)
             if proxy_pool is not None:
                 proxy_pool.release(lease, healthy=healthy_exit)
             if debug_enabled and transport_failed:
@@ -1221,7 +1268,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     detail=_proxy_debug_detail(result.get('detail')),
                     retryable=transport_failed,
                     lease_reused=bool(lease and int(lease[2]) > 0),
-                    release='reusable' if healthy_exit else 'discarded',
+                    release='reusable' if healthy_exit else 'failure_recorded',
                     pool_before=acquire_before, pool_after=_proxy_pool_snapshot(proxy_pool))
             if transport_failed:
                 had_timeout = True
