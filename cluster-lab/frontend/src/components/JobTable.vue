@@ -23,7 +23,7 @@ async function remove(job: any) {
 }
 </script>
 <template>
-  <el-table :data="jobs" stripe class="job-table" empty-text="暂无任务，点击右上角创建任务">
+  <el-table :data="jobs" stripe class="job-table desktop-job-table" empty-text="暂无任务，点击右上角创建任务">
     <el-table-column label="任务名称" min-width="250"><template #default="{ row }"><el-button link type="primary" class="job-link" @click="router.push('/jobs/' + row.id)">{{ row.name }}</el-button><div class="muted table-meta">{{ date(row.created) }} · {{ row.mode === 'auth' ? '账号校验' : '数据任务' }}</div></template></el-table-column>
     <el-table-column label="状态" width="185"><template #default="{ row }"><StatusBadge :status="row.status" :unit-counts="row.unit_counts" /><div v-if="row.queue_position" class="muted table-meta">等待第 {{ row.queue_position }} 位</div></template></el-table-column>
     <el-table-column label="任务进度" min-width="220"><template #default="{ row }"><div class="progress-label">{{ fmt(Math.max(row.processed || 0, row.confirmed || 0)) }} / {{ fmt(row.rows) }} 条已处理</div><el-progress :percentage="Number(percent(row).toFixed(1))" :stroke-width="7" /></template></el-table-column>
@@ -34,4 +34,18 @@ async function remove(job: any) {
       </el-tooltip>
     </template></el-table-column>
   </el-table>
+  <div class="mobile-job-list">
+    <div v-if="!jobs.length" class="mobile-job-empty">暂无任务，点击上方按钮创建任务</div>
+    <article v-for="row in jobs" :key="row.id" class="mobile-job-card">
+      <div class="mobile-job-head">
+        <div class="mobile-job-name"><el-button link type="primary" class="job-link" @click="router.push('/jobs/' + row.id)">{{ row.name }}</el-button><div class="muted table-meta">{{ date(row.created) }} · {{ row.mode === 'auth' ? '账号校验' : '数据任务' }}</div></div>
+        <div class="mobile-job-status"><StatusBadge :status="row.status" :unit-counts="row.unit_counts" /><span v-if="row.queue_position" class="muted">等待第 {{ row.queue_position }} 位</span></div>
+      </div>
+      <div class="mobile-job-progress"><div class="progress-label">{{ fmt(Math.max(row.processed || 0, row.confirmed || 0)) }} / {{ fmt(row.rows) }} 条已处理</div><el-progress :percentage="Number(percent(row).toFixed(1))" :stroke-width="7" /></div>
+      <div class="mobile-job-actions">
+        <el-button type="primary" plain @click="router.push('/jobs/' + row.id)">查看详情</el-button>
+        <el-tooltip :disabled="row.status !== 'preparing'" content="文件准备完成后可删除" placement="top"><span><el-button class="mobile-delete-button" :icon="Delete" aria-label="删除任务" :disabled="row.status === 'preparing'" @click="remove(row)" /></span></el-tooltip>
+      </div>
+    </article>
+  </div>
 </template>

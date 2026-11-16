@@ -242,3 +242,19 @@ test('Task summary omits the in-flight-record card and keeps its other ten metri
     assert.ok(feedback.includes(`label: '${label}'`))
   }
 })
+
+test('Phone layout uses a bottom navigation and task cards without horizontal overflow', () => {
+  const app = source('src/App.vue')
+  const table = source('src/components/JobTable.vue')
+  const styles = source('src/style.css')
+  assert.match(app, /class="mobile-topbar-title"/)
+  assert.match(app, /class="sign-out-button" aria-label="退出"/)
+  assert.match(table, /class="mobile-job-list"/)
+  assert.match(table, /class="mobile-job-card"/)
+  assert.match(styles, /@media\(max-width:700px\)/)
+  assert.match(styles, /\.sidebar\{position:fixed;[^}]*right:0;bottom:0;left:0/)
+  assert.match(styles, /padding-bottom:calc\(72px \+ env\(safe-area-inset-bottom\)\)/)
+  assert.match(styles, /\.desktop-job-table,\.job-table\{display:none\}/)
+  assert.match(styles, /\.mobile-job-list\{display:grid/)
+  assert.match(styles, /overflow-x:hidden/)
+})
