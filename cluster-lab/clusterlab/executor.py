@@ -1062,8 +1062,9 @@ def execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
 
 def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     from collections import Counter
+    import heapq
     import sys
 
     directory = Path(directory)
@@ -1098,6 +1099,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         slot_ids = list(range(1, capacity + 1))
     timeout = float(descriptor.get('timeout') or 20)
     retries = max(0, int(descriptor.get('retries') or 0))
+    retry_delay = max(0.0, float(descriptor.get('_retry_delay',
+                                                PROXY_RETRY_DELAY_SECONDS)))
     workers = max(1, int(descriptor.get('threads') or 1))
     debug_enabled = _proxy_debug_enabled(descriptor)
     debug_path = (descriptor.get('_proxy_debug_path') or
@@ -1231,25 +1234,28 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         # 不再因某个 Apple ec 错误码而猜测账号已失效。
         return 'undetermined' if bucket in ('undetermined', 'unknown') else bucket
 
-    def one(row, index, line):
+    identity_default = object()
+
+    def one(row, index, line, start_attempt=0, account_started=None,
+            identity_override=identity_default, previous_proxy=None):
         if stop.is_set():
             return row, line, {'status': 'unknown', 'kind': 'stopped'}
         account, password = _split_account(line)
-        account_started = time.time()
+        account_started = time.time() if account_started is None else account_started
         slot_id, account_prefix = _slot_for_account(account, slot_ids)
         # 空白行仍是输入文件中的一条记录，但不应触发真实认证请求。
         # 作为未判断结果落盘，保证小包按描述的 rows 正常完成。
         if not line.strip():
             return row, line, {'status': 'undetermined', 'kind': 'blank_record',
                                'slot': slot_id, 'device_key': account_prefix, 'elapsed': 0}
-        identity = identities.get(slot_id)
+        identity = (identities.get(slot_id) if identity_override is identity_default
+                    else identity_override)
         result = None
-        previous_proxy = {'endpoint': '', 'host': '', 'port': None}
-        had_timeout = False
+        previous_proxy = previous_proxy or {'endpoint': '', 'host': '', 'port': None}
         # 用户设置的重试次数仍是唯一上限；节点池只负责每次重试换出口，
         # 不会在“0 次重试”时暗中多发请求。
         attempt_limit = retries + 1
-        for attempt in range(attempt_limit):
+        for attempt in range(start_attempt, attempt_limit):
             acquire_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
             acquire_started = time.monotonic() if debug_enabled else None
             account_proxy, lease = proxy_for(index + attempt)
@@ -1269,7 +1275,6 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             if descriptor.get('proxy_api') and not account_proxy:
                 result = {'status': 'error', 'kind': 'proxy', 'http': 0,
                           'stage': 'init', 'detail': '代理池暂时无可用出口'}
-                had_timeout = True
                 if debug_enabled:
                     _write_proxy_debug(
                         debug_path, 'pool_empty', row=row, slot=slot_id,
@@ -1280,10 +1285,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 if attempt + 1 >= attempt_limit:
                     result['_proxy_retries'] = attempt
                     break
-                if stop.wait(PROXY_RETRY_DELAY_SECONDS):
-                    result['_proxy_retries'] = attempt
-                    break
-                continue
+                result.update(_retry_at=time.monotonic() + retry_delay,
+                              _retry_attempt=attempt + 1,
+                              _retry_started=account_started,
+                              _retry_identity=identity,
+                              _retry_previous=current_proxy)
+                return row, line, result
             request_started = time.monotonic() if debug_enabled else None
             try:
                 if identity is None:
@@ -1348,8 +1355,6 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     release=('discarded' if immediate_discard else
                              ('reusable' if healthy_exit else 'failure_recorded')),
                     pool_before=acquire_before, pool_after=_proxy_pool_snapshot(proxy_pool))
-            if transport_failed:
-                had_timeout = True
             try:
                 apple_ec = int(result.get('apple_ec'))
             except (TypeError, ValueError):
@@ -1362,12 +1367,14 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             if not transport_failed or attempt + 1 >= attempt_limit:
                 result['_proxy_retries'] = attempt
                 break
-            # Do not occupy another exit during the backoff.  acquire() reads
-            # only the fresh/reusable queues, whose entries are not leased by
-            # any other worker.
-            if stop.wait(PROXY_RETRY_DELAY_SECONDS):
-                result['_proxy_retries'] = attempt
-                break
+            # Return this account to the coordinator's delayed retry heap.
+            # No worker thread sleeps during the five-second backoff.
+            result.update(_retry_at=time.monotonic() + retry_delay,
+                          _retry_attempt=attempt + 1,
+                          _retry_started=account_started,
+                          _retry_identity=identity,
+                          _retry_previous=current_proxy)
+            return row, line, result
         if result is None:
             result = {'status': 'error', 'kind': 'proxy', 'http': 0,
                       'stage': 'init', 'detail': '代理池未返回结果', '_proxy_retries': 0}
@@ -1392,26 +1399,61 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         output_path.chmod(0o600)
         first_row = int(descriptor.get('first_row') or 1)
         with ThreadPoolExecutor(max_workers=workers) as workers_pool:
-            # 只保留 2×线程数的在途 Future；分片上限调到 10 万时也不会
-            # 同时构造 10 万个 Future 和 10 万份账号对象。
-            pending = deque()
+            # 普通账号持续填充线程；需要重试的账号进入时间堆，延迟到期
+            # 后再提交，不占用工作线程，也不会阻塞后面的账号。
+            pending = set()
+            ready = deque()
+            delayed = []
+            retry_order = 0
             index = 0
             exhausted = False
-            while not exhausted or pending:
+            while not exhausted or pending or ready or delayed:
                 if stop_flag.is_set():
                     raise InterruptedError('租约失效或节点关闭')
-                while not exhausted and len(pending) < workers * 2:
-                    line = source.readline()
-                    if line == '':
-                        exhausted = True
+                now = time.monotonic()
+                while delayed and delayed[0][0] <= now:
+                    _at, _order, work = heapq.heappop(delayed)
+                    ready.append(work)
+                while len(pending) < workers * 2:
+                    if ready:
+                        work = ready.popleft()
+                    elif not exhausted:
+                        line = source.readline()
+                        if line == '':
+                            exhausted = True
+                            continue
+                        line = line.rstrip('\r\n')
+                        work = (first_row + index, index, line)
+                        index += 1
+                    else:
                         break
-                    line = line.rstrip('\r\n')
-                    pending.append(workers_pool.submit(one, first_row + index, index, line))
-                    index += 1
+                    pending.add(workers_pool.submit(one, *work))
                 if not pending:
+                    if delayed:
+                        stop_flag.wait(min(0.05, max(0.0, delayed[0][0] -
+                                                     time.monotonic())))
                     continue
-                future = pending.popleft()
+                wait_timeout = 0.25
+                if delayed:
+                    wait_timeout = min(wait_timeout, max(0.0, delayed[0][0] -
+                                                         time.monotonic()))
+                finished, _unfinished = wait(pending, timeout=wait_timeout,
+                                             return_when=FIRST_COMPLETED)
+                if not finished:
+                    continue
+                future = finished.pop()
+                pending.remove(future)
                 row, line, result = future.result()
+                retry_at = result.pop('_retry_at', None)
+                if retry_at is not None:
+                    work = (row, row - first_row, line,
+                            int(result.pop('_retry_attempt')),
+                            result.pop('_retry_started'),
+                            result.pop('_retry_identity'),
+                            result.pop('_retry_previous'))
+                    retry_order += 1
+                    heapq.heappush(delayed, (float(retry_at), retry_order, work))
+                    continue
                 status = auth_result_bucket(result)
                 counters[status] += 1
                 processed += 1

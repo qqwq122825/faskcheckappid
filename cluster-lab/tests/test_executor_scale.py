@@ -344,13 +344,92 @@ class ExecutorScaleTests(unittest.TestCase):
         finally:
             pool.close()
 
+    def test_two_nodes_each_request_1000_then_reuse_sparse_provider_stock(self):
+        context = mp.get_context('spawn')
+        observed = []
+        for node in (1, 2):
+            pool = NodeProxyPool(context, concurrency=1000, ttl=50, target=1000)
+            stop = threading.Event()
+            calls = []
+
+            def fetcher(_url, count, scheme=None, node=node):
+                calls.append(count)
+                return [f'{scheme}://node-{node}-only-exit:9000']
+
+            thread = threading.Thread(
+                target=proxy_supplier_loop,
+                args=(pool, f'http://proxy.test/node-{node}', 'socks5h', stop, fetcher))
+            thread.start()
+            self.assertTrue(pool.ready.wait(1))
+            stop.set()
+            pool.refill.set()
+            thread.join(1)
+            try:
+                first = pool.acquire(wait=.5)
+                pool.release(first, healthy=True)
+                reused = pool.acquire(wait=.5)
+                observed.append((calls[0], first[0], reused[0], reused[2]))
+                pool.release(reused, healthy=True)
+            finally:
+                pool.close()
+
+        self.assertEqual(observed, [
+            (1000, 'socks5h://node-1-only-exit:9000',
+             'socks5h://node-1-only-exit:9000', 1),
+            (1000, 'socks5h://node-2-only-exit:9000',
+             'socks5h://node-2-only-exit:9000', 1),
+        ])
+
+    def test_retry_delay_queue_frees_single_worker_for_next_account(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text(
+                'first----password\nsecond----password\n', encoding='utf-8')
+            descriptor = {'rows': 2, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
+                          'proxy_api': 'http://proxy.invalid/list', '_retry_delay': .05}
+            shared = ScriptedProxyPool([
+                'socks5h://bootstrap', 'socks5h://bad-first',
+                'socks5h://second-account', 'socks5h://first-retry'])
+            checked = []
+            first_calls = 0
+
+            def check(account, _password, proxy, **_kwargs):
+                nonlocal first_calls
+                checked.append((account, proxy))
+                if account == 'first' and first_calls == 0:
+                    first_calls += 1
+                    return {'status': 'error', 'kind': 'network', 'http': 0}
+                return {'status': 'valid', 'kind': 'valid', 'http': 200}
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool, check, lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+
+            records = [json.loads(line) for line in
+                       (root / 'results.jsonl').read_text().splitlines()]
+            by_account = {record['account']: record for record in records}
+            self.assertEqual(checked, [
+                ('first', 'socks5h://bad-first'),
+                ('second', 'socks5h://second-account'),
+                ('first', 'socks5h://first-retry'),
+            ])
+            self.assertEqual(by_account['first']['attempts'], 1)
+            self.assertEqual(by_account['second']['attempts'], 0)
+            self.assertEqual(shared.discards, ['socks5h://bad-first'])
+
     def test_auth_unit_rotates_proxy_after_http_zero_and_reuses_http_200(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'input.part').write_text('account----password\n', encoding='utf-8')
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
-                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1}
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
+                          '_retry_delay': 0}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://dead-exit', 'socks5h://good-exit'])
             stop = RecordingStop()
@@ -378,7 +457,7 @@ class ExecutorScaleTests(unittest.TestCase):
                 ('socks5h://good-exit', True),
             ])
             self.assertEqual(shared.discards, ['socks5h://dead-exit'])
-            self.assertEqual(stop.waits, [5.0])
+            self.assertEqual(stop.waits, [])
 
     def test_auth_unit_discards_http_503_waits_then_rotates_proxy(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -387,7 +466,7 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
-                          'proxy_api': 'http://proxy.invalid/list'}
+                          'proxy_api': 'http://proxy.invalid/list', '_retry_delay': 0}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://service-busy', 'socks5h://good-exit'])
             stop = RecordingStop()
@@ -416,7 +495,7 @@ class ExecutorScaleTests(unittest.TestCase):
                 ('socks5h://good-exit', True),
             ])
             self.assertEqual(shared.discards, ['socks5h://service-busy'])
-            self.assertEqual(stop.waits, [5.0])
+            self.assertEqual(stop.waits, [])
 
     def test_auth_unit_retries_22421_with_fresh_identity_and_keeps_apple_reason(self):
         class RefreshingPool(FakePool):
@@ -431,7 +510,8 @@ class ExecutorScaleTests(unittest.TestCase):
             (root / 'input.part').write_text('account----password\n', encoding='utf-8')
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
-                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1}
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
+                          '_retry_delay': 0}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://first-exit', 'socks5h://second-exit'])
             stop = RecordingStop()
@@ -468,7 +548,7 @@ class ExecutorScaleTests(unittest.TestCase):
                 ('socks5h://second-exit', True),
             ])
             self.assertEqual(shared.discards, [])
-            self.assertEqual(stop.waits, [5.0])
+            self.assertEqual(stop.waits, [])
 
     def test_auth_unit_uses_configured_two_retries_for_apple_try_again_later(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -476,7 +556,8 @@ class ExecutorScaleTests(unittest.TestCase):
             (root / 'input.part').write_text('account----password\n', encoding='utf-8')
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
-                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 2}
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 2,
+                          '_retry_delay': 0}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://first-exit',
                 'socks5h://second-exit', 'socks5h://third-exit'])
@@ -505,7 +586,7 @@ class ExecutorScaleTests(unittest.TestCase):
                 'socks5h://first-exit', 'socks5h://second-exit', 'socks5h://third-exit'])
             self.assertEqual((record['status'], record['attempts']), ('timeout', 2))
             self.assertEqual(record['reason'], reason)
-            self.assertEqual(stop.waits, [5.0, 5.0])
+            self.assertEqual(stop.waits, [])
             self.assertEqual(shared.discards, [
                 'socks5h://first-exit', 'socks5h://second-exit', 'socks5h://third-exit'])
 
@@ -520,7 +601,8 @@ class ExecutorScaleTests(unittest.TestCase):
                 (root / 'input.part').write_text('account----password\n', encoding='utf-8')
                 descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                               'device_capacity': 1, 'device_root': str(root / 'devices'),
-                              'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1}
+                              'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
+                              '_retry_delay': 0}
                 shared = ScriptedProxyPool([
                     'socks5h://bootstrap', 'socks5h://first-exit', 'socks5h://second-exit'])
                 stop = RecordingStop()
@@ -543,7 +625,7 @@ class ExecutorScaleTests(unittest.TestCase):
                 self.assertEqual(checked, ['socks5h://first-exit', 'socks5h://second-exit'])
                 self.assertEqual((record['status'], record['attempts']), ('timeout', 1))
                 self.assertEqual(record['reason'], reason)
-                self.assertEqual(stop.waits, [5.0])
+                self.assertEqual(stop.waits, [])
                 self.assertEqual(shared.discards,
                                  ['socks5h://first-exit', 'socks5h://second-exit'])
 
@@ -625,7 +707,7 @@ class ExecutorScaleTests(unittest.TestCase):
                  patch('fastcheck.workers.device_profile',
                        return_value={'client_info': 'test', 'user_agent': 'test'}), \
                  patch('clusterlab.executor._bump_usage'), \
-                 patch('clusterlab.executor.time.monotonic', side_effect=[10.0, 10.3]), \
+                 patch('clusterlab.executor.time.monotonic', side_effect=[10.0, 10.0, 10.3]), \
                  patch('clusterlab.executor.atomic_json', wraps=atomic_json) as writes:
                 _execute_auth_unit(root, descriptor, threading.Event())
 
