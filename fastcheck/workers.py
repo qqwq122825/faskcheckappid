@@ -26,10 +26,10 @@ _SESSION_LIMIT = 6
 
 
 # 每台设备报一个不同的 Mac 型号：同一批池子里全是 MacBookPro13,3 本身就是特征。
-# 下面这些型号都能跑 macOS 10.12.6（16G29 / Darwin 16.7.0），所以型号换、系统版本
+# 下面这些型号都能跑 macOS 10.13.6（17G65 / Darwin 17.7.0），所以型号换、系统版本
 # 不换，组合仍然自洽；Apple 那边不会出现"2016 款装 macOS 14"这种矛盾。
-_OS = 'Mac OS X;10.12.6;16G29'
-_UA = 'akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0'
+_OS = 'Mac OS X;10.13.6;17G65'
+_UA = 'akd/1.0 CFNetwork/902.2 Darwin/17.7.0'
 _KIT = '<com.apple.AuthKit/1 (com.apple.akd/1.0)>'
 DEVICE_MODELS = (
     'MacBookPro11,1', 'MacBookPro11,2', 'MacBookPro11,3', 'MacBookPro11,4', 'MacBookPro11,5',
