@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (NodeProxyPool, _device_id_label, _execute_auth_unit, _partition_device_slots,
+from clusterlab.executor import (NodeProxyPool, _auth_process_limit, _auth_worker_limit, _device_id_label, _execute_auth_unit, _partition_device_slots,
                                  _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration)
@@ -91,6 +91,13 @@ def use_shared_proxy_pool(pool, output):
 
 
 class ExecutorScaleTests(unittest.TestCase):
+    def test_native_srp_keeps_configured_process_and_thread_capacity(self):
+        self.assertEqual(_auth_process_limit(10, rows=1000, cpu_count=4), 10)
+        self.assertEqual(_auth_process_limit(10, rows=1000, cpu_count=16), 10)
+        self.assertEqual(_auth_worker_limit(100, node_processes=10, cpu_count=4), 100)
+        self.assertEqual(_auth_worker_limit(100, node_processes=10, cpu_count=2), 100)
+        self.assertEqual(_auth_worker_limit(8, node_processes=4, cpu_count=4), 8)
+
     def test_device_id_uses_short_base64_label(self):
         self.assertEqual(_device_id_label('device-1'), 'B64:ZGV2aWNl')
         self.assertEqual(_device_id_label(''), '')

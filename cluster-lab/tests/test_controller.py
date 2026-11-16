@@ -26,6 +26,9 @@ class ControllerTests(unittest.TestCase):
         self.service.close()
         self.temp.cleanup()
 
+    def test_default_lease_allows_cpu_bound_heartbeat_jitter(self):
+        self.assertEqual(self.service.lease_seconds, 120)
+
     def test_new_node_defaults_to_thirty_device_registrations(self):
         node = self.service.add_node('auto-devices', 10, 100)
         with self.service.db.connect() as db:

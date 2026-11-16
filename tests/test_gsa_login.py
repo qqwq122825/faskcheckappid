@@ -100,6 +100,30 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(result["two_factor_status"], "unknown")
                 self.assertEqual(len(server.requests), 2)
 
+    def test_native_modular_power_matches_python_exactly(self):
+        class Native:
+            calls = 0
+
+            @classmethod
+            def powmod(cls, base, exponent, modulus):
+                cls.calls += 1
+                return pow(base, exponent, modulus)
+
+        private = b"fixed-private-srp-value-000000"[:32]
+        challenge = integer(srp_auth.N - 3)
+        with patch.object(srp_auth.secrets, "token_bytes", return_value=private), \
+             patch.object(srp_auth, "_gmpy2", None):
+            python_client = srp_auth.GrandSlamSRPClient("owned@example.invalid", "synthetic-password")
+            python_m1 = python_client.process_challenge(b"fixed-salt", challenge, 1000, "s2k")
+        with patch.object(srp_auth.secrets, "token_bytes", return_value=private), \
+             patch.object(srp_auth, "_gmpy2", Native):
+            native_client = srp_auth.GrandSlamSRPClient("owned@example.invalid", "synthetic-password")
+            native_m1 = native_client.process_challenge(b"fixed-salt", challenge, 1000, "s2k")
+        self.assertGreaterEqual(Native.calls, 3)
+        self.assertEqual(native_client.A_bytes, python_client.A_bytes)
+        self.assertEqual(native_m1, python_m1)
+        self.assertEqual(native_client.M2_expected, python_client.M2_expected)
+
     def test_missing_and_tampered_server_proofs_are_rejected(self):
         for proof in ("missing", "tampered"):
             with self.subTest(proof=proof):

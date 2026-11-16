@@ -709,6 +709,15 @@ def execute_unit(directory, descriptor, stop):
 
 
 def _group_child(directory, descriptor, stop, proxy_pool=None):
+    # 认证子进程属于吞吐型后台工作。降低它相对节点主进程的调度优先级，
+    # 避免 SRP/PBKDF2/TLS 高负载时心跳线程拿不到 CPU 而误丢租约。
+    worker_nice = 0
+    if mp.parent_process() is not None:
+        try:
+            worker_nice = os.nice(5)
+        except (AttributeError, OSError):
+            worker_nice = 0
+    descriptor['_worker_nice'] = worker_nice
     if proxy_pool is not None:
         # Proxy stock is expendable; result files are independently flushed.
         # A child must not wait at exit for its reusable-queue feeder to drain
@@ -720,6 +729,21 @@ def _group_child(directory, descriptor, stop, proxy_pool=None):
         runner(directory, descriptor, stop, proxy_pool=proxy_pool)
     else:
         runner(directory, descriptor, stop)
+
+
+def _auth_worker_limit(configured, node_processes=1, cpu_count=None):
+    """Retain the operator's configured network concurrency."""
+    del node_processes, cpu_count
+    configured = max(1, int(configured or 1))
+    return configured
+
+
+def _auth_process_limit(configured, rows, cpu_count=None):
+    """Retain the operator's configured process concurrency."""
+    del cpu_count
+    configured = max(1, int(configured or 1))
+    rows = max(1, int(rows or 1))
+    return min(configured, rows)
 
 
 def execute_unit_group(directory, descriptor, stop):
@@ -749,13 +773,23 @@ def execute_unit_group(directory, descriptor, stop):
     started = time.time()
     rows = max(0, int(descriptor.get('rows') or 0))
     process_limit = max(1, int(descriptor.get('processes') or 1))
+    node_cpu_count = max(1, int(os.cpu_count() or 1))
     process_count = min(process_limit, max(1, rows))
+    if descriptor.get('mode') == 'auth':
+        process_count = _auth_process_limit(process_limit, rows, node_cpu_count)
+    descriptor['_node_process_count'] = process_count
+    descriptor['_node_cpu_count'] = node_cpu_count
+    active_threads_per_process = (
+        _auth_worker_limit(descriptor.get('threads'), process_count,
+                           descriptor['_node_cpu_count'])
+        if descriptor.get('mode') == 'auth'
+        else max(1, int(descriptor.get('threads') or 1)))
     context = mp.get_context('spawn')
     proxy_pool = None
     supplier_stop = None
     supplier_thread = None
     if descriptor.get('mode') == 'auth' and descriptor.get('proxy_api'):
-        concurrency = process_count * max(1, int(descriptor.get('threads') or 1))
+        concurrency = process_count * active_threads_per_process
         configured_target = max(1, int(descriptor.get('proxy_pool_size') or concurrency))
         proxy_pool = NodeProxyPool(
             context, concurrency,
@@ -795,7 +829,9 @@ def execute_unit_group(directory, descriptor, stop):
         except (OSError, ValueError):
             pass
         read_progress.update(workers=0, worker_limit=process_limit,
-                             threads_per_process=int(descriptor.get('threads') or 1))
+                             active_process_limit=process_count,
+                             threads_per_process=int(descriptor.get('threads') or 1),
+                             active_threads_per_process=active_threads_per_process)
         if proxy_pool is not None:
             read_progress['proxy_pool'] = proxy_pool.snapshot()
         atomic_json(directory / 'progress.json', read_progress)
@@ -881,7 +917,9 @@ def execute_unit_group(directory, descriptor, stop):
                 atomic_json(directory / 'progress.json',
                             {'processed': processed, 'started': started,
                              'workers': active, 'worker_limit': process_count,
+                             'configured_process_limit': process_limit,
                              'threads_per_process': int(descriptor.get('threads') or 1),
+                             'active_threads_per_process': active_threads_per_process,
                              'counts': live_counts,
                              **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
                 last_write = now
@@ -922,13 +960,17 @@ def execute_unit_group(directory, descriptor, stop):
         atomic_json(directory / 'progress.json',
                     {'processed': processed, 'started': started, 'workers': 0,
                      'worker_limit': process_count,
+                     'configured_process_limit': process_limit,
                      'threads_per_process': int(descriptor.get('threads') or 1),
+                     'active_threads_per_process': active_threads_per_process,
                      'counts': merged_counts,
                      **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
         atomic_json(directory / 'done.json',
                     {'ok': True, 'processed': processed, 'counts': merged_counts,
                      'checksum': output_digest.hexdigest(),
                      'workers': process_count, 'elapsed': time.time() - started,
+                     'configured_process_limit': process_limit,
+                     'active_threads_per_process': active_threads_per_process,
                      **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
     except Exception as exc:                                      # noqa: BLE001
         for process, child_stop, _ in children:
@@ -950,7 +992,9 @@ def execute_unit_group(directory, descriptor, stop):
         atomic_json(directory / 'progress.json',
                     {'processed': processed, 'started': started, 'workers': 0,
                      'worker_limit': process_count,
+                     'configured_process_limit': process_limit,
                      'threads_per_process': int(descriptor.get('threads') or 1),
+                     'active_threads_per_process': active_threads_per_process,
                      'counts': live_counts,
                      **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
         atomic_json(directory / 'done.json',
@@ -1101,7 +1145,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     retries = max(0, int(descriptor.get('retries') or 0))
     retry_delay = max(0.0, float(descriptor.get('_retry_delay',
                                                 PROXY_RETRY_DELAY_SECONDS)))
-    workers = max(1, int(descriptor.get('threads') or 1))
+    configured_workers = max(1, int(descriptor.get('threads') or 1))
+    workers = _auth_worker_limit(
+        configured_workers, descriptor.get('_node_process_count') or 1,
+        descriptor.get('_node_cpu_count'))
     debug_enabled = _proxy_debug_enabled(descriptor)
     debug_path = (descriptor.get('_proxy_debug_path') or
                   str(directory / 'proxy-debug.jsonl')) if debug_enabled else None
@@ -1116,7 +1163,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         _write_proxy_debug(debug_path, 'worker_start',
                            rows=int(descriptor.get('rows') or 0),
                            first_row=int(descriptor.get('first_row') or 1),
-                           threads=workers, retries=retries, timeout=timeout,
+                           threads=workers, configured_threads=configured_workers,
+                           worker_nice=int(descriptor.get('_worker_nice') or 0),
+                           retries=retries, timeout=timeout,
                            slots=slot_ids, credentials_recorded=False)
 
     # 一个包内把账号摊到所有设备上：一台设备只承担 rows/capacity 条，

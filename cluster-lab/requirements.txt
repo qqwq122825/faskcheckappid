@@ -9,3 +9,5 @@ psutil==7.2.0
 portalocker==4.4.2
 websockets==16.1.1
 python-socks==3.2.1
+# CPython 3.11 Linux nodes install the bundled manylinux GMP wheel.
+gmpy2==2.3.2

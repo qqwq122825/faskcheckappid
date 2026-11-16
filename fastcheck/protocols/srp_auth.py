@@ -11,6 +11,20 @@ import hashlib
 import hmac
 import secrets
 
+try:
+    import gmpy2 as _gmpy2
+except ImportError:  # Portable fallback for unsupported development platforms.
+    _gmpy2 = None
+
+SRP_MATH_BACKEND = "gmpy2" if _gmpy2 is not None else "python"
+
+
+def mod_pow(base: int, exponent: int, modulus: int) -> int:
+    """Use GMP's native modular exponentiation when the wheel is installed."""
+    if _gmpy2 is not None:
+        return int(_gmpy2.powmod(base, exponent, modulus))
+    return pow(base, exponent, modulus)
+
 # Apple's 2048-bit SRP group (RFC 5054 group-14 prime, Apple's own generator g=2)
 N_HEX = (
     "AC6BDB41324A9A9BF166DE5E1389582FAF72B6651987EE07FC3192943DB56050A37329CBB4"
@@ -50,6 +64,17 @@ def pad(x, n_bytes: int = N_BYTES) -> bytes:
     return x.rjust(n_bytes, b"\x00")
 
 
+# Group-wide values never depend on an account or challenge.  Computing these
+# hashes and integer conversions in every SRPClient multiplied small Python
+# overhead by the full account count.
+_N_BYTES_MIN = i2b(N)
+_G_BYTES_PADDED = pad(g)
+_H_N = H(_N_BYTES_MIN)
+_H_G = H(_G_BYTES_PADDED)
+_K_MULTIPLIER = b2i(H(_N_BYTES_MIN, _G_BYTES_PADDED))
+_H_N_XOR_H_G = bytes(left ^ right for left, right in zip(_H_N, _H_G))
+
+
 def s2k(password: str, salt: bytes, iters: int) -> bytes:
     """PBKDF2(sha256(password), salt, iters) - 32 bytes."""
     p = hashlib.sha256(password.encode("utf-8")).digest()
@@ -71,9 +96,9 @@ class SRPClient:
         self.I = username.encode("utf-8")
         self.P = password
         self.a = b2i(secrets.token_bytes(32))
-        self.A = pow(g, self.a, N)
+        self.A = mod_pow(g, self.a, N)
         self.A_bytes = pad(self.A)
-        self.k = b2i(H(i2b(N), pad(g)))
+        self.k = _K_MULTIPLIER
         self.K = b""
         self.M1 = b""
         self.M2_expected = b""
@@ -89,10 +114,10 @@ class SRPClient:
         P_key = s2k_fo(self.P, salt, iters) if ps == "s2k_fo" else s2k(self.P, salt, iters)
         inner = H(b":", P_key)
         x = b2i(H(salt, inner))
-        S = pow((B - self.k * pow(g, x, N)) % N, self.a + u * x, N)
+        S = mod_pow((B - self.k * mod_pow(g, x, N)) % N,
+                    self.a + u * x, N)
         self.K = H(i2b(S))
-        hN_xor_hg = bytes(a ^ b for a, b in zip(H(i2b(N)), H(pad(g))))
-        self.M1 = H(hN_xor_hg, H(self.I), salt, self.A_bytes, B_bytes, self.K)
+        self.M1 = H(_H_N_XOR_H_G, H(self.I), salt, self.A_bytes, B_bytes, self.K)
         self.M2_expected = H(self.A_bytes, self.M1, self.K)
         return self.M1
 
