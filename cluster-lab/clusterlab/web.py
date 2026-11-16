@@ -122,7 +122,7 @@ def create_app(role, service, password=None):
         @app.post('/api/nodes')
         def add_node():
             data = request.get_json() or {}
-            return jsonify(service.add_node(data.get('name'), data.get('processes', 10), data.get('threads', 100))), 201
+            return jsonify(service.add_node(data.get('name'), data.get('processes', 4), data.get('threads', 250))), 201
 
         @app.post('/api/nodes/<node_id>/devices')
         def request_devices(node_id):

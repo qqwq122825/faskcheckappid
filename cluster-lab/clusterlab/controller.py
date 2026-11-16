@@ -36,8 +36,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE TABLE IF NOT EXISTS nodes (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
  created REAL NOT NULL, last_seen REAL, session TEXT, hostname TEXT,
- enabled INTEGER NOT NULL DEFAULT 1, desired_processes INTEGER NOT NULL DEFAULT 10,
- desired_threads INTEGER NOT NULL DEFAULT 100, max_processes INTEGER,
+ enabled INTEGER NOT NULL DEFAULT 1, desired_processes INTEGER NOT NULL DEFAULT 4,
+ desired_threads INTEGER NOT NULL DEFAULT 250, max_processes INTEGER,
  max_threads INTEGER, version TEXT, last_total INTEGER NOT NULL DEFAULT 0,
  rate REAL NOT NULL DEFAULT 0, last_error TEXT,
  update_generation INTEGER NOT NULL DEFAULT 0,
@@ -212,8 +212,8 @@ def result_reason_cn(value, bucket=None):
 
 
 class Controller:
-    MAX_PROCESSES = 200
-    MAX_THREADS = 512
+    MAX_PROCESSES = 4
+    MAX_THREADS = 500
     MAX_ACTIVE_UNITS = 512
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid', 'not_found',
@@ -368,7 +368,7 @@ class Controller:
                            (json.dumps(dict(counts), separators=(',', ':')),
                             self.RESULT_CLASSIFICATION_VERSION, unit['id']))
 
-    def add_node(self, name, processes=10, threads=100):
+    def add_node(self, name, processes=4, threads=250):
         name = str(name).strip()[:80]
         if not name:
             raise ValueError('请填写节点名称')
@@ -394,22 +394,23 @@ class Controller:
     def configure_node(self, node_id, data):
         processes = integer(data.get('processes'), '进程数', 1, self.MAX_PROCESSES)
         threads = integer(data.get('threads'), '线程数', 1, self.MAX_THREADS)
-        if type(data.get('enabled')) is not bool:
+        if 'enabled' in data and type(data.get('enabled')) is not bool:
             raise ValueError('节点接单状态无效')
         with self.db.transaction() as db:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:
                 raise ValueError('节点不存在')
             initialization = self._device_initialization(node)
-            if data['enabled'] and not node['enabled'] and not initialization['complete']:
+            enabled = bool(node['enabled']) if 'enabled' not in data else data['enabled']
+            if enabled and not node['enabled'] and not initialization['complete']:
                 raise Conflict(f'设备初始化完成后才能开始接单（'
                                f'{initialization["ready"]}/{initialization["requested"]}）')
             active = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? AND status IN ('leased','running')", (node_id,)).fetchone()[0]
-            if data['enabled'] and (node['stop_version'] > node['ack_stop_version'] or
+            if enabled and (node['stop_version'] > node['ack_stop_version'] or
                                     not node['enabled'] and node['stop_version'] > 0 and active):
                 raise Conflict('节点尚未确认停止，暂不能恢复接单')
             db.execute('UPDATE nodes SET desired_processes=?,desired_threads=?,enabled=? WHERE id=?',
-                       (processes, threads, int(data['enabled']), node_id))
+                       (processes, threads, int(enabled), node_id))
             event(db, 'node_config', '节点执行配置已更新，下一次心跳下发；在途工作包保持原配置', node_id=node_id)
 
     def request_updates(self, node_ids, target_ref, parallel=2):
@@ -1156,8 +1157,9 @@ class Controller:
         session = str(data.get('session', ''))[:64]
         if not session:
             raise ValueError('缺少节点会话')
-        max_p = integer(data.get('max_processes'), '节点进程上限', 1, self.MAX_PROCESSES)
-        max_t = integer(data.get('max_threads'), '节点线程上限', 1, self.MAX_THREADS)
+        # 滚动更新期间允许旧节点继续上报 10×100；新的可配置上限仍是 4×500。
+        max_p = integer(data.get('max_processes'), '节点进程上限', 1, 200)
+        max_t = integer(data.get('max_threads'), '节点线程上限', 1, 512)
         active = data.get('active', [])
         interrupted = data.get('interrupted', [])
         if not isinstance(active, list) or len(active) > self.MAX_ACTIVE_UNITS:
@@ -1181,12 +1183,19 @@ class Controller:
                 raise Conflict('同一节点身份已有另一个实例在线；请等待旧实例离线或使用独立接入凭证')
             desired_processes = node['desired_processes']
             desired_threads = node['desired_threads']
-            # 0.3.5 前端把线程数上限错误限制为 32。对正好卡在
-            # 旧上限、而本机明确支持 100 线程的节点做一次升级。
+            # 0.3.66 把 4 核节点从 10×100 改为 4×250，保持总并发 1000。
+            if desired_processes == 10 and desired_threads == 100 and max_p >= 4 and max_t >= 250:
+                desired_processes, desired_threads = 4, 250
+                db.execute('UPDATE nodes SET desired_processes=?,desired_threads=? WHERE id=?',
+                           (desired_processes, desired_threads, node_id))
+                event(db, 'node_config', '已将旧版 10×100 等并发迁移为 4×250', node_id=node_id)
+            # 0.3.5 前端把线程数上限错误限制为 32。
             if desired_threads == 32 and max_t >= 100 and str(node['version'] or '') != '0.3.6':
-                desired_threads = 100
-                db.execute('UPDATE nodes SET desired_threads=? WHERE id=?', (desired_threads, node_id))
-                event(db, 'node_config', '已将旧版 32 线程上限升级为本机 100 线程；下一工作包生效',
+                desired_threads = 250
+                desired_processes = min(desired_processes, 4)
+                db.execute('UPDATE nodes SET desired_processes=?,desired_threads=? WHERE id=?',
+                           (desired_processes, desired_threads, node_id))
+                event(db, 'node_config', '已将旧版线程配置升级为 4 核节点配置',
                       node_id=node_id)
             reject, confirmed, interrupted_ack, reported_ack = [], [], [], {}
             traffic_jobs = set()

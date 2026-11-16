@@ -56,6 +56,10 @@ class Node:
             self.primary_instance = True
         self.max_processes = integer(max_processes, '本机进程上限', 1, 200)
         self.max_threads = integer(max_threads, '本机线程上限', 1, 512)
+        # 已部署的 systemd 仍传入旧参数 10×100。新版将它等并发
+        # 迁移为 4×250，并把节点可调上限公告为 4×500。
+        if (self.max_processes, self.max_threads) == (10, 100):
+            self.max_processes, self.max_threads = 4, 500
         self.allow_http, self.interval = allow_http, interval
         self.instance = uuid.uuid4().hex
         self.context = mp.get_context('spawn')
@@ -162,7 +166,7 @@ class Node:
         updater = repo / 'cluster-lab' / 'tools' / 'node_update.py'
         requirements = repo / 'cluster-lab' / 'requirements.txt'
         systemd_run = shutil.which('systemd-run')
-        if not systemd_run or not updater.is_file() or not (repo / '.git').is_dir():
+        if not systemd_run or not updater.is_file() or not (repo / '.git').exists():
             atomic_json(self.update_status_path, {'generation': generation, 'state': 'failed',
                         'message': '节点未使用标准 Git + systemd 部署，无法自动更新'})
             self.update_generation = generation

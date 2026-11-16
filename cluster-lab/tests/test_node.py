@@ -134,6 +134,14 @@ class NodeRecoveryTests(unittest.TestCase):
         self.node.close()
         self.temp.cleanup()
 
+    def test_legacy_service_limits_are_migrated_to_four_by_five_hundred(self):
+        with tempfile.TemporaryDirectory() as root:
+            legacy = Node(root, max_processes=10, max_threads=100)
+            try:
+                self.assertEqual((legacy.max_processes, legacy.max_threads), (4, 500))
+            finally:
+                legacy.close()
+
     def test_upload_failure_keeps_outbox_and_retry_confirms(self):
         with patch.object(self.node, '_request', side_effect=ConnectionError('offline')):
             with self.assertRaises(ConnectionError):

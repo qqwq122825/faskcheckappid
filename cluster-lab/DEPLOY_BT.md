@@ -40,7 +40,7 @@ git clone https://github.com/qqwq122825/faskcheckappid.git faskcheckappid
 
 - 宝塔项目名可以继续叫 `cluster-node`。
 - 项目根目录：`/www/wwwroot/faskcheckappid/cluster-lab`。
-- 当前节点启动命令：`python node.py --host 0.0.0.0 --port 18771 --max-processes 10 --max-threads 100 --allow-http`。
+- 当前节点启动命令：`python node.py --host 0.0.0.0 --port 18771 --max-processes 4 --max-threads 500 --allow-http`。
 - 默认数据：`runtime/node/`，每台节点保存自己的连接配置、数据库和待回传文件。
 - 环境变量：本机独立的 `CLUSTER_LAB_ADMIN_PASSWORD`。
 - 节点连接总控一次后，更新代码不需要重新添加节点或重新生成凭证。
@@ -109,7 +109,7 @@ git -C faskcheckappid rev-parse HEAD
 7. 启动命令固定为：
 
    ```bash
-   python node.py --host 0.0.0.0 --port 18771 --max-processes 10 --max-threads 100 --allow-http
+   python node.py --host 0.0.0.0 --port 18771 --max-processes 4 --max-threads 500 --allow-http
    ```
 
 8. 环境变量至少设置本机独立的 `CLUSTER_LAB_ADMIN_PASSWORD`（不少于 8 位）。
@@ -123,7 +123,7 @@ git -C faskcheckappid rev-parse HEAD
 ### 4. 创建接入凭证并连接
 
 1. 打开总控“节点配置”，点“添加节点”。
-2. 节点名使用能识别机器的名称；默认设置 `10` 进程、`100` 线程。
+2. 节点名使用能识别机器的名称；4 核机器默认设置 `4` 进程、`250` 线程，最高 `4 × 500`。
 3. 创建后立刻复制一次性节点接入凭证并安全保存。
 4. 打开 `http://<NEW_NODE_IP>:18771`，使用该节点自己的管理员密码登录。
 5. 在“连接总控”填写 `http://104.160.36.118:8766` 和刚生成的凭证，点“保存并连接”。
@@ -164,7 +164,7 @@ systemd 服务，并确认代码目录是完整 Git 仓库。
 - [ ] 创建 Python 3.11+ 环境并安装依赖
 - [ ] 创建 `cluster-node`，使用固定启动命令
 - [ ] 开放节点管理端口 `18771`
-- [ ] 在总控创建 10×100 节点并保存一次性凭证
+- [ ] 在总控创建 4×250 节点并保存一次性凭证
 - [ ] 节点连接总控，心跳与可接单状态正常
 - [ ] 小任务闭环通过，调试日志开关符合预期
 

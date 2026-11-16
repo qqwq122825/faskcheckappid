@@ -29,28 +29,35 @@ class ControllerTests(unittest.TestCase):
     def test_default_lease_allows_cpu_bound_heartbeat_jitter(self):
         self.assertEqual(self.service.lease_seconds, 120)
 
+    def test_saving_concurrency_without_enabled_preserves_accepting_state(self):
+        self.service.configure_node(self.node['id'], {'processes': 4, 'threads': 250})
+        saved = next(value for value in self.service.snapshot()['nodes']
+                     if value['id'] == self.node['id'])
+        self.assertTrue(saved['enabled'])
+        self.assertEqual((saved['desired_processes'], saved['desired_threads']), (4, 250))
+
     def test_new_node_defaults_to_thirty_device_registrations(self):
-        node = self.service.add_node('auto-devices', 10, 100)
+        node = self.service.add_node('auto-devices', 4, 250)
         with self.service.db.connect() as db:
             saved = db.execute('SELECT device_request,enabled FROM nodes WHERE id=?',
                                (node['id'],)).fetchone()
         response = self.service.heartbeat(node['id'], {
             'session': 'auto-device-session', 'hostname': 'new-node', 'version': 'test',
-            'max_processes': 10, 'max_threads': 100, 'active': [], 'interrupted': []})
+            'max_processes': 4, 'max_threads': 500, 'active': [], 'interrupted': []})
         self.assertEqual(saved['device_request'], 30)
         self.assertFalse(saved['enabled'])
         self.assertEqual(response['device_request'], 30)
         self.assertFalse(response['enabled'])
         with self.assertRaisesRegex(Conflict, '设备初始化完成后'):
-            self.service.configure_node(node['id'], {'processes': 10, 'threads': 100,
+            self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
                                                        'enabled': True})
         self.service.heartbeat(node['id'], {
             'session': 'auto-device-session', 'hostname': 'new-node', 'version': 'test',
-            'max_processes': 10, 'max_threads': 100, 'active': [], 'interrupted': [],
+            'max_processes': 4, 'max_threads': 500, 'active': [], 'interrupted': [],
             'devices': {'running': False, 'capacity': 30, 'ready': 30,
                         'built': 30, 'failed': 0, 'attempted': 30}})
         self.assertTrue(self.service.snapshot()['nodes'][-1]['device_initialization_complete'])
-        self.service.configure_node(node['id'], {'processes': 10, 'threads': 100,
+        self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
                                                   'enabled': True})
 
     def test_rolling_update_drains_limits_parallelism_and_resumes_after_health(self):
@@ -294,34 +301,38 @@ class ControllerTests(unittest.TestCase):
         unit = self.service.lease(self.node['id'], 'test-session')
         self.assertIs(unit['_proxy_debug'], True)
 
-    def test_large_node_capacity_is_accepted(self):
-        """P0：单节点可以要 100 进程 / 100 线程，不再被 16/32 上限卡住。"""
-        node = self.service.add_node('big', 100, 100)
-        self.service.heartbeat(node['id'], dict(session='big-session', max_processes=200,
-                                                max_threads=512, active=[], interrupted=[],
+    def test_four_process_five_hundred_thread_capacity_is_accepted(self):
+        """4 核节点的用户可调上限为 4 进程 / 500 线程。"""
+        node = self.service.add_node('big', 4, 500)
+        self.service.heartbeat(node['id'], dict(session='big-session', max_processes=4,
+                                                max_threads=500, active=[], interrupted=[],
                                                 devices={'running': False, 'capacity': 30,
                                                          'ready': 30, 'built': 30,
                                                          'failed': 0, 'attempted': 30}))
-        self.service.configure_node(node['id'], {'processes': 100, 'threads': 100,
+        self.service.configure_node(node['id'], {'processes': 4, 'threads': 500,
                                                   'enabled': True})
         job = self.job()
         self.service.job_action(job, 'start')
         unit = self.service.lease(node['id'], 'big-session')
         self.assertIsNotNone(unit)
-        self.assertEqual(unit['threads'], 100)
-        self.assertEqual(unit['processes'], 50)  # 50 rows cannot use more than 50 processes.
+        self.assertEqual(unit['threads'], 500)
+        self.assertEqual(unit['processes'], 4)
         self.assertIsNone(self.service.lease(node['id'], 'big-session'))
 
-    def test_legacy_32_thread_ceiling_upgrades_to_node_100_thread_capacity(self):
-        node = self.service.add_node('legacy-32', 10, 32)
+    def test_legacy_ten_by_one_hundred_migrates_to_four_by_two_fifty(self):
+        node = self.service.add_node('legacy-10x100', 4, 250)
+        with self.service.db.transaction() as db:
+            db.execute('UPDATE nodes SET desired_processes=10,desired_threads=100 WHERE id=?',
+                       (node['id'],))
         response = self.service.heartbeat(node['id'], {
-            'session': 'legacy-session', 'version': '0.3.5',
-            'max_processes': 10, 'max_threads': 100, 'active': [], 'interrupted': []})
-        self.assertEqual((response['processes'], response['threads']), (10, 100))
-        self.assertEqual(response['desired_threads'], 100)
+            'session': 'legacy-session', 'version': '0.3.66',
+            'max_processes': 4, 'max_threads': 500, 'active': [], 'interrupted': []})
+        self.assertEqual((response['processes'], response['threads']), (4, 250))
+        self.assertEqual((response['desired_processes'], response['desired_threads']), (4, 250))
         with self.service.db.connect() as db:
-            self.assertEqual(db.execute('SELECT desired_threads FROM nodes WHERE id=?',
-                                        (node['id'],)).fetchone()[0], 100)
+            saved = db.execute('SELECT desired_processes,desired_threads FROM nodes WHERE id=?',
+                               (node['id'],)).fetchone()
+        self.assertEqual(tuple(saved), (4, 250))
 
     def test_lease_carries_job_timeout_and_indexed_package_bytes(self):
         job = self.service.create_job('indexed', io.BytesIO(b'hello\n' * 100), 50,

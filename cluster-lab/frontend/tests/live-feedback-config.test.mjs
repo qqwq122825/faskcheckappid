@@ -7,7 +7,7 @@ import { dirname, resolve } from 'node:path'
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const source = path => readFileSync(resolve(root, path), 'utf8')
 
-test('Task creation exposes retries and node settings allow 10 x 100', () => {
+test('Task creation exposes retries and node settings allow up to 4 x 500', () => {
   const task = source('src/components/CreateTaskDialog.vue')
   const nodes = source('src/components/NodeDialogs.vue')
   assert.match(task, /超时后重试次数/)
@@ -15,9 +15,13 @@ test('Task creation exposes retries and node settings allow 10 x 100', () => {
   assert.doesNotMatch(task, /预计设备池数量/)
   assert.doesNotMatch(task, /device_capacity/)
   assert.doesNotMatch(task, /deviceCapacity/)
-  assert.match(nodes, /processes: 10, threads: 100/)
-  assert.match(nodes, /:max="100"/)
+  assert.match(nodes, /processes: 4, threads: 250/)
+  assert.match(nodes, /:max="4"/)
+  assert.match(nodes, /:max="500"/)
+  assert.match(nodes, /最高可设 4 × 500/)
   assert.match(nodes, /使用本机上限/)
+  assert.doesNotMatch(nodes, /v-model="config\.enabled"/)
+  assert.doesNotMatch(nodes, /active-text="允许领取新工作包"/)
 })
 
 test('New nodes stay paused until all default devices are initialized', () => {
@@ -27,7 +31,7 @@ test('New nodes stay paused until all default devices are initialized', () => {
   assert.match(nodes, /设备初始化 \{\{ node\.device_ready \|\| 0 \}\}\/\{\{ node\.device_request \|\| 30 \}\}/)
   assert.match(nodes, /开始接单/)
   assert.match(dialogs, /新节点先暂停接单并自动初始化 30 台设备/)
-  assert.match(dialogs, /:disabled="!node\?\.enabled && !node\?\.device_initialization_complete"/)
+  assert.doesNotMatch(dialogs, /允许领取新工作包/)
 })
 
 test('Controller exposes guarded rolling Git updates with visible node phases', () => {
