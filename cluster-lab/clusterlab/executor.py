@@ -26,6 +26,7 @@ PROXY_FETCH_LIMIT = 1000
 PROXY_POOL_LIMIT = 10000
 PROXY_FAILURE_LIMIT = 3
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
+PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
@@ -400,8 +401,11 @@ class NodeProxyPool:
             self._recent_exits[key] = expires_at
             added += 1
         self._add(self.fetched, added)
-        if (self._value(self.fresh_count) + self._value(self.reusable_count) >=
-                self.target):
+        # A rate-limited provider may return fewer exits than the requested
+        # target (for example 200 per minute for 1,000 workers).  Start work as
+        # soon as any usable stock exists; remaining workers now backpressure
+        # on the shared pool and reuse leases as they are returned.
+        if added:
             self.ready.set()
         return added
 
@@ -1167,8 +1171,27 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     def proxy_for(index):
         if proxy_pool is not None:
-            lease = proxy_pool.acquire(wait=PROXY_ACQUIRE_WAIT_SECONDS)
-            return (lease[0] if lease is not None else None), lease
+            # Pool exhaustion is backpressure, not an account result.  A
+            # healthy exit may be busy in another worker and become reusable
+            # after that request finishes, so keep waiting while the pool has
+            # any known (queued or leased) inventory.  Only report an empty
+            # pool after both queues and all active leases have remained empty
+            # for a full supplier window.
+            empty_since = None
+            while not stop.is_set():
+                lease = proxy_pool.acquire(wait=PROXY_ACQUIRE_WAIT_SECONDS)
+                if lease is not None:
+                    return lease[0], lease
+                state = _proxy_pool_snapshot(proxy_pool)
+                if int(state.get('known') or 0) > 0:
+                    empty_since = None
+                    continue
+                now = time.monotonic()
+                if empty_since is None:
+                    empty_since = now
+                if now - empty_since >= PROXY_EMPTY_GRACE_SECONDS:
+                    break
+            return None, None
         if not proxies:
             return proxy, None
         return proxies[index % len(proxies)], None
@@ -1254,6 +1277,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                         request_sent=False, acquire_ms=acquire_ms, **switch,
                         pool_before=acquire_before,
                         pool_after=_proxy_pool_snapshot(proxy_pool))
+                if attempt + 1 >= attempt_limit:
+                    result['_proxy_retries'] = attempt
+                    break
+                if stop.wait(PROXY_RETRY_DELAY_SECONDS):
+                    result['_proxy_retries'] = attempt
+                    break
                 continue
             request_started = time.monotonic() if debug_enabled else None
             try:

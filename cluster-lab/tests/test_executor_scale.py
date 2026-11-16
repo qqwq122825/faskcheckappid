@@ -50,6 +50,28 @@ class ScriptedProxyPool:
         self.discards.append(lease[0] if lease else None)
 
 
+class BusyThenReusableProxyPool(ScriptedProxyPool):
+    """Expose one busy interval before a healthy lease is reusable."""
+
+    def __init__(self):
+        super().__init__(['socks5h://bootstrap'])
+        self.account_acquires = 0
+
+    def acquire(self, wait=1.0):
+        if self.leases:
+            return super().acquire(wait)
+        self.account_acquires += 1
+        if self.account_acquires == 1:
+            return None
+        now = time.monotonic()
+        return ('socks5h://reused-after-busy', now + 60, 1, 0)
+
+    def snapshot(self):
+        # The first account acquisition observes an exit leased by another
+        # worker.  The executor must wait for it instead of recording a row.
+        return {'available': 0, 'in_use': 1, 'known': 1}
+
+
 class RecordingStop:
     def __init__(self):
         self.waits = []
@@ -100,7 +122,8 @@ class ExecutorScaleTests(unittest.TestCase):
                           'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 0,
                           'proxy_api': 'http://proxy.invalid/list'}
             shared = ScriptedProxyPool([])
-            with patch('clusterlab.executor._load_fastcheck', return_value=(
+            with patch('clusterlab.executor.PROXY_EMPTY_GRACE_SECONDS', 0), \
+                 patch('clusterlab.executor._load_fastcheck', return_value=(
                     FakePool, lambda *_args, **_kwargs: self.fail('request used direct connection'),
                     lambda result: result['status'])), \
                  patch('fastcheck.workers.device_profile',
@@ -111,6 +134,34 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(record['status'], 'timeout')
             self.assertEqual(record['device_key'][:4], 'B64:')
             self.assertFalse((root / 'devices' / 'registrations').exists())
+
+    def test_auth_unit_waits_for_busy_exit_then_reuses_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text('account----password\n', encoding='utf-8')
+            descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 0,
+                          'proxy_api': 'http://proxy.invalid/list'}
+            shared = BusyThenReusableProxyPool()
+            checked = []
+
+            def check(_account, _password, proxy, **_kwargs):
+                checked.append(proxy)
+                return {'status': 'valid', 'kind': 'valid', 'http': 200}
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool, check, lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+
+            record = json.loads((root / 'results.jsonl').read_text())
+            self.assertEqual(checked, ['socks5h://reused-after-busy'])
+            self.assertEqual(record['status'], 'valid')
+            self.assertEqual(record['attempts'], 0)
+            self.assertEqual(shared.account_acquires, 2)
 
     def test_explicit_debug_setting_overrides_legacy_node_environment(self):
         with patch.dict(os.environ, {'CLUSTER_PROXY_DEBUG': '1'}):
@@ -277,6 +328,19 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(metrics['fetched'], pool.target)
             self.assertEqual(metrics['fetch_calls'], 1)
             self.assertEqual(calls, [(pool.target, 'socks5h')])
+        finally:
+            pool.close()
+
+    def test_partial_proxy_batch_marks_pool_ready_for_reuse(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=1000, ttl=50, target=1000)
+        try:
+            self.assertEqual(pool.add_fresh([
+                f'socks5h://partial-{index}' for index in range(200)
+            ]), 200)
+            self.assertTrue(pool.ready.is_set())
+            self.assertEqual(pool.snapshot()['available'], 200)
+            self.assertEqual(pool.snapshot()['target'], 1000)
         finally:
             pool.close()
 
