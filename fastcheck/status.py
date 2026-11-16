@@ -8,7 +8,10 @@ import unicodedata
 
 _APPLE_REASON_BUCKETS = (
     ('unable to sign you in to your apple account. try again later', 'timeout'),
+    ('this request could not be completed because of a server error', 'timeout'),
+    ('this action cannot be completed', 'timeout'),
     ('this apple account has been locked for security reasons', 'locked'),
+    ('this apple account has been locked', 'locked'),
     ('enter the correct password for this apple account', 'wrong_password'),
     ('this apple account is not active', 'invalid'),
     ('your account information was entered incorrectly', 'not_found'),

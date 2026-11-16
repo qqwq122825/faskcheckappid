@@ -589,6 +589,10 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result_record_bucket(dict(shared, reason=fuzzy_locked)), 'locked')
         self.assertEqual(result_reason_cn(dict(shared, reason=fuzzy_locked)),
                          '账号因安全原因被锁定')
+        managed_locked = ('This Apple Account has been Locked. Contact your Administrator '
+                          'or Manager to reset your password and unlock your account.')
+        self.assertEqual(result_record_bucket(dict(shared, reason=managed_locked)), 'locked')
+        self.assertEqual(result_reason_cn(dict(shared, reason=managed_locked)), '账号已被锁定')
         self.assertEqual(result_record_bucket(dict(
             shared, reason='Enter the correct password for this Apple Account.')), 'wrong_password')
         self.assertEqual(result_record_bucket(dict(
@@ -597,6 +601,13 @@ class ControllerTests(unittest.TestCase):
             shared, reason='Your account information was entered incorrectly.')), 'not_found')
         self.assertEqual(result_record_bucket({
             'status': 'undetermined', 'reason': 'A new Apple English reason.'}), 'undetermined')
+        self.assertEqual(result_record_bucket({
+            'status': 'undetermined',
+            'reason': 'This request could not be completed because of a server error.'}),
+            'timeout')
+        self.assertEqual(result_record_bucket({
+            'status': 'undetermined', 'reason': 'This Action Cannot Be Completed'}),
+            'timeout')
         self.assertEqual(result_reason_cn({
             'status': 'undetermined', 'reason': 'A new Apple English reason.'}),
             'A new Apple English reason.')

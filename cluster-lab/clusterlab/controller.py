@@ -116,7 +116,10 @@ def mask_api(value):
 
 _APPLE_REASON_BUCKETS = (
     ('unable to sign you in to your apple account. try again later', 'timeout'),
+    ('this request could not be completed because of a server error', 'timeout'),
+    ('this action cannot be completed', 'timeout'),
     ('this apple account has been locked for security reasons', 'locked'),
+    ('this apple account has been locked', 'locked'),
     ('enter the correct password for this apple account', 'wrong_password'),
     ('this apple account is not active', 'invalid'),
     ('your account information was entered incorrectly', 'not_found'),
@@ -180,8 +183,13 @@ def result_reason_cn(value, bucket=None):
     translations = (
         ('unable to sign you in to your apple account. try again later',
          '暂时无法登录，已按任务设置重试'),
+        ('this request could not be completed because of a server error',
+         'Apple 服务器错误，已按任务设置重试'),
+        ('this action cannot be completed',
+         'Apple 操作暂时无法完成，已按任务设置重试'),
         ('this apple account has been locked for security reasons',
          '账号因安全原因被锁定'),
+        ('this apple account has been locked', '账号已被锁定'),
         ('enter the correct password for this apple account', '密码错误'),
         ('this apple account is not active', '账号未激活'),
         ('your account information was entered incorrectly', '账号不存在'),
@@ -210,7 +218,7 @@ class Controller:
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid', 'not_found',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 6
+    RESULT_CLASSIFICATION_VERSION = 7
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')

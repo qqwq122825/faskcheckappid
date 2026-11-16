@@ -43,11 +43,14 @@ class StatusTests(unittest.TestCase):
         shared = {'status': 'error', 'stage': 'init', 'apple_ec': -20970}
         samples = {
             'Unable to sign you in to your Apple Account. Try again later.': 'timeout',
+            'This request could not be completed because of a server error.': 'timeout',
+            'This Action Cannot Be Completed': 'timeout',
             'This Apple Account has been\u00a0locked\u00a0for security reasons. Visit iForgot to reset your account (https://iforgot.apple.com).': 'locked',
             'Enter the correct password for this Apple Account.': 'wrong_password',
             'This Apple Account is not active.': 'invalid',
             'Your account information was entered incorrectly.': 'not_found',
             'This Apple Account has been lockd for security reasons. Visit iForgot to reset your account.': 'locked',
+            'This Apple Account has been Locked. Contact your Administrator or Manager to reset your password and unlock your account.': 'locked',
         }
         for reason, expected in samples.items():
             with self.subTest(reason=reason):

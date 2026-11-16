@@ -1175,9 +1175,13 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     def apple_retry_later(result):
         apple_text = ' '.join(str(result.get(key) or '').strip()
-                              for key in ('apple_message', 'detail')).casefold()
-        return ('unable to sign you in to your apple account. try again later'
-                in apple_text)
+                              for key in ('apple_message', 'reason', 'detail')).casefold()
+        phrases = (
+            'unable to sign you in to your apple account. try again later',
+            'this request could not be completed because of a server error',
+            'this action cannot be completed',
+        )
+        return any(phrase in apple_text for phrase in phrases)
 
     def retryable_transport(result):
         try:
@@ -1284,7 +1288,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             # wait five seconds, then acquire an available (never in-use) exit.
             # Proxy-auth 407 and other transport failures retain the general
             # three-strike policy used outside this retry branch.
-            # 三种明确重试条件都淘汰当前出口，等待 5 秒后从池中获取
+            # 明确重试条件都淘汰当前出口，等待 5 秒后从池中获取
             # 另一条 IP；否则刚释放的健康租约可能被同一账号再次拿到。
             immediate_discard = result_http in (0, 503) or apple_retry_later(result)
             healthy_exit = result_http not in (None, 0, 407)

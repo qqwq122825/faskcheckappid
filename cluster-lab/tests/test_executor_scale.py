@@ -445,6 +445,44 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(shared.discards, [
                 'socks5h://first-exit', 'socks5h://second-exit', 'socks5h://third-exit'])
 
+    def test_auth_unit_retries_apple_server_error_reasons_with_new_ip(self):
+        reasons = (
+            'This request could not be completed because of a server error.',
+            'This Action Cannot Be Completed',
+        )
+        for reason in reasons:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / 'input.part').write_text('account----password\n', encoding='utf-8')
+                descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
+                              'device_capacity': 1, 'device_root': str(root / 'devices'),
+                              'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1}
+                shared = ScriptedProxyPool([
+                    'socks5h://bootstrap', 'socks5h://first-exit', 'socks5h://second-exit'])
+                stop = RecordingStop()
+                checked = []
+
+                def check(_account, _password, proxy, **_kwargs):
+                    checked.append(proxy)
+                    return {'status': 'error', 'kind': 'protocol', 'stage': 'complete',
+                            'http': 200, 'apple_ec': -1, 'detail': reason,
+                            'apple_message': reason}
+
+                with patch('clusterlab.executor._load_fastcheck', return_value=(
+                        FakePool, check, lambda _result: 'timeout')), \
+                     patch('fastcheck.workers.device_profile',
+                           return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                     patch('clusterlab.executor._bump_usage'):
+                    _execute_auth_unit(root, descriptor, stop, proxy_pool=shared)
+
+                record = json.loads((root / 'results.jsonl').read_text())
+                self.assertEqual(checked, ['socks5h://first-exit', 'socks5h://second-exit'])
+                self.assertEqual((record['status'], record['attempts']), ('timeout', 1))
+                self.assertEqual(record['reason'], reason)
+                self.assertEqual(stop.waits, [5.0])
+                self.assertEqual(shared.discards,
+                                 ['socks5h://first-exit', 'socks5h://second-exit'])
+
     def test_registration_history_keeps_the_first_time_and_proxy_per_slot(self):
         with tempfile.TemporaryDirectory() as temporary:
             self.assertTrue(record_device_registration(temporary, 3, 'socks5h://first:9000',
