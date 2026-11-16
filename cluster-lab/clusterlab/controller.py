@@ -138,8 +138,15 @@ def apple_reason_matches(text, phrase, threshold=0.90):
     if phrase in text:
         return True
     candidate = text[:len(phrase)]
-    return bool(candidate and SequenceMatcher(
-        None, phrase, candidate, autojunk=False).ratio() >= threshold)
+    if not candidate:
+        return False
+    # SequenceMatcher's best possible ratio is bounded by the two lengths.
+    # Reject impossible >=90% matches before constructing its edit graph; this
+    # keeps short unknown reasons from dominating a large category scan.
+    shorter, combined = min(len(phrase), len(candidate)), len(phrase) + len(candidate)
+    if 2 * shorter < threshold * combined:
+        return False
+    return SequenceMatcher(None, phrase, candidate, autojunk=False).ratio() >= threshold
 
 
 def apple_reason_bucket(value):

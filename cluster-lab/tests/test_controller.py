@@ -1069,6 +1069,11 @@ class ControllerTests(unittest.TestCase):
                    side_effect=AssertionError('exact reasons must not use fuzzy matching')):
             self.assertEqual(apple_reason_bucket(value), 'not_found')
 
+    def test_short_reason_skips_impossible_fuzzy_matches(self):
+        with patch('clusterlab.controller.SequenceMatcher',
+                   side_effect=AssertionError('impossible length must not use fuzzy matching')):
+            self.assertIsNone(apple_reason_bucket({'reason': 'probe'}))
+
     def test_live_category_page_stops_scanning_after_limit(self):
         job = self.job(200)
         result = Path(self.temp.name) / 'many-other-errors.jsonl'
