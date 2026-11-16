@@ -553,10 +553,9 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(record['reason'], 'au=trustedDeviceSecondaryAuth')
             self.assertEqual(shared.releases, [
                 ('socks5h://bootstrap', True),
-                ('socks5h://first-exit', True),
                 ('socks5h://second-exit', True),
             ])
-            self.assertEqual(shared.discards, [])
+            self.assertEqual(shared.discards, ['socks5h://first-exit'])
             self.assertEqual(stop.waits, [])
 
     def test_auth_unit_uses_configured_two_retries_for_apple_try_again_later(self):
@@ -599,7 +598,7 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(shared.discards, [
                 'socks5h://first-exit', 'socks5h://second-exit', 'socks5h://third-exit'])
 
-    def test_auth_unit_retries_332000_codes_with_new_ip_and_identity(self):
+    def test_auth_unit_retries_transient_apple_codes_with_new_ip_and_identity(self):
         class RefreshingPool(FakePool):
             fetch_count = 0
 
@@ -607,7 +606,7 @@ class ExecutorScaleTests(unittest.TestCase):
                 type(self).fetch_count += 1
                 return {'generation': type(self).fetch_count}
 
-        for code in (-332000, -33200):
+        for code in (-332000, -33200, -3000303, -22410):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as temporary:
                 RefreshingPool.fetch_count = 0
                 root = Path(temporary)
@@ -633,7 +632,8 @@ class ExecutorScaleTests(unittest.TestCase):
                 with patch('clusterlab.executor._load_fastcheck', return_value=(
                         RefreshingPool, check,
                         lambda result: ('timeout' if result.get('apple_ec') in
-                                        (-332000, -33200) else result['status']))), \
+                                        (-332000, -33200, -3000303, -22410)
+                                        else result['status']))), \
                      patch('fastcheck.workers.device_profile',
                            return_value={'client_info': 'test', 'user_agent': 'test'}), \
                      patch('clusterlab.executor._bump_usage'):
@@ -652,6 +652,7 @@ class ExecutorScaleTests(unittest.TestCase):
         reasons = (
             'This request could not be completed because of a server error.',
             'This Action Cannot Be Completed',
+            'This action could not be completed. Try again.',
             'The request cannot be processed at this time. Please try again later.',
             'We cannot process your request, please try again later.',
         )

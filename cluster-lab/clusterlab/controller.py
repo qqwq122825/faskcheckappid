@@ -118,6 +118,7 @@ _APPLE_REASON_BUCKETS = (
     ('unable to sign you in to your apple account. try again later', 'timeout'),
     ('this request could not be completed because of a server error', 'timeout'),
     ('this action cannot be completed', 'timeout'),
+    ('this action could not be completed. try again', 'timeout'),
     ('the request cannot be processed at this time. please try again later', 'timeout'),
     ('we cannot process your request, please try again later', 'timeout'),
     ('this apple account has been locked for security reasons', 'locked'),
@@ -185,7 +186,8 @@ def result_record_bucket(value):
             codes.append(int(value.get(key)))
         except (TypeError, ValueError):
             continue
-    if any(code in (-22421, -332000, -33200) for code in codes):
+    if any(code in (-22421, -22410, -332000, -33200, -3000303)
+           for code in codes):
         return 'timeout'
     bucket = value.get('status') or 'unknown'
     if bucket in ('valid', 'need_2fa', 'timeout', 'undetermined', 'unknown'):
@@ -203,6 +205,8 @@ def result_reason_cn(value, bucket=None):
         ('this request could not be completed because of a server error',
          'Apple 服务器错误，已按任务设置重试'),
         ('this action cannot be completed',
+         'Apple 操作暂时无法完成，已按任务设置重试'),
+        ('this action could not be completed. try again',
          'Apple 操作暂时无法完成，已按任务设置重试'),
         ('the request cannot be processed at this time. please try again later',
          'Apple 当前无法处理请求，已按任务设置重试'),
@@ -231,7 +235,7 @@ def result_reason_cn(value, bucket=None):
         return '密码正确'
     if resolved == 'timeout':
         try:
-            if int(value.get('code')) in (-332000, -33200):
+            if int(value.get('code')) in (-22410, -332000, -33200, -3000303):
                 return 'Apple 当前无法处理请求，已按任务设置重试'
         except (TypeError, ValueError):
             pass
@@ -248,7 +252,7 @@ class Controller:
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid', 'not_found',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 9
+    RESULT_CLASSIFICATION_VERSION = 10
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')

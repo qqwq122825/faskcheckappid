@@ -594,6 +594,10 @@ class ControllerTests(unittest.TestCase):
             {'status': 'invalid', 'http': 200, 'code': '-332000'}), 'timeout')
         self.assertEqual(result_record_bucket(
             {'status': 'invalid', 'http': 200, 'code': '-33200'}), 'timeout')
+        self.assertEqual(result_record_bucket(
+            {'status': 'invalid', 'http': 200, 'code': '-3000303'}), 'timeout')
+        self.assertEqual(result_record_bucket(
+            {'status': 'invalid', 'http': 200, 'code': '-22410'}), 'timeout')
 
         shared = {'status': 'invalid', 'http': 200, 'code': '-20970'}
         self.assertEqual(result_record_bucket(dict(
@@ -631,6 +635,13 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result_record_bucket({
             'status': 'undetermined', 'reason': 'This Action Cannot Be Completed'}),
             'timeout')
+        self.assertEqual(result_record_bucket({
+            'status': 'undetermined',
+            'reason': 'This action could not be completed. Try again.'}), 'timeout')
+        self.assertEqual(result_reason_cn({
+            'status': 'undetermined',
+            'reason': 'This action could not be completed. Try again.'}),
+            'Apple 操作暂时无法完成，已按任务设置重试')
         for reason in (
                 'The request cannot be processed at this time. Please try again later.',
                 'We cannot process your request, please try again later.'):
@@ -642,6 +653,9 @@ class ControllerTests(unittest.TestCase):
                     'Apple 当前无法处理请求，已按任务设置重试')
         self.assertEqual(result_reason_cn({
             'status': 'undetermined', 'http': 200, 'code': '-332000'}),
+            'Apple 当前无法处理请求，已按任务设置重试')
+        self.assertEqual(result_reason_cn({
+            'status': 'undetermined', 'http': 200, 'code': '-3000303'}),
             'Apple 当前无法处理请求，已按任务设置重试')
         self.assertEqual(result_reason_cn({
             'status': 'undetermined', 'reason': 'A new Apple English reason.'}),

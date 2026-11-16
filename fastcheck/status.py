@@ -10,6 +10,7 @@ _APPLE_REASON_BUCKETS = (
     ('unable to sign you in to your apple account. try again later', 'timeout'),
     ('this request could not be completed because of a server error', 'timeout'),
     ('this action cannot be completed', 'timeout'),
+    ('this action could not be completed. try again', 'timeout'),
     ('the request cannot be processed at this time. please try again later', 'timeout'),
     ('we cannot process your request, please try again later', 'timeout'),
     ('this apple account has been locked for security reasons', 'locked'),
@@ -68,7 +69,7 @@ def result_bucket(result):
     reason_bucket = apple_reason_bucket(result)
     if reason_bucket:
         return reason_bucket
-    if apple_ec in (-22421, -332000, -33200):
+    if apple_ec in (-22421, -22410, -332000, -33200, -3000303):
         return 'timeout'
     if status == 'need_2fa':
         return 'need_2fa'
