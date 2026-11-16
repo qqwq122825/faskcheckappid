@@ -159,7 +159,7 @@ async function saveProxyDebug(value: string | number | boolean) {
                    active-text="开启调试日志" inactive-text="关闭调试日志"
                    @change="saveProxyDebug" />
         <span class="field-note">
-          开启时，结果列表显示已保存的原始错误原因；关闭时隐藏原因，接口也不返回错误详情。此显示开关即时生效，原始结果不删除。关闭后，新工作包不再创建 proxy-debug.jsonl，已有日志保留。
+          Apple 原始原因始终由节点上报，总控统一显示中文原因，不受本开关影响。开启后额外记录代理出口与诊断详情；关闭后，新工作包不再创建 proxy-debug.jsonl，已有日志保留。
           仅排查代理问题时开启，避免产生大量日志。
         </span>
       </el-form-item>

@@ -58,7 +58,8 @@ class PortableRuntimeTests(unittest.TestCase):
             save_json(directory/'state.json',{'state':'completed'})
             save_json(directory/'accounts-index.json',[{'row':1,'email':'first@example.invalid'},{'row':2,'email':'second@example.invalid'}])
             first=json.dumps({'row':1,'status':'init_refused','stage':'init',
-                              'apple_ec':-20970,'attempts':1})+'\n'
+                              'apple_ec':-20970,'apple_message':'This Apple Account is not active.',
+                              'attempts':1})+'\n'
             second=json.dumps({'row':2,'status':'need_2fa','attempts':1})+'\n'
             path=directory/'results.jsonl';path.write_text(first+second[:10])
             self.assertEqual(manager.read_results(job)['total'],1)

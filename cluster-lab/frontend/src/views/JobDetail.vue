@@ -13,13 +13,14 @@ import { buildRuntimeFeedback } from '../lib/runtimeFeedback.js'
 const route = useRoute(), router = useRouter(), expanded = ref<string[]>([])
 const exportOptions = [
   { label: '全部结果', value: 'all' },
-  { label: '密正', value: 'valid' },
+  { label: '密码正确', value: 'valid' },
   { label: '密码错误', value: 'wrong_password' },
   { label: '双重验证', value: 'need_2fa' },
   { label: '锁定', value: 'locked' },
-  { label: '已失效', value: 'invalid' },
-  { label: '超时', value: 'timeout' },
-  { label: '其他未验证', value: 'undetermined' },
+  { label: '未激活', value: 'invalid' },
+  { label: '不存在', value: 'not_found' },
+  { label: '请重试', value: 'timeout' },
+  { label: '其他错误', value: 'undetermined' },
 ]
 function download(category: string) {
   if (!job.value) return

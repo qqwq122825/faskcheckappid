@@ -13,7 +13,9 @@ class ExportTests(unittest.TestCase):
             export=ClassifiedExports(Path(directory)/'exports')
             account=Account(1,'owned@example.invalid','private-password')
             export.write(account,{'row':1,'protocol':'gsa','status':'need_2fa','attempts':1})
-            export.write(account,{'row':2,'protocol':'gsa','status':'init_refused','stage':'init','apple_ec':-20970,'attempts':1})
+            export.write(account,{'row':2,'protocol':'gsa','status':'init_refused','stage':'init',
+                                  'apple_ec':-20970,'apple_message':'This Apple Account is not active.',
+                                  'attempts':1})
             self.assertEqual((export.directory/'accepted_passwords.txt').read_text(),'owned@example.invalid----private-password\n')
             self.assertIn('private-password',(export.directory/'invalid.txt').read_text())
             details=(export.directory/'undetermined-details.jsonl').read_text()

@@ -122,7 +122,7 @@ async function submit() {
       </el-form-item>
       <el-form-item label="超时后重试次数">
         <el-input-number v-model="retries" :min="0" :max="5" :step="1" :precision="0" :disabled="busy" />
-        <span class="field-note">0 表示不重试；只对超时、TLS 和 5xx 等可重试错误生效，密码错误、锁定等明确结论不重试。</span>
+        <span class="field-note">0 表示不重试；对超时、TLS、5xx，以及 Apple 返回“Try again later”生效；密码错误、锁定等明确结论不重试。</span>
       </el-form-item>
       <el-alert title="总控自动按每包最多 10,000 条建立字节索引；节点领包后使用全部进程和线程处理。" type="info" :closable="false" show-icon />
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />

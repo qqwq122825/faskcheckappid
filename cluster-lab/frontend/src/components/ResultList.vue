@@ -17,16 +17,16 @@ let backgroundQueued = false
 
 const options = [
   { label: '全部结果', value: 'all' },
-  { label: '密正', value: 'valid' },
+  { label: '密码正确', value: 'valid' },
   { label: '密码错误', value: 'wrong_password' },
   { label: '双重验证', value: 'need_2fa' },
   { label: '锁定', value: 'locked' },
-  { label: '已失效', value: 'invalid' },
-  { label: '超时', value: 'timeout' },
-  { label: '其他未验证', value: 'undetermined' },
+  { label: '未激活', value: 'invalid' },
+  { label: '不存在', value: 'not_found' },
+  { label: '请重试', value: 'timeout' },
+  { label: '其他错误', value: 'undetermined' },
 ]
 const labels: Record<string, string> = Object.fromEntries(options.map(item => [item.value, item.label]))
-const showErrorReasons = computed(() => state.value?.settings?.proxy_debug === true)
 const valid = computed(() => category.value === 'valid')
 const visibleTotal = computed(() => valid.value ? total.value : Math.min(total.value, pageSize))
 const page = computed(() => Math.floor(offset.value / pageSize) + 1)
@@ -70,21 +70,11 @@ async function refreshInBackground() {
     backgroundPending = false
   }
 }
-watch(showErrorReasons, () => {
-  if (!showErrorReasons.value) {
-    rows.value = rows.value.map(row => {
-      const { reason, detail, apple_message, error, traceback, raw_response, ...safe } = row
-      if (safe.code && !/^-?\d+$|^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/.test(String(safe.code))) safe.code = ''
-      return safe
-    })
-  }
-  void refreshInBackground()
-})
 function changeCategory() { load(true) }
 function previous() { offset.value = Math.max(0, offset.value - pageSize); load() }
 function next() { offset.value += pageSize; load() }
 const elapsed = (value: any) => value == null ? '—' : `${Number(value).toFixed(2)}s`
-const statusLabel = (row: any) => labels[row.status] || labels[category.value] || '其他未验证'
+const statusLabel = (row: any) => labels[row.status] || labels[category.value] || '其他错误'
 
 watch(
   () => [props.job?.id, Number(props.job?.confirmed) || 0] as const,
@@ -104,7 +94,7 @@ watch(
   <el-card shadow="never" class="section-card result-list-card">
     <template #header>
       <div class="section-heading result-list-heading">
-        <div><h2>账号结果</h2><p>密正结果可逐页查看全部；其他分类各显示前 100 条。</p></div>
+        <div><h2>账号结果</h2><p>密码正确结果可逐页查看全部；其他分类各显示前 100 条。</p></div>
         <el-select v-model="category" class="result-filter" @change="changeCategory">
           <el-option v-for="item in options" :key="item.value" :label="item.label" :value="item.value" />
         </el-select>
@@ -119,13 +109,13 @@ watch(
       <el-table-column prop="stage" label="阶段" min-width="130" show-overflow-tooltip />
       <el-table-column prop="http" label="HTTP" width="90" />
       <el-table-column prop="code" label="结果码" min-width="140" show-overflow-tooltip />
-      <el-table-column v-if="showErrorReasons" prop="reason" label="Apple原始原因" min-width="320" show-overflow-tooltip />
+      <el-table-column prop="reason_cn" label="中文原因" min-width="280" show-overflow-tooltip />
       <el-table-column prop="device_display" label="设备" min-width="210" show-overflow-tooltip />
       <el-table-column label="耗时" width="100"><template #default="scope">{{ elapsed(scope.row.elapsed) }}</template></el-table-column>
       <el-table-column prop="attempts" label="重试" width="80" />
     </el-table>
     <div class="result-list-footer">
-      <span v-if="valid">共 {{ fmt(total) }} 条密正结果 · 第 {{ page }} / {{ pageCount }} 页</span>
+      <span v-if="valid">共 {{ fmt(total) }} 条密码正确结果 · 第 {{ page }} / {{ pageCount }} 页</span>
       <span v-else-if="category === 'all'">共 {{ fmt(total) }} 条已确认结果，当前显示前 {{ fmt(visibleTotal) }} 条</span>
       <span v-else>共 {{ fmt(total) }} 条{{ labels[category] }}，当前显示前 {{ fmt(visibleTotal) }} 条</span>
       <div v-if="valid && total > pageSize" class="actions">

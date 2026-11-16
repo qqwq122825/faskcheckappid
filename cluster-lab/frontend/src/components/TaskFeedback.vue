@@ -22,13 +22,14 @@ const cells = computed<Cell[]>(() => [
   { label: '已确认', value: props.completed,
     tone: props.total && props.completed >= props.total ? 'success' : undefined },
   { label: '剩余', value: Math.max(0, props.total - (reportedProcessed.value ?? props.completed)) },
-  { label: '密正', value: categories.value.valid ?? 0, tone: 'success' },
+  { label: '密码正确', value: categories.value.valid ?? 0, tone: 'success' },
   { label: '密码错误', value: categories.value.wrong_password ?? 0 },
   { label: '双重验证', value: categories.value.need_2fa ?? 0 },
   { label: '锁定', value: categories.value.locked ?? 0 },
-  { label: '超时', value: categories.value.timeout ?? 0, tone: 'warning' },
-  { label: '已失效', value: categories.value.invalid ?? 0, tone: 'danger' },
-  { label: '其他异常', value: categories.value.unknown ?? 0 },
+  { label: '未激活', value: categories.value.invalid ?? 0, tone: 'danger' },
+  { label: '不存在', value: categories.value.not_found ?? 0, tone: 'danger' },
+  { label: '请重试', value: categories.value.timeout ?? 0, tone: 'warning' },
+  { label: '其他错误', value: categories.value.unknown ?? 0 },
   ...(props.trafficBytes == null ? [] : [{ label: '任务流量', value: Number(trafficGb.value.toFixed(3)), suffix: ' GB' }]),
 ])
 </script>

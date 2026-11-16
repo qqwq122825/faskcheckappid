@@ -380,8 +380,9 @@ class ExecutorScaleTests(unittest.TestCase):
                             'http': 200, 'apple_ec': -22421,
                             'detail': 'ec=-22421',
                             'apple_message': 'This action could not be completed. Try again.'}
-                return {'status': 'valid', 'kind': 'valid', 'stage': 'complete',
-                        'http': 200, 'detail': '密码证明通过；未确认业务服务登录状态'}
+                return {'status': 'need_2fa', 'kind': 'valid', 'stage': 'complete',
+                        'http': 200, 'detail': '密码证明通过，服务要求二次验证',
+                        'auth_type': 'trustedDeviceSecondaryAuth'}
 
             with patch('clusterlab.executor._load_fastcheck', return_value=(
                     RefreshingPool, check,
@@ -395,8 +396,8 @@ class ExecutorScaleTests(unittest.TestCase):
             record = json.loads((root / 'results.jsonl').read_text())
             self.assertEqual(checked, [
                 ('socks5h://first-exit', 1), ('socks5h://second-exit', 2)])
-            self.assertEqual((record['status'], record['attempts']), ('valid', 1))
-            self.assertEqual(record['reason'], '密码证明通过；未确认业务服务登录状态')
+            self.assertEqual((record['status'], record['attempts']), ('need_2fa', 1))
+            self.assertEqual(record['reason'], 'au=trustedDeviceSecondaryAuth')
             self.assertEqual(shared.releases, [
                 ('socks5h://bootstrap', True),
                 ('socks5h://first-exit', True),
@@ -404,6 +405,45 @@ class ExecutorScaleTests(unittest.TestCase):
             ])
             self.assertEqual(shared.discards, [])
             self.assertEqual(stop.waits, [5.0])
+
+    def test_auth_unit_uses_configured_two_retries_for_apple_try_again_later(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text('account----password\n', encoding='utf-8')
+            descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 2}
+            shared = ScriptedProxyPool([
+                'socks5h://bootstrap', 'socks5h://first-exit',
+                'socks5h://second-exit', 'socks5h://third-exit'])
+            stop = RecordingStop()
+            checked = []
+            reason = 'Unable to sign you in to your Apple Account. Try again later.'
+
+            def check(_account, _password, proxy, **_kwargs):
+                checked.append(proxy)
+                return {'status': 'error', 'kind': 'protocol', 'stage': 'complete',
+                        'http': 200, 'apple_ec': -1, 'detail': f'ec=-1 {reason}',
+                        'apple_message': reason}
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool, check,
+                    lambda result: ('timeout' if reason.casefold() in
+                                    str(result.get('apple_message') or '').casefold()
+                                    else 'undetermined'))), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, stop, proxy_pool=shared)
+
+            record = json.loads((root / 'results.jsonl').read_text())
+            self.assertEqual(checked, [
+                'socks5h://first-exit', 'socks5h://second-exit', 'socks5h://third-exit'])
+            self.assertEqual((record['status'], record['attempts']), ('timeout', 2))
+            self.assertEqual(record['reason'], reason)
+            self.assertEqual(stop.waits, [5.0, 5.0])
+            self.assertEqual(shared.discards, [
+                'socks5h://first-exit', 'socks5h://second-exit', 'socks5h://third-exit'])
 
     def test_registration_history_keeps_the_first_time_and_proxy_per_slot(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -5,6 +5,25 @@ import time
 import unicodedata
 
 
+_APPLE_REASON_BUCKETS = (
+    ('unable to sign you in to your apple account. try again later', 'timeout'),
+    ('this apple account has been locked for security reasons', 'locked'),
+    ('enter the correct password for this apple account', 'wrong_password'),
+    ('this apple account is not active', 'invalid'),
+    ('your account information was entered incorrectly', 'not_found'),
+)
+
+
+def apple_reason_bucket(result):
+    """Classify only explicit English account reasons returned by Apple."""
+    values = (result.get('apple_message'), result.get('reason'), result.get('detail'))
+    text = ' '.join(str(value).strip() for value in values if value).casefold()
+    for phrase, bucket in _APPLE_REASON_BUCKETS:
+        if phrase in text:
+            return bucket
+    return None
+
+
 def result_bucket(result):
     status = result.get('status')
     try:
@@ -21,28 +40,22 @@ def result_bucket(result):
         explicit_http_zero = False
     if explicit_http_zero:
         return 'timeout'
-    # 业务展示口径：-22421 是 Anisette/设备环境异常，需要重试；
-    # GSA -20970 归入“已失效”，-20209 归入“锁定”。
-    # 结果码优先于旧版执行器给出的 status，便于新总控兼容旧节点。
+    # 账号业务分类以 Apple 返回的英文原因为准，不用可复用于多种
+    # 原因的 ec 错误码猜测账号状态。-22421 仅是设备环境异常的重试信号。
+    reason_bucket = apple_reason_bucket(result)
+    if reason_bucket:
+        return reason_bucket
     if apple_ec == -22421:
         return 'timeout'
-    if apple_ec == -20970:
-        return 'invalid'
-    if apple_ec == -20209:
-        return 'locked'
     if status == 'need_2fa':
         return 'need_2fa'
     if status == 'valid' or (status == 'needs_setup' and result.get('password_verified') is True):
         return 'valid'
-    if status == 'wrong_password':
-        return 'wrong_password'
-    if status in ('security_lock', 'locked'):
-        return 'locked'
     return 'undetermined'
 
 
 def snapshot(total, results, active=0):
-    counts = {key: 0 for key in ('valid','wrong_password','need_2fa','locked','timeout','invalid','undetermined')}
+    counts = {key: 0 for key in ('valid','wrong_password','need_2fa','locked','timeout','invalid','not_found','undetermined')}
     processed = 0
     for result in results.values():
         if result.get('attempts', 1) <= 0 or result.get('status') == 'not_started':
@@ -58,10 +71,11 @@ def status_tokens(counts, elapsed, phase, devices=None):
     speed = round(counts['processed']*3600/elapsed) if elapsed>0 else 0
     tokens = [f'[{phase}]',f'总数:{counts["total"]}',f'已运行:{counts["processed"]}',
               f'剩余:{counts["remaining"]}',f'运行中:{counts["active"]}',
-              f'密正:{counts["valid"]}',f'错误:{counts["wrong_password"]}',
+              f'密码正确:{counts["valid"]}',f'密码错误:{counts["wrong_password"]}',
               f'双重:{counts["need_2fa"]}',f'锁定:{counts["locked"]}',
-              f'超时:{counts["timeout"]}',f'已失效:{counts["invalid"]}',
-              f'其他未验证:{counts["undetermined"]}',
+              f'请重试:{counts["timeout"]}',f'未激活:{counts["invalid"]}',
+              f'不存在:{counts["not_found"]}',
+              f'其他错误:{counts["undetermined"]}',
               f'用时:{duration}',f'速度:{speed}/时']
     if devices is not None:
         if isinstance(devices,dict):

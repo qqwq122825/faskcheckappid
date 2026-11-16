@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS jobs (
  c_valid INTEGER NOT NULL DEFAULT 0, c_wrong INTEGER NOT NULL DEFAULT 0,
  c_2fa INTEGER NOT NULL DEFAULT 0, c_locked INTEGER NOT NULL DEFAULT 0,
  c_timeout INTEGER NOT NULL DEFAULT 0, c_invalid INTEGER NOT NULL DEFAULT 0,
+ c_not_found INTEGER NOT NULL DEFAULT 0,
  c_unknown INTEGER NOT NULL DEFAULT 0, c_web_recheck INTEGER NOT NULL DEFAULT 0,
  reported_rows INTEGER NOT NULL DEFAULT 0,
  traffic_bytes INTEGER NOT NULL DEFAULT 0,
@@ -111,8 +112,27 @@ def mask_api(value):
     return _re.sub(r'(?i)(password|passwd|pwd|token|key)=[^&\s]+', r'\1=***', str(value))
 
 
+_APPLE_REASON_BUCKETS = (
+    ('unable to sign you in to your apple account. try again later', 'timeout'),
+    ('this apple account has been locked for security reasons', 'locked'),
+    ('enter the correct password for this apple account', 'wrong_password'),
+    ('this apple account is not active', 'invalid'),
+    ('your account information was entered incorrectly', 'not_found'),
+)
+
+
+def apple_reason_bucket(value):
+    """Return a business bucket only for explicit English Apple reasons."""
+    fields = (value.get('reason'), value.get('apple_message'), value.get('detail'))
+    text = ' '.join(str(field).strip() for field in fields if field).casefold()
+    for phrase, bucket in _APPLE_REASON_BUCKETS:
+        if phrase in text:
+            return bucket
+    return None
+
+
 def result_record_bucket(value):
-    """Normalize result codes from current and older nodes to the active UI categories."""
+    """Classify account results by explicit English reasons, never business ec codes."""
     try:
         explicit_http_zero = ('http' in value and value.get('http') is not None
                               and int(value['http']) == 0)
@@ -120,6 +140,9 @@ def result_record_bucket(value):
         explicit_http_zero = False
     if explicit_http_zero:
         return 'timeout'
+    reason_bucket = apple_reason_bucket(value)
+    if reason_bucket:
+        return reason_bucket
     codes = []
     for key in ('code', 'apple_ec', 'gsa_code'):
         try:
@@ -128,15 +151,38 @@ def result_record_bucket(value):
             continue
     if -22421 in codes:
         return 'timeout'
-    if -20209 in codes:
-        return 'locked'
-    if -20970 in codes:
-        return 'invalid'
-    bucket = value.get('status') or 'valid'
-    if bucket not in ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid',
-                      'timeout', 'undetermined', 'unknown'):
-        return 'unknown'
-    return bucket
+    bucket = value.get('status') or 'unknown'
+    if bucket in ('valid', 'need_2fa', 'timeout', 'undetermined', 'unknown'):
+        return bucket
+    return 'unknown'
+
+
+def result_reason_cn(value, bucket=None):
+    """Translate the node's shortcut category/raw Apple reason for display."""
+    raw = str(value.get('reason') or value.get('apple_message') or '').strip()
+    low = raw.casefold()
+    translations = (
+        ('unable to sign you in to your apple account. try again later',
+         '暂时无法登录，已按任务设置重试'),
+        ('this apple account has been locked for security reasons',
+         '账号因安全原因被锁定'),
+        ('enter the correct password for this apple account', '密码错误'),
+        ('this apple account is not active', '账号未激活'),
+        ('your account information was entered incorrectly', '账号不存在'),
+    )
+    for phrase, translated in translations:
+        if phrase in low:
+            return translated
+    resolved = bucket or result_record_bucket(value)
+    if resolved == 'need_2fa':
+        if low.startswith('au='):
+            return f'密码已通过，需要双重验证（{raw}）'
+        return '密码已通过，需要双重验证'
+    if resolved == 'valid':
+        return '密码正确'
+    if resolved == 'timeout':
+        return '请求超时或服务暂时不可用'
+    return '其他错误'
 
 
 class Controller:
@@ -144,9 +190,9 @@ class Controller:
     MAX_THREADS = 512
     MAX_ACTIVE_UNITS = 512
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
-    RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid',
+    RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid', 'not_found',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 3
+    RESULT_CLASSIFICATION_VERSION = 5
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')
@@ -165,7 +211,7 @@ class Controller:
                 db.execute("UPDATE jobs SET queued_at=created WHERE status IN ('running','paused')")
             columns = {row['name'] for row in db.execute('PRAGMA table_info(nodes)')}
             job_columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
-            for name in ('c_valid', 'c_wrong', 'c_2fa', 'c_locked', 'c_timeout', 'c_invalid',
+            for name in ('c_valid', 'c_wrong', 'c_2fa', 'c_locked', 'c_timeout', 'c_invalid', 'c_not_found',
                          'c_unknown', 'c_web_recheck', 'reported_rows', 'traffic_bytes',
                          'req_timeout', 'req_retries', 'device_capacity', 'dual_recheck'):
                 if name not in job_columns:
@@ -271,7 +317,8 @@ class Controller:
                 previous = {}
             columns = {'valid': 'c_valid', 'wrong_password': 'c_wrong',
                        'need_2fa': 'c_2fa', 'locked': 'c_locked',
-                       'timeout': 'c_timeout', 'invalid': 'c_invalid'}
+                       'timeout': 'c_timeout', 'invalid': 'c_invalid',
+                       'not_found': 'c_not_found'}
             deltas = {key: int(counts.get(key, 0)) - int(previous.get(key, 0) or 0)
                       for key in columns}
             old_unknown = int(previous.get('undetermined', 0) or 0) + int(previous.get('unknown', 0) or 0)
@@ -285,9 +332,11 @@ class Controller:
                     "UPDATE jobs SET c_valid=MAX(0,c_valid+?),c_wrong=MAX(0,c_wrong+?),"
                     "c_2fa=MAX(0,c_2fa+?),c_locked=MAX(0,c_locked+?),"
                     "c_timeout=MAX(0,c_timeout+?),c_invalid=MAX(0,c_invalid+?),"
+                    "c_not_found=MAX(0,c_not_found+?),"
                     "c_unknown=MAX(0,c_unknown+?),updated=? WHERE id=?",
                     (deltas['valid'], deltas['wrong_password'], deltas['need_2fa'],
                      deltas['locked'], deltas['timeout'], deltas['invalid'],
+                     deltas['not_found'],
                      new_unknown - old_unknown, time.time(), unit['job_id']))
                 db.execute('UPDATE units SET result_counts=?,classification_version=? WHERE id=?',
                            (json.dumps(dict(counts), separators=(',', ':')),
@@ -812,10 +861,11 @@ class Controller:
             if job_mode == 'auth':
                 db.execute(
                     "UPDATE jobs SET c_valid=c_valid+?,c_wrong=c_wrong+?,c_2fa=c_2fa+?,"
-                    "c_locked=c_locked+?,c_timeout=c_timeout+?,c_invalid=c_invalid+?,"
+                    "c_locked=c_locked+?,c_timeout=c_timeout+?,c_invalid=c_invalid+?,c_not_found=c_not_found+?,"
                     "c_unknown=c_unknown+?,updated=? WHERE id=?",
                     (buckets['valid'], buckets['wrong_password'], buckets['need_2fa'],
                      buckets['locked'], buckets['timeout'], buckets['invalid'],
+                     buckets['not_found'],
                      buckets['undetermined'] + buckets['unknown'], time.time(), unit['job_id']))
             else:
                 db.execute('UPDATE jobs SET updated=? WHERE id=?',
@@ -1420,10 +1470,11 @@ class Controller:
                     # 只有账号校验才产生业务分类；摘要任务记成"密正"会误导
                     db.execute(
                         "UPDATE jobs SET c_valid=c_valid+?,c_wrong=c_wrong+?,c_2fa=c_2fa+?,"
-                        "c_locked=c_locked+?,c_timeout=c_timeout+?,c_invalid=c_invalid+?,"
+                        "c_locked=c_locked+?,c_timeout=c_timeout+?,c_invalid=c_invalid+?,c_not_found=c_not_found+?,"
                         "c_unknown=c_unknown+?,updated=? WHERE id=?",
                         (buckets['valid'], buckets['wrong_password'], buckets['need_2fa'],
                          buckets['locked'], buckets['timeout'], buckets['invalid'],
+                         buckets['not_found'],
                          buckets['undetermined'] + buckets['unknown'], time.time(), unit['job_id']))
                 else:
                     db.execute("UPDATE jobs SET updated=? WHERE id=?", (time.time(), unit['job_id']))
@@ -1484,6 +1535,7 @@ class Controller:
                                           'locked': row['c_locked'] + live['locked'],
                                           'timeout': row['c_timeout'] + live['timeout'],
                                           'invalid': row['c_invalid'] + live['invalid'],
+                                          'not_found': row['c_not_found'] + live['not_found'],
                                           'unknown': row['c_unknown'] + live['undetermined'] + live['unknown']},
                              reported=row['reported_rows'])
                 jobs.append(value)
@@ -1562,9 +1614,15 @@ class Controller:
         node_text = f'节点{number:02d}' if number else '节点—'
         device_text = label[:32] if label else (f'#{slot}' if slot else '—')
         record['device_display'] = f'{node_text} · {device_text}'
+        if record.get('reason') in ('密码证明通过，服务要求二次验证',
+                                    '密码证明通过；未确认业务服务登录状态'):
+            # 旧记录里这两句是本地生成的说明，不是 Apple 原始返回。
+            record['reason'] = ''
+        record['reason_cn'] = result_reason_cn(record, record.get('status'))
         if not show_errors:
+            # 原始 Apple 原因 reason 始终返回；调试开关只控制额外诊断字段。
             # Filter the response only; never rewrite authoritative result bytes.
-            for field in ('reason', 'detail', 'apple_message', 'error', 'traceback', 'raw_response'):
+            for field in ('detail', 'apple_message', 'error', 'traceback', 'raw_response'):
                 record.pop(field, None)
             code = str(record.get('code') or '')
             # Older workers used the first 180 characters of an exception as code.
@@ -1670,7 +1728,7 @@ class Controller:
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
         categories = ('all', 'valid', 'wrong_password', 'need_2fa', 'locked',
-                      'invalid', 'timeout', 'undetermined', 'unknown')
+                      'invalid', 'not_found', 'timeout', 'undetermined', 'unknown')
         if category not in categories:
             raise ValueError('结果分类无效')
         with self.db.connect() as db:

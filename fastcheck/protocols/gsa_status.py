@@ -499,20 +499,19 @@ def classify(ec, em: str) -> tuple[str, str]:
     em_l = (em or "").lower()
     if ec == 0:
         return "valid", ""
+    if "your account information was entered incorrectly" in em_l:
+        return "not_found", em
     if any(s in em_l for s in ("password was entered incorrectly",
+                              "enter the correct password for this apple account",
                               "incorrect username or password",
-                              "username or password is incorrect",
-                              "information was entered incorrectly")):
+                              "username or password is incorrect")):
         return "wrong_password", em
-    if ec in (-22406, -22025, -22420, -20101):
-        return "wrong_password", f"ec={ec}"
-    if "not active" in em_l or "request access" in em_l or ec == -20751:
+    if "not active" in em_l or "request access" in em_l:
         return "not_active", em or f"ec={ec}"
-    if "locked for security reasons" in em_l or ec == -20209:
+    if "locked for security reasons" in em_l:
         return "security_lock", em or f"ec={ec}"
     if any(s in em_l for s in ("account is disabled", "account is locked",
-                              "has been locked", "has been disabled", "accountdisabled")) \
-            or ec in (-20752, -22413, -22014):
+                              "has been locked", "has been disabled", "accountdisabled")):
         return "locked", em or f"ec={ec}"
     return "error", f"ec={ec} {em}".strip()
 
@@ -766,9 +765,9 @@ def _once(email: str, password: str, proxy: str | None, timeout: float,
             # GSA 只有在密码证明已通过后需要继续身份验证时才返回 au。
             # Apple 会按账号/地区返回不同名称（例如手机验证码挑战），
             # 所以不再只匹配两个固定字符串；有 au 就归入“双重验证”。
-            verdict, detail = "need_2fa", "密码证明通过，服务要求二次验证"
+            verdict, detail = "need_2fa", f"au={auth_type[:80]}"
         else:
-            detail = "密码证明通过；未确认业务服务登录状态"
+            detail = ""
         result = _result(verdict, detail, started, stage="complete")
         result.update(password_verified=True,
                       two_factor_status="required" if verdict == "need_2fa" else "unknown",

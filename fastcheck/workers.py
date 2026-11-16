@@ -150,7 +150,7 @@ def shared_session(proxy, want_trace=False):
 
 def safe_result(result):
     keys = ('status', 'kind', 'stage', 'apple_ec', 'password_verified', 'two_factor_status',
-            'http', 'init_http', 'complete_http', 'error_type')
+            'auth_type', 'apple_message', 'http', 'init_http', 'complete_http', 'error_type')
     value = {key: result[key] for key in keys if key in result}
     value.setdefault('status', 'error')
     detail=str(result.get('detail',''))
@@ -296,7 +296,9 @@ def demo_attempt(payload, output, stop):
     socket.socket.connect = forbidden
     time.sleep(.2)
     if payload['row'] == 1:
-        return {'status': 'error', 'kind': 'protocol', 'stage': 'init', 'apple_ec': -20970}
+        return {'status': 'error', 'kind': 'protocol', 'stage': 'init',
+                'apple_ec': -20970,
+                'apple_message': 'This Apple Account is not active.'}
     return {'status': 'need_2fa', 'stage': 'complete', 'password_verified': True}
 
 

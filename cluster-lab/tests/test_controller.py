@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from clusterlab.controller import Conflict, Controller, result_record_bucket
+from clusterlab.controller import Conflict, Controller, result_reason_cn, result_record_bucket
 from clusterlab.web import create_app
 
 
@@ -136,7 +136,8 @@ class ControllerTests(unittest.TestCase):
         self.fail('preparation did not finish')
 
     def output(self, unit):
-        value = b''.join((json.dumps({'row': n, 'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
+        value = b''.join((json.dumps({'row': n, 'status': 'valid',
+                                     'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
                                     separators=(',', ':')) + '\n').encode()
                          for n in range(unit['first_row'], unit['first_row'] + unit['rows']))
         return value, hashlib.sha256(value).hexdigest()
@@ -416,7 +417,7 @@ class ControllerTests(unittest.TestCase):
         unit = self.service.lease(self.node['id'], 'test-session')
         live = {'wrong_password': 3, 'locked': 2, 'invalid': 4, 'undetermined': 1}
         self.service.heartbeat(self.node['id'], {
-            'session': 'test-session', 'version': '0.3.6',
+            'session': 'test-session', 'version': '0.3.58',
             'max_processes': 1, 'max_threads': 2, 'interrupted': [],
             'active': [{'id': unit['id'], 'token': unit['token'],
                         'processed': 10, 'counts': live}]})
@@ -424,21 +425,23 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(state['processed'], 10)
         self.assertEqual(state['categorized'], {
             'valid': 0, 'wrong_password': 3, 'need_2fa': 0,
-            'locked': 2, 'timeout': 0, 'invalid': 4, 'unknown': 1})
+            'locked': 2, 'timeout': 0, 'invalid': 4, 'not_found': 0, 'unknown': 1})
 
-        statuses = (['wrong_password'] * 3 + ['locked'] * 2 +
-                    ['invalid'] * 4 + ['undetermined'] + ['valid'] * 40)
+        statuses = ([('wrong_password', 'Enter the correct password for this Apple Account.')] * 3 +
+                    [('locked', 'This Apple Account has been locked for security reasons.')] * 2 +
+                    [('invalid', 'This Apple Account is not active.')] * 4 +
+                    [('undetermined', '')] + [('valid', '')] * 40)
         payload = b''.join((json.dumps({
-            'row': unit['first_row'] + offset, 'status': status,
+            'row': unit['first_row'] + offset, 'status': status, 'reason': reason,
             'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
             separators=(',', ':')) + '\n').encode()
-            for offset, status in enumerate(statuses))
+            for offset, (status, reason) in enumerate(statuses))
         self.service.accept_result(self.node['id'], unit['id'], unit['token'],
                                    io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
         state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
         self.assertEqual(state['categorized'], {
             'valid': 40, 'wrong_password': 3, 'need_2fa': 0,
-            'locked': 2, 'timeout': 0, 'invalid': 4, 'unknown': 1})
+            'locked': 2, 'timeout': 0, 'invalid': 4, 'not_found': 0, 'unknown': 1})
         with self.service.db.connect() as db:
             self.assertIsNone(db.execute('SELECT live_counts FROM units WHERE id=?',
                                          (unit['id'],)).fetchone()[0])
@@ -546,6 +549,8 @@ class ControllerTests(unittest.TestCase):
             'status': 'undetermined' if offset < 2 else 'valid',
             'protocol': 'GSA',
             'code': -20970 if offset == 0 else (-20209 if offset == 1 else 0),
+            'reason': ('This Apple Account is not active.' if offset == 0 else
+                       'This Apple Account has been locked for security reasons.' if offset == 1 else ''),
             'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
             separators=(',', ':')) + '\n').encode()
             for offset in range(unit['rows']))
@@ -554,7 +559,7 @@ class ControllerTests(unittest.TestCase):
         state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
         self.assertEqual(state['categorized'], {
             'valid': 48, 'wrong_password': 0, 'need_2fa': 0,
-            'locked': 1, 'timeout': 0, 'invalid': 1, 'unknown': 0})
+            'locked': 1, 'timeout': 0, 'invalid': 1, 'not_found': 0, 'unknown': 0})
         invalid = self.service.read_rows(job, 0, 100, 'invalid')
         locked = self.service.read_rows(job, 0, 100, 'locked')
         self.assertEqual((invalid['total'], invalid['rows'][0]['status'], invalid['rows'][0]['code']),
@@ -567,7 +572,26 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result_record_bucket({'status': 'undetermined', 'http': 0}), 'timeout')
         self.assertEqual(result_record_bucket({'status': 'undetermined'}), 'undetermined')
         self.assertEqual(result_record_bucket(
+            {'status': 'invalid', 'http': 200, 'code': '-20970'}), 'unknown')
+        self.assertEqual(result_record_bucket(
             {'status': 'invalid', 'http': 200, 'code': '-22421'}), 'timeout')
+
+        shared = {'status': 'invalid', 'http': 200, 'code': '-20970'}
+        self.assertEqual(result_record_bucket(dict(
+            shared, reason='This Apple Account has been locked for security reasons.')), 'locked')
+        self.assertEqual(result_record_bucket(dict(
+            shared, reason='Enter the correct password for this Apple Account.')), 'wrong_password')
+        self.assertEqual(result_record_bucket(dict(
+            shared, reason='This Apple Account is not active.')), 'invalid')
+        self.assertEqual(result_record_bucket(dict(
+            shared, reason='Your account information was entered incorrectly.')), 'not_found')
+        self.assertEqual(result_record_bucket({
+            'status': 'undetermined', 'reason': 'A new Apple English reason.'}), 'undetermined')
+        self.assertEqual(result_reason_cn({
+            'status': 'undetermined', 'reason': 'A new Apple English reason.'}), '其他错误')
+        self.assertEqual(result_reason_cn({
+            'status': 'need_2fa', 'reason': 'au=trustedDeviceSecondaryAuth'}),
+            '密码已通过，需要双重验证（au=trustedDeviceSecondaryAuth）')
         job = self.job(50)
         result = Path(self.temp.name) / 'legacy-http-zero.jsonl'
         with result.open('w', encoding='utf-8') as stream:

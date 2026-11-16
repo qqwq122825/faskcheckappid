@@ -141,7 +141,7 @@ test('Task detail lists all valid rows by page and caps each other category at 1
   const results = source('src/components/ResultList.vue')
   assert.match(detail, /<ResultList/)
   assert.match(results, /const pageSize = 100/)
-  assert.match(results, /密正结果可逐页查看全部/)
+  assert.match(results, /密码正确结果可逐页查看全部/)
   assert.match(results, /其他分类各显示前 100 条/)
   assert.match(results, /category=\$\{category\.value\}/)
   assert.match(results, /props\.job\?\.confirmed/)
@@ -188,11 +188,13 @@ test('Device pool has a guarded one-click clear action', () => {
 test('GSA result categories expose invalid and locked business states', () => {
   const feedback = source('src/components/TaskFeedback.vue')
   const detail = source('src/views/JobDetail.vue')
-  assert.match(feedback, /label: '已失效'/)
+  assert.match(feedback, /label: '未激活'/)
+  assert.match(feedback, /label: '不存在'/)
   assert.match(feedback, /categories\.value\.invalid/)
-  assert.match(detail, /label: '已失效', value: 'invalid'/)
+  assert.match(detail, /label: '未激活', value: 'invalid'/)
+  assert.match(detail, /label: '不存在', value: 'not_found'/)
   assert.match(detail, /label: '锁定', value: 'locked'/)
-  assert.match(feedback, /label: '其他异常'/)
+  assert.match(feedback, /label: '其他错误'/)
   assert.match(feedback, /categories\.value\.unknown/)
 })
 
@@ -209,7 +211,7 @@ test('Result list keeps one result-code column without web recheck fields', () =
   assert.match(results, /label: '全部结果', value: 'all'/)
   assert.match(results, /const category = ref\('all'\)/)
   assert.match(results, /prop="code" label="结果码"/)
-  assert.match(results, /prop="reason" label="Apple原始原因"/)
+  assert.match(results, /prop="reason_cn" label="中文原因"/)
   assert.doesNotMatch(results, /GSA 码|网页码|gsa_code|web_code|网页复检/)
   assert.match(results, /labels\[row\.status\]/)
 })
@@ -239,7 +241,7 @@ test('Task detail shows one node-reported traffic card with the 1 GB estimate', 
 test('Task summary omits the in-flight-record card and keeps its other ten metrics', () => {
   const feedback = source('src/components/TaskFeedback.vue')
   assert.doesNotMatch(feedback, /在途记录/)
-  for (const label of ['总数', '已确认', '剩余', '密正', '密码错误', '双重验证', '锁定', '超时', '已失效', '其他异常']) {
+  for (const label of ['总数', '已确认', '剩余', '密码正确', '密码错误', '双重验证', '锁定', '未激活', '不存在', '请重试', '其他错误']) {
     assert.ok(feedback.includes(`label: '${label}'`))
   }
 })

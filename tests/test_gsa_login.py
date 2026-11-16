@@ -132,10 +132,15 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(len(server.requests), 1)
 
+    def test_exact_account_information_reason_is_not_found(self):
+        self.assertEqual(gsa.classify(
+            -20970, 'Your account information was entered incorrectly.'),
+            ('not_found', 'Your account information was entered incorrectly.'))
+
     def test_complete_error_stops_after_one_attempt(self):
         server = SyntheticServer(complete_ec=-22406)
         result = self.authenticate(server)
-        self.assertEqual(result["status"], "wrong_password")
+        self.assertEqual(result["status"], "error")
         self.assertEqual(len(server.requests), 2)
 
     def test_actual_http_status_is_recorded_and_does_not_leak_to_next_account(self):

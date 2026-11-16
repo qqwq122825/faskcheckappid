@@ -97,6 +97,18 @@ def _proxy_debug_detail(value):
     return text[:240]
 
 
+def _apple_reason_for_record(result, status):
+    """Keep only Apple's raw message or its raw 2FA ``au`` signal."""
+    message = result.get('apple_message')
+    if isinstance(message, str) and message.strip():
+        return message.strip()[:2048]
+    if status == 'need_2fa':
+        auth_type = str(result.get('auth_type') or '').strip()
+        if auth_type and auth_type != 'none':
+            return f'au={auth_type[:80]}'
+    return ''
+
+
 def _write_proxy_debug(path, event, **fields):
     """Append one bounded JSONL event without ever persisting proxy credentials."""
     if not path:
@@ -1161,6 +1173,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             return proxy, None
         return proxies[index % len(proxies)], None
 
+    def apple_retry_later(result):
+        apple_text = ' '.join(str(result.get(key) or '').strip()
+                              for key in ('apple_message', 'detail')).casefold()
+        return ('unable to sign you in to your apple account. try again later'
+                in apple_text)
+
     def retryable_transport(result):
         try:
             http = int(result.get('http'))
@@ -1170,8 +1188,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             apple_ec = int(result.get('apple_ec'))
         except (TypeError, ValueError):
             apple_ec = None
-        # 没拿到 HTTP 响应、服务不可用或 Anisette/设备环境失效时重试。
-        return http in (0, 503) or apple_ec == -22421
+        # 没拿到 HTTP 响应、服务不可用、Apple 明确要求稍后再试，或
+        # Anisette/设备环境失效时重试。重试次数仍严格受用户设置控制。
+        return http in (0, 503) or apple_ec == -22421 or apple_retry_later(result)
 
     def auth_result_bucket(result):
         try:
@@ -1181,8 +1200,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         if http in (0, 503):
             return 'timeout'
         bucket = result_bucket(result)
-        # 认证核心不保留模糊分类：已知业务结果照常展示，其余异常归失效。
-        return 'invalid' if bucket in ('undetermined', 'unknown') else bucket
+        # 没有命中内置英文原因的结果保留为“其他错误”，
+        # 不再因某个 Apple ec 错误码而猜测账号已失效。
+        return 'undetermined' if bucket in ('undetermined', 'unknown') else bucket
 
     def one(row, index, line):
         if stop.is_set():
@@ -1264,7 +1284,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             # wait five seconds, then acquire an available (never in-use) exit.
             # Proxy-auth 407 and other transport failures retain the general
             # three-strike policy used outside this retry branch.
-            immediate_discard = result_http in (0, 503)
+            # 三种明确重试条件都淘汰当前出口，等待 5 秒后从池中获取
+            # 另一条 IP；否则刚释放的健康租约可能被同一账号再次拿到。
+            immediate_discard = result_http in (0, 503) or apple_retry_later(result)
             healthy_exit = result_http not in (None, 0, 407)
             if proxy_pool is not None:
                 if immediate_discard:
@@ -1367,7 +1389,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 business_code = result.get('apple_ec')
                 if business_code is None:
                     business_code = (result.get('detail') or result.get('kind') or '')[:180]
-                reason = (result.get('apple_message') or result.get('detail') or '')[:2048]
+                reason = _apple_reason_for_record(result, status)
                 record = {'row': row, 'account': account, 'password': password, 'status': status,
                           'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
                           'stage': result.get('stage') or '', 'http': result.get('http'),
