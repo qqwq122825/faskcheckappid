@@ -35,6 +35,8 @@ class Node:
     # 两处不一致时总控切得出、节点收不下，大包会一直重试到租约过期。
     UNIT_BYTE_LIMIT = 34 * 1024 * 1024
     LIVE_RESULT_LIMIT = 1000
+    RESULT_RECORD_BYTE_LIMIT = 64 * 1024
+    LIVE_RESULT_BYTE_LIMIT = 1024 * 1024
 
     def __init__(self, root, max_processes=2, max_threads=8, allow_http=False, interval=1.0):
         self.root = private_dir(root)
@@ -321,6 +323,8 @@ class Node:
         state = read_json(state_path, {'files': {}})
         offsets = dict(state.get('files') or {})
         records = []
+        record_bytes = 0
+        batch_full = False
         for path in self._live_result_paths(unit_id):
             key = str(path.relative_to(directory))
             offset = max(0, int(offsets.get(key) or 0))
@@ -331,13 +335,17 @@ class Node:
                     stream.seek(offset)
                     while len(records) < self.LIVE_RESULT_LIMIT:
                         start = stream.tell()
-                        line = stream.readline(1025)
+                        line = stream.readline(self.RESULT_RECORD_BYTE_LIMIT + 1)
                         if not line:
                             break
-                        if len(line) > 1024:
+                        if len(line) > self.RESULT_RECORD_BYTE_LIMIT:
                             raise ValueError('实时结果记录过长')
                         if not line.endswith(b'\n'):
                             stream.seek(start)
+                            break
+                        if record_bytes + len(line) > self.LIVE_RESULT_BYTE_LIMIT:
+                            stream.seek(start)
+                            batch_full = True
                             break
                         try:
                             record = json.loads(line)
@@ -349,11 +357,12 @@ class Node:
                         # promote the streamed rows into the authoritative file
                         # with the same checksum as the later full-file replay.
                         records.append(line[:-1].decode('utf-8'))
+                        record_bytes += len(line)
                         offset = stream.tell()
             except FileNotFoundError:
                 continue
             offsets[key] = offset
-            if len(records) >= self.LIVE_RESULT_LIMIT:
+            if len(records) >= self.LIVE_RESULT_LIMIT or batch_full:
                 break
         return records, {'files': offsets, 'updated': time.time()}
 
@@ -370,6 +379,7 @@ class Node:
     def _heartbeat(self):
         self._refresh_progress()
         report_states = {}
+        report_errors = []
         with self.db.connect() as db:
             values, interrupted = [], []
             for task in db.execute("SELECT * FROM tasks WHERE status IN ('running','outbox','interrupted')"):
@@ -383,7 +393,14 @@ class Node:
                 # 失败原因一并上报，否则总控只能看到"待确认"，看不到为什么
                 if task['error']:
                     item['error'] = str(task['error'])[:180]
-                records, next_state = self._collect_live_records(task['id'])
+                try:
+                    records, next_state = self._collect_live_records(task['id'])
+                except (OSError, ValueError):
+                    # Result validation must not suppress liveness or control ACKs.
+                    # Keep both the source and cursor intact for diagnosis/retry.
+                    item['error'] = '实时结果上报失败，原文件已保留'
+                    report_errors.append(item['error'])
+                    records, next_state = [], None
                 if records:
                     item['records'] = records
                     report_states[task['id']] = next_state
@@ -398,7 +415,7 @@ class Node:
                            'telemetry': dict(self.telemetry.latest,
                                              worker_processes=self._active_worker_count()),
                            'devices': self._device_status(),
-                           'error': ''}) as response:
+                           'error': '; '.join(report_errors)[:200]}) as response:
             value = response.json()
         reported = value.get('reported') if isinstance(value.get('reported'), dict) else {}
         for unit_id, next_state in report_states.items():
@@ -406,7 +423,7 @@ class Node:
                 atomic_json(self.spool / unit_id / 'report-state.json', next_state)
         with self.lock:
             self.settings = value
-            self.connected, self.error, self.last_success = True, '', time.time()
+            self.connected, self.error, self.last_success = True, '; '.join(report_errors)[:240], time.time()
             if value.get('stop_version', 0) > self.stop_version:
                 for process, stop in self.active.values():
                     stop.set()

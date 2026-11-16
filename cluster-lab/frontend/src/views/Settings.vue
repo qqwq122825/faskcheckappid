@@ -159,7 +159,7 @@ async function saveProxyDebug(value: string | number | boolean) {
                    active-text="开启调试日志" inactive-text="关闭调试日志"
                    @change="saveProxyDebug" />
         <span class="field-note">
-          关闭后，新领取的工作包不会创建 proxy-debug.jsonl；已有日志不会自动删除。
+          开启时，结果列表显示已保存的原始错误原因；关闭时隐藏原因，接口也不返回错误详情。此显示开关即时生效，原始结果不删除。关闭后，新工作包不再创建 proxy-debug.jsonl，已有日志保留。
           仅排查代理问题时开启，避免产生大量日志。
         </span>
       </el-form-item>

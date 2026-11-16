@@ -143,6 +143,7 @@ class Controller:
     MAX_PROCESSES = 200
     MAX_THREADS = 512
     MAX_ACTIVE_UNITS = 512
+    RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid',
                       'timeout', 'undetermined', 'unknown')
     RESULT_CLASSIFICATION_VERSION = 3
@@ -717,7 +718,7 @@ class Controller:
         Workers only append local JSONL files.  The node agent reads those files
         once per heartbeat and sends at most 1,000 complete lines here.  Keeping
         this validation identical to the final-result path means a live row can
-        never bypass the package row range or the 1 KiB record limit.
+        never bypass the package row range or the bounded result-record byte limit.
         """
         if value is None:
             return []
@@ -749,7 +750,7 @@ class Controller:
                     or not isinstance(digest, str)
                     or not re.fullmatch('[0-9a-f]{64}', digest)):
                 raise ValueError('实时结果编号或摘要无效')
-            if len(encoded.encode('utf-8')) + 1 > 1024:
+            if len(encoded.encode('utf-8')) + 1 > cls.RESULT_RECORD_BYTE_LIMIT:
                 raise ValueError('实时结果记录过长')
             seen.add(row)
             result.append((row, result_record_bucket(record), encoded))
@@ -1367,10 +1368,10 @@ class Controller:
             with temporary.open('xb') as output:
                 temporary.chmod(0o600)
                 while True:
-                    line = stream.readline(1025)
+                    line = stream.readline(self.RESULT_RECORD_BYTE_LIMIT + 1)
                     if not line:
                         break
-                    if len(line) > 1024 or not line.endswith(b'\n'):
+                    if len(line) > self.RESULT_RECORD_BYTE_LIMIT or not line.endswith(b'\n'):
                         raise ValueError('结果记录格式无效')
                     value = json.loads(line)
                     # 必需字段固定，允许执行器附加 account/status 等业务字段
@@ -1542,11 +1543,13 @@ class Controller:
                 label = str(item.get('label') or '').strip()
                 if label:
                     labels[(node['id'], slot)] = label[:32]
-        return numbers, labels
+        setting = db.execute("SELECT value FROM controller_settings WHERE key='proxy_debug'").fetchone()
+        show_errors = bool(setting and str(setting[0]) in ('1', 'True', 'true'))
+        return numbers, labels, show_errors
 
     @staticmethod
     def _decorate_result_device(record, unit, context):
-        numbers, labels = context
+        numbers, labels, show_errors = context
         node_id = unit['node_id']
         number = numbers.get(node_id)
         try:
@@ -1559,6 +1562,15 @@ class Controller:
         node_text = f'节点{number:02d}' if number else '节点—'
         device_text = label[:32] if label else (f'#{slot}' if slot else '—')
         record['device_display'] = f'{node_text} · {device_text}'
+        if not show_errors:
+            # Filter the response only; never rewrite authoritative result bytes.
+            for field in ('reason', 'detail', 'apple_message', 'error', 'traceback', 'raw_response'):
+                record.pop(field, None)
+            code = str(record.get('code') or '')
+            # Older workers used the first 180 characters of an exception as code.
+            # Keep numeric/machine codes, but do not leak that fallback when off.
+            if code and not re.fullmatch(r'-?\d+|[A-Za-z][A-Za-z0-9_.:-]{0,63}', code):
+                record['code'] = ''
         return record
 
     def _read_rows_with_live(self, db, job_id, offset, limit, category, device_context):

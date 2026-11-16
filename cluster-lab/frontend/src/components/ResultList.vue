@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { api, fmt } from '../composables/useCluster'
+import { api, fmt, state } from '../composables/useCluster'
 
 const props = defineProps<{ job: any }>()
 const pageSize = 100
@@ -26,6 +26,7 @@ const options = [
   { label: '其他未验证', value: 'undetermined' },
 ]
 const labels: Record<string, string> = Object.fromEntries(options.map(item => [item.value, item.label]))
+const showErrorReasons = computed(() => state.value?.settings?.proxy_debug === true)
 const valid = computed(() => category.value === 'valid')
 const visibleTotal = computed(() => valid.value ? total.value : Math.min(total.value, pageSize))
 const page = computed(() => Math.floor(offset.value / pageSize) + 1)
@@ -69,6 +70,16 @@ async function refreshInBackground() {
     backgroundPending = false
   }
 }
+watch(showErrorReasons, () => {
+  if (!showErrorReasons.value) {
+    rows.value = rows.value.map(row => {
+      const { reason, detail, apple_message, error, traceback, raw_response, ...safe } = row
+      if (safe.code && !/^-?\d+$|^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/.test(String(safe.code))) safe.code = ''
+      return safe
+    })
+  }
+  void refreshInBackground()
+})
 function changeCategory() { load(true) }
 function previous() { offset.value = Math.max(0, offset.value - pageSize); load() }
 function next() { offset.value += pageSize; load() }
@@ -108,7 +119,7 @@ watch(
       <el-table-column prop="stage" label="阶段" min-width="130" show-overflow-tooltip />
       <el-table-column prop="http" label="HTTP" width="90" />
       <el-table-column prop="code" label="结果码" min-width="140" show-overflow-tooltip />
-      <el-table-column prop="reason" label="Apple原始原因" min-width="320" show-overflow-tooltip />
+      <el-table-column v-if="showErrorReasons" prop="reason" label="Apple原始原因" min-width="320" show-overflow-tooltip />
       <el-table-column prop="device_display" label="设备" min-width="210" show-overflow-tooltip />
       <el-table-column label="耗时" width="100"><template #default="scope">{{ elapsed(scope.row.elapsed) }}</template></el-table-column>
       <el-table-column prop="attempts" label="重试" width="80" />
