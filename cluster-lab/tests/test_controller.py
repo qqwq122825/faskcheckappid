@@ -618,6 +618,10 @@ class ControllerTests(unittest.TestCase):
             shared, reason='This Apple Account is not active.')), 'invalid')
         self.assertEqual(result_record_bucket(dict(
             shared, reason='Your account information was entered incorrectly.')), 'not_found')
+        self.assertEqual(result_record_bucket(dict(
+            shared, reason='The account does not exist.')), 'not_found')
+        self.assertEqual(result_reason_cn(dict(
+            shared, reason='The account does not exist.')), '账号不存在')
         self.assertEqual(result_record_bucket({
             'status': 'undetermined', 'reason': 'A new Apple English reason.'}), 'undetermined')
         self.assertEqual(result_record_bucket({

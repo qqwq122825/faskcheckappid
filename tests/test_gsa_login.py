@@ -160,6 +160,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(gsa.classify(
             -20970, 'Your account information was entered incorrectly.'),
             ('not_found', 'Your account information was entered incorrectly.'))
+        self.assertEqual(gsa.classify(
+            -20970, 'The account does not exist.'),
+            ('not_found', 'The account does not exist.'))
 
     def test_complete_error_stops_after_one_attempt(self):
         server = SyntheticServer(complete_ec=-22406)

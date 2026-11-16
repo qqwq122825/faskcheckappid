@@ -125,6 +125,7 @@ _APPLE_REASON_BUCKETS = (
     ('enter the correct password for this apple account', 'wrong_password'),
     ('this apple account is not active', 'invalid'),
     ('your account information was entered incorrectly', 'not_found'),
+    ('the account does not exist', 'not_found'),
 )
 
 
@@ -213,6 +214,7 @@ def result_reason_cn(value, bucket=None):
         ('enter the correct password for this apple account', '密码错误'),
         ('this apple account is not active', '账号未激活'),
         ('your account information was entered incorrectly', '账号不存在'),
+        ('the account does not exist', '账号不存在'),
     )
     for phrase, translated in translations:
         if phrase in low:
@@ -246,7 +248,7 @@ class Controller:
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid', 'not_found',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 8
+    RESULT_CLASSIFICATION_VERSION = 9
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')

@@ -55,6 +55,7 @@ class StatusTests(unittest.TestCase):
             'Enter the correct password for this Apple Account.': 'wrong_password',
             'This Apple Account is not active.': 'invalid',
             'Your account information was entered incorrectly.': 'not_found',
+            'The account does not exist.': 'not_found',
             'This Apple Account has been lockd for security reasons. Visit iForgot to reset your account.': 'locked',
             'This Apple Account has been Locked. Contact your Administrator or Manager to reset your password and unlock your account.': 'locked',
         }
