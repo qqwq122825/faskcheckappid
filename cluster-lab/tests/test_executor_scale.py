@@ -599,10 +599,61 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(shared.discards, [
                 'socks5h://first-exit', 'socks5h://second-exit', 'socks5h://third-exit'])
 
+    def test_auth_unit_retries_332000_codes_with_new_ip_and_identity(self):
+        class RefreshingPool(FakePool):
+            fetch_count = 0
+
+            def fetch_headers(self, *_args, **_kwargs):
+                type(self).fetch_count += 1
+                return {'generation': type(self).fetch_count}
+
+        for code in (-332000, -33200):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as temporary:
+                RefreshingPool.fetch_count = 0
+                root = Path(temporary)
+                (root / 'input.part').write_text('account----password\n', encoding='utf-8')
+                descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
+                              'device_capacity': 1, 'device_root': str(root / 'devices'),
+                              'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
+                              '_retry_delay': 0}
+                shared = ScriptedProxyPool([
+                    'socks5h://bootstrap', 'socks5h://first-exit', 'socks5h://second-exit'])
+                stop = RecordingStop()
+                checked = []
+
+                def check(_account, _password, proxy, **kwargs):
+                    checked.append((proxy, kwargs['identity']['generation']))
+                    if proxy == 'socks5h://first-exit':
+                        return {'status': 'error', 'kind': 'protocol', 'stage': 'init',
+                                'http': 200, 'apple_ec': code,
+                                'apple_message': 'Error Description not available'}
+                    return {'status': 'need_2fa', 'kind': 'valid', 'stage': 'complete',
+                            'http': 200, 'auth_type': 'trustedDeviceSecondaryAuth'}
+
+                with patch('clusterlab.executor._load_fastcheck', return_value=(
+                        RefreshingPool, check,
+                        lambda result: ('timeout' if result.get('apple_ec') in
+                                        (-332000, -33200) else result['status']))), \
+                     patch('fastcheck.workers.device_profile',
+                           return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                     patch('clusterlab.executor._bump_usage'):
+                    _execute_auth_unit(root, descriptor, stop, proxy_pool=shared)
+
+                record = json.loads((root / 'results.jsonl').read_text())
+                self.assertEqual(checked, [
+                    ('socks5h://first-exit', 1), ('socks5h://second-exit', 2)])
+                self.assertEqual((record['status'], record['attempts']), ('need_2fa', 1))
+                self.assertEqual(shared.discards, ['socks5h://first-exit'])
+                self.assertEqual(shared.releases, [
+                    ('socks5h://bootstrap', True), ('socks5h://second-exit', True)])
+                self.assertEqual(stop.waits, [])
+
     def test_auth_unit_retries_apple_server_error_reasons_with_new_ip(self):
         reasons = (
             'This request could not be completed because of a server error.',
             'This Action Cannot Be Completed',
+            'The request cannot be processed at this time. Please try again later.',
+            'We cannot process your request, please try again later.',
         )
         for reason in reasons:
             with self.subTest(reason=reason), tempfile.TemporaryDirectory() as temporary:

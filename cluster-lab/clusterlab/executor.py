@@ -1260,6 +1260,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             'unable to sign you in to your apple account. try again later',
             'this request could not be completed because of a server error',
             'this action cannot be completed',
+            'the request cannot be processed at this time. please try again later',
+            'we cannot process your request, please try again later',
         )
         return any(phrase in apple_text for phrase in phrases)
 
@@ -1274,7 +1276,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             apple_ec = None
         # 没拿到 HTTP 响应、服务不可用、Apple 明确要求稍后再试，或
         # Anisette/设备环境失效时重试。重试次数仍严格受用户设置控制。
-        return http in (0, 503) or apple_ec == -22421 or apple_retry_later(result)
+        return (http in (0, 503) or apple_ec in (-22421, -332000, -33200)
+                or apple_retry_later(result))
 
     def auth_result_bucket(result):
         try:
@@ -1374,13 +1377,19 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 result_http = int(result.get('http'))
             except (TypeError, ValueError):
                 result_http = None
+            try:
+                apple_ec = int(result.get('apple_ec'))
+            except (TypeError, ValueError):
+                apple_ec = None
             # HTTP 0 and 503 are retry outcomes: remove that exact lease now,
             # wait five seconds, then acquire an available (never in-use) exit.
             # Proxy-auth 407 and other transport failures retain the general
             # three-strike policy used outside this retry branch.
             # 明确重试条件都淘汰当前出口，等待 5 秒后从池中获取
             # 另一条 IP；否则刚释放的健康租约可能被同一账号再次拿到。
-            immediate_discard = result_http in (0, 503) or apple_retry_later(result)
+            immediate_discard = (result_http in (0, 503)
+                                 or apple_ec in (-332000, -33200)
+                                 or apple_retry_later(result))
             healthy_exit = result_http not in (None, 0, 407)
             if proxy_pool is not None:
                 if immediate_discard:
@@ -1409,11 +1418,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     release=('discarded' if immediate_discard else
                              ('reusable' if healthy_exit else 'failure_recorded')),
                     pool_before=acquire_before, pool_after=_proxy_pool_snapshot(proxy_pool))
-            try:
-                apple_ec = int(result.get('apple_ec'))
-            except (TypeError, ValueError):
-                apple_ec = None
-            if apple_ec == -22421:
+            if apple_ec in (-22421, -332000, -33200):
                 # 这不是账号结论；下一次重新获取 Anisette 身份，避免用
                 # 同一份无效设备认证数据重复请求。
                 identity = None

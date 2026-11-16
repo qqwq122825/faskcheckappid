@@ -35,6 +35,10 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(result_bucket({'status':'error','stage':'init','apple_ec':'-20209'}), 'undetermined')
         self.assertEqual(result_bucket({'status':'error','stage':'init','http':200,
                                         'apple_ec':'-22421'}), 'timeout')
+        self.assertEqual(result_bucket({'status':'error','stage':'init','http':200,
+                                        'apple_ec':'-332000'}), 'timeout')
+        self.assertEqual(result_bucket({'status':'error','stage':'init','http':200,
+                                        'apple_ec':'-33200'}), 'timeout')
         self.assertEqual(result_bucket({'status':'not_active'}),'undetermined')
         self.assertEqual(result_bucket({'status':'needs_setup','password_verified':True}),'valid')
         self.assertEqual(result_bucket({'status':'needs_setup'}),'undetermined')
@@ -45,6 +49,8 @@ class StatusTests(unittest.TestCase):
             'Unable to sign you in to your Apple Account. Try again later.': 'timeout',
             'This request could not be completed because of a server error.': 'timeout',
             'This Action Cannot Be Completed': 'timeout',
+            'The request cannot be processed at this time. Please try again later.': 'timeout',
+            'We cannot process your request, please try again later.': 'timeout',
             'This Apple Account has been\u00a0locked\u00a0for security reasons. Visit iForgot to reset your account (https://iforgot.apple.com).': 'locked',
             'Enter the correct password for this Apple Account.': 'wrong_password',
             'This Apple Account is not active.': 'invalid',
