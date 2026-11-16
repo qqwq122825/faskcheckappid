@@ -22,6 +22,7 @@ import socket
 import ssl
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -496,7 +497,7 @@ def set_rotate_every(n: int) -> None:
 # --------------------------------------------------------------------------- #
 def classify(ec, em: str) -> tuple[str, str]:
     """Map (ec, em) to one of the public status strings."""
-    em_l = (em or "").lower()
+    em_l = ' '.join(unicodedata.normalize('NFKC', em or '').split()).casefold()
     if ec == 0:
         return "valid", ""
     if "your account information was entered incorrectly" in em_l:

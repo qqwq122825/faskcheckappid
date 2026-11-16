@@ -579,6 +579,11 @@ class ControllerTests(unittest.TestCase):
         shared = {'status': 'invalid', 'http': 200, 'code': '-20970'}
         self.assertEqual(result_record_bucket(dict(
             shared, reason='This Apple Account has been locked for security reasons.')), 'locked')
+        locked_with_iforgot = ('This Apple Account has been\u00a0locked\u00a0for security reasons. '
+                               'Visit iForgot to reset your account (https://iforgot.apple.com).')
+        self.assertEqual(result_record_bucket(dict(shared, reason=locked_with_iforgot)), 'locked')
+        self.assertEqual(result_reason_cn(dict(shared, reason=locked_with_iforgot)),
+                         '账号因安全原因被锁定')
         self.assertEqual(result_record_bucket(dict(
             shared, reason='Enter the correct password for this Apple Account.')), 'wrong_password')
         self.assertEqual(result_record_bucket(dict(

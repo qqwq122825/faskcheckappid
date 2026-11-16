@@ -14,10 +14,16 @@ _APPLE_REASON_BUCKETS = (
 )
 
 
+def _normalized_apple_reason(*values):
+    """Normalize Apple prose without changing the raw reason we persist."""
+    text = ' '.join(str(value).strip() for value in values if value)
+    return ' '.join(unicodedata.normalize('NFKC', text).split()).casefold()
+
+
 def apple_reason_bucket(result):
     """Classify only explicit English account reasons returned by Apple."""
     values = (result.get('apple_message'), result.get('reason'), result.get('detail'))
-    text = ' '.join(str(value).strip() for value in values if value).casefold()
+    text = _normalized_apple_reason(*values)
     for phrase, bucket in _APPLE_REASON_BUCKETS:
         if phrase in text:
             return bucket

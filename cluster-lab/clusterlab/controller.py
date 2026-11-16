@@ -10,6 +10,7 @@ import secrets
 import shutil
 import threading
 import time
+import unicodedata
 import uuid
 
 from .common import Database, event, file_digest, integer, private_dir
@@ -121,10 +122,16 @@ _APPLE_REASON_BUCKETS = (
 )
 
 
+def normalized_apple_reason(*values):
+    """Collapse Unicode whitespace for matching while preserving stored raw text."""
+    text = ' '.join(str(value).strip() for value in values if value)
+    return ' '.join(unicodedata.normalize('NFKC', text).split()).casefold()
+
+
 def apple_reason_bucket(value):
     """Return a business bucket only for explicit English Apple reasons."""
     fields = (value.get('reason'), value.get('apple_message'), value.get('detail'))
-    text = ' '.join(str(field).strip() for field in fields if field).casefold()
+    text = normalized_apple_reason(*fields)
     for phrase, bucket in _APPLE_REASON_BUCKETS:
         if phrase in text:
             return bucket
@@ -160,7 +167,7 @@ def result_record_bucket(value):
 def result_reason_cn(value, bucket=None):
     """Translate the node's shortcut category/raw Apple reason for display."""
     raw = str(value.get('reason') or value.get('apple_message') or '').strip()
-    low = raw.casefold()
+    low = normalized_apple_reason(raw)
     translations = (
         ('unable to sign you in to your apple account. try again later',
          '暂时无法登录，已按任务设置重试'),
@@ -194,7 +201,7 @@ class Controller:
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid', 'not_found',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 5
+    RESULT_CLASSIFICATION_VERSION = 6
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')
