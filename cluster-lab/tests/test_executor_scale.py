@@ -354,6 +354,57 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(shared.discards, ['socks5h://service-busy'])
             self.assertEqual(stop.waits, [5.0])
 
+    def test_auth_unit_retries_22421_with_fresh_identity_and_keeps_apple_reason(self):
+        class RefreshingPool(FakePool):
+            fetch_count = 0
+
+            def fetch_headers(self, *_args, **_kwargs):
+                type(self).fetch_count += 1
+                return {'generation': type(self).fetch_count}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text('account----password\n', encoding='utf-8')
+            descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1}
+            shared = ScriptedProxyPool([
+                'socks5h://bootstrap', 'socks5h://first-exit', 'socks5h://second-exit'])
+            stop = RecordingStop()
+            checked = []
+
+            def check(_account, _password, proxy, **kwargs):
+                checked.append((proxy, kwargs['identity']['generation']))
+                if proxy == 'socks5h://first-exit':
+                    return {'status': 'error', 'kind': 'protocol', 'stage': 'init',
+                            'http': 200, 'apple_ec': -22421,
+                            'detail': 'ec=-22421',
+                            'apple_message': 'This action could not be completed. Try again.'}
+                return {'status': 'valid', 'kind': 'valid', 'stage': 'complete',
+                        'http': 200, 'detail': '密码证明通过；未确认业务服务登录状态'}
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    RefreshingPool, check,
+                    lambda result: ('timeout' if result.get('apple_ec') == -22421
+                                    else result['status']))), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, stop, proxy_pool=shared)
+
+            record = json.loads((root / 'results.jsonl').read_text())
+            self.assertEqual(checked, [
+                ('socks5h://first-exit', 1), ('socks5h://second-exit', 2)])
+            self.assertEqual((record['status'], record['attempts']), ('valid', 1))
+            self.assertEqual(record['reason'], '密码证明通过；未确认业务服务登录状态')
+            self.assertEqual(shared.releases, [
+                ('socks5h://bootstrap', True),
+                ('socks5h://first-exit', True),
+                ('socks5h://second-exit', True),
+            ])
+            self.assertEqual(shared.discards, [])
+            self.assertEqual(stop.waits, [5.0])
+
     def test_registration_history_keeps_the_first_time_and_proxy_per_slot(self):
         with tempfile.TemporaryDirectory() as temporary:
             self.assertTrue(record_device_registration(temporary, 3, 'socks5h://first:9000',
@@ -454,7 +505,8 @@ class ExecutorScaleTests(unittest.TestCase):
                     FakePool,
                     lambda *_args, **_kwargs: {'status': 'error', 'kind': 'protocol',
                                                'stage': 'init', 'http': 200,
-                                               'apple_ec': -20970, 'ms': 5},
+                                               'apple_ec': -20970, 'ms': 5,
+                                               'apple_message': 'Apple init refused this request'},
                     lambda result: 'invalid' if result.get('apple_ec') == -20970 else 'undetermined')), \
                  patch('fastcheck.workers.device_profile',
                        return_value={'client_info': 'test', 'user_agent': 'test'}), \
@@ -465,6 +517,7 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(record['status'], 'invalid')
             self.assertEqual(record['protocol'], 'GSA')
             self.assertEqual((record['http'], record['code']), (200, '-20970'))
+            self.assertEqual(record['reason'], 'Apple init refused this request')
             self.assertNotIn('gsa_code', record)
             self.assertNotIn('web_code', record)
             done = json.loads((root / 'done.json').read_text())

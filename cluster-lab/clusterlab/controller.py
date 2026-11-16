@@ -126,6 +126,8 @@ def result_record_bucket(value):
             codes.append(int(value.get(key)))
         except (TypeError, ValueError):
             continue
+    if -22421 in codes:
+        return 'timeout'
     if -20209 in codes:
         return 'locked'
     if -20970 in codes:
@@ -143,7 +145,7 @@ class Controller:
     MAX_ACTIVE_UNITS = 512
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 2
+    RESULT_CLASSIFICATION_VERSION = 3
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')

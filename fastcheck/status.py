@@ -21,8 +21,11 @@ def result_bucket(result):
         explicit_http_zero = False
     if explicit_http_zero:
         return 'timeout'
-    # 业务展示口径：GSA -20970 归入“已失效”，-20209 归入“锁定”。
+    # 业务展示口径：-22421 是 Anisette/设备环境异常，需要重试；
+    # GSA -20970 归入“已失效”，-20209 归入“锁定”。
     # 结果码优先于旧版执行器给出的 status，便于新总控兼容旧节点。
+    if apple_ec == -22421:
+        return 'timeout'
     if apple_ec == -20970:
         return 'invalid'
     if apple_ec == -20209:

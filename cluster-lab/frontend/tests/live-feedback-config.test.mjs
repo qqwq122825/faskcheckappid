@@ -209,6 +209,7 @@ test('Result list keeps one result-code column without web recheck fields', () =
   assert.match(results, /label: '全部结果', value: 'all'/)
   assert.match(results, /const category = ref\('all'\)/)
   assert.match(results, /prop="code" label="结果码"/)
+  assert.match(results, /prop="reason" label="Apple原始原因"/)
   assert.doesNotMatch(results, /GSA 码|网页码|gsa_code|web_code|网页复检/)
   assert.match(results, /labels\[row\.status\]/)
 })

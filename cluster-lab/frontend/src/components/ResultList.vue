@@ -108,6 +108,7 @@ watch(
       <el-table-column prop="stage" label="阶段" min-width="130" show-overflow-tooltip />
       <el-table-column prop="http" label="HTTP" width="90" />
       <el-table-column prop="code" label="结果码" min-width="140" show-overflow-tooltip />
+      <el-table-column prop="reason" label="Apple原始原因" min-width="320" show-overflow-tooltip />
       <el-table-column prop="device_display" label="设备" min-width="210" show-overflow-tooltip />
       <el-table-column label="耗时" width="100"><template #default="scope">{{ elapsed(scope.row.elapsed) }}</template></el-table-column>
       <el-table-column prop="attempts" label="重试" width="80" />

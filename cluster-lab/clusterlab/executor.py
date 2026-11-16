@@ -1166,8 +1166,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             http = int(result.get('http'))
         except (TypeError, ValueError):
             http = None
-        # 只有没拿到 HTTP 响应（0）或服务不可用（503）才换出口重试。
-        return http in (0, 503)
+        try:
+            apple_ec = int(result.get('apple_ec'))
+        except (TypeError, ValueError):
+            apple_ec = None
+        # 没拿到 HTTP 响应、服务不可用或 Anisette/设备环境失效时重试。
+        return http in (0, 503) or apple_ec == -22421
 
     def auth_result_bucket(result):
         try:
@@ -1291,6 +1295,14 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     pool_before=acquire_before, pool_after=_proxy_pool_snapshot(proxy_pool))
             if transport_failed:
                 had_timeout = True
+            try:
+                apple_ec = int(result.get('apple_ec'))
+            except (TypeError, ValueError):
+                apple_ec = None
+            if apple_ec == -22421:
+                # 这不是账号结论；下一次重新获取 Anisette 身份，避免用
+                # 同一份无效设备认证数据重复请求。
+                identity = None
             previous_proxy = current_proxy
             if not transport_failed or attempt + 1 >= attempt_limit:
                 result['_proxy_retries'] = attempt
@@ -1355,10 +1367,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 business_code = result.get('apple_ec')
                 if business_code is None:
                     business_code = (result.get('detail') or result.get('kind') or '')[:180]
+                reason = (result.get('apple_message') or result.get('detail') or '')[:2048]
                 record = {'row': row, 'account': account, 'password': password, 'status': status,
                           'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
                           'stage': result.get('stage') or '', 'http': result.get('http'),
-                          'code': str(business_code)[:180],
+                          'code': str(business_code)[:180], 'reason': reason,
                           'protocol': 'GSA',
                           'device': device,
                           'device_key': result.get('device_key') or '',

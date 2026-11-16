@@ -566,6 +566,8 @@ class ControllerTests(unittest.TestCase):
     def test_http_zero_is_timeout_and_legacy_counts_are_reconciled(self):
         self.assertEqual(result_record_bucket({'status': 'undetermined', 'http': 0}), 'timeout')
         self.assertEqual(result_record_bucket({'status': 'undetermined'}), 'undetermined')
+        self.assertEqual(result_record_bucket(
+            {'status': 'invalid', 'http': 200, 'code': '-22421'}), 'timeout')
         job = self.job(50)
         result = Path(self.temp.name) / 'legacy-http-zero.jsonl'
         with result.open('w', encoding='utf-8') as stream:
