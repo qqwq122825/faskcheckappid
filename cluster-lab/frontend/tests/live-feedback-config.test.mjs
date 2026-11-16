@@ -158,6 +158,15 @@ test('Live result updates refresh silently without flashing the table loading ma
   assert.match(results, /await load\(false, false\)/)
   assert.match(results, /if \(showLoading\) \{[\s\S]*loading\.value = true/)
   assert.doesNotMatch(results, /\[props\.job\?\.id, props\.job\?\.confirmed\], \(\) => load\(\)/)
+  assert.match(results, /if \(reset\) \{[\s\S]*rows\.value = \[\][\s\S]*total\.value = 0/)
+  assert.match(results, /if \(backgroundPending \|\| loading\.value\) return/)
+  assert.doesNotMatch(results, /backgroundQueued/)
+})
+
+test('GET timeout errors identify the controller query instead of exposing a signal error', () => {
+  const cluster = source('src/composables/useCluster.ts')
+  assert.match(cluster, /总控查询超时，请稍后重试/)
+  assert.match(cluster, /error\?\.name === 'TimeoutError'/)
 })
 
 test('Paused tasks can export their confirmed result subset', () => {

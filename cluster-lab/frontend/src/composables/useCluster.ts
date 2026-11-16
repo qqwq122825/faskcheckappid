@@ -23,7 +23,13 @@ export async function api(path: string, data?: any, method?: string): Promise<an
   if (verb === 'GET') options.signal = AbortSignal.timeout(15000)
   if (data instanceof FormData) options.body = data
   else if (data !== undefined) { headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(data) }
-  const response = await fetch(path, options)
+  let response: Response
+  try { response = await fetch(path, options) }
+  catch (error: any) {
+    if (error?.name === 'TimeoutError' || /timed out/i.test(String(error?.message || '')))
+      throw new Error('总控查询超时，请稍后重试')
+    throw error
+  }
   const result = await response.json()
   if (!response.ok) {
     if (response.status === 401 && session.value) session.value.authenticated = false

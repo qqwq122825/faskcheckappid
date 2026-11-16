@@ -8,7 +8,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-from clusterlab.controller import Conflict, Controller, result_reason_cn, result_record_bucket
+from clusterlab.controller import (Conflict, Controller, apple_reason_bucket,
+                                   result_reason_cn, result_record_bucket)
 from clusterlab.web import create_app
 
 
@@ -1011,6 +1012,37 @@ class ControllerTests(unittest.TestCase):
             counts = [json.loads(row['result_counts']) for row in
                       db.execute('SELECT result_counts FROM units WHERE job_id=? ORDER BY seq', (job,))]
         self.assertEqual(counts, [{'valid': 50}, {'valid': 50}])
+
+    def test_exact_apple_reason_avoids_fuzzy_matcher(self):
+        value = {'reason': 'Your account information was entered incorrectly.'}
+        with patch('clusterlab.controller.SequenceMatcher',
+                   side_effect=AssertionError('exact reasons must not use fuzzy matching')):
+            self.assertEqual(apple_reason_bucket(value), 'not_found')
+
+    def test_live_category_page_stops_scanning_after_limit(self):
+        job = self.job(200)
+        result = Path(self.temp.name) / 'many-other-errors.jsonl'
+        with result.open('w', encoding='utf-8') as stream:
+            for row in range(1, 201):
+                stream.write(json.dumps({'row': row, 'status': 'undetermined'}) + '\n')
+        with self.service.db.transaction() as db:
+            units = list(db.execute('SELECT id FROM units WHERE job_id=? ORDER BY seq',
+                                    (job,)))
+            db.execute("UPDATE units SET status='completed',rows=200,result_path=?,"
+                       "result_counts=? WHERE id=?",
+                       (str(result), '{"undetermined":200}', units[0]['id']))
+            db.execute("UPDATE units SET status='running',reported_rows=1,node_id=? WHERE id=?",
+                       (self.node['id'], units[1]['id']))
+            live = json.dumps({'row': 51, 'status': 'unknown',
+                               'sha256': '0' * 64, 'bytes': 1}, separators=(',', ':'))
+            db.execute('INSERT INTO live_result_rows(unit_id,job_id,row,category,payload) '
+                       'VALUES(?,?,?,?,?)',
+                       (units[1]['id'], job, 51, 'unknown', live))
+        original = result_record_bucket
+        with patch('clusterlab.controller.result_record_bucket', wraps=original) as classify:
+            page = self.service.read_rows(job, 0, 100, 'undetermined')
+        self.assertEqual((page['total'], len(page['rows'])), (201, 100))
+        self.assertEqual(classify.call_count, 100)
 
     def test_raw_stream_upload_avoids_multipart_copy(self):
         client = create_app('controller', self.service).test_client()

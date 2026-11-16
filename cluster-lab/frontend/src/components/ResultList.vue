@@ -13,7 +13,6 @@ const error = ref('')
 let generation = 0
 let foregroundRequests = 0
 let backgroundPending = false
-let backgroundQueued = false
 
 const options = [
   { label: '全部结果', value: 'all' },
@@ -35,6 +34,11 @@ const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 async function load(reset = false, showLoading = true) {
   if (!props.job?.id) return
   if (reset || !valid.value) offset.value = 0
+  if (reset) {
+    // Never leave rows from the previous category under a new filter label.
+    rows.value = []
+    total.value = 0
+  }
   const current = ++generation
   if (showLoading) {
     foregroundRequests += 1
@@ -47,7 +51,10 @@ async function load(reset = false, showLoading = true) {
     rows.value = Array.isArray(result.rows) ? result.rows : []
     total.value = Math.max(0, Number(result.total) || 0)
   } catch (exc: any) {
-    if (current === generation) error.value = exc?.message || '结果加载失败'
+    // A silent live refresh must not replace a valid table with a transient
+    // network warning. Foreground category/page requests still surface errors.
+    if (current === generation && showLoading)
+      error.value = exc?.message || '结果加载失败'
   } finally {
     if (showLoading) {
       foregroundRequests = Math.max(0, foregroundRequests - 1)
@@ -56,16 +63,12 @@ async function load(reset = false, showLoading = true) {
   }
 }
 async function refreshInBackground() {
-  if (backgroundPending) {
-    backgroundQueued = true
-    return
-  }
+  // Heartbeats can advance once per second. Keep at most one category query in
+  // flight instead of immediately replaying a queued request after a slow one.
+  if (backgroundPending || loading.value) return
   backgroundPending = true
   try {
-    do {
-      backgroundQueued = false
-      await load(false, false)
-    } while (backgroundQueued)
+    await load(false, false)
   } finally {
     backgroundPending = false
   }

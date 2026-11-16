@@ -144,6 +144,13 @@ def apple_reason_bucket(value):
     """Return a business bucket only for explicit English Apple reasons."""
     fields = (value.get('reason'), value.get('apple_message'), value.get('detail'))
     texts = [normalized_apple_reason(field) for field in fields if field]
+    # Almost every production response contains the canonical English phrase.
+    # Check all cheap substring matches before invoking SequenceMatcher; doing a
+    # fuzzy comparison for every earlier, unrelated phrase made large result
+    # pages unnecessarily CPU-heavy on the controller.
+    for phrase, bucket in _APPLE_REASON_BUCKETS:
+        if any(phrase in text for text in texts):
+            return bucket
     for phrase, bucket in _APPLE_REASON_BUCKETS:
         if any(apple_reason_matches(text, phrase) for text in texts):
             return bucket
@@ -194,6 +201,9 @@ def result_reason_cn(value, bucket=None):
         ('this apple account is not active', '账号未激活'),
         ('your account information was entered incorrectly', '账号不存在'),
     )
+    for phrase, translated in translations:
+        if phrase in low:
+            return translated
     for phrase, translated in translations:
         if apple_reason_matches(low, phrase):
             return translated
@@ -1674,6 +1684,8 @@ class Controller:
         scalable file/index path.  Iterating package metadata preserves row
         order without retaining an unbounded per-account database table.
         """
+        wanted = (('undetermined', 'unknown') if category == 'undetermined'
+                  else (category,))
         units = list(db.execute(
             "SELECT id,seq,status,first_row,rows,result_path,result_counts,reported_rows,node_id "
             "FROM units WHERE job_id=? AND (status='completed' OR reported_rows>0) ORDER BY seq",
@@ -1691,7 +1703,7 @@ class Controller:
                     except (TypeError, ValueError):
                         counts = None
                     if counts is not None:
-                        count = int(counts.get(category, 0) or 0)
+                        count = sum(int(counts.get(key, 0) or 0) for key in wanted)
                     else:
                         # Legacy files without counts are uncommon and small;
                         # let the scan below determine their contribution.
@@ -1700,9 +1712,11 @@ class Controller:
                 if category == 'all':
                     count = int(unit['reported_rows'] or 0)
                 else:
+                    placeholders = ','.join('?' for _ in wanted)
                     count = int(db.execute(
-                        'SELECT COUNT(*) FROM live_result_rows WHERE unit_id=? AND category=?',
-                        (unit['id'], category)).fetchone()[0])
+                        f'SELECT COUNT(*) FROM live_result_rows WHERE unit_id=? '
+                        f'AND category IN ({placeholders})',
+                        (unit['id'], *wanted)).fetchone()[0])
             total += count
             if count and skipped + count <= offset:
                 skipped += count
@@ -1723,7 +1737,7 @@ class Controller:
                                 continue
                             record['status'] = result_record_bucket(record)
                             self._decorate_result_device(record, unit, device_context)
-                            if category != 'all' and record['status'] != category:
+                            if category != 'all' and record['status'] not in wanted:
                                 continue
                             if counts is None and category != 'all':
                                 total += 1
@@ -1732,14 +1746,19 @@ class Controller:
                                 continue
                             if len(result) < limit:
                                 result.append(record)
+                            if (len(result) >= limit
+                                    and (category == 'all' or counts is not None)):
+                                break
                 except OSError:
                     continue
             else:
+                placeholders = ','.join('?' for _ in wanted)
                 sql = ('SELECT payload FROM live_result_rows WHERE unit_id=? '
-                       + ('' if category == 'all' else 'AND category=? ')
+                       + ('' if category == 'all'
+                          else f'AND category IN ({placeholders}) ')
                        + 'ORDER BY row')
                 params = ((unit['id'],) if category == 'all'
-                          else (unit['id'], category))
+                          else (unit['id'], *wanted))
                 for live in db.execute(sql, params):
                     try:
                         record = json.loads(live['payload'])
@@ -1766,6 +1785,8 @@ class Controller:
                       'invalid', 'not_found', 'timeout', 'undetermined', 'unknown')
         if category not in categories:
             raise ValueError('结果分类无效')
+        wanted = (('undetermined', 'unknown') if category == 'undetermined'
+                  else (category,))
         with self.db.connect() as db:
             device_context = self._result_device_context(db)
             job = db.execute(
@@ -1800,7 +1821,7 @@ class Controller:
                     except (TypeError, ValueError):
                         counts = None
                 if category != 'all' and counts is not None:
-                    count = int(counts.get(category, 0) or 0)
+                    count = sum(int(counts.get(key, 0) or 0) for key in wanted)
                     total += count
                     if skipped + count <= offset:
                         skipped += count
@@ -1824,7 +1845,7 @@ class Controller:
                                 continue
                             record['status'] = result_record_bucket(record)
                             self._decorate_result_device(record, unit, device_context)
-                            if category != 'all' and record['status'] != category:
+                            if category != 'all' and record['status'] not in wanted:
                                 continue
                             if category == 'all':
                                 absolute = unit['first_row'] + local_index
@@ -1838,6 +1859,9 @@ class Controller:
                                 continue
                             if len(rows) < limit:
                                 rows.append(record)
+                            if (len(rows) >= limit
+                                    and (category == 'all' or counts is not None)):
+                                break
                 except OSError:
                     continue
             return {'rows': rows, 'total': job['total'] if category == 'all' else total,
