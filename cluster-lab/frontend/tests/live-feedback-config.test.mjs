@@ -258,3 +258,9 @@ test('Phone layout uses a bottom navigation and task cards without horizontal ov
   assert.match(styles, /\.mobile-job-list\{display:grid/)
   assert.match(styles, /overflow-x:hidden/)
 })
+
+test('Collapsed desktop rail hides labels while phone navigation keeps them visible', () => {
+  const styles = source('src/style.css')
+  assert.match(styles, /\.sidebar \.el-menu--collapse \.el-menu-item span\{display:none\}/)
+  assert.match(styles, /@media\(max-width:700px\)[\s\S]*?\.sidebar \.el-menu--collapse \.el-menu-item span\{display:block/)
+})
