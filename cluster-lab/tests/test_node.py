@@ -374,6 +374,172 @@ class NodeRecoveryTests(unittest.TestCase):
             self.node._heartbeat()
         start.assert_not_called()
 
+    def test_auto_rotation_registers_one_replacement_before_removing_any_device(self):
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 0,
+                 'device_auto_rotate': True, 'device_rotate_after': 20}
+        complete = {'running': False, 'capacity': 30, 'ready': 30, 'built': 0,
+                    'failed': 0, 'current': 0, 'attempted': 30, 'slots': []}
+        with patch.object(self.node, '_request', return_value=Response(value)), \
+             patch.object(self.node.builder, 'snapshot', return_value=complete), \
+             patch.object(self.node.builder, 'reserved_slots', return_value=set()), \
+             patch.object(self.node.builder, 'retirable', return_value=[7]) as retirable, \
+             patch.object(self.node.builder, 'oldest', return_value=[1]) as oldest, \
+             patch.object(self.node.builder, 'rotate') as rotate, \
+             patch.object(self.node.builder, 'retire') as retire, \
+             patch.object(self.node.builder, 'start') as start:
+            self.node._heartbeat()
+        retirable.assert_called_once_with(20, exclude=set())
+        oldest.assert_called_once_with(1, candidates=list(range(1, 31)))
+        rotate.assert_called_once_with(30, 1)
+        retire.assert_not_called()
+        start.assert_not_called()
+
+    def test_auto_rotation_keeps_all_reserved_devices_untouched(self):
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 0,
+                 'device_auto_rotate': True, 'device_rotate_after': 20}
+        complete = {'running': False, 'capacity': 30, 'ready': 30, 'built': 0,
+                    'failed': 0, 'current': 0, 'attempted': 30, 'slots': []}
+        reserved = set(range(1, 31))
+        with patch.object(self.node, '_request', return_value=Response(value)), \
+             patch.object(self.node.builder, 'snapshot', return_value=complete), \
+             patch.object(self.node.builder, 'reserved_slots', return_value=reserved), \
+             patch.object(self.node.builder, 'retirable', return_value=[]) as retirable, \
+             patch.object(self.node.builder, 'rotate') as rotate, \
+             patch.object(self.node.builder, 'start') as start:
+            self.node._heartbeat()
+        retirable.assert_called_once_with(20, exclude=reserved)
+        rotate.assert_not_called()
+        start.assert_not_called()
+
+    def test_auto_rotation_fills_an_existing_gap_before_starting_a_replacement(self):
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 0,
+                 'device_auto_rotate': True, 'device_rotate_after': 20}
+        incomplete = {'running': False, 'capacity': 30, 'ready': 29, 'built': 0,
+                      'failed': 0, 'current': 0, 'attempted': 30, 'slots': []}
+        with patch.object(self.node, '_request', return_value=Response(value)), \
+             patch.object(self.node.builder, 'snapshot', return_value=incomplete), \
+             patch.object(self.node.builder, 'retirable') as retirable, \
+             patch.object(self.node.builder, 'rotate') as rotate, \
+             patch.object(self.node.builder, 'start') as start:
+            self.node._heartbeat()
+        start.assert_called_once_with(30)
+        retirable.assert_not_called()
+        rotate.assert_not_called()
+
+    def test_failed_staged_rotation_keeps_the_live_device(self):
+        live = self.node.root / 'device-pool' / 'origin' / 'devices' / '01'
+        live.mkdir(parents=True)
+        (live / 'old').write_text('old', 'utf-8')
+
+        class Pool:
+            def __init__(inner, root, _origin, max_devices):
+                inner.base = Path(root) / 'origin'
+                inner.max_devices = max_devices
+
+            def slot_directory(inner, slot):
+                return inner.base / 'devices' / f'{slot:02d}'
+
+            def inspect(inner, slot):
+                return {'state': 'missing'}
+
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)), \
+             patch.object(self.node.builder, '_proxy', return_value='socks5h://proxy'), \
+             patch.object(self.node.builder, '_provision', return_value={'ok': False, 'error': 'failed'}), \
+             patch.object(self.node.builder, '_commit_rotation') as commit:
+            self.node.builder._run_rotation(1, 1)
+        self.assertEqual((live / 'old').read_text('utf-8'), 'old')
+        commit.assert_not_called()
+        self.assertIn('原设备已保留', self.node.builder.state['message'])
+
+    def test_successful_staged_rotation_swaps_then_removes_the_oldest_device(self):
+        class Pool:
+            def __init__(inner, root, _origin, max_devices):
+                inner.base = Path(root) / 'origin'
+                inner.max_devices = max_devices
+
+            def slot_directory(inner, slot):
+                return inner.base / 'devices' / f'{slot:02d}'
+
+            def inspect(inner, slot):
+                directory = inner.slot_directory(slot)
+                return {'state': 'ready' if (directory / 'ready').exists() else 'missing'}
+
+        live_root = self.node.root / 'device-pool'
+        staging_root = self.node.root / 'device-pool-rotation'
+        old = live_root / 'origin' / 'devices' / '01'
+        new = staging_root / 'origin' / 'devices' / '01'
+        old.mkdir(parents=True)
+        new.mkdir(parents=True)
+        (old / 'ready').write_text('old', 'utf-8')
+        (old / 'old-only').write_text('old', 'utf-8')
+        (new / 'ready').write_text('new', 'utf-8')
+        (new / 'new-only').write_text('new', 'utf-8')
+        (live_root / 'usage.json').write_text('{"1":20,"2":7}', 'utf-8')
+        health = live_root / 'origin' / 'health.json'
+        health.write_text('{"devices":{"1":{"failures":5},"2":{}},"events":[[1,1],[2,2]]}', 'utf-8')
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)):
+            changed = self.node.builder._commit_rotation(
+                staging_root, 1, 30, 'socks5h://proxy', 'MacBookPro14,3')
+        self.assertTrue(changed)
+        self.assertEqual((old / 'ready').read_text('utf-8'), 'new')
+        self.assertTrue((old / 'new-only').exists())
+        self.assertFalse((old / 'old-only').exists())
+        self.assertEqual(json.loads((live_root / 'usage.json').read_text()), {'2': 7})
+        saved_health = json.loads(health.read_text())
+        self.assertNotIn('1', saved_health['devices'])
+        self.assertEqual(saved_health['events'], [[2, 2]])
+        registration = json.loads(
+            (live_root / 'registrations' / '001.json').read_text('utf-8'))
+        self.assertEqual(registration['model'], 'MacBookPro14,3')
+        self.assertEqual(registration['slot'], 1)
+        self.assertFalse(list(old.parent.glob('.rotation-backup-*')))
+
+    def test_rotation_commit_failure_restores_the_original_device(self):
+        class Pool:
+            def __init__(inner, root, _origin, max_devices):
+                inner.base = Path(root) / 'origin'
+                inner.max_devices = max_devices
+
+            def slot_directory(inner, slot):
+                return inner.base / 'devices' / f'{slot:02d}'
+
+            def inspect(inner, slot):
+                directory = inner.slot_directory(slot)
+                return {'state': 'ready' if (directory / 'ready').exists() else 'missing'}
+
+        live_root = self.node.root / 'device-pool'
+        staging_root = self.node.root / 'device-pool-rotation'
+        old = live_root / 'origin' / 'devices' / '01'
+        new = staging_root / 'origin' / 'devices' / '01'
+        old.mkdir(parents=True)
+        new.mkdir(parents=True)
+        (old / 'ready').write_text('old', 'utf-8')
+        (old / 'old-only').write_text('old', 'utf-8')
+        (new / 'ready').write_text('new', 'utf-8')
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)), \
+             patch.object(self.node.builder, '_record', return_value=False):
+            with self.assertRaisesRegex(OSError, '注册记录'):
+                self.node.builder._commit_rotation(
+                    staging_root, 1, 30, 'socks5h://proxy', 'MacBookPro14,3')
+        self.assertEqual((old / 'ready').read_text('utf-8'), 'old')
+        self.assertTrue((old / 'old-only').exists())
+        self.assertFalse(list(old.parent.glob('.rotation-backup-*')))
+
+    def test_oldest_rotation_candidate_uses_birth_time_and_excludes_busy_slots(self):
+        registrations = self.node.root / 'device-pool' / 'registrations'
+        registrations.mkdir(parents=True)
+        for slot, born in ((1, 30), (2, 10), (3, 20)):
+            (registrations / f'{slot:03d}.json').write_text(json.dumps({
+                'slot': slot, 'ts': born, 'proxy': '', 'model': '', 'at': ''}), 'utf-8')
+        (self.node.root / 'device-pool' / 'usage.json').write_text(
+            '{"1":20,"2":20,"3":20}', 'utf-8')
+        eligible = self.node.builder.retirable(20, exclude={2})
+        self.assertEqual(eligible, [1, 3])
+        self.assertEqual(self.node.builder.oldest(1, candidates=eligible), [3])
+
     def test_remote_http_requires_explicit_test_override(self):
         with self.assertRaisesRegex(ValueError, 'HTTPS'):
             self.node.connect('http://example.com','x'*32)

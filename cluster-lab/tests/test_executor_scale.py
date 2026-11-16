@@ -37,6 +37,7 @@ class ScriptedProxyPool:
         now = time.monotonic()
         self.leases = [(proxy, now + 60, 0) for proxy in proxies]
         self.releases = []
+        self.discards = []
 
     def acquire(self, wait=1.0):
         del wait
@@ -44,6 +45,21 @@ class ScriptedProxyPool:
 
     def release(self, lease, healthy):
         self.releases.append((lease[0] if lease else None, healthy))
+
+    def discard(self, lease):
+        self.discards.append(lease[0] if lease else None)
+
+
+class RecordingStop:
+    def __init__(self):
+        self.waits = []
+
+    def is_set(self):
+        return False
+
+    def wait(self, seconds):
+        self.waits.append(float(seconds))
+        return False
 
 
 def use_shared_proxy_pool(pool, output):
@@ -170,6 +186,45 @@ class ExecutorScaleTests(unittest.TestCase):
         finally:
             pool.close()
 
+    def test_node_proxy_pool_immediate_discard_removes_exit_and_requests_refill(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=1, ttl=50, target=1)
+        try:
+            pool.add_fresh(['socks5h://http-error'])
+            lease = pool.acquire(wait=.5)
+            pool.refill.clear()
+            pool.discard(lease)
+            state = pool.snapshot()
+            self.assertEqual(state['known'], 0)
+            self.assertEqual(state['discarded'], 1)
+            self.assertTrue(pool.refill.is_set())
+            # The deleted endpoint remains quarantined for its original TTL,
+            # while a different available endpoint can fill the empty slot.
+            self.assertEqual(pool.add_fresh(['socks5h://http-error']), 0)
+            self.assertEqual(pool.add_fresh(['socks5h://replacement']), 1)
+        finally:
+            pool.close()
+
+    def test_node_proxy_pool_never_leases_an_exit_that_is_already_in_use(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=2, ttl=50, target=2)
+        try:
+            pool.add_fresh(['socks5h://one', 'socks5h://two'])
+            first = pool.acquire(wait=.5)
+            second = pool.acquire(wait=.5)
+            self.assertEqual({first[0], second[0]},
+                             {'socks5h://one', 'socks5h://two'})
+            self.assertIsNone(pool.acquire(wait=.05))
+            pool.discard(first)
+            # The other worker still owns `second`; it cannot be leased again.
+            self.assertIsNone(pool.acquire(wait=.05))
+            pool.release(second, healthy=True)
+            available = pool.acquire(wait=.5)
+            self.assertEqual(available[0], second[0])
+            pool.release(available, healthy=True)
+        finally:
+            pool.close()
+
     def test_node_proxy_pool_never_exceeds_configured_logical_capacity(self):
         context = mp.get_context('spawn')
         pool = NodeProxyPool(context, concurrency=2, ttl=30, target=2)
@@ -234,6 +289,7 @@ class ExecutorScaleTests(unittest.TestCase):
                           'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://dead-exit', 'socks5h://good-exit'])
+            stop = RecordingStop()
             checked = []
 
             def check(_account, _password, proxy, **_kwargs):
@@ -247,7 +303,7 @@ class ExecutorScaleTests(unittest.TestCase):
                  patch('fastcheck.workers.device_profile',
                        return_value={'client_info': 'test', 'user_agent': 'test'}), \
                  patch('clusterlab.executor._bump_usage'):
-                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+                _execute_auth_unit(root, descriptor, stop, proxy_pool=shared)
 
             record = json.loads((root / 'results.jsonl').read_text())
             self.assertEqual(checked, ['socks5h://dead-exit', 'socks5h://good-exit'])
@@ -255,35 +311,48 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(record['attempts'], 1)
             self.assertEqual(shared.releases, [
                 ('socks5h://bootstrap', True),
-                ('socks5h://dead-exit', False),
                 ('socks5h://good-exit', True),
             ])
+            self.assertEqual(shared.discards, ['socks5h://dead-exit'])
+            self.assertEqual(stop.waits, [5.0])
 
-    def test_auth_unit_keeps_proxy_reusable_after_http_503(self):
+    def test_auth_unit_discards_http_503_waits_then_rotates_proxy(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'input.part').write_text('account----password\n', encoding='utf-8')
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
-                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 0,
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
                           'proxy_api': 'http://proxy.invalid/list'}
-            shared = ScriptedProxyPool(['socks5h://bootstrap', 'socks5h://service-busy'])
+            shared = ScriptedProxyPool([
+                'socks5h://bootstrap', 'socks5h://service-busy', 'socks5h://good-exit'])
+            stop = RecordingStop()
+            checked = []
+
+            def check(_account, _password, proxy, **_kwargs):
+                checked.append(proxy)
+                if proxy == 'socks5h://service-busy':
+                    return {'status': 'error', 'kind': 'service', 'http': 503}
+                return {'status': 'invalid', 'kind': 'invalid', 'http': 200}
 
             with patch('clusterlab.executor._load_fastcheck', return_value=(
-                    FakePool, lambda *_args, **_kwargs: {
-                        'status': 'error', 'kind': 'service', 'http': 503},
+                    FakePool, check,
                     lambda result: result['status'])), \
                  patch('fastcheck.workers.device_profile',
                        return_value={'client_info': 'test', 'user_agent': 'test'}), \
                  patch('clusterlab.executor._bump_usage'):
-                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+                _execute_auth_unit(root, descriptor, stop, proxy_pool=shared)
 
             record = json.loads((root / 'results.jsonl').read_text())
-            self.assertEqual(record['status'], 'timeout')
+            self.assertEqual(checked, ['socks5h://service-busy', 'socks5h://good-exit'])
+            self.assertEqual(record['status'], 'invalid')
+            self.assertEqual(record['attempts'], 1)
             self.assertEqual(shared.releases, [
                 ('socks5h://bootstrap', True),
-                ('socks5h://service-busy', True),
+                ('socks5h://good-exit', True),
             ])
+            self.assertEqual(shared.discards, ['socks5h://service-busy'])
+            self.assertEqual(stop.waits, [5.0])
 
     def test_registration_history_keeps_the_first_time_and_proxy_per_slot(self):
         with tempfile.TemporaryDirectory() as temporary:

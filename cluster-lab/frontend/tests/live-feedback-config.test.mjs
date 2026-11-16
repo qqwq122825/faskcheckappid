@@ -222,6 +222,8 @@ test('Device refill switch reopens from persisted settings and publishes save im
   assert.match(drawer, /const saved = await api\('\/api\/settings\/rotation'/)
   assert.match(drawer, /state\.value\.settings =/)
   assert.match(drawer, /:disabled="building \|\| savingAuto"/)
+  assert.match(drawer, /先注册一台替换设备/)
+  assert.match(drawer, /新设备成功后才移除出生日期最早且空闲的旧设备/)
 })
 
 test('Task detail shows one node-reported traffic card with the 1 GB estimate', () => {

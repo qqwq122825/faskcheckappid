@@ -26,6 +26,7 @@ PROXY_FETCH_LIMIT = 1000
 PROXY_POOL_LIMIT = 10000
 PROXY_FAILURE_LIMIT = 3
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
+PROXY_RETRY_DELAY_SECONDS = 5.0
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
 PROXY_EXIT_IP_TIMEOUT = 4.0
@@ -469,6 +470,19 @@ class NodeProxyPool:
             self._add(self.reusable_count, -1)
             self._add(self.discarded, 1)
             return
+
+    def discard(self, lease):
+        """Remove a leased exit immediately and request a replacement.
+
+        The supplier's recent-exit history still remembers the endpoint until
+        its original TTL, so an HTTP 0/503 exit cannot be fetched straight back
+        into the pool during the five-second retry delay.
+        """
+        if lease is None:
+            return
+        self._add(self.in_use_count, -1)
+        self._add(self.discarded, 1)
+        self.refill.set()
 
     def prune_expired(self):
         """Remove idle expired leases, even when no worker acquires an exit."""
@@ -1242,13 +1256,17 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 result_http = int(result.get('http'))
             except (TypeError, ValueError):
                 result_http = None
-            # Any real upstream HTTP response proves that the proxy tunnel is
-            # alive. In particular, 503 is a service-side retry signal, not a
-            # reason to destroy the exit. HTTP 0 and proxy-auth 407 count as
-            # transport failures; the pool retires them only after 3 strikes.
+            # HTTP 0 and 503 are retry outcomes: remove that exact lease now,
+            # wait five seconds, then acquire an available (never in-use) exit.
+            # Proxy-auth 407 and other transport failures retain the general
+            # three-strike policy used outside this retry branch.
+            immediate_discard = result_http in (0, 503)
             healthy_exit = result_http not in (None, 0, 407)
             if proxy_pool is not None:
-                proxy_pool.release(lease, healthy=healthy_exit)
+                if immediate_discard:
+                    proxy_pool.discard(lease)
+                else:
+                    proxy_pool.release(lease, healthy=healthy_exit)
             if debug_enabled and transport_failed:
                 debug_event = 'timeout_attempt'
                 exit_ip_debug.submit(
@@ -1268,12 +1286,19 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     detail=_proxy_debug_detail(result.get('detail')),
                     retryable=transport_failed,
                     lease_reused=bool(lease and int(lease[2]) > 0),
-                    release='reusable' if healthy_exit else 'failure_recorded',
+                    release=('discarded' if immediate_discard else
+                             ('reusable' if healthy_exit else 'failure_recorded')),
                     pool_before=acquire_before, pool_after=_proxy_pool_snapshot(proxy_pool))
             if transport_failed:
                 had_timeout = True
             previous_proxy = current_proxy
             if not transport_failed or attempt + 1 >= attempt_limit:
+                result['_proxy_retries'] = attempt
+                break
+            # Do not occupy another exit during the backoff.  acquire() reads
+            # only the fresh/reusable queues, whose entries are not leased by
+            # any other worker.
+            if stop.wait(PROXY_RETRY_DELAY_SECONDS):
                 result['_proxy_retries'] = attempt
                 break
         if result is None:

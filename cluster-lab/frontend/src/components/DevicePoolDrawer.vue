@@ -130,10 +130,10 @@ async function clearPool() {
         </el-form-item>
         <el-form-item label="自动补充">
           <el-switch v-model="autoRotate" :loading="savingAuto" :disabled="savingAuto"
-                     @change="toggleAuto" active-text="任务运行时持续换新并补齐" />
+                     @change="toggleAuto" active-text="持续先增后换并补齐" />
           <span class="field-note">
-            开启后，节点在任务执行期间淘汰用满次数的设备并自动注册新的，
-            池子始终保持目标数量；关闭时只保留手动初始化。
+            开启后，原有设备保持可用；节点先注册一台替换设备，
+            只有新设备成功后才移除出生日期最早且空闲的旧设备。
           </span>
         </el-form-item>
         <div class="actions">

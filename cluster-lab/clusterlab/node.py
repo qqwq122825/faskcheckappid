@@ -450,19 +450,32 @@ class Node:
                 except (RuntimeError, ValueError) as exc:
                     # 不能静默吞：面板上看不到原因会以为节点没响应
                     self.builder._update(message=str(exc))
-            # 自动补充：任务跑着也维护设备池——淘汰用满次数的，把空槽位补满
+            # 自动补充：先补缺口；满池轮换时先在隔离目录注册新设备，
+            # 成功后才替换一台最老且未被任务占用的旧设备。
             auto = bool(value.get('device_auto_rotate'))
             limit = int(value.get('device_rotate_after') or 0)
             if auto and not self.builder.state['running']:
-                if limit:
-                    # 有用满次数的设备 → 触发一次轮换；淘汰对象是出生最早的那台
-                    stale = self.builder.retirable(limit)
-                    if stale:
-                        self.builder.retire(self.builder.oldest(len(stale)))
-                capacity = int(self.builder.state['capacity'] or 0)
+                snapshot = self.builder.snapshot()
+                capacity = int(snapshot.get('capacity') or self.builder.state['capacity'] or 0)
                 if capacity:
                     try:
-                        self.builder.start(capacity)   # 已就绪的槽位会跳过，只补空的
+                        if int(snapshot.get('ready') or 0) < capacity:
+                            # 先补既有缺口，不再额外淘汰。
+                            self.builder.start(capacity)
+                        elif limit:
+                            reserved = self.builder.reserved_slots()
+                            stale = self.builder.retirable(limit, exclude=reserved)
+                            if stale:
+                                candidates = [int(item['slot'])
+                                              for item in snapshot.get('slots') or []
+                                              if item.get('state') == 'ready'
+                                              and int(item['slot']) not in reserved]
+                                if not candidates:
+                                    candidates = [slot for slot in range(1, capacity + 1)
+                                                  if slot not in reserved]
+                                oldest = self.builder.oldest(1, candidates=candidates)
+                                if oldest:
+                                    self.builder.rotate(capacity, oldest[0])
                     except (RuntimeError, ValueError):
                         pass
             for unit_id in value['rejected']:
@@ -608,7 +621,8 @@ class Node:
                 self.stop.wait(self.interval)
                 continue
             try:
-                if settings['enabled']:
+                # 初始化/轮换期间不领新包；已在运行的包不受影响。
+                if settings['enabled'] and not self.builder.state['running']:
                     with self.db.connect() as db:
                         backlog = db.execute("SELECT COUNT(*) FROM tasks WHERE status='outbox'").fetchone()[0]
                     with self.lock:
