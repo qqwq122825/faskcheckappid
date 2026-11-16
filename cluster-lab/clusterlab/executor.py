@@ -731,19 +731,21 @@ def _group_child(directory, descriptor, stop, proxy_pool=None):
         runner(directory, descriptor, stop)
 
 
-def _auth_worker_limit(configured, node_processes=1, cpu_count=None):
-    """Retain the operator's configured network concurrency."""
-    del node_processes, cpu_count
+def _auth_worker_limit(configured, configured_processes=1, active_processes=None):
+    """Preserve total network concurrency across CPU-sized auth processes."""
     configured = max(1, int(configured or 1))
-    return configured
+    configured_processes = max(1, int(configured_processes or 1))
+    active_processes = max(1, int(active_processes or configured_processes))
+    total_concurrency = configured_processes * configured
+    return (total_concurrency + active_processes - 1) // active_processes
 
 
 def _auth_process_limit(configured, rows, cpu_count=None):
-    """Retain the operator's configured process concurrency."""
-    del cpu_count
+    """Use one GMP compute lane per logical CPU."""
     configured = max(1, int(configured or 1))
     rows = max(1, int(rows or 1))
-    return min(configured, rows)
+    logical_cpus = max(1, int(cpu_count or os.cpu_count() or 1))
+    return min(configured, rows, logical_cpus)
 
 
 def execute_unit_group(directory, descriptor, stop):
@@ -778,12 +780,13 @@ def execute_unit_group(directory, descriptor, stop):
     if descriptor.get('mode') == 'auth':
         process_count = _auth_process_limit(process_limit, rows, node_cpu_count)
     descriptor['_node_process_count'] = process_count
+    descriptor['_node_configured_process_count'] = process_limit
     descriptor['_node_cpu_count'] = node_cpu_count
     active_threads_per_process = (
-        _auth_worker_limit(descriptor.get('threads'), process_count,
-                           descriptor['_node_cpu_count'])
+        _auth_worker_limit(descriptor.get('threads'), process_limit, process_count)
         if descriptor.get('mode') == 'auth'
         else max(1, int(descriptor.get('threads') or 1)))
+    descriptor['_active_threads_per_process'] = active_threads_per_process
     context = mp.get_context('spawn')
     proxy_pool = None
     supplier_stop = None
@@ -1146,9 +1149,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     retry_delay = max(0.0, float(descriptor.get('_retry_delay',
                                                 PROXY_RETRY_DELAY_SECONDS)))
     configured_workers = max(1, int(descriptor.get('threads') or 1))
-    workers = _auth_worker_limit(
-        configured_workers, descriptor.get('_node_process_count') or 1,
-        descriptor.get('_node_cpu_count'))
+    workers = max(1, int(descriptor.get('_active_threads_per_process') or
+                         _auth_worker_limit(
+                             configured_workers,
+                             descriptor.get('_node_configured_process_count') or 1,
+                             descriptor.get('_node_process_count') or 1)))
     debug_enabled = _proxy_debug_enabled(descriptor)
     debug_path = (descriptor.get('_proxy_debug_path') or
                   str(directory / 'proxy-debug.jsonl')) if debug_enabled else None
