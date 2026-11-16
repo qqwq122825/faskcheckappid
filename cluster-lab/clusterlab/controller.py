@@ -1,4 +1,4 @@
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 import hashlib
@@ -239,7 +239,7 @@ class Controller:
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid', 'not_found',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 7
+    RESULT_CLASSIFICATION_VERSION = 8
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')
@@ -300,6 +300,11 @@ class Controller:
         self.dispatch_per_second = max(0, int(dispatch_per_second or 0))
         self.rate_lock = threading.Lock()
         self.dispatch_times = deque()
+        # Stable result pages are reused until the job update timestamp changes.
+        # Serializing misses also prevents identical browser requests from
+        # scanning the same result shards concurrently.
+        self.result_query_lock = threading.Lock()
+        self.result_page_cache = OrderedDict()
         self.preparer = ThreadPoolExecutor(max_workers=1, thread_name_prefix='file-preparation')
         self.closing = threading.Event()
         with self.db.transaction() as db:
@@ -1784,7 +1789,7 @@ class Controller:
                         result.append(record)
         return {'rows': result, 'total': total, 'offset': offset}
 
-    def read_rows(self, job_id, offset=0, limit=100, category='all'):
+    def _read_rows_uncached(self, job_id, offset=0, limit=100, category='all'):
         """按行号窗口读取结果，供页面表格分页。
 
         全部结果按 first_row 直接定位覆盖页面的分片；分类结果利用每片
@@ -1875,8 +1880,45 @@ class Controller:
                                 break
                 except OSError:
                     continue
+            if category != 'all':
+                # Older shards may carry counts produced by an earlier rule set.
+                # A complete short-page scan must never display fewer total rows
+                # than it actually returned.
+                total = max(total, offset + len(rows))
             return {'rows': rows, 'total': job['total'] if category == 'all' else total,
                     'offset': offset}
+
+    @staticmethod
+    def _copy_result_page(page):
+        return {'rows': [dict(row) for row in page['rows']],
+                'total': page['total'], 'offset': page['offset']}
+
+    def read_rows(self, job_id, offset=0, limit=100, category='all'):
+        """Read a page once and reuse it while a paused/completed job is stable."""
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        with self.result_query_lock:
+            with self.db.connect() as db:
+                job = db.execute('SELECT status,updated FROM jobs WHERE id=?',
+                                 (job_id,)).fetchone()
+                debug_row = db.execute(
+                    "SELECT value FROM controller_settings WHERE key='proxy_debug'").fetchone()
+            if not job:
+                raise ValueError('任务不存在')
+            stable = job['status'] in ('paused', 'completed')
+            key = (job_id, offset, limit, category, float(job['updated']),
+                   str(debug_row['value']) if debug_row else '0')
+            if stable and key in self.result_page_cache:
+                page = self.result_page_cache.pop(key)
+                self.result_page_cache[key] = page
+                return self._copy_result_page(page)
+
+            page = self._read_rows_uncached(job_id, offset, limit, category)
+            if stable:
+                self.result_page_cache[key] = self._copy_result_page(page)
+                while len(self.result_page_cache) > 32:
+                    self.result_page_cache.popitem(last=False)
+            return self._copy_result_page(page)
 
     def delete_job(self, job_id):
         """删除任务并撤销已下发工作包；节点下次心跳会立即中止。"""

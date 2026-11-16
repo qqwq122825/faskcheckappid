@@ -1029,6 +1029,40 @@ class ControllerTests(unittest.TestCase):
                       db.execute('SELECT result_counts FROM units WHERE job_id=? ORDER BY seq', (job,))]
         self.assertEqual(counts, [{'valid': 50}, {'valid': 50}])
 
+    def test_stable_category_page_is_cached_without_rescanning_shards(self):
+        job = self.job(100)
+        self.service.job_action(job, 'start')
+        while unit := self.service.lease(self.node['id'], 'test-session'):
+            self.confirm(unit)
+        opened = []
+        original_open = Path.open
+
+        def counting_open(path, *args, **kwargs):
+            if str(path).endswith('.jsonl'):
+                opened.append(str(path))
+            return original_open(path, *args, **kwargs)
+
+        with patch.object(Path, 'open', counting_open):
+            first = self.service.read_rows(job, 0, 100, 'valid')
+            second = self.service.read_rows(job, 0, 100, 'valid')
+        self.assertEqual(first, second)
+        self.assertEqual(len(opened), 2)
+
+    def test_category_total_never_trails_rows_after_rule_change(self):
+        job = self.job(50)
+        result = Path(self.temp.name) / 'stale-counts.jsonl'
+        with result.open('w', encoding='utf-8') as stream:
+            stream.write(json.dumps({'row': 1, 'status': 'valid'}) + '\n')
+            stream.write(json.dumps({'row': 2, 'status': 'valid'}) + '\n')
+        with self.service.db.transaction() as db:
+            unit = db.execute('SELECT id FROM units WHERE job_id=? ORDER BY seq LIMIT 1',
+                              (job,)).fetchone()
+            db.execute("UPDATE units SET status='completed',rows=2,result_path=?,result_counts=? "
+                       "WHERE id=?", (str(result), '{\"valid\":1}', unit['id']))
+            db.execute("UPDATE jobs SET status='completed',rows=2 WHERE id=?", (job,))
+        page = self.service.read_rows(job, 0, 100, 'valid')
+        self.assertEqual((page['total'], len(page['rows'])), (2, 2))
+
     def test_exact_apple_reason_avoids_fuzzy_matcher(self):
         value = {'reason': 'Your account information was entered incorrectly.'}
         with patch('clusterlab.controller.SequenceMatcher',
