@@ -63,7 +63,7 @@ _BASE_HEADERS = {
 
 MOCK_RESULTS = ("valid", "wrong_password", "wrong_password", "not_active",
                 "security_lock", "locked", "need_2fa", "error")
-MOCK_CN = {"valid": "有效", "wrong_password": "密码错误", "not_active": "未激活",
+MOCK_CN = {"valid": "有效", "wrong_password": "密码错误",
            "security_lock": "安全锁定", "locked": "已锁定", "need_2fa": "需要二次验证",
            "error": "请求失败"}
 

@@ -29,8 +29,8 @@ class StatusTests(unittest.TestCase):
         counts=snapshot(12,rows,active=1)
         self.assertEqual({k:counts[k] for k in ('processed','remaining','active')},
                          {'processed':10,'remaining':2,'active':1})
-        self.assertEqual([counts[k] for k in ('valid','wrong_password','need_2fa','locked','timeout','invalid','not_found','undetermined')],
-                         [1,1,1,1,1,1,0,4])
+        self.assertEqual([counts[k] for k in ('valid','wrong_password','need_2fa','locked','timeout','not_found','undetermined')],
+                         [1,1,1,2,1,0,4])
         self.assertEqual(result_bucket({'status':'init_refused','stage':'init','apple_ec':-20970}), 'undetermined')
         self.assertEqual(result_bucket({'status':'error','stage':'init','apple_ec':'-20209'}), 'undetermined')
         self.assertEqual(result_bucket({'status':'error','stage':'init','http':200,
@@ -58,8 +58,8 @@ class StatusTests(unittest.TestCase):
             'We cannot process your request, please try again later.': 'timeout',
             'This Apple Account has been\u00a0locked\u00a0for security reasons. Visit iForgot to reset your account (https://iforgot.apple.com).': 'locked',
             'Enter the correct password for this Apple Account.': 'wrong_password',
-            'This Apple Account is not active.': 'invalid',
-            'Your account information was entered incorrectly.': 'not_found',
+            'This Apple Account is not active.': 'locked',
+            'Your account information was entered incorrectly.': 'wrong_password',
             'The account does not exist.': 'not_found',
             'This Apple Account has been lockd for security reasons. Visit iForgot to reset your account.': 'locked',
             'This Apple Account has been Locked. Contact your Administrator or Manager to reset your password and unlock your account.': 'locked',
@@ -92,7 +92,7 @@ class StatusTests(unittest.TestCase):
         with patch('fastcheck.status.shutil.get_terminal_size',return_value=os.terminal_size((60,24))):
             panel.update(snapshot(82,{}),0,'准备')
             panel.update(snapshot(82,{}),1,'已停止',final=True)
-        for label in ('总数','已运行','剩余','密码正确','错误','双重','锁定','请重试','未激活','不存在','其他错误'):
+        for label in ('总数','已运行','剩余','密码正确','错误','双重','锁定','请重试','不存在','其他错误'):
             self.assertIn(label,stream.getvalue())
         self.assertIn('\x1b[1A',stream.getvalue())
         self.assertEqual(panel.previous_rows,0)

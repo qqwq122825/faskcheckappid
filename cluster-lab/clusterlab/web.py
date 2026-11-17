@@ -238,7 +238,7 @@ def create_app(role, service, password=None):
         def download_results(job_id):
             labels = {'all': '全部结果', 'valid': '密码正确', 'wrong_password': '密码错误',
                       'need_2fa': '双重验证', 'locked': '锁定',
-                      'invalid': '未激活', 'not_found': '不存在',
+                      'not_found': '不存在',
                       'timeout': '请重试', 'undetermined': '其他错误'}
             category = request.args.get('category', 'all')
             if category not in labels:

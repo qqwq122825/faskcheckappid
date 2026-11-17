@@ -124,7 +124,7 @@ _APPLE_REASON_BUCKETS = (
     ('this apple account has been locked for security reasons', 'locked'),
     ('this apple account has been locked', 'locked'),
     ('enter the correct password for this apple account', 'wrong_password'),
-    ('this apple account is not active', 'invalid'),
+    ('this apple account is not active', 'locked'),
     ('your account information was entered incorrectly', 'wrong_password'),
     ('the account does not exist', 'not_found'),
 )
@@ -216,7 +216,7 @@ def result_reason_cn(value, bucket=None):
          '账号因安全原因被锁定'),
         ('this apple account has been locked', '账号已被锁定'),
         ('enter the correct password for this apple account', '密码错误'),
-        ('this apple account is not active', '账号未激活'),
+        ('this apple account is not active', '账号已被锁定'),
         ('your account information was entered incorrectly', '密码错误'),
         ('the account does not exist', '账号不存在'),
     )
@@ -250,9 +250,9 @@ class Controller:
     MAX_THREADS = 500
     MAX_ACTIVE_UNITS = 512
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
-    RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'invalid', 'not_found',
+    RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'not_found',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 10
+    RESULT_CLASSIFICATION_VERSION = 11
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')
@@ -816,12 +816,19 @@ class Controller:
         if not isinstance(value, dict):
             return {}
         result = {}
+        # Fold legacy nodes' former "invalid" counter into locked while a
+        # rolling update is in progress; the public category no longer exists.
+        legacy_invalid = value.get('invalid', 0)
+        if type(legacy_invalid) is not int or legacy_invalid < 0 or legacy_invalid > rows:
+            raise ValueError('实时分类计数无效')
         for key in cls.RESULT_BUCKETS:
             count = value.get(key, 0)
             if type(count) is not int or count < 0 or count > rows:
                 raise ValueError('实时分类计数无效')
             if count:
                 result[key] = count
+        if legacy_invalid:
+            result['locked'] = result.get('locked', 0) + legacy_invalid
         if sum(result.get(key, 0) for key in cls.RESULT_BUCKETS) > processed:
             raise ValueError('实时分类数超过已处理数')
         return result
@@ -1624,9 +1631,8 @@ class Controller:
                              categorized={'valid': row['c_valid'] + live['valid'],
                                           'wrong_password': row['c_wrong'] + live['wrong_password'],
                                           'need_2fa': row['c_2fa'] + live['need_2fa'],
-                                          'locked': row['c_locked'] + live['locked'],
+                                          'locked': row['c_locked'] + row['c_invalid'] + live['locked'],
                                           'timeout': row['c_timeout'] + live['timeout'],
-                                          'invalid': row['c_invalid'] + live['invalid'],
                                           'not_found': row['c_not_found'] + live['not_found'],
                                           'unknown': row['c_unknown'] + live['undetermined'] + live['unknown']},
                              reported=row['reported_rows'])
@@ -1829,7 +1835,7 @@ class Controller:
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
         categories = ('all', 'valid', 'wrong_password', 'need_2fa', 'locked',
-                      'invalid', 'not_found', 'timeout', 'undetermined', 'unknown')
+                      'not_found', 'timeout', 'undetermined', 'unknown')
         if category not in categories:
             raise ValueError('结果分类无效')
         wanted = (('undetermined', 'unknown') if category == 'undetermined'

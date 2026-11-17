@@ -73,13 +73,6 @@
         "interrupted"
       ]
     },
-    "invalid": {
-      "label": "未激活",
-      "english_reasons": [
-        "This Apple Account is not active."
-      ],
-      "meaning": "reserved for explicit invalid-account verdicts and historical exports"
-    },
     "not_found": {
       "label": "不存在",
       "english_reasons": [
@@ -104,8 +97,8 @@
       "http": 200,
       "apple_ec": -20970,
       "apple_reason": "This Apple Account is not active.",
-      "category": "invalid",
-      "account_state_from_response": "invalid",
+      "category": "locked",
+      "account_state_from_response": "locked",
       "password_result": "not_checked",
       "automatic_retry": false
     },

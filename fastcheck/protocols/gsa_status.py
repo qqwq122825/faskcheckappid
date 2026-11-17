@@ -2,7 +2,7 @@
 
 Protocol and verdict table are the ones verified from the shipped build:
 
-    init      -> tells you not_active / security_lock / locked WITHOUT a password
+    init      -> tells you security_lock / locked WITHOUT a password
     complete  -> tells you valid / wrong_password (needs the SRP proof)
 
 Additions over the original: per-account timing, finer error classification
@@ -90,10 +90,10 @@ _CONNECT_TIMEOUT_CAP = 10.0
 _TLS = threading.local()
 _SESSION_IDS = count(1)
 
-MOCK_RESULTS = ("valid", "wrong_password", "wrong_password", "not_active",
+MOCK_RESULTS = ("valid", "wrong_password", "wrong_password", "security_lock",
                 "security_lock", "locked", "error")
 
-MOCK_CN = {"valid": "有效", "wrong_password": "密码错误", "not_active": "未激活",
+MOCK_CN = {"valid": "有效", "wrong_password": "密码错误",
            "security_lock": "安全锁定", "locked": "已锁定", "error": "请求失败"}
 
 
@@ -527,7 +527,7 @@ def classify(ec, em: str) -> tuple[str, str]:
                               "username or password is incorrect")):
         return "wrong_password", em
     if "not active" in em_l or "request access" in em_l:
-        return "not_active", em or f"ec={ec}"
+        return "security_lock", em or f"ec={ec}"
     if "locked for security reasons" in em_l:
         return "security_lock", em or f"ec={ec}"
     if any(s in em_l for s in ("account is disabled", "account is locked",

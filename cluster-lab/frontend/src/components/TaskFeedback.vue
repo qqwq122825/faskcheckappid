@@ -26,7 +26,6 @@ const cells = computed<Cell[]>(() => [
   { label: '密码错误', value: categories.value.wrong_password ?? 0 },
   { label: '双重验证', value: categories.value.need_2fa ?? 0 },
   { label: '锁定', value: categories.value.locked ?? 0 },
-  { label: '未激活', value: categories.value.invalid ?? 0, tone: 'danger' },
   { label: '不存在', value: categories.value.not_found ?? 0, tone: 'danger' },
   { label: '请重试', value: categories.value.timeout ?? 0, tone: 'warning' },
   { label: '其他错误', value: categories.value.unknown ?? 0 },

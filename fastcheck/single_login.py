@@ -47,7 +47,6 @@ def render_result(result):
         "wrong_password": "密码认证失败。",
         "security_lock": "账号安全锁定，已停止。",
         "locked": "账号已锁定或停用，已停止。",
-        "not_active": "账号未激活。",
         "stopped": "认证已停止。",
         "error": "未取得认证结论。",
     }

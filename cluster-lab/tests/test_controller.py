@@ -460,7 +460,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(state['processed'], 10)
         self.assertEqual(state['categorized'], {
             'valid': 0, 'wrong_password': 3, 'need_2fa': 0,
-            'locked': 2, 'timeout': 0, 'invalid': 4, 'not_found': 0, 'unknown': 1})
+            'locked': 6, 'timeout': 0, 'not_found': 0, 'unknown': 1})
 
         statuses = ([('wrong_password', 'Enter the correct password for this Apple Account.')] * 3 +
                     [('locked', 'This Apple Account has been locked for security reasons.')] * 2 +
@@ -476,7 +476,7 @@ class ControllerTests(unittest.TestCase):
         state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
         self.assertEqual(state['categorized'], {
             'valid': 40, 'wrong_password': 3, 'need_2fa': 0,
-            'locked': 2, 'timeout': 0, 'invalid': 4, 'not_found': 0, 'unknown': 1})
+            'locked': 6, 'timeout': 0, 'not_found': 0, 'unknown': 1})
         with self.service.db.connect() as db:
             self.assertIsNone(db.execute('SELECT live_counts FROM units WHERE id=?',
                                          (unit['id'],)).fetchone()[0])
@@ -594,14 +594,11 @@ class ControllerTests(unittest.TestCase):
         state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
         self.assertEqual(state['categorized'], {
             'valid': 48, 'wrong_password': 0, 'need_2fa': 0,
-            'locked': 1, 'timeout': 0, 'invalid': 1, 'not_found': 0, 'unknown': 0})
-        invalid = self.service.read_rows(job, 0, 100, 'invalid')
+            'locked': 2, 'timeout': 0, 'not_found': 0, 'unknown': 0})
         locked = self.service.read_rows(job, 0, 100, 'locked')
-        self.assertEqual((invalid['total'], invalid['rows'][0]['status'], invalid['rows'][0]['code']),
-                         (1, 'invalid', -20970))
         self.assertEqual((locked['total'], locked['rows'][0]['status'], locked['rows'][0]['code']),
-                         (1, 'locked', -20209))
-        self.assertEqual(b''.join(self.service.export_results(job, 'invalid')), b'hello\n')
+                         (2, 'locked', -20970))
+        self.assertEqual(b''.join(self.service.export_results(job, 'locked')), b'hello\n' * 2)
 
     def test_http_zero_is_timeout_and_legacy_counts_are_reconciled(self):
         self.assertEqual(result_record_bucket({'status': 'undetermined', 'http': 0}), 'timeout')
@@ -639,7 +636,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result_record_bucket(dict(
             shared, reason='Enter the correct password for this Apple Account.')), 'wrong_password')
         self.assertEqual(result_record_bucket(dict(
-            shared, reason='This Apple Account is not active.')), 'invalid')
+            shared, reason='This Apple Account is not active.')), 'locked')
         self.assertEqual(result_record_bucket(dict(
             shared, reason='Your account information was entered incorrectly.')), 'wrong_password')
         self.assertEqual(result_record_bucket(dict(

@@ -16,8 +16,8 @@ _APPLE_REASON_BUCKETS = (
     ('this apple account has been locked for security reasons', 'locked'),
     ('this apple account has been locked', 'locked'),
     ('enter the correct password for this apple account', 'wrong_password'),
-    ('this apple account is not active', 'invalid'),
-    ('your account information was entered incorrectly', 'not_found'),
+    ('this apple account is not active', 'locked'),
+    ('your account information was entered incorrectly', 'wrong_password'),
     ('the account does not exist', 'not_found'),
 )
 
@@ -79,7 +79,7 @@ def result_bucket(result):
 
 
 def snapshot(total, results, active=0):
-    counts = {key: 0 for key in ('valid','wrong_password','need_2fa','locked','timeout','invalid','not_found','undetermined')}
+    counts = {key: 0 for key in ('valid','wrong_password','need_2fa','locked','timeout','not_found','undetermined')}
     processed = 0
     for result in results.values():
         if result.get('attempts', 1) <= 0 or result.get('status') == 'not_started':
@@ -97,7 +97,7 @@ def status_tokens(counts, elapsed, phase, devices=None):
               f'剩余:{counts["remaining"]}',f'运行中:{counts["active"]}',
               f'密码正确:{counts["valid"]}',f'密码错误:{counts["wrong_password"]}',
               f'双重:{counts["need_2fa"]}',f'锁定:{counts["locked"]}',
-              f'请重试:{counts["timeout"]}',f'未激活:{counts["invalid"]}',
+              f'请重试:{counts["timeout"]}',
               f'不存在:{counts["not_found"]}',
               f'其他错误:{counts["undetermined"]}',
               f'用时:{duration}',f'速度:{speed}/时']
