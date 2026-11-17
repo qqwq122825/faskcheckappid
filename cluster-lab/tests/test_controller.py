@@ -641,7 +641,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result_record_bucket(dict(
             shared, reason='This Apple Account is not active.')), 'invalid')
         self.assertEqual(result_record_bucket(dict(
-            shared, reason='Your account information was entered incorrectly.')), 'not_found')
+            shared, reason='Your account information was entered incorrectly.')), 'wrong_password')
         self.assertEqual(result_record_bucket(dict(
             shared, reason='The account does not exist.')), 'not_found')
         self.assertEqual(result_reason_cn(dict(
@@ -1105,7 +1105,7 @@ class ControllerTests(unittest.TestCase):
         value = {'reason': 'Your account information was entered incorrectly.'}
         with patch('clusterlab.controller.SequenceMatcher',
                    side_effect=AssertionError('exact reasons must not use fuzzy matching')):
-            self.assertEqual(apple_reason_bucket(value), 'not_found')
+            self.assertEqual(apple_reason_bucket(value), 'wrong_password')
 
     def test_short_reason_skips_impossible_fuzzy_matches(self):
         with patch('clusterlab.controller.SequenceMatcher',

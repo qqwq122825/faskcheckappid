@@ -156,10 +156,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(len(server.requests), 1)
 
-    def test_exact_account_information_reason_is_not_found(self):
+    def test_account_information_reason_is_wrong_password(self):
         self.assertEqual(gsa.classify(
             -20970, 'Your account information was entered incorrectly.'),
-            ('not_found', 'Your account information was entered incorrectly.'))
+            ('wrong_password', 'Your account information was entered incorrectly.'))
         self.assertEqual(gsa.classify(
             -20970, 'The account does not exist.'),
             ('not_found', 'The account does not exist.'))

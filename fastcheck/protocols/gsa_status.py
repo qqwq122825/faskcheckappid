@@ -518,11 +518,10 @@ def classify(ec, em: str) -> tuple[str, str]:
     em_l = ' '.join(unicodedata.normalize('NFKC', em or '').split()).casefold()
     if ec == 0:
         return "valid", ""
-    if any(reason in em_l for reason in (
-            "your account information was entered incorrectly",
-            "the account does not exist")):
+    if "the account does not exist" in em_l:
         return "not_found", em
-    if any(s in em_l for s in ("password was entered incorrectly",
+    if any(s in em_l for s in ("your account information was entered incorrectly",
+                              "password was entered incorrectly",
                               "enter the correct password for this apple account",
                               "incorrect username or password",
                               "username or password is incorrect")):
