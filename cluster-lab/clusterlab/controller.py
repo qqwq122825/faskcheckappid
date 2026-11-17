@@ -1246,13 +1246,31 @@ class Controller:
                     continue
                 count = integer(value.get('processed', 0), '中断记录数', 0, unit['rows'])
                 self._clear_live_unit(db, unit['id'])
-                db.execute("UPDATE units SET status='unknown',processed=?,live_counts=NULL,lease_token=NULL,lease_until=NULL,updated=? WHERE id=?",
-                           (count, now, unit['id']))
                 interrupted_ack.append(unit['id'])
                 reason = str(value.get('error') or '')[:120]
-                event(db, 'unit_interrupted',
-                      f'节点已中止工作包 #{unit["seq"]}，未完成包进入待确认'
-                      + (f'（{reason}）' if reason else ''), unit['job_id'], node_id)
+                if '无进度' in reason and int(unit['attempt'] or 0) < 3:
+                    # Watchdog failures are safe to retry: the previous lease
+                    # token is revoked and live rows are cleared before this
+                    # exact package is offered again.  Manual stops and node
+                    # shutdowns deliberately keep the old "unknown" behavior.
+                    db.execute(
+                        "UPDATE units SET status='pending',node_id=NULL,processed=0,"
+                        "live_counts=NULL,reported_rows=0,lease_token=NULL,lease_until=NULL,updated=? WHERE id=?",
+                        (now, unit['id']))
+                    event(db, 'unit_auto_requeued',
+                          f'工作包 #{unit["seq"]} 无进度，已自动重排（第 {int(unit["attempt"] or 0)} 次）',
+                          unit['job_id'], node_id)
+                else:
+                    db.execute("UPDATE units SET status='unknown',processed=?,live_counts=NULL,lease_token=NULL,lease_until=NULL,updated=? WHERE id=?",
+                               (count, now, unit['id']))
+                    event(db, 'unit_interrupted',
+                          f'节点已中止工作包 #{unit["seq"]}，未完成包进入待确认'
+                          + (f'（{reason}）' if reason else ''), unit['job_id'], node_id)
+                    if '无进度' in reason:
+                        db.execute("UPDATE jobs SET status='paused',error=?,updated=? WHERE id=? AND status='running'",
+                                   ('工作包连续 3 次无进度，已自动暂停以免阻塞后续任务', now,
+                                    unit['job_id']))
+                        self._advance_queue(db)
             for value in active:
                 unit = db.execute('SELECT * FROM units WHERE id=? AND node_id=?', (value.get('id'), node_id)).fetchone()
                 if unit and unit['lease_token'] == value.get('token') and unit['status'] == 'completed':

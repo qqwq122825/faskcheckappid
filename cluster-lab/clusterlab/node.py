@@ -18,7 +18,7 @@ import requests
 
 from . import VERSION
 from .common import Database, atomic_json, file_digest, integer, private_dir, read_json
-from .executor import execute_unit_group
+from .executor import execute_unit_group, stall_timeout_seconds
 from .telemetry import HostTelemetry
 
 SCHEMA = '''
@@ -37,6 +37,10 @@ class Node:
     LIVE_RESULT_LIMIT = 1000
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     LIVE_RESULT_BYTE_LIMIT = 1024 * 1024
+    # Coordinator has its own watchdog; this outer guard also handles a wedged
+    # coordinator event loop.  The effective budget is raised for configured
+    # request/retry windows below.
+    TASK_STALL_SECONDS = 210.0
 
     def __init__(self, root, max_processes=2, max_threads=8, allow_http=False, interval=1.0):
         self.root = private_dir(root)
@@ -66,6 +70,7 @@ class Node:
         self.stop = threading.Event()
         self.lock = threading.RLock()
         self.active = {}
+        self.progress_watch = {}
         self.connected = False
         self.error = ''
         self.last_success = None
@@ -249,8 +254,33 @@ class Node:
             active = list(self.active.items())
         for unit_id, (process, stop) in active:
             progress = read_json(self.spool / unit_id / 'progress.json', {})
+            processed = int(progress.get('processed') or 0)
+            now = time.monotonic()
+            watch = self.progress_watch.setdefault(
+                unit_id, {'processed': processed, 'changed': now})
+            if processed != int(watch['processed']):
+                watch.update(processed=processed, changed=now)
+            descriptor = read_json(self.spool / unit_id / 'manifest.json', {})
+            stall_budget = stall_timeout_seconds(
+                descriptor, minimum=self.TASK_STALL_SECONDS, padding=90.0)
+            if process.is_alive() and now - float(watch['changed']) >= stall_budget:
+                stop.set()
+                process.join(2)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(2)
+                error = f'执行进程无进度超过 {int(stall_budget)} 秒，已中止并等待总控重排'
+                with self.db.transaction() as db:
+                    db.execute('UPDATE tasks SET status=?,processed=?,error=?,updated=? WHERE id=?',
+                               ('interrupted', processed, error, time.time(), unit_id))
+                self.builder.release(descriptor.get('device_slots') or [])
+                with self.lock:
+                    self.active.pop(unit_id, None)
+                self.progress_watch.pop(unit_id, None)
+                process.close()
+                continue
             with self.db.transaction() as db:
-                db.execute('UPDATE tasks SET processed=?,updated=? WHERE id=?', (progress.get('processed', 0), time.time(), unit_id))
+                db.execute('UPDATE tasks SET processed=?,updated=? WHERE id=?', (processed, time.time(), unit_id))
             if not process.is_alive():
                 process.join()
                 done = read_json(self.spool / unit_id / 'done.json', {})
@@ -264,6 +294,7 @@ class Node:
                 self.builder.release(descriptor.get('device_slots') or [])
                 with self.lock:
                     self.active.pop(unit_id, None)
+                self.progress_watch.pop(unit_id, None)
 
     def _refresh_progress(self):
         """Persist coordinator counters immediately before a heartbeat."""
@@ -569,6 +600,7 @@ class Node:
         process.start()
         with self.lock:
             self.active[unit_id] = (process, stop)
+        self.progress_watch[unit_id] = {'processed': 0, 'changed': time.monotonic()}
         return True
 
     def _prepare_auth_devices(self, descriptor):

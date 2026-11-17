@@ -320,6 +320,26 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(unit['processes'], 4)
         self.assertIsNone(self.service.lease(node['id'], 'big-session'))
 
+    def test_watchdog_interruption_requeues_same_package_without_blocking(self):
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        first = self.service.lease(self.node['id'], 'test-session')
+        response = self.service.heartbeat(self.node['id'], {
+            'session': 'test-session', 'version': '0.3.73',
+            'max_processes': 1, 'max_threads': 2, 'active': [],
+            'interrupted': [{'id': first['id'], 'token': first['token'],
+                             'processed': 43,
+                             'error': '执行进程无进度超过 210 秒，已中止'}]})
+        self.assertEqual(response['interrupted_ack'], [first['id']])
+        second = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual(second['id'], first['id'])
+        self.assertNotEqual(second['token'], first['token'])
+        with self.service.db.connect() as db:
+            saved = db.execute('SELECT status,attempt,processed FROM units WHERE id=?',
+                               (first['id'],)).fetchone()
+        self.assertEqual((saved['status'], saved['attempt'], saved['processed']),
+                         ('leased', 2, 0))
+
     def test_legacy_ten_by_one_hundred_migrates_to_four_by_two_fifty(self):
         node = self.service.add_node('legacy-10x100', 4, 250)
         with self.service.db.transaction() as db:

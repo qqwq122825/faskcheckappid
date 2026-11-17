@@ -142,6 +142,46 @@ class NodeRecoveryTests(unittest.TestCase):
             finally:
                 legacy.close()
 
+    def test_stalled_coordinator_is_terminated_and_reported(self):
+        class WedgedProcess:
+            def __init__(inner):
+                inner.alive = True
+                inner.terminated = False
+
+            def is_alive(inner):
+                return inner.alive
+
+            def join(inner, _timeout=None):
+                pass
+
+            def terminate(inner):
+                inner.terminated = True
+                inner.alive = False
+
+            def close(inner):
+                pass
+
+        process = WedgedProcess()
+        stop = threading.Event()
+        directory = self.node.spool / self.unit
+        (directory / 'manifest.json').write_text(
+            json.dumps({'timeout': 20, 'retries': 0, 'device_slots': []}), 'utf-8')
+        (directory / 'progress.json').write_text(json.dumps({'processed': 7}), 'utf-8')
+        with self.node.db.transaction() as db:
+            db.execute("UPDATE tasks SET status='running',processed=7 WHERE id=?", (self.unit,))
+        self.node.active[self.unit] = (process, stop)
+        self.node.progress_watch[self.unit] = {'processed': 7, 'changed': 0.0}
+        with patch('clusterlab.node.time.monotonic', return_value=1000.0), \
+             patch.object(self.node.builder, 'release'):
+            self.node._poll_processes()
+        with self.node.db.connect() as db:
+            task = db.execute('SELECT status,processed,error FROM tasks WHERE id=?',
+                              (self.unit,)).fetchone()
+        self.assertTrue(process.terminated)
+        self.assertTrue(stop.is_set())
+        self.assertEqual((task['status'], task['processed']), ('interrupted', 7))
+        self.assertIn('无进度', task['error'])
+
     def test_upload_failure_keeps_outbox_and_retry_confirms(self):
         with patch.object(self.node, '_request', side_effect=ConnectionError('offline')):
             with self.assertRaises(ConnectionError):

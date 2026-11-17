@@ -186,6 +186,31 @@ class ProtocolTests(unittest.TestCase):
                                retries=0, identity=self.identity)
         self.assertNotEqual(result.get('http'), 200)
 
+    def test_proxy_rotation_closes_previous_thread_session(self):
+        class FakeImpl:
+            def __init__(inner):
+                inner.closed = False
+
+            def close(inner):
+                inner.closed = True
+
+        class FakeSession:
+            def __init__(inner, proxy, resolver=None):
+                inner.proxy = proxy
+                inner._impl = FakeImpl()
+
+            def close(inner):
+                inner._impl.close()
+
+        gsa._TLS.sess = None
+        try:
+            with patch.object(gsa, '_Session', FakeSession):
+                first = gsa._session_for('http://first')
+                gsa._session_for('http://second')
+            self.assertTrue(first._impl.closed)
+        finally:
+            gsa._TLS.sess = None
+
     def test_server_rejects_invalid_public_value(self):
         client = srp_auth.GrandSlamSRPClient("owned@example.invalid", "synthetic-password")
         with self.assertRaises(ValueError):

@@ -384,6 +384,18 @@ class _Session:
                 handlers.append(urllib.request.ProxyHandler({}))
             self._impl = urllib.request.build_opener(*handlers)
 
+    def close(self) -> None:
+        """Close every socket owned by this per-thread session."""
+        impl, self._impl = self._impl, None
+        try:
+            if impl is not None and hasattr(impl, "close"):
+                impl.close()
+        except Exception:
+            pass
+
+    def __del__(self):
+        self.close()
+
     def rotate_if_needed(self) -> None:
         self._count += 1
         if self._count % _ROTATE_EVERY == 0:
@@ -471,6 +483,12 @@ class _Session:
 def _session_for(proxy: str | None) -> _Session:
     sess = getattr(_TLS, "sess", None)
     if sess is None or sess.proxy != proxy:
+        # Proxy rotation used to abandon the old requests.Session without
+        # closing its connection pool.  Under high concurrency those orphaned
+        # sockets accumulated in CLOSE_WAIT until the worker stopped making
+        # progress.  Close before replacing the thread-local session.
+        if sess is not None:
+            sess.close()
         sess = _Session(proxy, resolver=getattr(_TLS, "resolver", None))
         _TLS.sess = sess
     return sess
@@ -480,8 +498,8 @@ def close_session() -> None:
     """Discard this thread's cookies and connections after a CLI attempt."""
     sess = getattr(_TLS, "sess", None)
     try:
-        if sess is not None and _HAS_REQUESTS:
-            sess._impl.close()
+        if sess is not None:
+            sess.close()
     finally:
         _TLS.sess = None
         _TLS.resolver = None

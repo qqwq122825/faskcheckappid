@@ -28,10 +28,19 @@ PROXY_FAILURE_LIMIT = 3
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
 PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
+MIN_STALL_TIMEOUT_SECONDS = 180.0
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
 PROXY_EXIT_IP_TIMEOUT = 4.0
 PROXY_EXIT_IP_MAX = 2048
+
+
+def stall_timeout_seconds(descriptor, minimum=MIN_STALL_TIMEOUT_SECONDS,
+                          padding=60.0):
+    """Return a no-progress budget larger than every configured retry."""
+    timeout = max(0.1, float(descriptor.get('timeout') or 20))
+    attempts = max(0, int(descriptor.get('retries') or 0)) + 1
+    return max(float(minimum), timeout * attempts + float(padding))
 
 
 def _partition_device_slots(slot_ids, process_count, process_index):
@@ -899,6 +908,9 @@ def execute_unit_group(directory, descriptor, stop):
             children.append((process, child_stop, child_dir))
 
         last_write = 0.0
+        last_processed = -1
+        last_progress_at = time.monotonic()
+        stall_timeout = stall_timeout_seconds(descriptor)
         while any(process.is_alive() for process, _, _ in children):
             if stop.is_set():
                 for _, child_stop, _ in children:
@@ -916,6 +928,12 @@ def execute_unit_group(directory, descriptor, stop):
                 except (OSError, ValueError):
                     pass
             now = time.monotonic()
+            if processed != last_processed:
+                last_processed = processed
+                last_progress_at = now
+            elif not stop.is_set() and now - last_progress_at >= stall_timeout:
+                raise RuntimeError(
+                    f'工作包无进度超过 {int(stall_timeout)} 秒，已中止并交回总控')
             if now - last_write >= 0.25:
                 atomic_json(directory / 'progress.json',
                             {'processed': processed, 'started': started,
