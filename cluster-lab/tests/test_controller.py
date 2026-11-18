@@ -616,6 +616,14 @@ class ControllerTests(unittest.TestCase):
     def test_http_zero_is_timeout_and_legacy_counts_are_reconciled(self):
         self.assertEqual(result_record_bucket({'status': 'undetermined', 'http': 0}), 'timeout')
         self.assertEqual(result_record_bucket({'status': 'undetermined'}), 'undetermined')
+        for status, reason in (
+                ('wrong_password', '密码错误'),
+                ('locked', '账号已锁定'),
+                ('not_found', '账号不存在')):
+            with self.subTest(status=status):
+                record = {'status': status, 'http': 200}
+                self.assertEqual(result_record_bucket(record), status)
+                self.assertEqual(result_reason_cn(record, status), reason)
         self.assertEqual(result_record_bucket(
             {'status': 'invalid', 'http': 200, 'code': '-20970'}), 'unknown')
         self.assertEqual(result_record_bucket(

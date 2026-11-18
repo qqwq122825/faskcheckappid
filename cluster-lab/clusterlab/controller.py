@@ -191,7 +191,11 @@ def result_record_bucket(value):
            for code in codes):
         return 'timeout'
     bucket = value.get('status') or 'unknown'
-    if bucket in ('valid', 'need_2fa', 'timeout', 'undetermined', 'unknown'):
+    # The node has already completed the protocol-specific classification.
+    # Preserve every public result bucket here so live-row indexing uses the
+    # same category as the counters reported by that node.
+    if bucket in ('valid', 'wrong_password', 'need_2fa', 'locked',
+                  'not_found', 'timeout', 'undetermined', 'unknown'):
         return bucket
     return 'unknown'
 
@@ -253,6 +257,12 @@ def result_reason_cn(value, bucket=None):
         return '密码已通过，需要双重验证'
     if resolved == 'valid':
         return '密码正确'
+    if resolved == 'wrong_password':
+        return '密码错误'
+    if resolved == 'locked':
+        return '账号已锁定'
+    if resolved == 'not_found':
+        return '账号不存在'
     if resolved == 'timeout':
         try:
             if int(value.get('code')) in (-22410, -332000, -33200, -3000303):
@@ -272,7 +282,7 @@ class Controller:
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'not_found',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 11
+    RESULT_CLASSIFICATION_VERSION = 12
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')
