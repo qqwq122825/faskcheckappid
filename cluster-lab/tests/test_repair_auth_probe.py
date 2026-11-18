@@ -216,6 +216,19 @@ class RepairAuthProbeTests(unittest.TestCase):
             failure['reason_cn'],
             'Web 二次校验失败：HTTP 503（苹果服务暂不可用）；保留 GSA 结果')
 
+    def test_web_reason_wins_over_gsa_repair_in_debug_mode(self):
+        record = Controller._decorate_result_device(
+            {'status': 'need_2fa', 'code': 'au=repair', 'reason': 'au=repair',
+             'device': 8, 'web_status': 'error', 'web_stage': 'complete',
+             'web_http': 503, 'web_kind': 'server',
+             'web_detail': 'HTTP 503（苹果服务或网络链路暂不可用，无法判断账号密码）'},
+            {'node_id': 'node-a'},
+            ({'node-a': 1}, {('node-a', 8): 'B64:test'}, True),
+        )
+        self.assertEqual(
+            record['reason_cn'],
+            'Web 二次校验失败：HTTP 503（苹果服务或网络链路暂不可用，无法判断账号密码）；保留 GSA 结果')
+
 
 if __name__ == '__main__':
     unittest.main()

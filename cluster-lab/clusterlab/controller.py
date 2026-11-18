@@ -1762,7 +1762,15 @@ class Controller:
             # 旧记录里这两句是本地生成的说明，不是 Apple 原始返回。
             record['reason'] = ''
         raw_reason = str(record.get('reason') or record.get('apple_message') or '').strip()
-        if show_errors and raw_reason:
+        if record.get('web_status'):
+            # A supplemental Web probe is more specific than GSA's umbrella
+            # au=repair reason.  Keep that result visible even when raw Apple
+            # reason debugging is enabled.
+            public_record = dict(record)
+            public_record.pop('reason', None)
+            public_record.pop('apple_message', None)
+            record['reason_cn'] = result_reason_cn(public_record, record.get('status'))
+        elif show_errors and raw_reason:
             # 调试模式直接显示并返回 Apple 的原始英文，不再用中文覆盖。
             record['reason_cn'] = raw_reason[:2048]
         else:
