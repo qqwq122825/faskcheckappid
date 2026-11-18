@@ -131,6 +131,18 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(self.service.settings()['proxy_debug'])
         self.assertFalse(self.service.configure_debug({'proxy_debug': False})['proxy_debug'])
 
+    def test_web_secondary_auth_defaults_on_persists_and_rejects_non_boolean(self):
+        self.assertTrue(self.service.settings()['web_secondary_auth'])
+        self.assertFalse(self.service.configure_web_secondary_auth(
+            {'web_secondary_auth': False})['web_secondary_auth'])
+        with self.assertRaisesRegex(ValueError, '布尔'):
+            self.service.configure_web_secondary_auth({'web_secondary_auth': 'true'})
+        self.service.close()
+        self.service = Controller(self.temp.name)
+        self.assertFalse(self.service.settings()['web_secondary_auth'])
+        self.assertTrue(self.service.configure_web_secondary_auth(
+            {'web_secondary_auth': True})['web_secondary_auth'])
+
     def heartbeat(self, **extra):
         return self.service.heartbeat(self.node['id'], dict(session='test-session', max_processes=1,
                                       max_threads=2, active=[], **extra))
@@ -286,6 +298,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(unit['proxy_api'], first)
         self.assertEqual(unit['proxy_pool_size'], 10000)
         self.assertIs(unit['_proxy_debug'], False)
+        self.assertIs(unit['_web_secondary_auth'], True)
         self.assertNotIn(second, unit['proxy_api'])
 
         settings = self.service.configure_proxy({'action': 'delete', 'index': 0})

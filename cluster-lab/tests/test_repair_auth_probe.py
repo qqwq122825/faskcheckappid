@@ -5,6 +5,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from fastcheck.protocols import idmsa
 from clusterlab.controller import Controller, result_reason_cn
 from clusterlab.executor import _execute_auth_unit, _refine_repair_auth
 
@@ -34,10 +35,10 @@ class RepairAuthProbeTests(unittest.TestCase):
             return {'status': status, 'stage': 'complete'}
         return run
 
-    def refine(self, checker, result=None):
+    def refine(self, checker, result=None, retries=0):
         return _refine_repair_auth(
             result or dict(self.base), 'owned@example.invalid', 'secret', None,
-            20, threading.Event().is_set, checker=checker)
+            20, threading.Event().is_set, retries=retries, checker=checker)
 
     def test_hsa2_challenge_is_verification_code(self):
         value = self.refine(self.checker('hsa2'))
@@ -47,11 +48,39 @@ class RepairAuthProbeTests(unittest.TestCase):
         self.assertEqual(result_reason_cn(value, 'need_2fa'),
                          '密码已通过，需要手机或 App 验证码')
 
-    def test_security_auth_types_are_repair(self):
-        for auth_type in ('sa', 'non-sa', 'dnu'):
+    def test_sa_and_non_sa_move_to_password_correct(self):
+        for auth_type in ('sa', 'non-sa'):
             with self.subTest(auth_type=auth_type):
                 value = self.refine(self.checker(auth_type, status='valid', http=200))
+                self.assertEqual(value['status'], 'valid')
                 self.assertEqual(value['two_factor_method'], 'security_repair')
+
+    def test_dnu_stays_in_two_factor_bucket(self):
+        value = self.refine(self.checker('dnu', status='error', http=409))
+        self.assertEqual(value['status'], 'need_2fa')
+        self.assertEqual(value['two_factor_method'], 'security_repair')
+
+    def test_web_transport_retries_follow_task_setting(self):
+        seen = {}
+        def failing(_email, _password, _proxy, **kwargs):
+            seen.update(kwargs)
+            return {'status': 'error', 'kind': 'server', 'stage': 'init'}
+        value = self.refine(failing, retries=3)
+        self.assertEqual(seen['retries'], 3)
+        self.assertEqual(value['status'], 'need_2fa')
+
+    def test_idmsa_http_zero_and_503_consume_retry_budget(self):
+        outcomes = [
+            {'status': 'error', 'kind': 'network', 'stage': 'init',
+             'detail': 'init ConnectionError'},
+            {'status': 'error', 'kind': 'server', 'stage': 'init',
+             'detail': 'HTTP 503'},
+            {'status': 'need_2fa', 'kind': '', 'stage': 'complete'},
+        ]
+        with patch.object(idmsa, '_once', side_effect=outcomes) as request:
+            value = idmsa.check('owned@example.invalid', 'secret', None, retries=2)
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(value['status'], 'need_2fa')
 
     def test_http_412_setup_is_not_claimed_as_code_challenge(self):
         value = self.refine(self.checker('hsa2', status='needs_setup', http=412))
@@ -81,10 +110,12 @@ class RepairAuthProbeTests(unittest.TestCase):
             descriptor = {
                 'rows': 1, 'first_row': 1, 'threads': 1,
                 'device_capacity': 1, 'device_root': str(root / 'devices'),
-                'origin': 'http://127.0.0.1:1', 'timeout': 5,
+                'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 2,
+                '_web_secondary_auth': True,
             }
 
             def web_check(_email, _password, _proxy, **kwargs):
+                self.assertEqual(kwargs['retries'], 2)
                 kwargs['trace']({'stage': 'complete', 'http': 409,
                                  'auth_type': 'hsa2'})
                 return {'status': 'need_2fa', 'stage': 'complete'}
@@ -108,6 +139,34 @@ class RepairAuthProbeTests(unittest.TestCase):
             self.assertEqual(record['two_factor_method'], 'verification_code')
             self.assertEqual(record['web_auth_type'], 'hsa2')
             self.assertEqual(record['web_http'], 409)
+
+    def test_executor_skips_web_probe_when_setting_is_off(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text(
+                'owned@example.invalid----secret\n', encoding='utf-8')
+            descriptor = {
+                'rows': 1, 'first_row': 1, 'threads': 1,
+                'device_capacity': 1, 'device_root': str(root / 'devices'),
+                'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 2,
+                '_web_secondary_auth': False,
+            }
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool,
+                    lambda *_args, **_kwargs: {
+                        'status': 'need_2fa', 'auth_type': 'repair',
+                        'detail': 'au=repair', 'http': 200,
+                    },
+                    lambda result: result['status'])), \
+                 patch('fastcheck.protocols.idmsa.check',
+                       side_effect=AssertionError('Web probe must stay off')), \
+                 patch('fastcheck.workers.device_profile', return_value={
+                     'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event())
+            record = json.loads((root / 'results.jsonl').read_text('utf-8'))
+            self.assertEqual(record['status'], 'need_2fa')
+            self.assertNotIn('web_status', record)
 
     def test_controller_exposes_chinese_method_with_debug_off(self):
         record = Controller._decorate_result_device(

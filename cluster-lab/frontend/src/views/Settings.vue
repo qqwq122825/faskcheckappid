@@ -7,6 +7,7 @@ const proxyApi = ref(''), proxyScheme = ref('socks5h'), proxyError = ref(''), pr
 const proxyPoolSize = ref(1000), proxyPoolBusy = ref(false)
 const rotateAfter = ref(0), rotateBusy = ref(false)
 const proxyDebug = ref(false), proxyDebugBusy = ref(false)
+const webSecondaryAuth = ref(true), webSecondaryAuthBusy = ref(false)
 watch(() => state.value?.settings?.device_rotate_after, value => {
   if (value != null) rotateAfter.value = value
 }, { immediate: true })
@@ -18,6 +19,9 @@ watch(() => state.value?.settings?.proxy_scheme, value => {
 }, { immediate: true })
 watch(() => state.value?.settings?.proxy_debug, value => {
   if (value != null) proxyDebug.value = Boolean(value)
+}, { immediate: true })
+watch(() => state.value?.settings?.web_secondary_auth, value => {
+  if (value != null) webSecondaryAuth.value = Boolean(value)
 }, { immediate: true })
 watch(() => state.value?.settings?.proxy_pool_size, value => {
   if (value != null) proxyPoolSize.value = Number(value)
@@ -78,6 +82,17 @@ async function saveProxyDebug(value: string | number | boolean) {
     ElMessage.error((e as Error).message)
   } finally { proxyDebugBusy.value = false }
 }
+async function saveWebSecondaryAuth(value: string | number | boolean) {
+  const enabled = Boolean(value)
+  webSecondaryAuthBusy.value = true
+  try {
+    await mutate('/api/settings/web-secondary-auth', { web_secondary_auth: enabled },
+                 enabled ? 'Web 二次验证已开启，仅对 au=repair 的新工作包生效' : 'Web 二次验证已关闭')
+  } catch (e) {
+    webSecondaryAuth.value = !enabled
+    ElMessage.error((e as Error).message)
+  } finally { webSecondaryAuthBusy.value = false }
+}
 </script>
 <template>
   <el-card v-if="!isNode" shadow="never" class="section-card">
@@ -88,6 +103,24 @@ async function saveProxyDebug(value: string | number | boolean) {
       <p class="muted">保存后仅对新任务生效；已有任务和在途分片保持原配置。</p>
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
       <el-button type="primary" native-type="submit" :loading="busy">保存分片设置</el-button>
+    </el-form>
+  </el-card>
+  <el-card v-if="!isNode" shadow="never" class="section-card">
+    <template #header><h2>Web 二次验证</h2></template>
+    <el-form label-position="top">
+      <el-form-item label="细分 GSA au=repair 结果">
+        <el-switch v-model="webSecondaryAuth" :loading="webSecondaryAuthBusy" :disabled="webSecondaryAuthBusy"
+                   active-text="开启 Web 校验" inactive-text="关闭 Web 校验"
+                   @change="saveWebSecondaryAuth" />
+        <span class="field-note">
+          仅对 GSA 返回 au=repair 的账号追加一次 Web 校验。authType=sa/non-sa 归入密码正确；
+          hsa/hsa2 保留为双重验证。Web HTTP 0 或 503 按任务设置的重试次数重试。
+        </span>
+      </el-form-item>
+      <el-descriptions :column="1" border>
+        <el-descriptions-item label="当前状态">{{ webSecondaryAuth ? '已开启' : '已关闭' }}</el-descriptions-item>
+        <el-descriptions-item label="生效范围">新领取的工作包</el-descriptions-item>
+      </el-descriptions>
     </el-form>
   </el-card>
   <el-card v-if="!isNode" shadow="never" class="section-card">

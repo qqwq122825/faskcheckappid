@@ -107,6 +107,10 @@ def create_app(role, service, password=None):
         def configure_debug():
             return jsonify(service.configure_debug(request.get_json() or {}))
 
+        @app.post('/api/settings/web-secondary-auth')
+        def configure_web_secondary_auth():
+            return jsonify(service.configure_web_secondary_auth(request.get_json() or {}))
+
         @app.post('/api/settings/rotation')
         def configure_rotation():
             return jsonify(service.configure_rotation(request.get_json() or {}))

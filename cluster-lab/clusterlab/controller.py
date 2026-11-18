@@ -85,6 +85,7 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_auto_rotate'
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_pool_size','1000');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('web_secondary_auth','1');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('update_parallel','2');
 '''
 
@@ -611,7 +612,9 @@ class Controller:
                 'device_auto_rotate': str(values.get('device_auto_rotate', '0')) in ('1', 'True', 'true'),
                 'proxy_ttl': int(values.get('proxy_ttl', 50) or 50),
                 'proxy_pool_size': int(values.get('proxy_pool_size', 1000) or 1000),
-                'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true')}
+                'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true'),
+                'web_secondary_auth': str(values.get('web_secondary_auth', '1')) in
+                                      ('1', 'True', 'true')}
 
     def proxy_for_node(self, node):
         """节点专属出口：按创建顺序把链接分给各节点，避免所有节点抢同一条配额。"""
@@ -651,6 +654,21 @@ class Controller:
             event(db, 'controller_config',
                   '代理调试日志已开启；新工作包将记录超时出口明细' if enabled else
                   '代理调试日志已关闭；新工作包不再写入调试日志')
+        return self.settings()
+
+    def configure_web_secondary_auth(self, data):
+        enabled = data.get('web_secondary_auth')
+        if type(enabled) is not bool:
+            raise ValueError('Web 二次验证开关应为布尔值')
+        value = '1' if enabled else '0'
+        with self.db.transaction() as db:
+            db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       ('web_secondary_auth', value))
+            event(db, 'controller_config',
+                  'Web 二次验证已开启；仅对 GSA au=repair 的新工作包执行 Web 校验'
+                  if enabled else
+                  'Web 二次验证已关闭；新工作包只使用 GSA 结果')
         return self.settings()
 
     def configure_rotation(self, data):
@@ -1460,7 +1478,8 @@ class Controller:
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
                                proxy_pool_size=int(settings.get('proxy_pool_size') or 1000),
                                origin=settings.get('origin', 'https://new.ani.sidestore.io'),
-                               _proxy_debug=bool(settings.get('proxy_debug')))
+                               _proxy_debug=bool(settings.get('proxy_debug')),
+                               _web_secondary_auth=bool(settings.get('web_secondary_auth')))
             return payload
 
     def unit_for_node(self, node_id, unit_id, token):

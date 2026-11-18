@@ -142,7 +142,7 @@ def _repair_probe_method(web_result, trace):
 
 
 def _refine_repair_auth(result, email, password, proxy, timeout, cancel,
-                        checker=None):
+                        retries=0, checker=None):
     """Probe IDMSA once only after a verified GSA ``au=repair`` response.
 
     The GSA result remains authoritative.  A failed supplemental request never
@@ -167,7 +167,8 @@ def _refine_repair_auth(result, email, password, proxy, timeout, cancel,
             }
 
     try:
-        web_result = checker(email, password, proxy, timeout=timeout, retries=0,
+        web_result = checker(email, password, proxy, timeout=timeout,
+                             retries=max(0, int(retries or 0)),
                              cancel=cancel, trace=remember)
     except Exception as exc:                                      # noqa: BLE001
         web_result = {'status': 'error', 'kind': type(exc).__name__}
@@ -179,6 +180,12 @@ def _refine_repair_auth(result, email, password, proxy, timeout, cancel,
         web_http=complete.get('http'),
         web_status=str(web_result.get('status') or '')[:32],
     )
+    # Web sa/non-sa proves the password and belongs in the password-correct
+    # bucket even when GSA used its broad au=repair continuation.
+    if (str(complete.get('auth_type') or '').strip().casefold() in ('sa', 'non-sa')
+            and str(web_result.get('status') or '').strip().casefold()
+            in ('valid', 'needs_setup')):
+        enriched['status'] = 'valid'
     return enriched
 
 
@@ -1450,8 +1457,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 result = gsa_check(account, password, account_proxy, timeout=timeout,
                                    retries=0 if proxy_pool is not None else retries,
                                    cancel=stop.is_set, identity=identity)
-                result = _refine_repair_auth(
-                    result, account, password, account_proxy, timeout, stop.is_set)
+                if descriptor.get('_web_secondary_auth'):
+                    result = _refine_repair_auth(
+                        result, account, password, account_proxy, timeout,
+                        stop.is_set, retries=retries)
             except Exception as exc:                               # noqa: BLE001
                 result = {'status': 'error', 'kind': type(exc).__name__, 'http': 0,
                           'stage': 'init', 'detail': str(exc)[:180]}

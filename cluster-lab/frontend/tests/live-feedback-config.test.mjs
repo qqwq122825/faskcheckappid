@@ -51,7 +51,7 @@ test('Device rows use short Base64 labels instead of reusable slot numbers', () 
   assert.match(drawer, /label: item\.label \|\| `#\$\{item\.slot\}`/)
   assert.match(drawer, /prop="label" label="设备标识"/)
   assert.match(results, /prop="device_display" label="设备"/)
-  assert.match(results, /prop="two_factor_method_cn" label="二次验证方式"/)
+  assert.doesNotMatch(results, /label="二次验证方式"/)
   assert.doesNotMatch(results, /prop="device" label="设备"/)
 })
 
@@ -96,6 +96,15 @@ test('Proxy debug setting is explicit, persistent, and warns about log volume', 
   assert.match(settings, /节点直接回传 Apple 原始英文原因/)
   assert.match(settings, /节点只回传快捷分类，总控显示中文原因/)
   assert.match(settings, /避免产生大量日志/)
+})
+
+test('Web secondary auth setting only refines repair continuations', () => {
+  const settings = source('src/views/Settings.vue')
+  assert.match(settings, /\/api\/settings\/web-secondary-auth/)
+  assert.match(settings, /web_secondary_auth: enabled/)
+  assert.match(settings, /仅对 GSA 返回 au=repair/)
+  assert.match(settings, /authType=sa\/non-sa 归入密码正确/)
+  assert.match(settings, /Web HTTP 0 或 503 按任务设置的重试次数重试/)
 })
 
 test('Executive-facing pages omit test, demo, preview, and unfinished feature copy', () => {
