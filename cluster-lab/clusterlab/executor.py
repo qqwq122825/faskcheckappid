@@ -161,10 +161,23 @@ def _refine_repair_auth(result, email, password, proxy, timeout, cancel,
             return
         stage = str(event.get('stage') or '')
         if stage in ('init', 'complete'):
-            trace[stage] = {
+            metadata = {
                 'http': event.get('http'),
                 'auth_type': event.get('auth_type'),
+                'attempt': event.get('attempt'),
+                'server': str(event.get('server') or '')[:128],
+                'via': str(event.get('via') or '')[:128],
+                'retry_after': str(event.get('retry_after') or '')[:64],
+                'content_type': str(event.get('content_type') or '')[:128],
+                'response_body_bytes': event.get('response_body_bytes'),
+                'response_body_sha256': str(event.get('response_body_sha256') or '')[:64],
+                'response_keys': list(event.get('response_keys') or [])[:32],
+                'service_error_codes': list(event.get('service_error_codes') or [])[:16],
+                'has_session_headers': bool(event.get('has_session_headers')),
+                'has_set_cookie': bool(event.get('has_set_cookie')),
             }
+            trace[stage] = metadata
+            trace['latest'] = metadata
 
     try:
         web_result = checker(email, password, proxy, timeout=timeout,
@@ -176,7 +189,8 @@ def _refine_repair_auth(result, email, password, proxy, timeout, cancel,
         web_result = {'status': 'error', 'kind': type(exc).__name__,
                       'detail': type(exc).__name__}
     web_result = web_result if isinstance(web_result, dict) else {}
-    latest = (trace.get('complete') if isinstance(trace.get('complete'), dict)
+    latest = (trace.get('latest') if isinstance(trace.get('latest'), dict)
+              else trace.get('complete') if isinstance(trace.get('complete'), dict)
               else trace.get('init') if isinstance(trace.get('init'), dict)
               else {})
     complete = trace.get('complete') if isinstance(trace.get('complete'), dict) else {}
@@ -190,6 +204,17 @@ def _refine_repair_auth(result, email, password, proxy, timeout, cancel,
                       ('complete' if complete else 'init' if latest else ''))[:32],
         web_kind=str(web_result.get('kind') or '')[:64],
         web_detail=str(web_result.get('detail') or '')[:256],
+        web_attempts=max(0, int(latest.get('attempt') or 0)),
+        web_server=latest.get('server') or '',
+        web_via=latest.get('via') or '',
+        web_retry_after=latest.get('retry_after') or '',
+        web_content_type=latest.get('content_type') or '',
+        web_response_bytes=latest.get('response_body_bytes'),
+        web_response_sha256=latest.get('response_body_sha256') or '',
+        web_response_keys=(latest.get('response_keys') or []) if latest else None,
+        web_service_error_codes=(latest.get('service_error_codes') or []) if latest else None,
+        web_has_session_headers=bool(latest.get('has_session_headers')) if latest else None,
+        web_has_set_cookie=bool(latest.get('has_set_cookie')) if latest else None,
     )
     # Web sa/non-sa proves the password and belongs in the password-correct
     # bucket even when GSA used its broad au=repair continuation.
@@ -1640,7 +1665,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'elapsed': result.get('elapsed'),
                           'attempts': int(result.get('_proxy_retries') or 0)}
                 for key in ('two_factor_method', 'web_auth_type', 'web_http',
-                            'web_status', 'web_stage', 'web_kind', 'web_detail'):
+                            'web_status', 'web_stage', 'web_kind', 'web_detail',
+                            'web_attempts', 'web_server', 'web_via',
+                            'web_retry_after', 'web_content_type',
+                            'web_response_bytes', 'web_response_sha256',
+                            'web_response_keys', 'web_service_error_codes',
+                            'web_has_session_headers', 'web_has_set_cookie'):
                     if result.get(key) not in (None, ''):
                         record[key] = result[key]
                 encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()

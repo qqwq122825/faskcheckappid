@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import nullcontext
+import hashlib
 import http.cookiejar
 import json
 import ssl
@@ -289,7 +290,13 @@ def check(email: str, password: str, proxy: str | None, timeout: float = 20.0,
             return _result("stopped", "", started, stage="check")
         if attempt and last and not should_retry(last):
             return last
-        result = _once(email, password, proxy, timeout, cancel, started, trace, diagnostics,
+        attempt_trace = trace
+        if trace is not None:
+            def attempt_trace(entry, number=attempt + 1):
+                payload = dict(entry) if isinstance(entry, dict) else {}
+                payload['attempt'] = number
+                trace(payload)
+        result = _once(email, password, proxy, timeout, cancel, started, attempt_trace, diagnostics,
                        session=session)
         if result["status"] in ("stopped",):
             return result
@@ -307,18 +314,26 @@ def _once(email: str, password: str, proxy: str | None, timeout: float,
         return _authenticate(client, email, password, cancel, started, trace, diagnostics)
 
 
-def _trace(callback, stage, code, data, headers):
-    """Only protocol metadata; never passwords, proofs, cookies or header values."""
+def _trace(callback, stage, code, data, headers, raw=b''):
+    """Safe protocol metadata; never passwords, proofs, cookies or response bodies."""
     if callback is None:
         return
+    headers = {str(key).lower(): value for key, value in (headers or {}).items()}
     auth = data.get("authType")
     errors = data.get("serviceErrors") or []
     codes = [str(item.get("code", ""))[:24] for item in errors if isinstance(item, dict)] if isinstance(errors, list) else []
+    body = bytes(raw or b'')[:8192]
     entry = {"stage": stage, "http": code,
              "auth_type": auth if auth in ("sa", "non-sa", "hsa", "hsa2", "dnu") else None,
              "response_keys": sorted(str(key)[:64] for key in data), "service_error_codes": codes,
-             "has_session_headers": any(key.lower() in ("scnt", "x-apple-id-session-id") for key in headers),
-             "has_set_cookie": any(key.lower() == "set-cookie" for key in headers)}
+             "server": str(headers.get("server") or "")[:128],
+             "via": str(headers.get("via") or "")[:128],
+             "retry_after": str(headers.get("retry-after") or "")[:64],
+             "content_type": str(headers.get("content-type") or "")[:128],
+             "response_body_bytes": len(body),
+             "response_body_sha256": hashlib.sha256(body).hexdigest(),
+             "has_session_headers": any(key in ("scnt", "x-apple-id-session-id") for key in headers),
+             "has_set_cookie": "set-cookie" in headers}
     try:
         callback(entry)
     except Exception:
@@ -368,7 +383,7 @@ def _authenticate(client: _Client, email: str, password: str, cancel,
         code, raw, hdrs, err = client.post(IDMSA_INIT, _init_payload(email, srp))
         timing.update(http=code, error_type=err)
     data = _json(raw)
-    _trace(trace, "init", code, data, hdrs)
+    _trace(trace, "init", code, data, hdrs, raw)
     if cancel and cancel():
         return _result("stopped", "", started, stage="init")
     if code == 0:
@@ -402,7 +417,7 @@ def _authenticate(client: _Client, email: str, password: str, cancel,
         code, raw, hdrs, err = client.post(IDMSA_COMPLETE, payload)
         timing.update(http=code, error_type=err)
     data = _json(raw)
-    _trace(trace, "complete", code, data, hdrs)
+    _trace(trace, "complete", code, data, hdrs, raw)
     if code == 0:
         return _transport_result(err, started, "complete")
     _remember_session(client, hdrs)

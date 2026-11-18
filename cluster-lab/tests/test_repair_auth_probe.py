@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 import tempfile
 import threading
@@ -65,7 +66,15 @@ class RepairAuthProbeTests(unittest.TestCase):
         seen = {}
         def failing(_email, _password, _proxy, **kwargs):
             seen.update(kwargs)
-            kwargs['trace']({'stage': 'init', 'http': 503, 'auth_type': None})
+            kwargs['trace']({
+                'stage': 'init', 'http': 503, 'auth_type': None, 'attempt': 4,
+                'server': 'Apple', 'via': 'edge-gateway', 'retry_after': '5',
+                'content_type': 'application/json', 'response_body_bytes': 23,
+                'response_body_sha256': 'a' * 64,
+                'response_keys': ['serviceErrors'],
+                'service_error_codes': ['-1'],
+                'has_session_headers': False, 'has_set_cookie': True,
+            })
             return {'status': 'error', 'kind': 'server', 'stage': 'init',
                     'detail': 'HTTP 503（苹果服务暂不可用）'}
         value = self.refine(failing, retries=3)
@@ -75,6 +84,38 @@ class RepairAuthProbeTests(unittest.TestCase):
         self.assertEqual(value['web_http'], 503)
         self.assertEqual(value['web_kind'], 'server')
         self.assertEqual(value['web_detail'], 'HTTP 503（苹果服务暂不可用）')
+        self.assertEqual(value['web_attempts'], 4)
+        self.assertEqual(value['web_server'], 'Apple')
+        self.assertEqual(value['web_via'], 'edge-gateway')
+        self.assertEqual(value['web_retry_after'], '5')
+        self.assertEqual(value['web_response_sha256'], 'a' * 64)
+        self.assertEqual(value['web_response_keys'], ['serviceErrors'])
+        self.assertEqual(value['web_service_error_codes'], ['-1'])
+        self.assertTrue(value['web_has_set_cookie'])
+
+    def test_idmsa_trace_keeps_only_safe_response_metadata(self):
+        events = []
+        raw = b'{"serviceErrors":[{"code":"-1"}]}'
+        idmsa._trace(
+            events.append, 'init', 503,
+            {'serviceErrors': [{'code': '-1'}]},
+            {'Server': 'Apple', 'Via': 'edge-gateway', 'Retry-After': '5',
+             'Content-Type': 'application/json', 'Set-Cookie': 'secret-cookie',
+             'scnt': 'secret-session'}, raw)
+        event = events[0]
+        self.assertEqual(event['server'], 'Apple')
+        self.assertEqual(event['via'], 'edge-gateway')
+        self.assertEqual(event['retry_after'], '5')
+        self.assertEqual(event['response_body_bytes'], len(raw))
+        self.assertEqual(event['response_body_sha256'], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(event['response_keys'], ['serviceErrors'])
+        self.assertEqual(event['service_error_codes'], ['-1'])
+        self.assertTrue(event['has_session_headers'])
+        self.assertTrue(event['has_set_cookie'])
+        serialized = json.dumps(event)
+        self.assertNotIn('secret-cookie', serialized)
+        self.assertNotIn('secret-session', serialized)
+        self.assertNotIn(raw.decode(), serialized)
 
     def test_idmsa_http_zero_and_503_consume_retry_budget(self):
         outcomes = [
@@ -127,7 +168,15 @@ class RepairAuthProbeTests(unittest.TestCase):
             def web_check(_email, _password, _proxy, **kwargs):
                 self.assertEqual(kwargs['retries'], 2)
                 kwargs['trace']({'stage': 'complete', 'http': 409,
-                                 'auth_type': 'hsa2'})
+                                 'auth_type': 'hsa2', 'attempt': 1,
+                                 'server': 'Apple', 'via': '', 'retry_after': '',
+                                 'content_type': 'application/json',
+                                 'response_body_bytes': 18,
+                                 'response_body_sha256': 'b' * 64,
+                                 'response_keys': ['authType'],
+                                 'service_error_codes': [],
+                                 'has_session_headers': True,
+                                 'has_set_cookie': True})
                 return {'status': 'need_2fa', 'stage': 'complete'}
 
             with patch('clusterlab.executor._load_fastcheck', return_value=(
@@ -151,6 +200,12 @@ class RepairAuthProbeTests(unittest.TestCase):
             self.assertEqual(record['web_auth_type'], 'hsa2')
             self.assertEqual(record['web_http'], 409)
             self.assertEqual(record['web_stage'], 'complete')
+            self.assertEqual(record['web_attempts'], 1)
+            self.assertEqual(record['web_server'], 'Apple')
+            self.assertEqual(record['web_response_sha256'], 'b' * 64)
+            self.assertEqual(record['web_response_keys'], ['authType'])
+            self.assertTrue(record['web_has_session_headers'])
+            self.assertTrue(record['web_has_set_cookie'])
             self.assertNotIn('web_kind', record)
             self.assertNotIn('web_detail', record)
 
