@@ -92,6 +92,8 @@ test('Proxy debug setting is explicit, persistent, and warns about log volume', 
   assert.match(settings, /proxy_debug: enabled/)
   assert.match(settings, /代理调试日志/)
   assert.match(settings, /proxy-debug\.jsonl/)
+  assert.match(settings, /节点直接回传 Apple 原始英文原因/)
+  assert.match(settings, /节点只回传快捷分类，总控显示中文原因/)
   assert.match(settings, /避免产生大量日志/)
 })
 

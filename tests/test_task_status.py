@@ -114,6 +114,13 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(safe_result({'status':'error','kind':'server','detail':'HTTP 503'})['kind'],'server')
         self.assertEqual(safe_result({'status':'error','kind':'network','detail':'ConnectionError'})['kind'],'network')
 
+    def test_raw_apple_reason_is_returned_only_in_debug_mode(self):
+        source = {'status': 'wrong_password',
+                  'apple_message': 'Your account information was entered incorrectly.'}
+        self.assertNotIn('apple_message', safe_result(source))
+        self.assertEqual(safe_result(source, debug=True)['apple_message'],
+                         'Your account information was entered incorrectly.')
+
     def test_explicit_http_zero_is_timeout_but_missing_http_is_not(self):
         self.assertEqual(result_bucket({'status':'undetermined','kind':'network','http':0}), 'timeout')
         self.assertEqual(result_bucket({'status':'undetermined','kind':'network'}), 'undetermined')

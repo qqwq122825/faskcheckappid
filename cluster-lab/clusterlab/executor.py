@@ -107,8 +107,10 @@ def _proxy_debug_detail(value):
     return text[:240]
 
 
-def _apple_reason_for_record(result, status):
-    """Keep only Apple's raw message or its raw 2FA ``au`` signal."""
+def _apple_reason_for_record(result, status, debug=False):
+    """Return Apple's raw message only for an explicitly debug-enabled job."""
+    if not debug:
+        return ''
     message = result.get('apple_message')
     if isinstance(message, str) and message.strip():
         return message.strip()[:2048]
@@ -1543,7 +1545,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 business_code = result.get('apple_ec')
                 if business_code is None:
                     business_code = (result.get('detail') or result.get('kind') or '')[:180]
-                reason = _apple_reason_for_record(result, status)
+                reason = _apple_reason_for_record(result, status, debug_enabled)
                 record = {'row': row, 'account': account, 'password': password, 'status': status,
                           'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
                           'stage': result.get('stage') or '', 'http': result.get('http'),

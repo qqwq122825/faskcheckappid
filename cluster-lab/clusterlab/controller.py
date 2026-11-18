@@ -1716,11 +1716,19 @@ class Controller:
                                     '密码证明通过；未确认业务服务登录状态'):
             # 旧记录里这两句是本地生成的说明，不是 Apple 原始返回。
             record['reason'] = ''
-        record['reason_cn'] = result_reason_cn(record, record.get('status'))
+        raw_reason = str(record.get('reason') or record.get('apple_message') or '').strip()
+        if show_errors and raw_reason:
+            # 调试模式直接显示并返回 Apple 的原始英文，不再用中文覆盖。
+            record['reason_cn'] = raw_reason[:2048]
+        else:
+            # 普通模式只按快捷分类显示中文；历史记录中的原始原因也不回传。
+            public_record = dict(record)
+            public_record.pop('reason', None)
+            public_record.pop('apple_message', None)
+            record['reason_cn'] = result_reason_cn(public_record, record.get('status'))
         if not show_errors:
-            # 原始 Apple 原因 reason 始终返回；调试开关只控制额外诊断字段。
             # Filter the response only; never rewrite authoritative result bytes.
-            for field in ('detail', 'apple_message', 'error', 'traceback', 'raw_response'):
+            for field in ('reason', 'detail', 'apple_message', 'error', 'traceback', 'raw_response'):
                 record.pop(field, None)
             code = str(record.get('code') or '')
             # Older workers used the first 180 characters of an exception as code.

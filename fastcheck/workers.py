@@ -148,10 +148,12 @@ def shared_session(proxy, want_trace=False):
     return session
 
 
-def safe_result(result):
+def safe_result(result, debug=False):
     keys = ('status', 'kind', 'stage', 'apple_ec', 'password_verified', 'two_factor_status',
-            'auth_type', 'apple_message', 'http', 'init_http', 'complete_http', 'error_type')
+            'auth_type', 'http', 'init_http', 'complete_http', 'error_type')
     value = {key: result[key] for key in keys if key in result}
+    if debug and isinstance(result.get('apple_message'), str):
+        value['apple_message'] = result['apple_message'][:2048]
     value.setdefault('status', 'error')
     detail=str(result.get('detail',''))
     if 'http' not in value:
@@ -242,7 +244,7 @@ def worker_process(worker_id, threads, incoming, outgoing, stop, handler=protoco
               'pid': os.getpid(), 'thread_id': threading.get_ident()})
         try:
             gsa.close_session()
-            result = safe_result(handler(payload, outgoing, stop))
+            result = safe_result(handler(payload, outgoing, stop), debug=bool(payload.get('debug')))
         except PoolError:
             result = {'status': 'error', 'kind': 'resource', 'stage': 'device_lease'}
         except Exception as exc:

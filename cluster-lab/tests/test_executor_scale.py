@@ -13,7 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from clusterlab.executor import (NodeProxyPool, _auth_process_limit, _auth_worker_limit, _device_id_label, _execute_auth_unit, _partition_device_slots,
-                                 _proxy_debug_enabled, _slot_for_account, atomic_json,
+                                 _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
 
@@ -91,6 +91,12 @@ def use_shared_proxy_pool(pool, output):
 
 
 class ExecutorScaleTests(unittest.TestCase):
+    def test_raw_apple_reason_is_packaged_only_when_debug_is_enabled(self):
+        result = {'apple_message': 'Your account information was entered incorrectly.'}
+        self.assertEqual(_apple_reason_for_record(result, 'wrong_password'), '')
+        self.assertEqual(_apple_reason_for_record(result, 'wrong_password', True),
+                         'Your account information was entered incorrectly.')
+
     def test_stall_budget_covers_all_retry_windows(self):
         self.assertEqual(stall_timeout_seconds({'timeout': 20, 'retries': 4}), 180)
         self.assertEqual(stall_timeout_seconds({'timeout': 60, 'retries': 4}), 360)
