@@ -171,14 +171,25 @@ def _refine_repair_auth(result, email, password, proxy, timeout, cancel,
                              retries=max(0, int(retries or 0)),
                              cancel=cancel, trace=remember)
     except Exception as exc:                                      # noqa: BLE001
-        web_result = {'status': 'error', 'kind': type(exc).__name__}
+        # Persist only the exception class.  Exception messages from HTTP
+        # libraries may contain proxy URLs (and therefore credentials).
+        web_result = {'status': 'error', 'kind': type(exc).__name__,
+                      'detail': type(exc).__name__}
+    web_result = web_result if isinstance(web_result, dict) else {}
+    latest = (trace.get('complete') if isinstance(trace.get('complete'), dict)
+              else trace.get('init') if isinstance(trace.get('init'), dict)
+              else {})
     complete = trace.get('complete') if isinstance(trace.get('complete'), dict) else {}
     enriched = dict(result)
     enriched.update(
         two_factor_method=_repair_probe_method(web_result, trace),
         web_auth_type=str(complete.get('auth_type') or '')[:32],
-        web_http=complete.get('http'),
+        web_http=latest.get('http'),
         web_status=str(web_result.get('status') or '')[:32],
+        web_stage=str(web_result.get('stage') or
+                      ('complete' if complete else 'init' if latest else ''))[:32],
+        web_kind=str(web_result.get('kind') or '')[:64],
+        web_detail=str(web_result.get('detail') or '')[:256],
     )
     # Web sa/non-sa proves the password and belongs in the password-correct
     # bucket even when GSA used its broad au=repair continuation.
@@ -1628,7 +1639,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'device_label': device_labels.get(device, ''),
                           'elapsed': result.get('elapsed'),
                           'attempts': int(result.get('_proxy_retries') or 0)}
-                for key in ('two_factor_method', 'web_auth_type', 'web_http', 'web_status'):
+                for key in ('two_factor_method', 'web_auth_type', 'web_http',
+                            'web_status', 'web_stage', 'web_kind', 'web_detail'):
                     if result.get(key) not in (None, ''):
                         record[key] = result[key]
                 encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()

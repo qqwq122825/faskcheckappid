@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -64,10 +65,16 @@ class RepairAuthProbeTests(unittest.TestCase):
         seen = {}
         def failing(_email, _password, _proxy, **kwargs):
             seen.update(kwargs)
-            return {'status': 'error', 'kind': 'server', 'stage': 'init'}
+            kwargs['trace']({'stage': 'init', 'http': 503, 'auth_type': None})
+            return {'status': 'error', 'kind': 'server', 'stage': 'init',
+                    'detail': 'HTTP 503（苹果服务暂不可用）'}
         value = self.refine(failing, retries=3)
         self.assertEqual(seen['retries'], 3)
         self.assertEqual(value['status'], 'need_2fa')
+        self.assertEqual(value['web_stage'], 'init')
+        self.assertEqual(value['web_http'], 503)
+        self.assertEqual(value['web_kind'], 'server')
+        self.assertEqual(value['web_detail'], 'HTTP 503（苹果服务暂不可用）')
 
     def test_idmsa_http_zero_and_503_consume_retry_budget(self):
         outcomes = [
@@ -88,11 +95,14 @@ class RepairAuthProbeTests(unittest.TestCase):
 
     def test_probe_failure_keeps_gsa_result(self):
         def failing(*_args, **_kwargs):
-            raise RuntimeError('offline')
+            raise RuntimeError('proxy://user:secret@example.invalid')
         value = self.refine(failing)
         self.assertEqual(value['status'], 'need_2fa')
         self.assertEqual(value['auth_type'], 'repair')
         self.assertEqual(value['two_factor_method'], 'repair_unspecified')
+        self.assertEqual(value['web_kind'], 'RuntimeError')
+        self.assertEqual(value['web_detail'], 'RuntimeError')
+        self.assertNotIn('secret', json.dumps(value))
 
     def test_non_repair_does_not_probe(self):
         def forbidden(*_args, **_kwargs):
@@ -128,8 +138,9 @@ class RepairAuthProbeTests(unittest.TestCase):
                     },
                     lambda result: result['status'])), \
                  patch('fastcheck.protocols.idmsa.check', side_effect=web_check), \
-                 patch('fastcheck.workers.device_profile', return_value={
-                     'client_info': 'test', 'user_agent': 'test'}), \
+                 patch.dict('sys.modules', {'fastcheck.workers': SimpleNamespace(
+                     device_profile=lambda *_args, **_kwargs: {
+                         'client_info': 'test', 'user_agent': 'test'})}), \
                  patch('clusterlab.executor._bump_usage'):
                 _execute_auth_unit(root, descriptor, threading.Event())
 
@@ -139,6 +150,9 @@ class RepairAuthProbeTests(unittest.TestCase):
             self.assertEqual(record['two_factor_method'], 'verification_code')
             self.assertEqual(record['web_auth_type'], 'hsa2')
             self.assertEqual(record['web_http'], 409)
+            self.assertEqual(record['web_stage'], 'complete')
+            self.assertNotIn('web_kind', record)
+            self.assertNotIn('web_detail', record)
 
     def test_executor_skips_web_probe_when_setting_is_off(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -160,8 +174,9 @@ class RepairAuthProbeTests(unittest.TestCase):
                     lambda result: result['status'])), \
                  patch('fastcheck.protocols.idmsa.check',
                        side_effect=AssertionError('Web probe must stay off')), \
-                 patch('fastcheck.workers.device_profile', return_value={
-                     'client_info': 'test', 'user_agent': 'test'}), \
+                 patch.dict('sys.modules', {'fastcheck.workers': SimpleNamespace(
+                     device_profile=lambda *_args, **_kwargs: {
+                         'client_info': 'test', 'user_agent': 'test'})}), \
                  patch('clusterlab.executor._bump_usage'):
                 _execute_auth_unit(root, descriptor, threading.Event())
             record = json.loads((root / 'results.jsonl').read_text('utf-8'))
