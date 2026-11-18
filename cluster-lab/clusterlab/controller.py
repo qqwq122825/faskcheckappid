@@ -227,6 +227,18 @@ def result_reason_cn(value, bucket=None):
     for phrase, translated in translations:
         if apple_reason_matches(low, phrase):
             return translated
+    web_status = str(value.get('web_status') or '').strip().casefold()
+    web_detail = str(value.get('web_detail') or '').strip()[:256]
+    if web_status:
+        if web_status in ('valid', 'needs_setup', 'need_2fa'):
+            return 'Web 二次校验后：' + (web_detail or {
+                'valid': '密码正确',
+                'needs_setup': '需要确认隐私或安全设置',
+                'need_2fa': '需要手机或 App 验证码',
+            }[web_status])
+        if web_status == 'error':
+            return ('Web 二次校验失败：' + web_detail + '；保留 GSA 结果'
+                    if web_detail else 'Web 二次校验失败；保留 GSA 结果')
     resolved = bucket or result_record_bucket(value)
     if resolved == 'need_2fa':
         method = str(value.get('two_factor_method') or '').strip()

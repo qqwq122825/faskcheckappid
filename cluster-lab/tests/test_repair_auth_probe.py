@@ -47,7 +47,7 @@ class RepairAuthProbeTests(unittest.TestCase):
         self.assertEqual(value['web_auth_type'], 'hsa2')
         self.assertEqual(value['web_http'], 409)
         self.assertEqual(result_reason_cn(value, 'need_2fa'),
-                         '密码已通过，需要手机或 App 验证码')
+                         'Web 二次校验后：需要手机或 App 验证码')
 
     def test_sa_and_non_sa_move_to_password_correct(self):
         for auth_type in ('sa', 'non-sa'):
@@ -192,6 +192,29 @@ class RepairAuthProbeTests(unittest.TestCase):
         )
         self.assertEqual(record['two_factor_method_cn'], '手机或 App 验证码')
         self.assertEqual(record['reason_cn'], '密码已通过，需要手机或 App 验证码')
+
+    def test_controller_reason_names_web_secondary_result(self):
+        success = Controller._decorate_result_device(
+            {'status': 'valid', 'code': 'au=repair', 'device': 5,
+             'web_status': 'valid', 'web_stage': 'complete',
+             'web_http': 412, 'web_auth_type': 'sa',
+             'web_detail': '密码验证通过（authType=sa）；隐私或安全设置待确认（HTTP 412）'},
+            {'node_id': 'node-a'},
+            ({'node-a': 1}, {('node-a', 5): 'B64:test'}, False),
+        )
+        self.assertEqual(
+            success['reason_cn'],
+            'Web 二次校验后：密码验证通过（authType=sa）；隐私或安全设置待确认（HTTP 412）')
+        failure = Controller._decorate_result_device(
+            {'status': 'need_2fa', 'code': 'au=repair', 'device': 5,
+             'web_status': 'error', 'web_stage': 'init', 'web_http': 503,
+             'web_kind': 'server', 'web_detail': 'HTTP 503（苹果服务暂不可用）'},
+            {'node_id': 'node-a'},
+            ({'node-a': 1}, {('node-a', 5): 'B64:test'}, False),
+        )
+        self.assertEqual(
+            failure['reason_cn'],
+            'Web 二次校验失败：HTTP 503（苹果服务暂不可用）；保留 GSA 结果')
 
 
 if __name__ == '__main__':
