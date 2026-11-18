@@ -9,7 +9,11 @@ from unittest.mock import patch
 
 from fastcheck.protocols import idmsa
 from clusterlab.controller import Controller, result_reason_cn
-from clusterlab.executor import _execute_auth_unit, _refine_repair_auth
+from clusterlab.executor import (
+    _execute_auth_unit,
+    _refine_repair_auth,
+    _refine_repair_auth_with_rotation,
+)
 
 
 class FakePool:
@@ -92,6 +96,34 @@ class RepairAuthProbeTests(unittest.TestCase):
         self.assertEqual(value['web_response_keys'], ['serviceErrors'])
         self.assertEqual(value['web_service_error_codes'], ['-1'])
         self.assertTrue(value['web_has_set_cookie'])
+
+    def test_web_transient_retry_rotates_proxy_without_repeating_gsa(self):
+        seen = []
+
+        def checker(_email, _password, proxy, **kwargs):
+            seen.append(proxy)
+            if proxy == 'proxy-a':
+                kwargs['trace']({'stage': 'init', 'http': 503, 'attempt': 1})
+                return {'status': 'error', 'kind': 'server', 'stage': 'init'}
+            kwargs['trace']({'stage': 'complete', 'http': 412,
+                             'auth_type': 'sa', 'attempt': 1})
+            return {'status': 'valid', 'stage': 'complete'}
+
+        rotations = []
+
+        def rotate(attempt):
+            rotations.append(attempt)
+            return 'proxy-b', True
+
+        value = _refine_repair_auth_with_rotation(
+            dict(self.base), 'owned@example.invalid', 'secret', 'proxy-a',
+            20, threading.Event().is_set, 2, rotate, checker=checker)
+        self.assertEqual(seen, ['proxy-a', 'proxy-b'])
+        self.assertEqual(rotations, [1])
+        self.assertEqual(value['status'], 'valid')
+        self.assertEqual(value['web_attempts'], 2)
+        self.assertEqual(value['web_proxy_rotations'], 1)
+        self.assertNotIn('web_rotation_exhausted', value)
 
     def test_idmsa_trace_keeps_only_safe_response_metadata(self):
         events = []
@@ -237,6 +269,75 @@ class RepairAuthProbeTests(unittest.TestCase):
             record = json.loads((root / 'results.jsonl').read_text('utf-8'))
             self.assertEqual(record['status'], 'need_2fa')
             self.assertNotIn('web_status', record)
+
+    def test_executor_discards_failed_web_exit_and_acquires_a_new_one(self):
+        class ProxyPool:
+            def __init__(self):
+                self.leases = [
+                    ('proxy-bootstrap', 1, 0),
+                    ('proxy-bad', 2, 0),
+                    ('proxy-good', 3, 0),
+                ]
+                self.discards = []
+                self.releases = []
+
+            def acquire(self, wait=1.0):
+                del wait
+                return self.leases.pop(0) if self.leases else None
+
+            def discard(self, lease):
+                self.discards.append(lease[0])
+
+            def release(self, lease, healthy):
+                self.releases.append((lease[0], healthy))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text(
+                'owned@example.invalid----secret\n', encoding='utf-8')
+            descriptor = {
+                'rows': 1, 'first_row': 1, 'threads': 1,
+                'device_capacity': 1, 'device_root': str(root / 'devices'),
+                'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 2,
+                'proxy_api': 'http://proxy.invalid/list',
+                '_web_secondary_auth': True,
+            }
+            pool = ProxyPool()
+            gsa_proxies = []
+            web_proxies = []
+
+            def gsa_check(_email, _password, proxy, **_kwargs):
+                gsa_proxies.append(proxy)
+                return {'status': 'need_2fa', 'auth_type': 'repair',
+                        'detail': 'au=repair', 'http': 200}
+
+            def web_check(_email, _password, proxy, **kwargs):
+                web_proxies.append(proxy)
+                if proxy == 'proxy-bad':
+                    kwargs['trace']({'stage': 'init', 'http': 503, 'attempt': 1})
+                    return {'status': 'error', 'kind': 'server', 'stage': 'init'}
+                kwargs['trace']({'stage': 'complete', 'http': 412,
+                                 'auth_type': 'sa', 'attempt': 1})
+                return {'status': 'valid', 'stage': 'complete'}
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool, gsa_check, lambda result: result['status'])), \
+                 patch('fastcheck.protocols.idmsa.check', side_effect=web_check), \
+                 patch.dict('sys.modules', {'fastcheck.workers': SimpleNamespace(
+                     device_profile=lambda *_args, **_kwargs: {
+                         'client_info': 'test', 'user_agent': 'test'})}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=pool)
+
+            record = json.loads((root / 'results.jsonl').read_text('utf-8'))
+            self.assertEqual(gsa_proxies, ['proxy-bad'])
+            self.assertEqual(web_proxies, ['proxy-bad', 'proxy-good'])
+            self.assertEqual(pool.discards, ['proxy-bad'])
+            self.assertIn(('proxy-good', True), pool.releases)
+            self.assertEqual(record['status'], 'valid')
+            self.assertEqual(record['attempts'], 1)
+            self.assertEqual(record['web_attempts'], 2)
+            self.assertEqual(record['web_proxy_rotations'], 1)
 
     def test_controller_exposes_chinese_method_with_debug_off(self):
         record = Controller._decorate_result_device(

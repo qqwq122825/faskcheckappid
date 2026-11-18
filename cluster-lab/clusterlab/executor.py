@@ -225,6 +225,46 @@ def _refine_repair_auth(result, email, password, proxy, timeout, cancel,
     return enriched
 
 
+def _refine_repair_auth_with_rotation(result, email, password, proxy, timeout,
+                                      cancel, retries, rotate_proxy,
+                                      checker=None):
+    """Retry transient Web HTTP 0/503 checks on newly acquired exits.
+
+    GSA is deliberately not repeated because its ``au=repair`` result is
+    already authoritative; only the supplemental Web request is retried.
+    """
+    current_proxy = proxy
+    refined = result
+    attempts = 0
+    rotations = 0
+    exhausted = False
+    limit = max(0, int(retries or 0)) + 1
+    for attempt in range(limit):
+        attempts += 1
+        refined = _refine_repair_auth(
+            result, email, password, current_proxy, timeout, cancel,
+            retries=0, checker=checker)
+        try:
+            web_http = int(refined.get('web_http'))
+        except (TypeError, ValueError):
+            web_http = None
+        transient = (str(refined.get('web_status') or '').casefold() == 'error'
+                     and web_http in (0, 503))
+        if not transient or attempt + 1 >= limit or (cancel and cancel()):
+            break
+        current_proxy, available = rotate_proxy(attempt + 1)
+        if not available:
+            exhausted = True
+            break
+        rotations += 1
+    if isinstance(refined, dict) and refined is not result:
+        refined['web_attempts'] = attempts
+        refined['web_proxy_rotations'] = rotations
+        if exhausted:
+            refined['web_rotation_exhausted'] = True
+    return refined
+
+
 def _write_proxy_debug(path, event, **fields):
     """Append one bounded JSONL event without ever persisting proxy credentials."""
     if not path:
@@ -1494,9 +1534,31 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                                    retries=0 if proxy_pool is not None else retries,
                                    cancel=stop.is_set, identity=identity)
                 if descriptor.get('_web_secondary_auth'):
-                    result = _refine_repair_auth(
-                        result, account, password, account_proxy, timeout,
-                        stop.is_set, retries=retries)
+                    def rotate_web(web_attempt):
+                        nonlocal account_proxy, lease, current_proxy
+                        if proxy_pool is not None:
+                            if lease is not None:
+                                proxy_pool.discard(lease)
+                                lease = None
+                            account_proxy, lease = proxy_for(index + attempt + web_attempt)
+                            current_proxy = (_proxy_identity(account_proxy)
+                                             if debug_enabled else current_proxy)
+                            return account_proxy, account_proxy is not None
+                        if len(proxies) > 1:
+                            account_proxy = proxies[(index + attempt + web_attempt) % len(proxies)]
+                            current_proxy = (_proxy_identity(account_proxy)
+                                             if debug_enabled else current_proxy)
+                            return account_proxy, True
+                        return account_proxy, False
+
+                    if proxy_pool is not None or len(proxies) > 1:
+                        result = _refine_repair_auth_with_rotation(
+                            result, account, password, account_proxy, timeout,
+                            stop.is_set, retries, rotate_web)
+                    else:
+                        result = _refine_repair_auth(
+                            result, account, password, account_proxy, timeout,
+                            stop.is_set, retries=retries)
             except Exception as exc:                               # noqa: BLE001
                 result = {'status': 'error', 'kind': type(exc).__name__, 'http': 0,
                           'stage': 'init', 'detail': str(exc)[:180]}
@@ -1511,21 +1573,38 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 apple_ec = int(result.get('apple_ec'))
             except (TypeError, ValueError):
                 apple_ec = None
+            try:
+                web_http = int(result.get('web_http'))
+            except (TypeError, ValueError):
+                web_http = None
+            web_failed = (str(result.get('web_status') or '').casefold() == 'error'
+                          and web_http in (0, 503))
             # HTTP 0 and 503 are retry outcomes: remove that exact lease now,
             # wait five seconds, then acquire an available (never in-use) exit.
             # Proxy-auth 407 and other transport failures retain the general
             # three-strike policy used outside this retry branch.
             # 明确重试条件都淘汰当前出口，等待 5 秒后从池中获取
             # 另一条 IP；否则刚释放的健康租约可能被同一账号再次拿到。
-            immediate_discard = (result_http in (0, 503)
+            immediate_discard = (result_http in (0, 503) or web_failed
                                  or apple_ec in (-22410, -332000, -33200, -3000303)
                                  or apple_retry_later(result))
-            healthy_exit = result_http not in (None, 0, 407)
-            if proxy_pool is not None:
+            healthy_exit = result_http not in (None, 0, 407) and not web_failed
+            if proxy_pool is not None and lease is not None:
                 if immediate_discard:
                     proxy_pool.discard(lease)
                 else:
                     proxy_pool.release(lease, healthy=healthy_exit)
+            if debug_enabled and (web_failed or int(result.get('web_attempts') or 0) > 1):
+                _write_proxy_debug(
+                    debug_path, 'web_retry_result', row=row, slot=slot_id,
+                    web_http=web_http,
+                    web_status=str(result.get('web_status') or ''),
+                    web_attempts=int(result.get('web_attempts') or 0),
+                    web_proxy_rotations=int(result.get('web_proxy_rotations') or 0),
+                    web_rotation_exhausted=bool(result.get('web_rotation_exhausted')),
+                    last_endpoint=current_proxy['endpoint'],
+                    release=('discarded' if immediate_discard else 'reusable'),
+                    pool=_proxy_pool_snapshot(proxy_pool))
             if debug_enabled and transport_failed:
                 debug_event = 'timeout_attempt'
                 exit_ip_debug.submit(
@@ -1570,7 +1649,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         result['elapsed'] = round(time.time() - account_started, 2)
         result['slot'] = slot_id
         result['device_key'] = account_prefix
-        if debug_enabled and auth_result_bucket(result) == 'timeout':
+        if debug_enabled and (auth_result_bucket(result) == 'timeout'
+                              or (str(result.get('web_status') or '').casefold() == 'error'
+                                  and result.get('web_http') in (0, 503))):
             _write_proxy_debug(
                 debug_path, 'final_timeout', row=row, slot=slot_id,
                 recorded_retries=int(result.get('_proxy_retries') or 0),
@@ -1663,14 +1744,17 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'device_key': result.get('device_key') or '',
                           'device_label': device_labels.get(device, ''),
                           'elapsed': result.get('elapsed'),
-                          'attempts': int(result.get('_proxy_retries') or 0)}
+                          'attempts': max(
+                              int(result.get('_proxy_retries') or 0),
+                              max(0, int(result.get('web_attempts') or 0) - 1))}
                 for key in ('two_factor_method', 'web_auth_type', 'web_http',
                             'web_status', 'web_stage', 'web_kind', 'web_detail',
                             'web_attempts', 'web_server', 'web_via',
                             'web_retry_after', 'web_content_type',
                             'web_response_bytes', 'web_response_sha256',
                             'web_response_keys', 'web_service_error_codes',
-                            'web_has_session_headers', 'web_has_set_cookie'):
+                            'web_has_session_headers', 'web_has_set_cookie',
+                            'web_proxy_rotations', 'web_rotation_exhausted'):
                     if result.get(key) not in (None, ''):
                         record[key] = result[key]
                 encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
