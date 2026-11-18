@@ -121,6 +121,67 @@ def _apple_reason_for_record(result, status, debug=False):
     return ''
 
 
+def _repair_probe_method(web_result, trace):
+    """Translate one supplemental IDMSA result without changing GSA truth.
+
+    ``au=repair`` is an umbrella GSA continuation.  IDMSA's complete response
+    is more specific, but only an explicit hsa/hsa2 challenge may be called a
+    verification-code flow.  HTTP 412 / ``needs_setup`` remains a security or
+    repair flow even when it carries an hsa-looking authType.
+    """
+    result = web_result if isinstance(web_result, dict) else {}
+    metadata = trace.get('complete') if isinstance(trace, dict) else None
+    metadata = metadata if isinstance(metadata, dict) else {}
+    auth_type = str(metadata.get('auth_type') or '').strip().casefold()
+    web_status = str(result.get('status') or '').strip().casefold()
+    if web_status == 'need_2fa' and auth_type in ('hsa', 'hsa2'):
+        return 'verification_code'
+    if auth_type in ('sa', 'non-sa', 'dnu') or web_status == 'needs_setup':
+        return 'security_repair'
+    return 'repair_unspecified'
+
+
+def _refine_repair_auth(result, email, password, proxy, timeout, cancel,
+                        checker=None):
+    """Probe IDMSA once only after a verified GSA ``au=repair`` response.
+
+    The GSA result remains authoritative.  A failed supplemental request never
+    turns a password-verified account into an error or a retry outcome.
+    """
+    if (not isinstance(result, dict)
+            or result.get('status') != 'need_2fa'
+            or str(result.get('auth_type') or '').strip().casefold() != 'repair'):
+        return result
+    if checker is None:
+        from fastcheck.protocols.idmsa import check as checker
+    trace = {}
+
+    def remember(event):
+        if not isinstance(event, dict):
+            return
+        stage = str(event.get('stage') or '')
+        if stage in ('init', 'complete'):
+            trace[stage] = {
+                'http': event.get('http'),
+                'auth_type': event.get('auth_type'),
+            }
+
+    try:
+        web_result = checker(email, password, proxy, timeout=timeout, retries=0,
+                             cancel=cancel, trace=remember)
+    except Exception as exc:                                      # noqa: BLE001
+        web_result = {'status': 'error', 'kind': type(exc).__name__}
+    complete = trace.get('complete') if isinstance(trace.get('complete'), dict) else {}
+    enriched = dict(result)
+    enriched.update(
+        two_factor_method=_repair_probe_method(web_result, trace),
+        web_auth_type=str(complete.get('auth_type') or '')[:32],
+        web_http=complete.get('http'),
+        web_status=str(web_result.get('status') or '')[:32],
+    )
+    return enriched
+
+
 def _write_proxy_debug(path, event, **fields):
     """Append one bounded JSONL event without ever persisting proxy credentials."""
     if not path:
@@ -1389,6 +1450,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 result = gsa_check(account, password, account_proxy, timeout=timeout,
                                    retries=0 if proxy_pool is not None else retries,
                                    cancel=stop.is_set, identity=identity)
+                result = _refine_repair_auth(
+                    result, account, password, account_proxy, timeout, stop.is_set)
             except Exception as exc:                               # noqa: BLE001
                 result = {'status': 'error', 'kind': type(exc).__name__, 'http': 0,
                           'stage': 'init', 'detail': str(exc)[:180]}
@@ -1556,6 +1619,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'device_label': device_labels.get(device, ''),
                           'elapsed': result.get('elapsed'),
                           'attempts': int(result.get('_proxy_retries') or 0)}
+                for key in ('two_factor_method', 'web_auth_type', 'web_http', 'web_status'):
+                    if result.get(key) not in (None, ''):
+                        record[key] = result[key]
                 encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
                 output.write(encoded)
                 output_digest.update(encoded)

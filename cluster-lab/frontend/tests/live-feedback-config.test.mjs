@@ -51,6 +51,7 @@ test('Device rows use short Base64 labels instead of reusable slot numbers', () 
   assert.match(drawer, /label: item\.label \|\| `#\$\{item\.slot\}`/)
   assert.match(drawer, /prop="label" label="设备标识"/)
   assert.match(results, /prop="device_display" label="设备"/)
+  assert.match(results, /prop="two_factor_method_cn" label="二次验证方式"/)
   assert.doesNotMatch(results, /prop="device" label="设备"/)
 })
 

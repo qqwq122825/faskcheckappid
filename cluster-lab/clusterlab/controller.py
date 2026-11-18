@@ -228,6 +228,13 @@ def result_reason_cn(value, bucket=None):
             return translated
     resolved = bucket or result_record_bucket(value)
     if resolved == 'need_2fa':
+        method = str(value.get('two_factor_method') or '').strip()
+        if method == 'verification_code':
+            return '密码已通过，需要手机或 App 验证码'
+        if method == 'security_repair':
+            return '密码已通过，需要密保或安全修复'
+        if method == 'repair_unspecified':
+            return '密码已通过，需要修复流程（未细分）'
         if low.startswith('au='):
             return f'密码已通过，需要双重验证（{raw}）'
         return '密码已通过，需要双重验证'
@@ -1712,6 +1719,13 @@ class Controller:
         node_text = f'节点{number:02d}' if number else '节点—'
         device_text = label[:32] if label else (f'#{slot}' if slot else '—')
         record['device_display'] = f'{node_text} · {device_text}'
+        method_labels = {
+            'verification_code': '手机或 App 验证码',
+            'security_repair': '密保或安全修复',
+            'repair_unspecified': '修复流程（未细分）',
+        }
+        record['two_factor_method_cn'] = method_labels.get(
+            str(record.get('two_factor_method') or ''), '')
         if record.get('reason') in ('密码证明通过，服务要求二次验证',
                                     '密码证明通过；未确认业务服务登录状态'):
             # 旧记录里这两句是本地生成的说明，不是 Apple 原始返回。
