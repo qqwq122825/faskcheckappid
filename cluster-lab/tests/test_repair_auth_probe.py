@@ -386,5 +386,37 @@ class RepairAuthProbeTests(unittest.TestCase):
             'Web 二次校验失败：HTTP 503（苹果服务或网络链路暂不可用，无法判断账号密码）；保留 GSA 结果')
 
 
+    def test_repair_auth_web_502_rotates_and_retries(self):
+        """A Web-only 502 consumes retry budget and switches proxy exits."""
+        from clusterlab.executor import _refine_repair_auth_with_rotation
+
+        proxies = []
+        rotations = []
+
+        def checker(email, password, proxy, timeout, retries, cancel, trace):
+            proxies.append(proxy)
+            http = 502 if len(proxies) == 1 else 409
+            trace({'stage': 'complete', 'http': http, 'attempt': 1,
+                   'auth_type': '' if http == 502 else 'hsa2', 'server': 'Apple'})
+            if http == 502:
+                return {'status': 'error', 'stage': 'complete', 'kind': 'protocol',
+                        'detail': 'HTTP 502'}
+            return {'status': 'need_2fa', 'stage': 'complete'}
+
+        def rotate(number):
+            rotations.append(number)
+            return 'proxy-b', True
+
+        result = _refine_repair_auth_with_rotation(
+            {'status': 'need_2fa', 'auth_type': 'repair', 'password_verified': True},
+            'account@example.com', 'secret', 'proxy-a', 20, None, 2, rotate, checker)
+
+        self.assertEqual(proxies, ['proxy-a', 'proxy-b'])
+        self.assertEqual(rotations, [1])
+        self.assertEqual(result['web_http'], 409)
+        self.assertEqual(result['web_attempts'], 2)
+        self.assertEqual(result['web_proxy_rotations'], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

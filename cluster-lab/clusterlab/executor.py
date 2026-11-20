@@ -228,7 +228,7 @@ def _refine_repair_auth(result, email, password, proxy, timeout, cancel,
 def _refine_repair_auth_with_rotation(result, email, password, proxy, timeout,
                                       cancel, retries, rotate_proxy,
                                       checker=None):
-    """Retry transient Web HTTP 0/503 checks on newly acquired exits.
+    """Retry transient Web HTTP 0/5xx checks on newly acquired exits.
 
     GSA is deliberately not repeated because its ``au=repair`` result is
     already authoritative; only the supplemental Web request is retried.
@@ -249,7 +249,7 @@ def _refine_repair_auth_with_rotation(result, email, password, proxy, timeout,
         except (TypeError, ValueError):
             web_http = None
         transient = (str(refined.get('web_status') or '').casefold() == 'error'
-                     and web_http in (0, 503))
+                     and web_http in (0, 500, 502, 503, 504))
         if not transient or attempt + 1 >= limit or (cancel and cancel()):
             break
         current_proxy, available = rotate_proxy(attempt + 1)
@@ -1579,8 +1579,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             except (TypeError, ValueError):
                 web_http = None
             web_failed = (str(result.get('web_status') or '').casefold() == 'error'
-                          and web_http in (0, 503))
-            # HTTP 0 and 503 are retry outcomes: remove that exact lease now,
+                          and web_http in (0, 500, 502, 503, 504))
+            # HTTP 0 and transient 5xx are retry outcomes: remove that exact lease now,
             # wait five seconds, then acquire an available (never in-use) exit.
             # Proxy-auth 407 and other transport failures retain the general
             # three-strike policy used outside this retry branch.
@@ -1652,7 +1652,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         result['device_key'] = account_prefix
         if debug_enabled and (auth_result_bucket(result) == 'timeout'
                               or (str(result.get('web_status') or '').casefold() == 'error'
-                                  and result.get('web_http') in (0, 503))):
+                                  and result.get('web_http') in (0, 500, 502, 503, 504))):
             _write_proxy_debug(
                 debug_path, 'final_timeout', row=row, slot=slot_id,
                 recorded_retries=int(result.get('_proxy_retries') or 0),
