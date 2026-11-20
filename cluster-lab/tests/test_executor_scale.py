@@ -665,6 +665,7 @@ class ExecutorScaleTests(unittest.TestCase):
             'This action could not be completed. Try again.',
             'The request cannot be processed at this time. Please try again later.',
             'We cannot process your request, please try again later.',
+            'Your account information was entered incorrectly.',
         )
         for reason in reasons:
             with self.subTest(reason=reason), tempfile.TemporaryDirectory() as temporary:
@@ -673,7 +674,7 @@ class ExecutorScaleTests(unittest.TestCase):
                 descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                               'device_capacity': 1, 'device_root': str(root / 'devices'),
                               'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
-                              '_retry_delay': 0}
+                              '_retry_delay': 0, '_proxy_debug': True}
                 shared = ScriptedProxyPool([
                     'socks5h://bootstrap', 'socks5h://first-exit', 'socks5h://second-exit'])
                 stop = RecordingStop()

@@ -59,7 +59,7 @@ class StatusTests(unittest.TestCase):
             'This Apple Account has been\u00a0locked\u00a0for security reasons. Visit iForgot to reset your account (https://iforgot.apple.com).': 'locked',
             'Enter the correct password for this Apple Account.': 'wrong_password',
             'This Apple Account is not active.': 'locked',
-            'Your account information was entered incorrectly.': 'wrong_password',
+            'Your account information was entered incorrectly.': 'timeout',
             'The account does not exist.': 'not_found',
             'This Apple Account has been lockd for security reasons. Visit iForgot to reset your account.': 'locked',
             'This Apple Account has been Locked. Contact your Administrator or Manager to reset your password and unlock your account.': 'locked',

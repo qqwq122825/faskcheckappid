@@ -17,7 +17,7 @@ _APPLE_REASON_BUCKETS = (
     ('this apple account has been locked', 'locked'),
     ('enter the correct password for this apple account', 'wrong_password'),
     ('this apple account is not active', 'locked'),
-    ('your account information was entered incorrectly', 'wrong_password'),
+    ('your account information was entered incorrectly', 'timeout'),
     ('the account does not exist', 'not_found'),
 )
 

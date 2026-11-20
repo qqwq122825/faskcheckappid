@@ -1427,6 +1427,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             'this action could not be completed. try again',
             'the request cannot be processed at this time. please try again later',
             'we cannot process your request, please try again later',
+            'your account information was entered incorrectly',
         )
         return any(phrase in apple_text for phrase in phrases)
 
