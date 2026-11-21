@@ -400,7 +400,7 @@ class Node:
             snapshot = self.builder.snapshot()
         except Exception:                                          # noqa: BLE001
             return []
-        return snapshot.get('slots', [])[:64]
+        return snapshot.get('slots', [])[:DEVICE_POOL_LIMIT]
 
     def _device_status(self):
         """Use one snapshot so summary counts and table rows always agree."""

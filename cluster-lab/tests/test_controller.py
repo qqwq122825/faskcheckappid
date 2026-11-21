@@ -1267,16 +1267,17 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(state['traffic_bytes'], 1_500)
 
     def test_host_metrics_are_finite_and_do_not_accept_arbitrary_fields(self):
+        slots = [{'slot': index, 'used': index} for index in range(1, 2002)]
+        slots[0].update({'label': 'B64:AbCdEf12',
+                         'error': 'AnisetteError: HTTP 503',
+                         'proxy': 'user:pass@1.2.3.4:80'})
         value = self.service.clean_telemetry({'cpu_percent':25.2,'memory_percent':float('nan'),
                                              'upload_bps':1024,'download_bps':-1,'network_bytes':123456,
                                              'worker_processes':2,'secret':'private',
                                              'device_pool': {'proxy_status': 'failed',
                                                              'proxy_ip': 'user:pass@1.2.3.4:80',
                                                              'message': '代理获取失败，请检查白名单',
-                                                             'slots': [{'slot': 1, 'used': 987,
-                                                                        'label': 'B64:AbCdEf12',
-                                                                        'error': 'AnisetteError: HTTP 503',
-                                                                        'proxy': 'user:pass@1.2.3.4:80'}]}})
+                                                             'slots': slots}})
         self.assertEqual(value['cpu_percent'], 25.2)
         self.assertIsNone(value['memory_percent'])
         self.assertIsNone(value['download_bps'])
@@ -1284,13 +1285,15 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(self.service.clean_telemetry({'network_bytes': -1})['network_bytes'])
         self.assertEqual(value['worker_processes'], 2)
         self.assertNotIn('secret', value)
-        self.assertEqual(value['device_pool']['slots'][0]['used'], 987)
+        self.assertEqual(value['device_pool']['slots'][0]['used'], 1)
         self.assertEqual(value['device_pool']['slots'][0]['label'], 'B64:AbCdEf12')
         self.assertEqual(value['device_pool']['slots'][0]['proxy'], '1.2.3.4:80')
         self.assertEqual(value['device_pool']['slots'][0]['error'], 'AnisetteError: HTTP 503')
         self.assertEqual(value['device_pool']['proxy_status'], 'failed')
         self.assertEqual(value['device_pool']['proxy_ip'], '1.2.3.4:80')
         self.assertEqual(value['device_pool']['message'], '代理获取失败，请检查白名单')
+        self.assertEqual(len(value['device_pool']['slots']), 2000)
+        self.assertEqual(value['device_pool']['slots'][-1]['slot'], 2000)
 
 
 if __name__ == '__main__':

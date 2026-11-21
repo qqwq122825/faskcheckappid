@@ -169,6 +169,7 @@ async function clearPool() {
         <span class="muted">{{ building && pool.current_slots?.length ? `正在并行注册：${pool.current_slots.join('、')}` : '等待中' }}</span>
       </div>
       <el-table :data="pageRows" empty-text="尚未初始化设备" stripe max-height="360">
+        <el-table-column prop="slot" label="ID" width="72" fixed="left" />
         <el-table-column prop="label" label="设备标识" width="145" />
         <el-table-column prop="state" label="状态" width="100" />
         <el-table-column prop="model" label="设备型号" min-width="150" show-overflow-tooltip />

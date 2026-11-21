@@ -16,6 +16,8 @@ import uuid
 
 from .common import Database, event, file_digest, integer, private_dir
 
+DEVICE_DETAIL_LIMIT = 2000
+
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS jobs (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL,
@@ -917,7 +919,7 @@ class Controller:
                      'used': (item.get('used') if type(item.get('used')) is int
                               and 0 <= item.get('used') <= 10**12 else 0),
                      'recorded': bool(item.get('recorded'))}
-                    for item in slots[:64] if isinstance(item, dict)]
+                    for item in slots[:DEVICE_DETAIL_LIMIT] if isinstance(item, dict)]
         return result
 
     @classmethod
