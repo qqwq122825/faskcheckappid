@@ -49,6 +49,11 @@ class RepairAuthProbeTests(unittest.TestCase):
             idmsa._verdict(400, {'serviceErrors': [{'code': '-900007'}]}, 'init')[2],
             'init_incomplete')
         self.assertEqual(idmsa._verdict(503, {}, 'complete')[2], 'server')
+        self.assertEqual(
+            idmsa._service_error_message({
+                'serviceErrors': [{'code': '-900007',
+                                   'message': '  Real   Apple message.  '}]}),
+            'Real Apple message.')
 
     base = {'status': 'need_2fa', 'auth_type': 'repair', 'detail': 'au=repair'}
 
@@ -276,7 +281,8 @@ class RepairAuthProbeTests(unittest.TestCase):
                 kwargs['trace']({'stage': 'complete', 'http': 200,
                                  'auth_type': 'sa', 'attempt': 1})
                 return {'status': 'valid', 'stage': 'complete',
-                        'detail': 'Web password verified'}
+                        'detail': 'Web password verified',
+                        'apple_message': 'Real Apple Web message.'}
 
             with patch('clusterlab.executor._load_fastcheck', return_value=(
                     FakePool,
@@ -290,6 +296,7 @@ class RepairAuthProbeTests(unittest.TestCase):
             self.assertEqual(record['protocol'], 'WEB')
             self.assertEqual(record['status'], 'valid')
             self.assertEqual(record['http'], 200)
+            self.assertEqual(record['reason'], 'Real Apple Web message.')
             self.assertIsNone(record['device'])
             self.assertIsNone(record['device_usage'])
 

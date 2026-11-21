@@ -219,6 +219,10 @@ def result_record_bucket(value):
 def result_reason_cn(value, bucket=None):
     """Translate the node's shortcut category/raw Apple reason for display."""
     raw = str(value.get('reason') or value.get('apple_message') or '').strip()
+    protocol = str(value.get('protocol') or '').strip().casefold()
+    if protocol == 'web' and raw:
+        # Web 原文由节点从 serviceErrors[].message 单独提取；不保存响应体。
+        return 'Apple 原文：' + raw[:2048]
     low = normalized_apple_reason(raw)
     translations = (
         ('unable to sign you in to your apple account. try again later',
@@ -248,7 +252,6 @@ def result_reason_cn(value, bucket=None):
     for phrase, translated in translations:
         if apple_reason_matches(low, phrase):
             return translated
-    protocol = str(value.get('protocol') or '').strip().casefold()
     stage = str(value.get('stage') or '').strip().casefold()
     try:
         web_pair = (int(value.get('http')), int(value.get('code')))
@@ -260,6 +263,17 @@ def result_reason_cn(value, bucket=None):
                       (403, -20751): '账号未激活或已停用'}.get(web_pair)
         if web_reason:
             return web_reason
+    try:
+        web_http = int(value.get('http'))
+    except (TypeError, ValueError):
+        web_http = None
+    if protocol == 'web' and stage == 'init':
+        if web_pair == (400, -900007):
+            return ('Apple 未返回文字说明；Web 初始化失败，尚未校验密码'
+                    '（原始码 -900007）')
+        if web_http == 403:
+            return ('Apple 未返回协议错误码或文字说明；Web 初始化被 HTTP 403 拒绝，'
+                    '尚未校验密码')
     web_status = str(value.get('web_status') or '').strip().casefold()
     web_detail = str(value.get('web_detail') or '').strip()[:256]
     if web_status:
@@ -311,7 +325,7 @@ class Controller:
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'not_found',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 14
+    RESULT_CLASSIFICATION_VERSION = 15
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')

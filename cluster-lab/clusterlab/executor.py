@@ -121,6 +121,14 @@ def _apple_reason_for_record(result, status, debug=False):
     return ''
 
 
+def _web_reason_for_record(result):
+    """Persist only Apple's bounded Web serviceErrors message, never a response body."""
+    message = result.get('apple_message')
+    if isinstance(message, str) and message.strip():
+        return message.strip()[:2048]
+    return ''
+
+
 def _repair_probe_method(web_result, trace):
     """Translate one supplemental IDMSA result without changing GSA truth.
 
@@ -1851,7 +1859,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     business_code = 'format_error'
                 if business_code is None:
                     business_code = (result.get('detail') or result.get('kind') or '')[:180]
-                reason = _apple_reason_for_record(result, status, debug_enabled)
+                reason = (_web_reason_for_record(result) if auth_protocol == 'web'
+                          else _apple_reason_for_record(result, status, debug_enabled))
                 if auth_protocol == 'gsa':
                     usage_counts[device] += 1
                     device_usage = int(usage_start.get(device, 0)) + usage_counts[device]

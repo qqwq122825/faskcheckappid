@@ -203,6 +203,27 @@ def _json(raw: bytes) -> dict:
         return {}
 
 
+def _service_error_message(data: dict) -> str:
+    """Return Apple's bounded serviceErrors message without response-body data."""
+    errors = data.get("serviceErrors") if isinstance(data, dict) else None
+    if not isinstance(errors, list):
+        return ""
+    for item in errors:
+        if not isinstance(item, dict):
+            continue
+        message = item.get("message")
+        if isinstance(message, str) and message.strip():
+            return " ".join(message.split())[:2048]
+    return ""
+
+
+def _with_service_error_message(result: dict, data: dict) -> dict:
+    message = _service_error_message(data)
+    if message:
+        result["apple_message"] = message
+    return result
+
+
 def _verdict(code: int, data: dict, stage: str) -> tuple[str, str, str]:
     """把响应翻译成 (状态, 详情, 错误类别)。"""
     # HTTP 错误优先；不能把服务不可用或初始化响应当成密码结论。
@@ -404,7 +425,8 @@ def _authenticate(client: _Client, email: str, password: str, cancel,
         if verdict in ("valid", "wrong_password", "need_2fa"):
             verdict, kind = "error", "protocol"
             detail = "init 未完成，尚未校验密码"
-        return _result(verdict, detail, started, kind=kind, stage="init")
+        return _with_service_error_message(
+            _result(verdict, detail, started, kind=kind, stage="init"), data)
     error = _challenge_error(data)
     if error:
         return _result("error", error, started, kind="protocol", stage="init")
@@ -433,7 +455,8 @@ def _authenticate(client: _Client, email: str, password: str, cancel,
     if cancel and cancel():
         return _result("stopped", "", started, stage="complete")
     verdict, detail, kind = _verdict(code, data, "complete")
-    return _result(verdict, detail, started, kind=kind, stage="complete")
+    return _with_service_error_message(
+        _result(verdict, detail, started, kind=kind, stage="complete"), data)
 
 
 def probe(email: str, proxy: str | None, timeout: float = 20.0, cancel=None) -> dict:
