@@ -666,11 +666,11 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result_reason_cn({
             'protocol': 'Web', 'stage': 'init', 'http': 400,
             'code': '-900007', 'status': 'undetermined'}),
-            'Apple 未返回文字说明；Web 初始化失败，尚未校验密码（原始码 -900007）')
+            '该记录未保存 Apple 文字说明；Web 初始化失败，尚未校验密码（原始码 -900007）')
         self.assertEqual(result_reason_cn({
             'protocol': 'Web', 'stage': 'init', 'http': 403,
             'code': 'HTTP 403（被拒）', 'status': 'undetermined'}),
-            'Apple 未返回协议错误码或文字说明；Web 初始化被 HTTP 403 拒绝，尚未校验密码')
+            '该记录未保存 Apple 协议错误码或文字说明；Web 初始化被 HTTP 403 拒绝，尚未校验密码')
         self.assertEqual(result_reason_cn({
             'protocol': 'Web', 'stage': 'complete', 'http': 400,
             'code': '-1', 'reason': 'Real Apple Web message.'}),

@@ -269,10 +269,10 @@ def result_reason_cn(value, bucket=None):
         web_http = None
     if protocol == 'web' and stage == 'init':
         if web_pair == (400, -900007):
-            return ('Apple 未返回文字说明；Web 初始化失败，尚未校验密码'
+            return ('该记录未保存 Apple 文字说明；Web 初始化失败，尚未校验密码'
                     '（原始码 -900007）')
         if web_http == 403:
-            return ('Apple 未返回协议错误码或文字说明；Web 初始化被 HTTP 403 拒绝，'
+            return ('该记录未保存 Apple 协议错误码或文字说明；Web 初始化被 HTTP 403 拒绝，'
                     '尚未校验密码')
     web_status = str(value.get('web_status') or '').strip().casefold()
     web_detail = str(value.get('web_detail') or '').strip()[:256]
