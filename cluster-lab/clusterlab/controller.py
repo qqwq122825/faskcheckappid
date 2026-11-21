@@ -172,7 +172,7 @@ def apple_reason_bucket(value):
 
 
 def result_record_bucket(value):
-    """Classify account results by explicit English reasons, never business ec codes."""
+    """Classify account results using explicit reasons or Web response triples."""
     try:
         explicit_http_zero = ('http' in value and value.get('http') is not None
                               and int(value['http']) == 0)
@@ -183,6 +183,20 @@ def result_record_bucket(value):
     reason_bucket = apple_reason_bucket(value)
     if reason_bucket:
         return reason_bucket
+    # Web/IDMSA 与 GSA 的错误码语义并不相同。仅接受线上同批账号已核对过的
+    # 完成阶段三元组，用于修复旧 Web 结果；不能把这些码泛化到 GSA 或 init。
+    protocol = str(value.get('protocol') or '').strip().casefold()
+    stage = str(value.get('stage') or '').strip().casefold()
+    try:
+        web_pair = (int(value.get('http')), int(value.get('code')))
+    except (TypeError, ValueError):
+        web_pair = None
+    if protocol == 'web' and stage == 'complete':
+        web_bucket = {(401, -20101): 'wrong_password',
+                      (403, -20209): 'locked',
+                      (403, -20751): 'locked'}.get(web_pair)
+        if web_bucket:
+            return web_bucket
     codes = []
     for key in ('code', 'apple_ec', 'gsa_code'):
         try:
@@ -234,6 +248,18 @@ def result_reason_cn(value, bucket=None):
     for phrase, translated in translations:
         if apple_reason_matches(low, phrase):
             return translated
+    protocol = str(value.get('protocol') or '').strip().casefold()
+    stage = str(value.get('stage') or '').strip().casefold()
+    try:
+        web_pair = (int(value.get('http')), int(value.get('code')))
+    except (TypeError, ValueError):
+        web_pair = None
+    if protocol == 'web' and stage == 'complete':
+        web_reason = {(401, -20101): '密码错误',
+                      (403, -20209): '账号因安全原因被锁定',
+                      (403, -20751): '账号未激活或已停用'}.get(web_pair)
+        if web_reason:
+            return web_reason
     web_status = str(value.get('web_status') or '').strip().casefold()
     web_detail = str(value.get('web_detail') or '').strip()[:256]
     if web_status:
@@ -285,7 +311,7 @@ class Controller:
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'not_found',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 13
+    RESULT_CLASSIFICATION_VERSION = 14
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')

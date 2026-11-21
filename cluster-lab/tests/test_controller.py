@@ -644,6 +644,25 @@ class ControllerTests(unittest.TestCase):
     def test_http_zero_is_timeout_and_legacy_counts_are_reconciled(self):
         self.assertEqual(result_record_bucket({'status': 'undetermined', 'http': 0}), 'timeout')
         self.assertEqual(result_record_bucket({'status': 'undetermined'}), 'undetermined')
+        web_rows = (
+            ({'protocol': 'Web', 'stage': 'complete', 'http': 401,
+              'code': '-20101', 'status': 'undetermined'}, 'wrong_password', '密码错误'),
+            ({'protocol': 'Web', 'stage': 'complete', 'http': 403,
+              'code': '-20209', 'status': 'undetermined'}, 'locked', '账号因安全原因被锁定'),
+            ({'protocol': 'Web', 'stage': 'complete', 'http': 403,
+              'code': '-20751', 'status': 'undetermined'}, 'locked', '账号未激活或已停用'),
+        )
+        for record, expected_bucket, expected_reason in web_rows:
+            with self.subTest(code=record['code']):
+                self.assertEqual(result_record_bucket(record), expected_bucket)
+                self.assertEqual(result_reason_cn(record), expected_reason)
+        # Web 映射必须同时匹配协议和完成阶段，不能污染 GSA 或 init 结果。
+        self.assertEqual(result_record_bucket({
+            'protocol': 'GSA', 'stage': 'complete', 'http': 401,
+            'code': '-20101', 'status': 'undetermined'}), 'undetermined')
+        self.assertEqual(result_record_bucket({
+            'protocol': 'Web', 'stage': 'init', 'http': 403,
+            'code': '-20209', 'status': 'undetermined'}), 'undetermined')
         for status, reason in (
                 ('wrong_password', '密码错误'),
                 ('locked', '账号已锁定'),

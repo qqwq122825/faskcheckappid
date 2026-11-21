@@ -31,6 +31,25 @@ class FakePool:
 
 
 class RepairAuthProbeTests(unittest.TestCase):
+    def test_web_complete_response_codes_use_web_specific_verdicts(self):
+        self.assertEqual(
+            idmsa._verdict(401, {'serviceErrors': [{'code': '-20101'}]}, 'complete')[0],
+            'wrong_password')
+        self.assertEqual(
+            idmsa._verdict(403, {'serviceErrors': [{'code': '-20209'}]}, 'complete')[0],
+            'locked')
+        self.assertEqual(
+            idmsa._verdict(403, {'serviceErrors': [{'code': '-20751'}]}, 'complete')[0],
+            'locked')
+        # 同一错误码不允许跨阶段推断；初始化失败尚未提交密码。
+        self.assertEqual(
+            idmsa._verdict(403, {'serviceErrors': [{'code': '-20209'}]}, 'init')[0],
+            'error')
+        self.assertEqual(
+            idmsa._verdict(400, {'serviceErrors': [{'code': '-900007'}]}, 'init')[2],
+            'init_incomplete')
+        self.assertEqual(idmsa._verdict(503, {}, 'complete')[2], 'server')
+
     base = {'status': 'need_2fa', 'auth_type': 'repair', 'detail': 'au=repair'}
 
     @staticmethod

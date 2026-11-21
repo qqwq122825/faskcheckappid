@@ -244,6 +244,15 @@ def _verdict(code: int, data: dict, stage: str) -> tuple[str, str, str]:
             ec_int = None
         if stage == "init" and ec_int == -900007:
             return "error", "初始化未完成（ec=-900007），尚未校验密码", "init_incomplete"
+        # IDMSA Web 的完成阶段使用一组不同于 GSA 的稳定错误码。这里只在
+        # HTTP、阶段和错误码三者同时匹配时给出账号结论；初始化失败、503
+        # 和连接异常仍保持可重试/未判定，避免把链路故障误判成密码错误。
+        if stage == "complete" and code == 401 and ec_int == -20101:
+            return "wrong_password", "苹果拒绝了账号或密码（Web ec=-20101）", ""
+        if stage == "complete" and code == 403 and ec_int == -20209:
+            return "locked", "账号因安全原因被锁定（Web ec=-20209）", ""
+        if stage == "complete" and code == 403 and ec_int == -20751:
+            return "locked", "账号未激活或已停用（Web ec=-20751）", ""
         if stage == "complete" and code == 401 and ec_int == -20283:
             return "credentials_rejected", "苹果拒绝了本次账号信息（ec=-20283）；请核对账号和密码，若官方可登录则需检查登录环境或请求兼容性", ""
         if ec_int in (-22406, -22025, -22420):
