@@ -633,7 +633,8 @@ class Controller:
 
     def create_job(self, name, stream, unit_rows=500, mode='auth', enqueue=False,
                    timeout=20.0, retries=0, device_capacity=30, dual_recheck=False):
-        integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
+        settings = self.settings()
+        integer(unit_rows, '每包记录数', 50, settings['max_unit_rows'])
         if type(enqueue) is not bool:
             raise ValueError('加入队列选项无效')
         if mode not in ('digest', 'simulate', 'auth'):
@@ -644,7 +645,7 @@ class Controller:
         device_capacity = 0
         # 兼容旧调用签名；主协议由系统设置在任务创建时固化。
         _ = dual_recheck
-        auth_protocol = ((self.settings().get('auth_protocol') or 'gsa')
+        auth_protocol = ((settings.get('auth_protocol') or 'gsa')
                          if mode == 'auth' else 'gsa')
         job_id = uuid.uuid4().hex
         target = self._source_path(name).resolve()
@@ -844,7 +845,7 @@ class Controller:
 
     def request_devices(self, node_id, capacity):
         """把设备初始化意图挂到节点上，节点下次心跳取走执行。"""
-        capacity = integer(int(capacity), '设备数量', 0, 200)
+        capacity = integer(int(capacity), '设备数量', 0, 2000)
         with self.db.transaction() as db:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:
@@ -1109,7 +1110,8 @@ class Controller:
                              timeout=20.0, retries=0, device_capacity=30,
                              dual_recheck=False):
         """复用已上传的源文件创建任务，不再接收文件内容。"""
-        integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
+        settings = self.settings()
+        integer(unit_rows, '每包记录数', 50, settings['max_unit_rows'])
         if mode not in ('digest', 'simulate', 'auth'):
             raise ValueError('执行模式应为 digest / simulate / auth')
         timeout, retries = self._check_exec(timeout, retries)
@@ -1118,7 +1120,7 @@ class Controller:
         device_capacity = 0
         # 兼容旧调用签名；主协议由系统设置在任务创建时固化。
         _ = dual_recheck
-        auth_protocol = ((self.settings().get('auth_protocol') or 'gsa')
+        auth_protocol = ((settings.get('auth_protocol') or 'gsa')
                          if mode == 'auth' else 'gsa')
         path = Path(str(source))
         if not path.exists():
@@ -1563,6 +1565,9 @@ class Controller:
                 settings = self.settings()
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
                                proxy_pool_size=int(settings.get('proxy_pool_size') or 1000),
+                               device_registration_workers=16,
+                               device_usage_limit=max(1, int(
+                                   settings.get('device_rotate_after') or 100)),
                                origin=settings.get('origin', 'https://new.ani.sidestore.io'),
                                _proxy_debug=bool(settings.get('proxy_debug')),
                                _auth_protocol=(unit['auth_protocol'] or 'gsa').lower(),

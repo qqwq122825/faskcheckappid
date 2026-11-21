@@ -530,7 +530,7 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
-                          '_retry_delay': 0}
+                          '_retry_delay': 0, '_proxy_debug': True}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://first-exit', 'socks5h://second-exit'])
             stop = RecordingStop()
@@ -575,7 +575,7 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 2,
-                          '_retry_delay': 0}
+                          '_retry_delay': 0, '_proxy_debug': True}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://first-exit',
                 'socks5h://second-exit', 'socks5h://third-exit'])
@@ -819,7 +819,7 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5,
-                          'dual_recheck': True}
+                          'dual_recheck': True, '_proxy_debug': True}
 
             with patch('clusterlab.executor._load_fastcheck', return_value=(
                     FakePool,

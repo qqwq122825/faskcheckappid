@@ -70,8 +70,8 @@ defineExpose({ show })
 async function initialize() {
   error.value = ''
   if (!node.value?.id) { error.value = '节点不可用'; return }
-  if (!Number.isInteger(capacity.value) || capacity.value < 1 || capacity.value > 200) {
-    error.value = '设备数量应为 1–200 的整数'; return
+  if (!Number.isInteger(capacity.value) || capacity.value < 1 || capacity.value > 2000) {
+    error.value = '设备数量应为 1–2000 的整数'; return
   }
   busy.value = true
   try {
@@ -125,7 +125,7 @@ async function clearPool() {
       </div>
       <el-form label-position="top" @submit.prevent="initialize">
         <el-form-item label="设备数量">
-          <el-input-number v-model="capacity" :min="1" :max="200" :step="1" :precision="0" :disabled="building || busy" />
+          <el-input-number v-model="capacity" :min="1" :max="2000" :step="1" :precision="0" :disabled="building || busy" />
           <span class="field-note">选择数量后，点击“开始初始化设备池”才会注册设备。</span>
         </el-form-item>
         <el-form-item label="自动补充">

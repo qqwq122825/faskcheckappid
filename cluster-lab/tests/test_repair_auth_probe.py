@@ -13,6 +13,7 @@ from clusterlab.executor import (
     _execute_auth_unit,
     _refine_repair_auth,
     _refine_repair_auth_with_rotation,
+    execute_auth_unit,
 )
 
 
@@ -299,6 +300,65 @@ class RepairAuthProbeTests(unittest.TestCase):
             self.assertEqual(record['reason'], 'Real Apple Web message.')
             self.assertIsNone(record['device'])
             self.assertIsNone(record['device_usage'])
+
+    def test_reserved_device_plan_reaches_but_never_recounts_hard_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text(
+                'owned@example.invalid----secret\n', encoding='utf-8')
+            descriptor = {
+                'rows': 1, 'first_row': 1, 'threads': 1,
+                'device_pool_capacity': 1, 'device_slots': [1],
+                'device_plan': [1], 'device_usage_reserved': True,
+                'device_usage_base': {'1': 99}, 'device_usage_limit': 100,
+                'device_root': str(root / 'devices'),
+                'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 0,
+                '_auth_protocol': 'gsa',
+            }
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool,
+                    lambda *_args, **_kwargs: {
+                        'status': 'valid', 'detail': 'ok', 'http': 200},
+                    lambda result: result['status'])), \
+                 patch.dict('sys.modules', {'fastcheck.workers': SimpleNamespace(
+                     device_profile=lambda *_args, **_kwargs: {
+                         'client_info': 'test', 'user_agent': 'test'})}), \
+                 patch('clusterlab.executor._bump_usage') as bump:
+                _execute_auth_unit(root, descriptor, threading.Event())
+            bump.assert_not_called()
+            record = json.loads((root / 'results.jsonl').read_text('utf-8'))
+            self.assertEqual(record['device'], 1)
+            self.assertEqual(record['device_usage'], 100)
+
+    def test_failed_full_device_replacement_aborts_before_any_account_check(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text(
+                'owned@example.invalid----secret\n', encoding='utf-8')
+            descriptor = {
+                'rows': 1, 'first_row': 1, 'threads': 250,
+                'device_pool_capacity': 1, 'device_slots': [1],
+                'device_plan': [1], 'device_reset_slots': [1],
+                'device_usage_reserved': True,
+                'device_usage_base': {'1': 0}, 'device_usage_limit': 100,
+                'device_root': str(root / 'devices'),
+                'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 0,
+                '_auth_protocol': 'gsa',
+            }
+            checked = []
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool,
+                    lambda *_args, **_kwargs: checked.append(True) or {'status': 'valid'},
+                    lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile', return_value={
+                     'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._replace_device_identity',
+                       side_effect=RuntimeError('registration failed')):
+                execute_auth_unit(root, descriptor, threading.Event())
+            self.assertEqual(checked, [])
+            done = json.loads((root / 'done.json').read_text('utf-8'))
+            self.assertFalse(done['ok'])
+            self.assertIn('未开始账号验证', done['error'])
 
     def test_gsa_primary_protocol_runs_enabled_web_secondary_probe_for_repair(self):
         with tempfile.TemporaryDirectory() as temporary:

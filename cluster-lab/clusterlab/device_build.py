@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from collections import Counter
 import json
 import multiprocessing as mp
 import os
@@ -13,12 +14,15 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import portalocker
+
 from .common import atomic_json, read_json
 from .executor import _load_fastcheck, record_device_registration
 
 REGISTRATION_TIMEOUT = 90
-IDLE_BUILD_WORKERS = 4
-BUSY_BUILD_WORKERS = 2
+DEVICE_POOL_LIMIT = 2000
+IDLE_BUILD_WORKERS = 16
+BUSY_BUILD_WORKERS = 4
 
 
 def device_label(device_id):
@@ -65,11 +69,12 @@ class DeviceBuilder:
             # The in-memory builder state resets on a service restart. Discover
             # the persisted slots so a task can still use the node's complete
             # device pool before any new initialization request is made.
-            pool = DevicePool(str(root), self.node.origin, max_devices=200)
+            pool = DevicePool(str(root), self.node.origin, max_devices=DEVICE_POOL_LIMIT)
             device_root = Path(getattr(pool, 'base', root)) / 'devices'
-            existing = [int(path.name) for path in device_root.iterdir()
-                        if path.is_dir() and path.name.isdigit()
-                        and 1 <= int(path.name) <= 200] if device_root.is_dir() else []
+            existing = ([int(path.name) for path in device_root.iterdir()
+                         if path.is_dir() and path.name.isdigit()
+                         and 1 <= int(path.name) <= DEVICE_POOL_LIMIT]
+                        if device_root.is_dir() else [])
             persisted_capacity = max(existing, default=0)
             limit = max(1, int(data.get('capacity') or 0), persisted_capacity)
             active_slots = set(data.get('current_slots') or [])
@@ -126,8 +131,8 @@ class DeviceBuilder:
         with self.lock:
             if self.state['running']:
                 raise RuntimeError('正在初始化设备，请等待本轮结束')
-            if not 1 <= int(capacity) <= 200:
-                raise ValueError('设备数量应为 1–200')
+            if not 1 <= int(capacity) <= DEVICE_POOL_LIMIT:
+                raise ValueError(f'设备数量应为 1–{DEVICE_POOL_LIMIT}')
             # 设备注册会连 Apple；没有代理就变成用机房 IP 注册，出生地不可改，
             # 宁可拒绝也不留这种设备。
             if not (self.node.proxy_api or '').strip():
@@ -204,7 +209,7 @@ class DeviceBuilder:
         with self.lock:
             if self.state['running']:
                 raise RuntimeError('正在初始化设备，请等待本轮结束')
-            if not 1 <= capacity <= 200 or not 1 <= slot <= capacity:
+            if not 1 <= capacity <= DEVICE_POOL_LIMIT or not 1 <= slot <= capacity:
                 raise ValueError('轮换设备编号无效')
             if slot in self.reserved:
                 raise RuntimeError('设备正在执行任务，本轮不轮换')
@@ -464,6 +469,34 @@ class DeviceBuilder:
             return json.loads(path.read_text('utf-8'))
         except (OSError, ValueError):
             return {}
+
+    def reserve_usage(self, plan, limit=100, reset_slots=()):
+        """Atomically reserve a complete package before any Apple request.
+
+        Reservations are intentionally not refunded after interruption: a
+        request may have reached Apple even when the local result was lost.
+        This makes ``limit`` a hard lifetime ceiling for one persisted device
+        identity rather than a best-effort display counter.
+        """
+        counts = Counter(int(slot) for slot in plan)
+        resets = {int(slot) for slot in reset_slots}
+        path = self.node.root / 'device-pool' / 'usage.json'
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock = path.with_suffix('.lock')
+        with portalocker.Lock(str(lock), mode='a+', timeout=10):
+            data = read_json(path, {})
+            data = data if isinstance(data, dict) else {}
+            base = {}
+            for slot, count in counts.items():
+                current = 0 if slot in resets else max(0, int(data.get(str(slot)) or 0))
+                if current + count > int(limit):
+                    raise RuntimeError(
+                        f'设备 {slot} 额度不足：{current}+{count}>{int(limit)}')
+                base[str(slot)] = current
+            for slot, count in counts.items():
+                data[str(slot)] = base[str(slot)] + count
+            atomic_json(path, data)
+        return base
 
     def retirable(self, limit, exclude=()):
         """返回使用次数已达上限、可以换新的槽位。"""

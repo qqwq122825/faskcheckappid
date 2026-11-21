@@ -14,11 +14,12 @@ import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import threading
 import time
 from urllib.parse import urlsplit
 
-from .common import atomic_json
+from .common import atomic_json, read_json
 
 
 PROXY_TTL_SECONDS = 50.0
@@ -1051,6 +1052,11 @@ def execute_unit_group(directory, descriptor, stop):
               for index in range(process_count)]
     child_descriptors = []
     current_row = int(descriptor.get('first_row') or 1)
+    plan = descriptor.get('device_plan')
+    plan = list(plan) if isinstance(plan, list) else None
+    plan_offset = 0
+    if plan is not None:
+        shutil.rmtree(workers_root / 'device-bootstrap', ignore_errors=True)
     with (directory / 'input.part').open('rb') as source:
         for index, count in enumerate(counts):
             child_dir = workers_root / f'{index + 1:03d}'
@@ -1069,16 +1075,27 @@ def execute_unit_group(directory, descriptor, stop):
                     output.write(line)
             child = dict(descriptor, first_row=current_row, rows=count, processes=1)
             if descriptor.get('mode') == 'auth':
-                # 每个进程分到一组不重叠槽位；30 台 / 10 进程时每进程 3 台，
-                # 避免整个子包的账号都累计到同一台设备。
                 assigned = descriptor.get('device_slots') or []
-                child['device_slots'] = _partition_device_slots(
-                    assigned or range(1, process_count + 1), process_count, index)
+                if plan is not None:
+                    child_plan = plan[plan_offset:plan_offset + count]
+                    if len(child_plan) != count:
+                        raise ValueError('device plan is shorter than package rows')
+                    child['device_plan'] = child_plan
+                    child['device_slots'] = sorted({int(slot) for slot in child_plan})
+                    child['_device_bootstrap_barrier'] = str(
+                        workers_root / 'device-bootstrap')
+                    child['_device_bootstrap_expected'] = process_count
+                    child['_device_bootstrap_index'] = index + 1
+                else:
+                    # Compatibility for packages created before quota planning.
+                    child['device_slots'] = _partition_device_slots(
+                        assigned or range(1, process_count + 1), process_count, index)
                 child['device_pool_capacity'] = int(
                     descriptor.get('device_pool_capacity') or max(assigned))
             atomic_json(child_dir / 'manifest.json', child)
             child_descriptors.append((child_dir, child))
             current_row += count
+            plan_offset += count
         if source.read(1):
             raise ValueError('input contains more rows than package descriptor')
 
@@ -1337,6 +1354,65 @@ def record_device_registration(device_root, slot, proxy, model=''):
         return False
 
 
+def _replace_device_identity(pool, device_root, slot, base_info, timeout, proxy,
+                             device_profile, usage_limit=100):
+    """Replace one exhausted identity; restore the old one on any failure."""
+    target = pool.slot_directory(int(slot))
+    backup = target.parent / f'.quota-backup-{int(slot)}-{os.getpid()}-{time.time_ns()}'
+    registration = Path(device_root) / 'registrations' / f'{int(slot):03d}.json'
+    health_path = pool.base / 'health.json'
+    metadata = {path: (path.read_bytes(), path.stat().st_mode & 0o777)
+                if path.exists() else None for path in (registration, health_path)}
+    had_target = target.exists()
+    if had_target:
+        os.replace(target, backup)
+    try:
+        profile = device_profile(pool, int(slot))
+        info = dict(base_info, client_info=profile['client_info'],
+                    user_agent=profile['user_agent'])
+        identity = pool.fetch_headers(int(slot), info, max(float(timeout), 40),
+                                      registered=False, proxy=proxy,
+                                      provider_direct=True)
+        if pool.inspect(int(slot)).get('state') != 'ready':
+            raise RuntimeError('replacement device did not become ready')
+        registration.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_json(registration, {
+            'slot': int(slot), 'proxy': str(proxy or ''),
+            'model': str(profile.get('model') or ''),
+            'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'ts': time.time(),
+        })
+        health = read_json(health_path, {})
+        if isinstance(health, dict) and health_path.exists():
+            devices = health.get('devices')
+            if isinstance(devices, dict):
+                devices.pop(str(int(slot)), None)
+            events = health.get('events')
+            if isinstance(events, list):
+                health['events'] = [item for item in events
+                                    if not (isinstance(item, list) and len(item) > 1
+                                            and item[1] == int(slot))]
+            atomic_json(health_path, health)
+        shutil.rmtree(backup, ignore_errors=True)
+        return identity, profile
+    except Exception:
+        shutil.rmtree(target, ignore_errors=True)
+        if had_target and backup.exists():
+            os.replace(backup, target)
+        for path, previous in metadata.items():
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                data, mode = previous
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                path.write_bytes(data)
+                path.chmod(mode)
+        usage = _usage_snapshot(device_root)
+        current = int(usage.get(int(slot), 0))
+        if current < int(usage_limit):
+            _bump_usage(device_root, {int(slot): int(usage_limit) - current})
+        raise
+
+
 def execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     """真实认证执行入口：任何异常都落成 done.json，避免节点只看到"进程退出"。"""
     try:
@@ -1389,6 +1465,14 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         slot_ids = [max(1, min(capacity, int(value))) for value in configured_slots]
     else:
         slot_ids = list(range(1, capacity + 1))
+    device_plan = descriptor.get('device_plan')
+    if isinstance(device_plan, list):
+        device_plan = [max(1, min(capacity, int(value))) for value in device_plan]
+        if len(device_plan) != int(descriptor.get('rows') or 0):
+            raise ValueError('device plan length does not match package rows')
+    else:
+        device_plan = None
+    reset_slots = {int(slot) for slot in descriptor.get('device_reset_slots') or []}
     timeout = float(descriptor.get('timeout') or 20)
     retries = max(0, int(descriptor.get('retries') or 0))
     retry_delay = max(0.0, float(descriptor.get('_retry_delay',
@@ -1419,67 +1503,103 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            slots=slot_ids, auth_protocol=auth_protocol,
                            credentials_recorded=False)
 
-    # 一个包内把账号摊到所有设备上：一台设备只承担 rows/capacity 条，
-    # 比固定用 1 号设备更分散，明显降低单设备被风控的概率。
-    identities, infos, device_labels = {}, {}, {}
-    for index in slot_ids:
+    # Device preparation has its own bounded pool.  It never borrows the 250
+    # account workers, so a shortage cannot create a 250-way registration storm.
+    def bootstrap(index):
         if auth_protocol == 'web':
-            infos[index] = None
-            identities[index] = None
             try:
-                device_labels[index] = _device_id_label(
-                    pool.inspect(index).get('device_id'))
+                label = _device_id_label(pool.inspect(index).get('device_id'))
             except Exception:                                     # noqa: BLE001
-                device_labels[index] = ''
-            continue
-        bootstrap_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
-        bootstrap_started = time.monotonic() if debug_enabled else None
-        bootstrap_lease = proxy_pool.acquire(wait=2.0) if proxy_pool is not None else None
-        bootstrap_proxy = bootstrap_lease[0] if bootstrap_lease is not None else proxy
-        bootstrap_identity = (_proxy_identity(bootstrap_proxy) if debug_enabled else
-                              {'endpoint': '', 'host': '', 'port': None})
-        if debug_enabled and proxy_pool is not None and bootstrap_lease is None:
-            _write_proxy_debug(
-                debug_path, 'bootstrap_pool_empty', slot=index,
-                wait_ms=round((time.monotonic() - bootstrap_started) * 1000, 2),
-                pool_before=bootstrap_before, pool_after=_proxy_pool_snapshot(proxy_pool))
-        if descriptor.get('proxy_api') and not bootstrap_proxy:
-            infos[index] = None
-            identities[index] = None
-            continue
+                label = ''
+            return index, None, None, label, False
+        before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
+        started_bootstrap = time.monotonic() if debug_enabled else None
+        lease = proxy_pool.acquire(wait=2.0) if proxy_pool is not None else None
+        selected_proxy = lease[0] if lease is not None else proxy
+        proxy_identity = (_proxy_identity(selected_proxy) if debug_enabled else
+                          {'endpoint': '', 'host': '', 'port': None})
         try:
-            base_info = pool.info(timeout, proxy=bootstrap_proxy, provider_direct=True)
-            profile = device_profile(pool, index)
-            infos[index] = dict(base_info, client_info=profile['client_info'],
-                                user_agent=profile['user_agent'])
-            inspected = pool.inspect(index)
-            ready = inspected['state'] == 'ready'
-            device_labels[index] = _device_id_label(inspected.get('device_id'))
-            identities[index] = pool.fetch_headers(index, infos[index], max(timeout, 40),
-                                                   registered=ready, proxy=bootstrap_proxy,
-                                                   provider_direct=True)
+            initially_ready = pool.inspect(index).get('state') == 'ready'
+        except Exception:                                         # noqa: BLE001
+            initially_ready = False
+        if descriptor.get('proxy_api') and not selected_proxy:
+            failed = index in reset_slots or not initially_ready
+            return index, None, None, '', failed
+        try:
+            base_info = pool.info(timeout, proxy=selected_proxy, provider_direct=True)
+            if index in reset_slots:
+                identity, profile = _replace_device_identity(
+                    pool, device_root, index, base_info, timeout,
+                    selected_proxy, device_profile,
+                    descriptor.get('device_usage_limit') or 100)
+                info = dict(base_info, client_info=profile['client_info'],
+                            user_agent=profile['user_agent'])
+                inspected = pool.inspect(index)
+            else:
+                profile = device_profile(pool, index)
+                info = dict(base_info, client_info=profile['client_info'],
+                            user_agent=profile['user_agent'])
+                inspected = pool.inspect(index)
+                identity = pool.fetch_headers(
+                    index, info, max(timeout, 40),
+                    registered=inspected['state'] == 'ready', proxy=selected_proxy,
+                    provider_direct=True)
             refreshed = pool.inspect(index)
-            device_labels[index] = (_device_id_label(refreshed.get('device_id')) or
-                                    device_labels[index])
-            if not ready and refreshed['state'] == 'ready':
-                record_device_registration(device_root, index, bootstrap_proxy,
+            label = _device_id_label(refreshed.get('device_id'))
+            if inspected['state'] != 'ready' and refreshed['state'] == 'ready':
+                record_device_registration(device_root, index, selected_proxy,
                                            profile.get('model', ''))
             if proxy_pool is not None:
-                proxy_pool.release(bootstrap_lease, healthy=True)
+                proxy_pool.release(lease, healthy=True)
+            return index, info, identity, label, False
         except Exception as exc:                                   # noqa: BLE001
-            infos[index] = None
-            identities[index] = None
             if proxy_pool is not None:
-                proxy_pool.release(bootstrap_lease, healthy=False)
+                proxy_pool.release(lease, healthy=False)
             if debug_enabled:
                 _write_proxy_debug(
                     debug_path, 'bootstrap_error', slot=index,
-                    wait_ms=round((time.monotonic() - bootstrap_started) * 1000, 2),
-                    endpoint=bootstrap_identity['endpoint'],
-                    host=bootstrap_identity['host'], port=bootstrap_identity['port'],
-                    error_type=type(exc).__name__, detail=_proxy_debug_detail(exc),
-                    pool_before=bootstrap_before,
+                    wait_ms=round((time.monotonic() - started_bootstrap) * 1000, 2),
+                    endpoint=proxy_identity['endpoint'], host=proxy_identity['host'],
+                    port=proxy_identity['port'], error_type=type(exc).__name__,
+                    detail=_proxy_debug_detail(exc), pool_before=before,
                     pool_after=_proxy_pool_snapshot(proxy_pool))
+            return index, None, None, '', index in reset_slots or not initially_ready
+
+    identities, infos, device_labels, unusable_slots = {}, {}, {}, set()
+    total_registration_workers = max(
+        1, min(16, int(descriptor.get('device_registration_workers') or 16)))
+    process_count = max(1, int(descriptor.get('_node_process_count') or 1))
+    registration_workers = min(
+        len(slot_ids), max(1, (total_registration_workers + process_count - 1)
+                            // process_count))
+    with ThreadPoolExecutor(max_workers=registration_workers,
+                            thread_name_prefix='device-bootstrap') as registration_pool:
+        for index, info, identity, label, failed in registration_pool.map(bootstrap, slot_ids):
+            infos[index], identities[index], device_labels[index] = info, identity, label
+            if failed:
+                unusable_slots.add(index)
+
+    barrier = descriptor.get('_device_bootstrap_barrier')
+    if barrier:
+        barrier = Path(barrier)
+        barrier.mkdir(mode=0o700, parents=True, exist_ok=True)
+        marker = barrier / f'{int(descriptor.get("_device_bootstrap_index") or 1):03d}.json'
+        atomic_json(marker, {'ok': not unusable_slots,
+                             'failed_slots': sorted(unusable_slots)})
+        expected = max(1, int(descriptor.get('_device_bootstrap_expected') or 1))
+        deadline = time.monotonic() + max(
+            180.0, max(float(timeout), 40.0) * max(1, len(slot_ids)) + 120.0)
+        while not stop.is_set() and time.monotonic() < deadline:
+            states = [read_json(path, {}) for path in barrier.glob('*.json')]
+            if len(states) >= expected:
+                if any(not state.get('ok') for state in states):
+                    raise RuntimeError('设备注册或替换失败，未开始账号验证')
+                break
+            stop.wait(0.1)
+        else:
+            raise RuntimeError('等待全部设备注册完成超时，未开始账号验证')
+    elif unusable_slots:
+        raise RuntimeError('设备注册或替换失败，未开始账号验证')
 
     def proxy_for(index):
         if proxy_pool is not None:
@@ -1569,7 +1689,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             return row, line, {'status': 'unknown', 'kind': 'stopped'}
         account, password = _split_account(line)
         account_started = time.time() if account_started is None else account_started
-        slot_id, account_prefix = _slot_for_account(account, slot_ids)
+        if device_plan is not None:
+            slot_id = int(device_plan[index])
+            _ignored, account_prefix = _slot_for_account(account, [slot_id])
+        else:
+            slot_id, account_prefix = _slot_for_account(account, slot_ids)
         # 空白行仍是输入文件中的一条记录，但不应触发真实认证请求。
         # 作为未判断结果落盘，保证小包按描述的 rows 正常完成。
         if not line.strip():
@@ -1580,6 +1704,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             # 输入格式问题不是 Apple 的答复，不能落成 -20970 那种"已失效"。
             return row, line, {'status': 'undetermined', 'kind': 'format_error',
                                'stage': 'input', 'http': None, 'detail': problem,
+                               'slot': slot_id, 'device_key': account_prefix, 'elapsed': 0}
+        if slot_id in unusable_slots:
+            return row, line, {'status': 'error', 'kind': 'device_quota',
+                               'stage': 'device', 'http': None,
+                               'detail': '设备额度已满且替换注册失败',
                                'slot': slot_id, 'device_key': account_prefix, 'elapsed': 0}
         identity = (identities.get(slot_id) if identity_override is identity_default
                     else identity_override)
@@ -1786,7 +1915,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     stop_flag = stop
     output_digest = hashlib.sha256()
     usage_counts = Counter()
-    usage_start = _usage_snapshot(device_root)
+    if descriptor.get('device_usage_reserved'):
+        usage_start = {int(slot): max(0, int(value or 0))
+                       for slot, value in
+                       (descriptor.get('device_usage_base') or {}).items()}
+    else:
+        usage_start = _usage_snapshot(device_root)
     with (directory / 'input.part').open('r', encoding='utf-8', errors='replace') as source, output_path.open('wb') as output:
         output_path.chmod(0o600)
         first_row = int(descriptor.get('first_row') or 1)
@@ -1906,7 +2040,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     if processed != int(descriptor.get('rows') or 0):
         raise ValueError('输入条数和工作包描述不一致')
-    _bump_usage(device_root, usage_counts)
+    if not descriptor.get('device_usage_reserved'):
+        _bump_usage(device_root, usage_counts)
     atomic_json(directory / 'progress.json',
                 {'processed': processed, 'started': started,
                  'counts': dict(counters)})

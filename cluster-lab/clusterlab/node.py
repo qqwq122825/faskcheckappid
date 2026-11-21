@@ -29,6 +29,83 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 '''
 
+DEVICE_AUTH_LIMIT = 100
+DEVICE_POOL_LIMIT = 2000
+
+
+def build_device_plan(rows, processes, slots, usage, limit=DEVICE_AUTH_LIMIT,
+                      max_slots=DEVICE_POOL_LIMIT, desired_devices=None):
+    """Allocate every row without letting one device identity exceed ``limit``.
+
+    Slots are exclusive to one child process for the package.  A consumed or
+    invalid slot is returned in ``reset_slots`` so that child replaces its
+    identity before starting any account checks.
+    """
+    rows, processes = max(1, int(rows)), max(1, min(int(processes), int(rows)))
+    states = {int(item['slot']): str(item.get('state') or '')
+              for item in slots if isinstance(item, dict) and item.get('slot')}
+    used = {}
+    for key, value in (usage or {}).items():
+        try:
+            used[int(key)] = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            continue
+    available = [(slot, int(limit) - used.get(slot, 0))
+                 for slot, state in states.items()
+                 if state == 'ready' and used.get(slot, 0) < int(limit)]
+    available.sort(key=lambda item: (-item[1], item[0]))
+    fresh = [(slot, int(limit)) for slot, state in sorted(states.items())
+             if state == 'missing' and used.get(slot, 0) == 0]
+    reset = [slot for slot, state in sorted(states.items())
+             if state not in ('missing',) and not (
+                 state == 'ready' and used.get(slot, 0) < int(limit))]
+    next_slot = max(states, default=0) + 1
+    reset_slots, plan = set(), []
+    child_counts = [rows // processes + (index < rows % processes)
+                    for index in range(processes)]
+    desired_devices = min(rows, int(max_slots), max(
+        processes, int(desired_devices or processes)))
+    desired_counts = [desired_devices // processes
+                      + (index < desired_devices % processes)
+                      for index in range(processes)]
+
+    def candidate():
+        nonlocal next_slot
+        if available:
+            return (*available.pop(0), False)
+        if fresh:
+            return (*fresh.pop(0), False)
+        if reset:
+            slot = reset.pop(0)
+            return slot, int(limit), True
+        if next_slot <= int(max_slots):
+            slot, next_slot = next_slot, next_slot + 1
+            return slot, int(limit), False
+        raise RuntimeError(
+            f'设备额度不足：本包 {rows} 个账号无法在 {max_slots} 个槽位内满足每台最多 {limit} 个')
+
+    for process_index, count in enumerate(child_counts):
+        selected = []
+        target = max((count + int(limit) - 1) // int(limit),
+                     desired_counts[process_index])
+        while len(selected) < target or sum(item[1] for item in selected) < count:
+            selected.append(candidate())
+        child, remaining = [], [int(item[1]) for item in selected]
+        while len(child) < count:
+            progressed = False
+            for offset, (slot, _capacity, must_reset) in enumerate(selected):
+                if remaining[offset] <= 0 or len(child) >= count:
+                    continue
+                child.append(slot)
+                remaining[offset] -= 1
+                progressed = True
+                if must_reset:
+                    reset_slots.add(slot)
+            if not progressed:
+                raise RuntimeError('设备额度规划失败')
+        plan.extend(child)
+    return plan, sorted(reset_slots)
+
 
 class Node:
     # 必须 >= 总控的 unit_byte_limit（controller.settings 里是 32 MiB）。
@@ -604,19 +681,37 @@ class Node:
         return True
 
     def _prepare_auth_devices(self, descriptor):
-        """Use exactly the ready devices owned by this node; tasks do not resize the pool."""
+        """Reserve a hard per-identity budget before any account reaches Apple."""
+        rows = max(1, int(descriptor.get('rows') or 1))
+        processes = max(1, min(int(descriptor.get('processes') or 1), rows))
+        if str(descriptor.get('_auth_protocol') or 'gsa').lower() == 'web':
+            descriptor.pop('device_capacity', None)
+            descriptor['processes'] = processes
+            descriptor['device_pool_capacity'] = 1
+            descriptor['device_slots'] = [1]
+            descriptor.pop('device_plan', None)
+            descriptor.pop('device_reset_slots', None)
+            return
         snapshot = self.builder.snapshot()
-        slots = [int(item['slot']) for item in snapshot.get('slots') or []
-                 if item.get('state') == 'ready']
-        if not slots:
-            raise RuntimeError('节点没有已就绪设备，请先初始化设备池')
-        processes = max(1, min(int(descriptor.get('processes') or 1),
-                               int(descriptor.get('rows') or 1), len(slots)))
+        entries = list(snapshot.get('slots') or [])
+        limit = max(1, int(descriptor.get('device_usage_limit') or DEVICE_AUTH_LIMIT))
+        desired_devices = min(rows, processes * max(1, int(
+            descriptor.get('threads') or 1)))
+        plan, reset_slots = build_device_plan(
+            rows, processes, entries, self.builder.usage(), limit=limit,
+            desired_devices=desired_devices)
+        slots = sorted(set(plan))
+        base = self.builder.reserve_usage(plan, limit, reset_slots)
         capacity = max(slots)
         descriptor.pop('device_capacity', None)
         descriptor['processes'] = processes
         descriptor['device_pool_capacity'] = capacity
         descriptor['device_slots'] = slots
+        descriptor['device_plan'] = plan
+        descriptor['device_reset_slots'] = reset_slots
+        descriptor['device_usage_limit'] = limit
+        descriptor['device_usage_base'] = base
+        descriptor['device_usage_reserved'] = True
         self.builder.reserve(slots)
 
     def start(self):

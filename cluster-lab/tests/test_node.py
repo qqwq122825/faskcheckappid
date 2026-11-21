@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import multiprocessing as mp
+from collections import Counter
 from pathlib import Path
 import tempfile
 import threading
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 from clusterlab.node import Node
 from clusterlab.device_build import REGISTRATION_TIMEOUT, _register
+from clusterlab.executor import _replace_device_identity
 
 
 class Response:
@@ -296,27 +298,172 @@ class NodeRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '结果待上传'):
             self.node.connect('http://127.0.0.1:18772','x'*32)
 
-    def test_auth_task_uses_only_this_nodes_ready_devices(self):
+    def test_auth_task_plans_at_most_one_hundred_accounts_per_device(self):
         descriptor = {'mode': 'auth', 'rows': 10000, 'seq': 2,
-                      'processes': 10, 'device_capacity': 30}
+                      'processes': 10, 'device_capacity': 30,
+                      '_auth_protocol': 'gsa'}
         ready = {'slots': [
             {'slot': 2, 'state': 'ready'}, {'slot': 4, 'state': 'failed'},
             {'slot': 7, 'state': 'ready'}, {'slot': 9, 'state': 'ready'}]}
-        with patch.object(self.node.builder, 'snapshot', return_value=ready), \
-             patch.object(self.node.builder, 'start') as start:
+        with patch.object(self.node.builder, 'snapshot', return_value=ready):
             self.node._prepare_auth_devices(descriptor)
-        self.assertEqual(descriptor['device_pool_capacity'], 9)
-        self.assertEqual(descriptor['device_slots'], [2, 7, 9])
-        self.assertEqual(descriptor['processes'], 3)
+        counts = Counter(descriptor['device_plan'])
+        self.assertEqual(len(descriptor['device_plan']), 10000)
+        self.assertTrue(counts)
+        self.assertLessEqual(max(counts.values()), 100)
+        self.assertEqual(len(counts), 100)
+        self.assertEqual(descriptor['processes'], 10)
+        self.assertIn(4, descriptor['device_reset_slots'])
+        self.assertEqual(json.loads((self.node.root / 'device-pool' / 'usage.json').read_text()),
+                         {str(slot): count for slot, count in counts.items()})
         self.assertNotIn('device_capacity', descriptor)
-        start.assert_not_called()
-        self.assertEqual(self.node.builder.reserved, {2, 7, 9})
+        self.assertEqual(self.node.builder.reserved, set(counts))
         self.node.builder.release(descriptor['device_slots'])
 
-    def test_auth_task_refuses_to_run_without_ready_devices(self):
+    def test_auth_task_with_no_devices_registers_before_verifying(self):
+        descriptor = {'mode': 'auth', 'rows': 50, 'processes': 4,
+                      '_auth_protocol': 'gsa'}
         with patch.object(self.node.builder, 'snapshot', return_value={'slots': []}):
-            with self.assertRaisesRegex(RuntimeError, '没有已就绪设备'):
-                self.node._prepare_auth_devices({'mode': 'auth', 'rows': 50, 'processes': 10})
+            self.node._prepare_auth_devices(descriptor)
+        self.assertEqual(len(descriptor['device_plan']), 50)
+        self.assertEqual(len(set(descriptor['device_plan'])), 4)
+        self.assertEqual(descriptor['device_reset_slots'], [])
+        self.assertEqual(descriptor['processes'], 4)
+
+    def test_web_task_does_not_require_or_reserve_devices(self):
+        descriptor = {'mode': 'auth', 'rows': 50, 'processes': 4,
+                      '_auth_protocol': 'web'}
+        with patch.object(self.node.builder, 'snapshot') as snapshot, \
+             patch.object(self.node.builder, 'reserve_usage') as reserve:
+            self.node._prepare_auth_devices(descriptor)
+        snapshot.assert_not_called()
+        reserve.assert_not_called()
+        self.assertEqual(descriptor['device_slots'], [1])
+        self.assertNotIn('device_plan', descriptor)
+
+    def test_usage_reservation_is_hard_and_reset_starts_new_identity_at_zero(self):
+        pool = self.node.root / 'device-pool'
+        pool.mkdir()
+        (pool / 'usage.json').write_text('{"1":99}', 'utf-8')
+        self.assertEqual(self.node.builder.reserve_usage([1], 100), {'1': 99})
+        with self.assertRaisesRegex(RuntimeError, '额度不足'):
+            self.node.builder.reserve_usage([1], 100)
+        self.assertEqual(self.node.builder.reserve_usage([1] * 100, 100, [1]),
+                         {'1': 0})
+        self.assertEqual(json.loads((pool / 'usage.json').read_text()), {'1': 100})
+
+    def test_all_full_devices_are_scheduled_for_replacement_before_auth(self):
+        pool = self.node.root / 'device-pool'
+        pool.mkdir()
+        (pool / 'usage.json').write_text(
+            json.dumps({str(slot): 100 for slot in range(1, 5)}), 'utf-8')
+        snapshot = {'slots': [
+            {'slot': slot, 'state': 'ready'} for slot in range(1, 5)]}
+        descriptor = {'mode': 'auth', 'rows': 400, 'processes': 4,
+                      '_auth_protocol': 'gsa', 'device_usage_limit': 100}
+        with patch.object(self.node.builder, 'snapshot', return_value=snapshot):
+            self.node._prepare_auth_devices(descriptor)
+        self.assertEqual(descriptor['device_reset_slots'], [1, 2, 3, 4])
+        self.assertEqual(Counter(descriptor['device_plan']),
+                         Counter({1: 100, 2: 100, 3: 100, 4: 100}))
+
+    def test_two_hundred_fifty_threads_use_distinct_planned_devices_without_thread_registration(self):
+        pool = self.node.root / 'device-pool'
+        pool.mkdir()
+        usage = {str(slot): (0 if slot == 100 else 100) for slot in range(1, 101)}
+        (pool / 'usage.json').write_text(json.dumps(usage), 'utf-8')
+        snapshot = {'slots': [
+            {'slot': slot, 'state': 'ready'} for slot in range(1, 101)]}
+        descriptor = {'mode': 'auth', 'rows': 250, 'processes': 4,
+                      'threads': 250, '_auth_protocol': 'gsa',
+                      'device_usage_limit': 100}
+        with patch.object(self.node.builder, 'snapshot', return_value=snapshot):
+            self.node._prepare_auth_devices(descriptor)
+        counts = Counter(descriptor['device_plan'])
+        self.assertEqual(sum(counts.values()), 250)
+        self.assertEqual(len(counts), 250)
+        self.assertLessEqual(max(counts.values()), 100)
+        self.assertEqual(len(descriptor['device_reset_slots']), 99)
+
+    def test_four_by_two_hundred_fifty_uses_one_thousand_prebuilt_devices_evenly(self):
+        snapshot = {'slots': [
+            {'slot': slot, 'state': 'ready'} for slot in range(1, 1001)]}
+        descriptor = {'mode': 'auth', 'rows': 10000, 'processes': 4,
+                      'threads': 250, '_auth_protocol': 'gsa',
+                      'device_usage_limit': 100}
+        with patch.object(self.node.builder, 'snapshot', return_value=snapshot):
+            self.node._prepare_auth_devices(descriptor)
+        counts = Counter(descriptor['device_plan'])
+        self.assertEqual(len(counts), 1000)
+        self.assertEqual(set(counts.values()), {10})
+        self.assertEqual(descriptor['device_reset_slots'], [])
+
+    def test_quota_replacement_restores_old_device_when_registration_fails(self):
+        root = Path(self.temp.name) / 'quota-replace'
+
+        class Pool:
+            base = root / 'origin'
+
+            def slot_directory(inner, slot):
+                return inner.base / 'devices' / f'{slot:02d}'
+
+            def fetch_headers(inner, *_args, **_kwargs):
+                raise RuntimeError('registration failed')
+
+            def inspect(inner, _slot):
+                return {'state': 'missing'}
+
+        pool = Pool()
+        target = pool.slot_directory(1)
+        target.mkdir(parents=True)
+        (target / 'old.json').write_text('old', 'utf-8')
+
+        def profile(_pool, _slot):
+            target.mkdir(parents=True, exist_ok=True)
+            (target / 'new.json').write_text('new', 'utf-8')
+            return {'model': 'MacBookPro14,3', 'client_info': 'client',
+                    'user_agent': 'agent'}
+
+        with self.assertRaisesRegex(RuntimeError, 'registration failed'):
+            _replace_device_identity(pool, root, 1, {}, 20, 'proxy', profile)
+        self.assertEqual((target / 'old.json').read_text(), 'old')
+        self.assertFalse((target / 'new.json').exists())
+        self.assertEqual(json.loads((root / 'usage.json').read_text()), {'1': 100})
+
+    def test_quota_replacement_commits_new_device_before_verification(self):
+        root = Path(self.temp.name) / 'quota-replace-ok'
+
+        class Pool:
+            base = root / 'origin'
+
+            def slot_directory(inner, slot):
+                return inner.base / 'devices' / f'{slot:02d}'
+
+            def fetch_headers(inner, *_args, **_kwargs):
+                (inner.slot_directory(1) / 'ready.json').write_text('ready', 'utf-8')
+                return {'identity': 'new'}
+
+            def inspect(inner, slot):
+                return {'state': ('ready' if (inner.slot_directory(slot) / 'ready.json').exists()
+                                  else 'missing'), 'device_id': 'new-device'}
+
+        pool = Pool()
+        target = pool.slot_directory(1)
+        target.mkdir(parents=True)
+        (target / 'old.json').write_text('old', 'utf-8')
+
+        def profile(_pool, _slot):
+            target.mkdir(parents=True, exist_ok=True)
+            return {'model': 'MacBookPro14,3', 'client_info': 'client',
+                    'user_agent': 'agent'}
+
+        identity, _profile = _replace_device_identity(
+            pool, root, 1, {}, 20, 'socks5h://proxy', profile)
+        self.assertEqual(identity, {'identity': 'new'})
+        self.assertFalse((target / 'old.json').exists())
+        self.assertTrue((target / 'ready.json').exists())
+        registration = json.loads((root / 'registrations' / '001.json').read_text())
+        self.assertEqual(registration['model'], 'MacBookPro14,3')
 
     def test_background_builder_never_registers_without_a_proxy(self):
         class Pool:
@@ -338,7 +485,7 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(self.node.builder.state['slot_errors']['1'], '代理获取失败')
         self.assertFalse((self.node.root / 'device-pool' / 'registrations').exists())
 
-    def test_idle_builder_registers_four_devices_in_parallel(self):
+    def test_idle_builder_registers_sixteen_devices_in_parallel(self):
         ready, guard = set(), threading.Lock()
         active = {'now': 0, 'max': 0}
 
@@ -359,17 +506,17 @@ class NodeRecoveryTests(unittest.TestCase):
                 active['now'] -= 1
             return {'ok': True, 'model': 'MacBookPro14,3'}
 
-        self.node.builder.state.update(running=True, capacity=4, workers=4)
+        self.node.builder.state.update(running=True, capacity=16, workers=16)
         with patch('clusterlab.device_build._load_fastcheck',
                    return_value=(Pool, None, None)), \
              patch.object(self.node.builder, '_proxy',
-                          side_effect=[f'socks5h://proxy-{slot}' for slot in range(4)]), \
+                          side_effect=[f'socks5h://proxy-{slot}' for slot in range(16)]), \
              patch.object(self.node.builder, '_provision', side_effect=provision), \
              patch.object(self.node.builder, '_record', return_value=True):
-            self.node.builder._run(4)
-        self.assertEqual(active['max'], 4)
+            self.node.builder._run(16)
+        self.assertEqual(active['max'], 16)
         self.assertEqual((self.node.builder.state['built'], self.node.builder.state['ready']),
-                         (4, 4))
+                         (16, 16))
 
     def test_snapshot_distinguishes_registering_failed_and_pending_slots(self):
         class Pool:
