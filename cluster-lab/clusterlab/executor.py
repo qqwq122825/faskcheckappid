@@ -1567,7 +1567,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     identities, infos, device_labels, unusable_slots = {}, {}, {}, set()
     total_registration_workers = max(
-        1, min(16, int(descriptor.get('device_registration_workers') or 16)))
+        1, min(4, int(descriptor.get('device_registration_workers') or 4)))
     process_count = max(1, int(descriptor.get('_node_process_count') or 1))
     registration_workers = min(
         len(slot_ids), max(1, (total_registration_workers + process_count - 1)

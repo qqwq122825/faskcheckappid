@@ -21,8 +21,8 @@ from .executor import _load_fastcheck, record_device_registration
 
 REGISTRATION_TIMEOUT = 90
 DEVICE_POOL_LIMIT = 2000
-IDLE_BUILD_WORKERS = 16
-BUSY_BUILD_WORKERS = 4
+IDLE_BUILD_WORKERS = 4
+BUSY_BUILD_WORKERS = 2
 
 
 def device_label(device_id):
