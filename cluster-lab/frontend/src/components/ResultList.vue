@@ -5,6 +5,7 @@ import { api, fmt, state } from '../composables/useCluster'
 const props = defineProps<{ job: any }>()
 const pageSize = 100
 const category = ref('all')
+const accountSearch = ref('')
 const offset = ref(0)
 const rows = ref<any[]>([])
 const total = ref(0)
@@ -13,6 +14,7 @@ const error = ref('')
 let generation = 0
 let foregroundRequests = 0
 let backgroundPending = false
+let searchTimer: ReturnType<typeof setTimeout> | undefined
 
 const options = [
   { label: '全部结果', value: 'all' },
@@ -45,7 +47,8 @@ async function load(reset = false, showLoading = true) {
     error.value = ''
   }
   try {
-    const result = await api(`/api/jobs/${props.job.id}/rows?category=${category.value}&offset=${offset.value}&limit=${pageSize}`)
+    const search = encodeURIComponent(accountSearch.value.trim())
+    const result = await api(`/api/jobs/${props.job.id}/rows?category=${category.value}&offset=${offset.value}&limit=${pageSize}&search=${search}`)
     if (current !== generation) return
     rows.value = Array.isArray(result.rows) ? result.rows : []
     total.value = Math.max(0, Number(result.total) || 0)
@@ -78,6 +81,11 @@ function next() { offset.value += pageSize; load() }
 const elapsed = (value: any) => value == null ? '—' : `${Number(value).toFixed(2)}s`
 const statusLabel = (row: any) => labels[row.status] || labels[category.value] || '其他错误'
 
+watch(accountSearch, () => {
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => void load(true), 300)
+})
+
 watch(
   () => [props.job?.id, Number(props.job?.confirmed) || 0] as const,
   ([jobId, confirmed], previous) => {
@@ -97,9 +105,12 @@ watch(
     <template #header>
       <div class="section-heading result-list-heading">
         <div><h2>账号结果</h2><p>密码正确结果可逐页查看全部；其他分类各显示前 100 条。</p></div>
-        <el-select v-model="category" class="result-filter" @change="changeCategory">
-          <el-option v-for="item in options" :key="item.value" :label="item.label" :value="item.value" />
-        </el-select>
+        <div class="result-list-controls">
+          <el-input v-model="accountSearch" clearable placeholder="搜索账号" aria-label="搜索账号" />
+          <el-select v-model="category" class="result-filter" @change="changeCategory">
+            <el-option v-for="item in options" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+        </div>
       </div>
     </template>
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />

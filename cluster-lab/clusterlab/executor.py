@@ -1237,6 +1237,24 @@ def _bump_usage(device_root, counts):
         pass
 
 
+def _usage_snapshot(device_root):
+    """Read the durable per-slot count used before this worker package starts."""
+    if not device_root:
+        return {}
+    path = Path(device_root) / 'usage.json'
+    try:
+        data = json.loads(path.read_text('utf-8')) if path.exists() else {}
+    except (OSError, TypeError, ValueError):
+        return {}
+    result = {}
+    for slot, count in data.items():
+        try:
+            result[int(slot)] = max(0, int(count or 0))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
 def record_device_registration(device_root, slot, proxy, model=''):
     """Persist the first observed registration facts for one device slot.
 
@@ -1666,6 +1684,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     stop_flag = stop
     output_digest = hashlib.sha256()
     usage_counts = Counter()
+    usage_start = _usage_snapshot(device_root)
     with (directory / 'input.part').open('r', encoding='utf-8', errors='replace') as source, output_path.open('wb') as output:
         output_path.chmod(0o600)
         first_row = int(descriptor.get('first_row') or 1)
@@ -1736,6 +1755,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 if business_code is None:
                     business_code = (result.get('detail') or result.get('kind') or '')[:180]
                 reason = _apple_reason_for_record(result, status, debug_enabled)
+                usage_counts[device] += 1
+                device_usage = int(usage_start.get(device, 0)) + usage_counts[device]
                 record = {'row': row, 'account': account, 'password': password, 'status': status,
                           'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
                           'stage': result.get('stage') or '', 'http': result.get('http'),
@@ -1744,6 +1765,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'device': device,
                           'device_key': result.get('device_key') or '',
                           'device_label': device_labels.get(device, ''),
+                          'device_usage': device_usage,
                           'elapsed': result.get('elapsed'),
                           'attempts': max(
                               int(result.get('_proxy_retries') or 0),
@@ -1761,7 +1783,6 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
                 output.write(encoded)
                 output_digest.update(encoded)
-                usage_counts[device] += 1
                 now = time.monotonic()
                 if now - last_progress >= 0.25:
                     # The node agent tails this local file once per second and

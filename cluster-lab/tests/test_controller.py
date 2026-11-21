@@ -550,7 +550,7 @@ class ControllerTests(unittest.TestCase):
         unit = self.service.lease(self.node['id'], 'test-session')
         payload = b''.join((json.dumps({
             'row': unit['first_row'] + offset, 'account': f'user{offset}@example.com',
-            'status': 'valid', 'device': 1,
+            'status': 'valid', 'device': 1, 'device_usage': offset + 17,
             'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
             separators=(',', ':')) + '\n').encode() for offset in range(50))
         with self.service.db.transaction() as db:
@@ -561,7 +561,11 @@ class ControllerTests(unittest.TestCase):
         self.service.accept_result(self.node['id'], unit['id'], unit['token'],
                                    io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
         row = self.service.read_rows(job, 0, 1, 'all')['rows'][0]
-        self.assertEqual(row['device_display'], '节点01 · B64:ZGV2aWNl')
+        self.assertEqual(row['device_display'], '节点01 · B64:ZGV2aWNl · 第 17 次')
+
+        found = self.service.read_rows(job, 0, 100, 'all', 'USER49@EXAMPLE')
+        self.assertEqual((found['total'], found['rows'][0]['account']),
+                         (1, 'user49@example.com'))
 
     def test_paused_export_includes_heartbeat_confirmed_partial_rows(self):
         job = self.job(50)

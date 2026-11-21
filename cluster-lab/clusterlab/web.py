@@ -236,7 +236,8 @@ def create_app(role, service, password=None):
             offset = int(request.args.get('offset', 0))
             limit = int(request.args.get('limit', 100))
             category = request.args.get('category', 'all')
-            return jsonify(service.read_rows(job_id, offset, limit, category))
+            search = request.args.get('search', '')
+            return jsonify(service.read_rows(job_id, offset, limit, category, search))
 
         @app.get('/api/jobs/<job_id>/results')
         def download_results(job_id):

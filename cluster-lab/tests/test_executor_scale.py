@@ -788,6 +788,30 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual([item['processed'] for item in progress], [1, 1])
             self.assertEqual(progress[0]['counts'], {'wrong_password': 1})
 
+    def test_auth_result_records_device_usage_at_that_account(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text(
+                'one@example.com----a\ntwo@example.com----b\nthree@example.com----c\n',
+                encoding='utf-8')
+            devices = root / 'devices'
+            devices.mkdir()
+            (devices / 'usage.json').write_text('{"1":7}', encoding='utf-8')
+            descriptor = {'rows': 3, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_root': str(devices),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool, lambda *_args, **_kwargs: {'status': 'valid'},
+                    lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event())
+
+            records = [json.loads(line) for line in
+                       (root / 'results.jsonl').read_text('utf-8').splitlines()]
+            self.assertEqual([record['device_usage'] for record in records], [8, 9, 10])
+
     def test_auth_unit_classifies_gsa_20970_as_invalid_without_web_recheck(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

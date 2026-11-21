@@ -1760,7 +1760,12 @@ class Controller:
             label = labels.get((node_id, slot), '')
         node_text = f'节点{number:02d}' if number else '节点—'
         device_text = label[:32] if label else (f'#{slot}' if slot else '—')
-        record['device_display'] = f'{node_text} · {device_text}'
+        try:
+            usage = max(0, int(record.get('device_usage') or 0))
+        except (TypeError, ValueError):
+            usage = 0
+        usage_text = f' · 第 {usage} 次' if usage else ''
+        record['device_display'] = f'{node_text} · {device_text}{usage_text}'
         method_labels = {
             'verification_code': '手机或 App 验证码',
             'security_repair': '密保或安全修复',
@@ -1898,7 +1903,61 @@ class Controller:
                         result.append(record)
         return {'rows': result, 'total': total, 'offset': offset}
 
-    def _read_rows_uncached(self, job_id, offset=0, limit=100, category='all'):
+    def _search_rows_uncached(self, db, job_id, offset, limit, category, wanted,
+                              device_context, search):
+        """Search confirmed accounts across completed shards and current live rows."""
+        needle = str(search or '').strip().casefold()
+        rows, total = [], 0
+        units = db.execute(
+            "SELECT id,status,result_path,node_id FROM units WHERE job_id=? "
+            "AND status IN ('leased','running','completed') ORDER BY seq", (job_id,))
+        for unit in units:
+            if unit['status'] == 'completed':
+                path = unit['result_path']
+                if not path or not Path(path).exists():
+                    continue
+                try:
+                    stream = Path(path).open('r', encoding='utf-8')
+                except OSError:
+                    continue
+                with stream:
+                    payloads = stream
+                    for payload in payloads:
+                        try:
+                            record = json.loads(payload)
+                        except (TypeError, ValueError):
+                            continue
+                        record['status'] = result_record_bucket(record)
+                        if category != 'all' and record['status'] not in wanted:
+                            continue
+                        if needle not in str(record.get('account') or '').casefold():
+                            continue
+                        total += 1
+                        if total <= offset or len(rows) >= limit:
+                            continue
+                        self._decorate_result_device(record, unit, device_context)
+                        rows.append(record)
+            else:
+                for live in db.execute(
+                        'SELECT payload FROM live_result_rows WHERE unit_id=? ORDER BY row',
+                        (unit['id'],)):
+                    try:
+                        record = json.loads(live['payload'])
+                    except (TypeError, ValueError):
+                        continue
+                    record['status'] = result_record_bucket(record)
+                    if category != 'all' and record['status'] not in wanted:
+                        continue
+                    if needle not in str(record.get('account') or '').casefold():
+                        continue
+                    total += 1
+                    if total <= offset or len(rows) >= limit:
+                        continue
+                    self._decorate_result_device(record, unit, device_context)
+                    rows.append(record)
+        return {'rows': rows, 'total': total, 'offset': offset, 'search': search}
+
+    def _read_rows_uncached(self, job_id, offset=0, limit=100, category='all', search=''):
         """按行号窗口读取结果，供页面表格分页。
 
         全部结果按 first_row 直接定位覆盖页面的分片；分类结果利用每片
@@ -1920,6 +1979,9 @@ class Controller:
                 (job_id, job_id)).fetchone()
             if not job:
                 raise ValueError('任务不存在')
+            if search:
+                return self._search_rows_uncached(
+                    db, job_id, offset, limit, category, wanted, device_context, search)
             if db.execute('SELECT 1 FROM live_result_rows WHERE job_id=? LIMIT 1',
                           (job_id,)).fetchone():
                 return self._read_rows_with_live(db, job_id, offset, limit, category,
@@ -2002,10 +2064,11 @@ class Controller:
         return {'rows': [dict(row) for row in page['rows']],
                 'total': page['total'], 'offset': page['offset']}
 
-    def read_rows(self, job_id, offset=0, limit=100, category='all'):
+    def read_rows(self, job_id, offset=0, limit=100, category='all', search=''):
         """Read a page once and reuse it while a paused/completed job is stable."""
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
+        search = str(search or '').strip()[:256]
         with self.result_query_lock:
             with self.db.connect() as db:
                 job = db.execute('SELECT status,updated FROM jobs WHERE id=?',
@@ -2015,14 +2078,14 @@ class Controller:
             if not job:
                 raise ValueError('任务不存在')
             stable = job['status'] in ('paused', 'completed')
-            key = (job_id, offset, limit, category, float(job['updated']),
+            key = (job_id, offset, limit, category, search, float(job['updated']),
                    str(debug_row['value']) if debug_row else '0')
             if stable and key in self.result_page_cache:
                 page = self.result_page_cache.pop(key)
                 self.result_page_cache[key] = page
                 return self._copy_result_page(page)
 
-            page = self._read_rows_uncached(job_id, offset, limit, category)
+            page = self._read_rows_uncached(job_id, offset, limit, category, search)
             if stable:
                 self.result_page_cache[key] = self._copy_result_page(page)
                 while len(self.result_page_cache) > 32:
