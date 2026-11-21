@@ -153,10 +153,11 @@ async function clearPool() {
       <div><span>目标数量</span><strong>{{ fmt(pool.capacity ?? capacity) }}</strong></div>
       <div><span>已尝试</span><strong>{{ fmt(actual) }}</strong></div>
       <div><span>就绪设备</span><strong>{{ fmt(ready) }}</strong></div>
+      <div><span>注册并发</span><strong>{{ fmt(pool.workers || 0) }}</strong></div>
     </div>
     <section>
       <div class="section-heading device-list-heading"><h2>设备列表</h2>
-        <span class="muted">{{ building && pool.current ? `正在注册第 ${pool.current} 台` : '等待中' }}</span>
+        <span class="muted">{{ building && pool.current_slots?.length ? `正在并行注册：${pool.current_slots.join('、')}` : '等待中' }}</span>
       </div>
       <el-table :data="rows" empty-text="尚未初始化设备" stripe max-height="360">
         <el-table-column prop="label" label="设备标识" width="145" />

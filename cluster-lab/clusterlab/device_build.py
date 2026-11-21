@@ -11,11 +11,14 @@ import re
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .common import atomic_json, read_json
 from .executor import _load_fastcheck, record_device_registration
 
 REGISTRATION_TIMEOUT = 90
+IDLE_BUILD_WORKERS = 4
+BUSY_BUILD_WORKERS = 2
 
 
 def device_label(device_id):
@@ -45,7 +48,8 @@ class DeviceBuilder:
         self.reserved = set()
         self.state = {'running': False, 'capacity': 0, 'ready': 0, 'built': 0,
                       'failed': 0, 'current': 0, 'message': '', 'started_at': None,
-                      'proxy_status': 'idle', 'proxy_ip': '', 'slot_errors': {}}
+                      'proxy_status': 'idle', 'proxy_ip': '', 'slot_errors': {},
+                      'workers': 0, 'current_slots': []}
 
     def snapshot(self):
         root = self.node.root / 'device-pool'
@@ -68,12 +72,15 @@ class DeviceBuilder:
                         and 1 <= int(path.name) <= 200] if device_root.is_dir() else []
             persisted_capacity = max(existing, default=0)
             limit = max(1, int(data.get('capacity') or 0), persisted_capacity)
+            active_slots = set(data.get('current_slots') or [])
+            if not active_slots and data.get('current'):
+                active_slots.add(int(data['current']))
             for slot in range(1, limit + 1):
                 inspected = pool.inspect(slot)
                 state = inspected['state']
                 if state == 'ready':
                     ready += 1
-                elif data.get('running') and slot == data.get('current'):
+                elif data.get('running') and slot in active_slots:
                     state = 'registering'
                 elif str(slot) in data['slot_errors']:
                     state = 'failed'
@@ -126,10 +133,12 @@ class DeviceBuilder:
             if not (self.node.proxy_api or '').strip():
                 raise ValueError('总控未下发代理 API，拒绝直连注册设备')
             self.stop.clear()
+            workers = min(int(capacity), BUSY_BUILD_WORKERS if self.node._active_worker_count()
+                          else IDLE_BUILD_WORKERS)
             self.state.update(running=True, capacity=int(capacity), ready=0, built=0,
                               failed=0, current=0, message='准备中',
                               proxy_status='checking', proxy_ip='',
-                              slot_errors={},
+                              slot_errors={}, workers=workers, current_slots=[],
                               started_at=time.strftime('%H:%M:%S'))
             self.thread = threading.Thread(target=self._run, args=(int(capacity),),
                                            name='device-builder', daemon=True)
@@ -151,7 +160,7 @@ class DeviceBuilder:
             self.state.update(running=False, capacity=0, ready=0, built=0,
                               failed=0, current=0, message='设备池已清空',
                               started_at=None, proxy_status='idle', proxy_ip='',
-                              slot_errors={})
+                              slot_errors={}, workers=0, current_slots=[])
         return True
 
     def reserve(self, slots):
@@ -174,6 +183,20 @@ class DeviceBuilder:
     def _update(self, **fields):
         with self.lock:
             self.state.update(fields)
+
+    def _increment(self, **fields):
+        with self.lock:
+            for key, amount in fields.items():
+                self.state[key] = int(self.state.get(key) or 0) + int(amount)
+
+    def _active_slot(self, slot, active):
+        with self.lock:
+            slots = set(self.state.get('current_slots') or [])
+            slots.add(int(slot)) if active else slots.discard(int(slot))
+            ordered = sorted(slots)
+            self.state['current_slots'] = ordered
+            self.state['current'] = ordered[0] if ordered else 0
+            return len(ordered)
 
     def rotate(self, capacity, slot):
         """Register a replacement first; swap it into one idle old slot later."""
@@ -235,48 +258,60 @@ class DeviceBuilder:
         try:
             DevicePool, _, _ = _load_fastcheck()
             pool = DevicePool(str(root), self.node.origin, max_devices=capacity)
+            missing = []
             for slot in range(1, capacity + 1):
-                if self.stop.is_set():
-                    self._update(message='已取消')
-                    break
                 if self._reserved(slot):
                     self._update(message=f'第 {slot} 台由任务进程初始化，后台继续补充')
                     continue
                 if pool.inspect(slot)['state'] == 'ready':
-                    self._update(ready=self.state['ready'] + 1)
+                    self._increment(ready=1)
                     continue
-                self._update(current=slot, message=f'正在注册第 {slot} 台')
-                proxy = self._proxy()
-                if not proxy:
-                    self._fail_slot(slot, '代理获取失败')
-                    self._update(failed=self.state['failed'] + 1,
-                                 proxy_status='failed', proxy_ip='',
-                                 message=f'第 {slot} 台代理获取失败，已禁止直连注册')
-                    continue
-                self._update(proxy_status='ok', proxy_ip=proxy_endpoint(proxy))
-                payload = {'slot': slot, 'capacity': capacity, 'proxy': proxy,
-                           'device_root': str(root), 'origin': self.node.origin,
-                           'timeout': REGISTRATION_TIMEOUT}
-                result = self._provision(payload)
-                ok = bool(result and result.get('ok')) and pool.inspect(slot)['state'] == 'ready'
-                if ok:
-                    self._record(slot, proxy, (result or {}).get('model'))
-                    self._clear_slot_error(slot)
-                    self._update(built=self.state['built'] + 1,
-                                 ready=self.state['ready'] + 1,
-                                 message=f'第 {slot} 台已就绪')
-                else:
-                    reason = (result or {}).get('error') or '超时'
-                    self._fail_slot(slot, reason)
-                    self._update(failed=self.state['failed'] + 1,
-                                 message=f'第 {slot} 台失败（{reason}）')
-            else:
-                if not self.state['failed']:
-                    self._update(message='全部完成')
+                missing.append(slot)
+            workers = max(1, min(len(missing) or 1, int(self.state.get('workers') or 1)))
+            with ThreadPoolExecutor(max_workers=workers,
+                                    thread_name_prefix='device-register') as executor:
+                futures = [executor.submit(self._build_slot, pool, root, capacity, slot)
+                           for slot in missing]
+                for future in as_completed(futures):
+                    future.result()
+            if self.stop.is_set():
+                self._update(message='已取消')
+            elif not self.state['failed']:
+                self._update(message='全部完成')
         except Exception as exc:                                   # noqa: BLE001
             self._update(message=f'异常：{type(exc).__name__}')
         finally:
-            self._update(running=False, current=0)
+            self._update(running=False, current=0, current_slots=[], workers=0)
+
+    def _build_slot(self, pool, root, capacity, slot):
+        if self.stop.is_set():
+            return
+        active = self._active_slot(slot, True)
+        self._update(message=f'正在并行注册 {active} 台设备')
+        try:
+            proxy = self._proxy()
+            if not proxy:
+                self._fail_slot(slot, '代理获取失败')
+                self._increment(failed=1)
+                self._update(proxy_status='failed', proxy_ip='',
+                             message=f'第 {slot} 台代理获取失败，已禁止直连注册')
+                return
+            self._update(proxy_status='ok', proxy_ip=proxy_endpoint(proxy))
+            payload = {'slot': slot, 'capacity': capacity, 'proxy': proxy,
+                       'device_root': str(root), 'origin': self.node.origin,
+                       'timeout': REGISTRATION_TIMEOUT}
+            result = self._provision(payload)
+            ok = bool(result and result.get('ok')) and pool.inspect(slot)['state'] == 'ready'
+            if ok:
+                self._record(slot, proxy, (result or {}).get('model'))
+                self._clear_slot_error(slot)
+                self._increment(built=1, ready=1)
+            else:
+                reason = (result or {}).get('error') or '超时'
+                self._fail_slot(slot, reason)
+                self._increment(failed=1)
+        finally:
+            self._active_slot(slot, False)
 
     def _run_rotation(self, capacity, slot):
         """Build outside the live pool, then replace exactly one idle old slot."""

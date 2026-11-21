@@ -338,6 +338,39 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(self.node.builder.state['slot_errors']['1'], '代理获取失败')
         self.assertFalse((self.node.root / 'device-pool' / 'registrations').exists())
 
+    def test_idle_builder_registers_four_devices_in_parallel(self):
+        ready, guard = set(), threading.Lock()
+        active = {'now': 0, 'max': 0}
+
+        class Pool:
+            def __init__(inner, *_args, **_kwargs):
+                pass
+
+            def inspect(inner, slot):
+                return {'state': 'ready' if slot in ready else 'missing'}
+
+        def provision(payload):
+            with guard:
+                active['now'] += 1
+                active['max'] = max(active['max'], active['now'])
+            threading.Event().wait(.04)
+            with guard:
+                ready.add(payload['slot'])
+                active['now'] -= 1
+            return {'ok': True, 'model': 'MacBookPro14,3'}
+
+        self.node.builder.state.update(running=True, capacity=4, workers=4)
+        with patch('clusterlab.device_build._load_fastcheck',
+                   return_value=(Pool, None, None)), \
+             patch.object(self.node.builder, '_proxy',
+                          side_effect=[f'socks5h://proxy-{slot}' for slot in range(4)]), \
+             patch.object(self.node.builder, '_provision', side_effect=provision), \
+             patch.object(self.node.builder, '_record', return_value=True):
+            self.node.builder._run(4)
+        self.assertEqual(active['max'], 4)
+        self.assertEqual((self.node.builder.state['built'], self.node.builder.state['ready']),
+                         (4, 4))
+
     def test_snapshot_distinguishes_registering_failed_and_pending_slots(self):
         class Pool:
             def __init__(inner, *_args, **_kwargs):
