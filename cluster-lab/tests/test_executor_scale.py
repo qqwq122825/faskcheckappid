@@ -695,7 +695,10 @@ class ExecutorScaleTests(unittest.TestCase):
 
                 record = json.loads((root / 'results.jsonl').read_text())
                 self.assertEqual(checked, ['socks5h://first-exit', 'socks5h://second-exit'])
-                self.assertEqual((record['status'], record['attempts']), ('timeout', 1))
+                expected = ('wrong_password'
+                            if reason == 'Your account information was entered incorrectly.'
+                            else 'timeout')
+                self.assertEqual((record['status'], record['attempts']), (expected, 1))
                 self.assertEqual(record['reason'], reason)
                 self.assertEqual(stop.waits, [])
                 self.assertEqual(shared.discards,

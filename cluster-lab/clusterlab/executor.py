@@ -1642,6 +1642,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         )
         return any(phrase in apple_text for phrase in phrases)
 
+    def account_information_incorrect(result):
+        apple_text = ' '.join(str(result.get(key) or '').strip()
+                              for key in ('apple_message', 'reason', 'detail')).casefold()
+        return 'your account information was entered incorrectly' in apple_text
+
     def retryable_transport(result):
         try:
             http = int(result.get('http'))
@@ -1676,6 +1681,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             }
             if status in direct:
                 return direct[status]
+        # Apple asks for a retry with this wording, so retryable_transport keeps
+        # rotating exits until the configured budget is exhausted.  Only the
+        # final result reaches this classifier, where the wording is a definite
+        # credential failure rather than another timeout.
+        if account_information_incorrect(result):
+            return 'wrong_password'
         bucket = result_bucket(result)
         # 没有命中内置英文原因的结果保留为“其他错误”，
         # 不再因某个 Apple ec 错误码而猜测账号已失效。

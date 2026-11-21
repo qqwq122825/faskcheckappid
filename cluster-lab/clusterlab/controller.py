@@ -128,7 +128,7 @@ _APPLE_REASON_BUCKETS = (
     ('this apple account has been locked', 'locked'),
     ('enter the correct password for this apple account', 'wrong_password'),
     ('this apple account is not active', 'locked'),
-    ('your account information was entered incorrectly', 'timeout'),
+    ('your account information was entered incorrectly', 'wrong_password'),
     ('the account does not exist', 'not_found'),
 )
 
@@ -242,8 +242,7 @@ def result_reason_cn(value, bucket=None):
         ('this apple account has been locked', '账号已被锁定'),
         ('enter the correct password for this apple account', '密码错误'),
         ('this apple account is not active', '账号已被锁定'),
-        ('your account information was entered incorrectly',
-         'Apple 返回账号信息不正确，已按任务设置重试'),
+        ('your account information was entered incorrectly', '密码错误'),
         ('the account does not exist', '账号不存在'),
     )
     for phrase, translated in translations:
