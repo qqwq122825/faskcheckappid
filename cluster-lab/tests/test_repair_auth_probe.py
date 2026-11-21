@@ -241,6 +241,66 @@ class RepairAuthProbeTests(unittest.TestCase):
             self.assertNotIn('web_kind', record)
             self.assertNotIn('web_detail', record)
 
+    def test_web_primary_protocol_never_calls_gsa(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text(
+                'owned@example.invalid----secret\n', encoding='utf-8')
+            descriptor = {
+                'rows': 1, 'first_row': 1, 'threads': 1,
+                'device_capacity': 1, 'device_root': str(root / 'devices'),
+                'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 0,
+                '_auth_protocol': 'web',
+            }
+
+            def web_check(_email, _password, _proxy, **kwargs):
+                kwargs['trace']({'stage': 'complete', 'http': 200,
+                                 'auth_type': 'sa', 'attempt': 1})
+                return {'status': 'valid', 'stage': 'complete',
+                        'detail': 'Web password verified'}
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool,
+                    lambda *_args, **_kwargs: self.fail('GSA must not run in Web mode'),
+                    lambda result: result['status'])), \
+                 patch('fastcheck.protocols.idmsa.check', side_effect=web_check), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event())
+
+            record = json.loads((root / 'results.jsonl').read_text('utf-8'))
+            self.assertEqual(record['protocol'], 'WEB')
+            self.assertEqual(record['status'], 'valid')
+            self.assertEqual(record['http'], 200)
+            self.assertIsNone(record['device'])
+            self.assertIsNone(record['device_usage'])
+
+    def test_gsa_primary_protocol_does_not_run_web_secondary_probe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text(
+                'owned@example.invalid----secret\n', encoding='utf-8')
+            descriptor = {
+                'rows': 1, 'first_row': 1, 'threads': 1,
+                'device_capacity': 1, 'device_root': str(root / 'devices'),
+                'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 0,
+                '_auth_protocol': 'gsa', '_web_secondary_auth': True,
+            }
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool,
+                    lambda *_args, **_kwargs: {'status': 'valid', 'http': 200},
+                    lambda result: result['status'])), \
+                 patch('fastcheck.protocols.idmsa.check',
+                       side_effect=AssertionError('Web must not run in GSA mode')), \
+                 patch.dict('sys.modules', {'fastcheck.workers': SimpleNamespace(
+                     device_profile=lambda *_args, **_kwargs: {
+                         'client_info': 'test', 'user_agent': 'test'})}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event())
+
+            record = json.loads((root / 'results.jsonl').read_text('utf-8'))
+            self.assertEqual(record['protocol'], 'GSA')
+            self.assertEqual(record['status'], 'valid')
+
     def test_executor_skips_web_probe_when_setting_is_off(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -143,6 +143,29 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(self.service.configure_web_secondary_auth(
             {'web_secondary_auth': True})['web_secondary_auth'])
 
+    def test_auth_protocol_defaults_to_gsa_and_is_frozen_per_new_job(self):
+        self.assertEqual(self.service.settings()['auth_protocol'], 'gsa')
+        client = create_app('controller', self.service).test_client()
+        csrf = client.get('/api/session').json['csrf']
+        response = client.post('/api/settings/auth-protocol',
+                               json={'auth_protocol': 'web'},
+                               headers={'X-CSRF-Token': csrf})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json['auth_protocol'], 'web')
+        with self.assertRaisesRegex(ValueError, 'GSA 或 Web'):
+            self.service.configure_auth_protocol({'auth_protocol': 'both'})
+        job = self.job(50)
+        self.service.configure_auth_protocol({'auth_protocol': 'gsa'})
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual(unit['_auth_protocol'], 'web')
+        self.assertIs(unit['_web_secondary_auth'], False)
+        state = next(item for item in self.service.snapshot()['jobs'] if item['id'] == job)
+        self.assertEqual(state['auth_protocol'], 'web')
+        self.service.close()
+        self.service = Controller(self.temp.name)
+        self.assertEqual(self.service.settings()['auth_protocol'], 'gsa')
+
     def heartbeat(self, **extra):
         return self.service.heartbeat(self.node['id'], dict(session='test-session', max_processes=1,
                                       max_threads=2, active=[], **extra))
@@ -298,7 +321,8 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(unit['proxy_api'], first)
         self.assertEqual(unit['proxy_pool_size'], 10000)
         self.assertIs(unit['_proxy_debug'], False)
-        self.assertIs(unit['_web_secondary_auth'], True)
+        self.assertEqual(unit['_auth_protocol'], 'gsa')
+        self.assertIs(unit['_web_secondary_auth'], False)
         self.assertNotIn(second, unit['proxy_api'])
 
         settings = self.service.configure_proxy({'action': 'delete', 'index': 0})

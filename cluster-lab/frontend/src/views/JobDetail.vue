@@ -67,7 +67,7 @@ const runtimeFeedback = computed(() => buildRuntimeFeedback(
         <div>
           <div class="task-name"><h2>{{ job.name }}</h2><StatusBadge :status="job.status" :unit-counts="job.unit_counts" /></div>
           <p>{{ date(job.created) }} 创建 · {{ job.mode === 'auth' ? '账号校验' : '数据任务' }}
-            <template v-if="job.mode === 'auth'"> · GSA</template>
+            <template v-if="job.mode === 'auth'"> · {{ (job.auth_protocol || 'gsa').toUpperCase() }}</template>
           </p>
         </div>
         <TaskActions :job="job" />

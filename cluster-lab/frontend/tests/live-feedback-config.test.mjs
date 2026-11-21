@@ -101,13 +101,14 @@ test('Proxy debug setting is explicit, persistent, and warns about log volume', 
   assert.match(settings, /避免产生大量日志/)
 })
 
-test('Web secondary auth setting only refines repair continuations', () => {
+test('Authentication protocol setting selects one primary protocol', () => {
   const settings = source('src/views/Settings.vue')
-  assert.match(settings, /\/api\/settings\/web-secondary-auth/)
-  assert.match(settings, /web_secondary_auth: enabled/)
-  assert.match(settings, /仅对 GSA 返回 au=repair/)
-  assert.match(settings, /authType=sa\/non-sa 归入密码正确/)
-  assert.match(settings, /Web HTTP 0 或 503 按任务设置的重试次数重试/)
+  assert.match(settings, /\/api\/settings\/auth-protocol/)
+  assert.match(settings, /auth_protocol: protocol/)
+  assert.match(settings, /GSA（默认）/)
+  assert.match(settings, /Web（IDMSA）/)
+  assert.match(settings, /不会先执行 GSA/)
+  assert.match(settings, /协议在创建任务时固定/)
 })
 
 test('Executive-facing pages omit test, demo, preview, and unfinished feature copy', () => {
@@ -226,12 +227,12 @@ test('GSA result categories expose invalid and locked business states', () => {
   assert.match(feedback, /categories\.value\.unknown/)
 })
 
-test('Task creation and detail use GSA only', () => {
+test('Task creation uses the saved primary protocol without per-task overrides', () => {
   const dialog = source('src/components/CreateTaskDialog.vue')
   const detail = source('src/views/JobDetail.vue')
   assert.doesNotMatch(dialog, /dualRecheck|dual_recheck|双协议|网页复检/)
   assert.doesNotMatch(detail, /dual_recheck|双协议|网页复检|GSA \+ /)
-  assert.match(detail, /job\.mode === 'auth'"> · GSA/)
+  assert.match(detail, /job\.auth_protocol \|\| 'gsa'/)
 })
 
 test('Result list keeps one result-code column without web recheck fields', () => {

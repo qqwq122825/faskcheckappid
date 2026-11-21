@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS jobs (
  traffic_bytes INTEGER NOT NULL DEFAULT 0,
  req_timeout REAL NOT NULL DEFAULT 20, req_retries INTEGER NOT NULL DEFAULT 0,
  device_capacity INTEGER NOT NULL DEFAULT 30,
- dual_recheck INTEGER NOT NULL DEFAULT 0
+ dual_recheck INTEGER NOT NULL DEFAULT 0,
+ auth_protocol TEXT NOT NULL DEFAULT 'gsa'
 );
 CREATE TABLE IF NOT EXISTS nodes (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
@@ -86,6 +87,7 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_pool_size','1000');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('web_secondary_auth','1');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('auth_protocol','gsa');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('update_parallel','2');
 '''
 
@@ -309,6 +311,8 @@ class Controller:
                     default = '20' if name == 'req_timeout' else ('30' if name == 'device_capacity' else '0')
                     column_type = 'REAL' if name == 'req_timeout' else 'INTEGER'
                     db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {column_type} NOT NULL DEFAULT {default}')
+            if 'auth_protocol' not in job_columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN auth_protocol TEXT NOT NULL DEFAULT 'gsa'")
             for name, definition in {'telemetry_json': "TEXT NOT NULL DEFAULT '{}'",
                                      'device_request': 'INTEGER NOT NULL DEFAULT 0',
                                      'stop_version': 'INTEGER NOT NULL DEFAULT 0',
@@ -598,8 +602,10 @@ class Controller:
         # 兼容旧调用参数，但任务不再决定节点设备数量。
         _ = device_capacity
         device_capacity = 0
-        # 兼容旧调用签名；双协议复检已撤回，所有新任务固定使用 GSA。
+        # 兼容旧调用签名；主协议由系统设置在任务创建时固化。
         _ = dual_recheck
+        auth_protocol = ((self.settings().get('auth_protocol') or 'gsa')
+                         if mode == 'auth' else 'gsa')
         job_id = uuid.uuid4().hex
         target = self._source_path(name).resolve()
         with target.open('xb') as output:
@@ -610,10 +616,10 @@ class Controller:
             raise ValueError('文件为空')
         now = time.time()
         with self.db.transaction() as db:
-            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,device_capacity,dual_recheck) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,device_capacity,dual_recheck,auth_protocol) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                        (job_id, str(name).strip()[:120] or '未命名任务', 'preparing', now, now,
                         str(target), target.stat().st_size, unit_rows, mode, now if enqueue else None,
-                        timeout, retries, device_capacity, 0))
+                        timeout, retries, device_capacity, 0, auth_protocol))
             event(db, 'job_uploaded', '输入文件已保存，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
@@ -637,7 +643,10 @@ class Controller:
                 'proxy_pool_size': int(values.get('proxy_pool_size', 1000) or 1000),
                 'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true'),
                 'web_secondary_auth': str(values.get('web_secondary_auth', '1')) in
-                                      ('1', 'True', 'true')}
+                                      ('1', 'True', 'true'),
+                'auth_protocol': (str(values.get('auth_protocol', 'gsa')).lower()
+                                  if str(values.get('auth_protocol', 'gsa')).lower()
+                                  in ('gsa', 'web') else 'gsa')}
 
     def proxy_for_node(self, node):
         """节点专属出口：按创建顺序把链接分给各节点，避免所有节点抢同一条配额。"""
@@ -692,6 +701,18 @@ class Controller:
                   'Web 二次验证已开启；仅对 GSA au=repair 的新工作包执行 Web 校验'
                   if enabled else
                   'Web 二次验证已关闭；新工作包只使用 GSA 结果')
+        return self.settings()
+
+    def configure_auth_protocol(self, data):
+        protocol = str(data.get('auth_protocol') or '').strip().lower()
+        if protocol not in ('gsa', 'web'):
+            raise ValueError('认证协议应为 GSA 或 Web')
+        with self.db.transaction() as db:
+            db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       ('auth_protocol', protocol))
+            event(db, 'controller_config',
+                  f'账号校验协议已切换为 {protocol.upper()}；仅对新建任务生效')
         return self.settings()
 
     def configure_rotation(self, data):
@@ -1055,8 +1076,10 @@ class Controller:
         # 兼容旧调用参数，但任务不再决定节点设备数量。
         _ = device_capacity
         device_capacity = 0
-        # 兼容旧调用签名；双协议复检已撤回，所有新任务固定使用 GSA。
+        # 兼容旧调用签名；主协议由系统设置在任务创建时固化。
         _ = dual_recheck
+        auth_protocol = ((self.settings().get('auth_protocol') or 'gsa')
+                         if mode == 'auth' else 'gsa')
         path = Path(str(source))
         if not path.exists():
             raise ValueError('源文件不存在或不可复用')
@@ -1066,11 +1089,11 @@ class Controller:
         job_id = uuid.uuid4().hex
         now = time.time()
         with self.db.transaction() as db:
-            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,device_capacity,dual_recheck) '
-                       'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,device_capacity,dual_recheck,auth_protocol) '
+                       'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                        (job_id, str(name).strip()[:120] or path.name, 'preparing', now, now,
                         str(path), path.stat().st_size, unit_rows, mode, now if enqueue else None,
-                        timeout, retries, device_capacity, 0))
+                        timeout, retries, device_capacity, 0, auth_protocol))
             event(db, 'job_uploaded', '复用已有输入文件，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
@@ -1471,7 +1494,7 @@ class Controller:
             # process/thread ceiling and recreate the old overload bug.
             if not node['enabled'] or active >= 1:
                 return None
-            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
+            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries,j.auth_protocol FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
             if not unit:
                 return None
             # A manually retried package must not inherit rows accepted under
@@ -1502,7 +1525,8 @@ class Controller:
                                proxy_pool_size=int(settings.get('proxy_pool_size') or 1000),
                                origin=settings.get('origin', 'https://new.ani.sidestore.io'),
                                _proxy_debug=bool(settings.get('proxy_debug')),
-                               _web_secondary_auth=bool(settings.get('web_secondary_auth')))
+                               _auth_protocol=(unit['auth_protocol'] or 'gsa').lower(),
+                               _web_secondary_auth=False)
             return payload
 
     def unit_for_node(self, node_id, unit_id, token):
@@ -1657,7 +1681,7 @@ class Controller:
                 "SELECT id FROM jobs WHERE status IN ('running','paused') "
                 "ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END, queued_at, created, id LIMIT 1").fetchone()
             for row in db.execute("SELECT * FROM jobs ORDER BY CASE WHEN status IN ('running','paused') THEN 0 WHEN status='queued' OR (status='preparing' AND queued_at IS NOT NULL) THEN 1 ELSE 2 END,CASE WHEN status IN ('queued','running','paused') OR (status='preparing' AND queued_at IS NOT NULL) THEN queued_at END,created DESC,id LIMIT 50"):
-                value = {k: row[k] for k in ('id', 'name', 'status', 'created', 'updated', 'bytes', 'rows', 'unit_rows', 'mode', 'error', 'queued_at', 'traffic_bytes')}
+                value = {k: row[k] for k in ('id', 'name', 'status', 'created', 'updated', 'bytes', 'rows', 'unit_rows', 'mode', 'error', 'queued_at', 'traffic_bytes', 'auth_protocol')}
                 value['queue_position'] = (db.execute(f'SELECT COUNT(*) FROM jobs WHERE {queue_filter} AND (queued_at<? OR (queued_at=? AND id<=?))', (row['queued_at'], row['queued_at'], row['id'])).fetchone()[0]
                                            if row['status'] in ('queued', 'preparing') and row['queued_at'] is not None else None)
                 groups = db.execute('SELECT status,COUNT(*) AS n,SUM(rows) AS rows FROM units WHERE job_id=? GROUP BY status', (row['id'],)).fetchall()
