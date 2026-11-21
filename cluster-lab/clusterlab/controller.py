@@ -1565,7 +1565,7 @@ class Controller:
                 settings = self.settings()
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
                                proxy_pool_size=int(settings.get('proxy_pool_size') or 1000),
-                               device_registration_workers=4,
+                               device_registration_workers=32,
                                device_usage_limit=max(1, int(
                                    settings.get('device_rotate_after') or 100)),
                                origin=settings.get('origin', 'https://new.ani.sidestore.io'),
