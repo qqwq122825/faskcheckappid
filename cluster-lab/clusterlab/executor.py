@@ -1215,6 +1215,24 @@ def _split_account(line):
     return line.strip(), ''
 
 
+def _input_problem(account, password):
+    """返回输入行的格式问题；None 表示可以提交认证。
+
+    三横线的 `邮箱---密码` 会被 _split_account 读成"整行账号 + 空密码"，
+    提交后 Apple 在 init 阶段回 -20970（Your account information was
+    entered incorrectly），面板显示"已失效"，看起来像账号失效，实际一行
+    请求都没到 SRP 阶段。这里提前拦下，不消耗设备与出口。
+    只拦"整行账号里还留着分隔符"这一种特征，其它输入照原样提交。
+    """
+    if '---' in account and not password:
+        return 'three dashes instead of four: the whole line was read as account'
+    if any(ord(character) < 32 for character in account + password):
+        return 'control character in account line'
+    if len(account) > 4096 or len(password) > 4096:
+        return 'field too long'
+    return None
+
+
 def _bump_usage(device_root, counts):
     """每个工作包合并写一次设备计数，并用进程锁防止覆盖。"""
     if not device_root or not counts:
@@ -1490,6 +1508,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         if not line.strip():
             return row, line, {'status': 'undetermined', 'kind': 'blank_record',
                                'slot': slot_id, 'device_key': account_prefix, 'elapsed': 0}
+        problem = _input_problem(account, password)
+        if problem:
+            # 输入格式问题不是 Apple 的答复，不能落成 -20970 那种"已失效"。
+            return row, line, {'status': 'undetermined', 'kind': 'format_error',
+                               'stage': 'input', 'http': None, 'detail': problem,
+                               'slot': slot_id, 'device_key': account_prefix, 'elapsed': 0}
         identity = (identities.get(slot_id) if identity_override is identity_default
                     else identity_override)
         result = None
@@ -1752,6 +1776,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 account, password = _split_account(line)
                 device = result.get('slot') or slot_ids[(row - first_row) % len(slot_ids)]
                 business_code = result.get('apple_ec')
+                if business_code is None and result.get('kind') == 'format_error':
+                    # 面板"结果码"直接显示 format_error，避免和 Apple 的 -20970 混淆。
+                    business_code = 'format_error'
                 if business_code is None:
                     business_code = (result.get('detail') or result.get('kind') or '')[:180]
                 reason = _apple_reason_for_record(result, status, debug_enabled)
