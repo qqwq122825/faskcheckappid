@@ -80,6 +80,17 @@ function previous() { offset.value = Math.max(0, offset.value - pageSize); load(
 function next() { offset.value += pageSize; load() }
 const elapsed = (value: any) => value == null ? '—' : `${Number(value).toFixed(2)}s`
 const statusLabel = (row: any) => labels[row.status] || labels[category.value] || '其他错误'
+const mainProtocol = (row: any) => String(row.protocol || props.job?.auth_protocol || 'gsa').toUpperCase()
+const verificationPath = (row: any) =>
+  mainProtocol(row) === 'GSA' && (row.web_status || row.web_stage || row.web_http != null)
+    ? 'GSA → Web（二次）'
+    : mainProtocol(row) === 'WEB' ? 'Web' : 'GSA'
+const stagePath = (row: any) => row.web_stage
+  ? `${row.stage || '—'} → ${row.web_stage}` : (row.stage || '—')
+const httpPath = (row: any) => row.web_http != null
+  ? `${row.http ?? '—'} → ${row.web_http}` : (row.http ?? '—')
+const protocolResult = (row: any) => row.web_auth_type
+  ? `${row.code || '—'} → ${row.web_auth_type}` : (row.code || '—')
 
 watch(accountSearch, () => {
   clearTimeout(searchTimer)
@@ -118,10 +129,18 @@ watch(
       <el-table-column prop="row" label="#" width="90" />
       <el-table-column prop="account" label="账号" min-width="260" show-overflow-tooltip />
       <el-table-column label="状态" width="120"><template #default="scope">{{ statusLabel(scope.row) }}</template></el-table-column>
-      <el-table-column prop="protocol" label="协议" min-width="150" show-overflow-tooltip />
-      <el-table-column prop="stage" label="阶段" min-width="130" show-overflow-tooltip />
-      <el-table-column prop="http" label="HTTP" width="90" />
-      <el-table-column prop="code" label="结果码" min-width="140" show-overflow-tooltip />
+      <el-table-column label="验证路径" min-width="180" show-overflow-tooltip>
+        <template #default="scope">{{ verificationPath(scope.row) }}</template>
+      </el-table-column>
+      <el-table-column label="结果阶段" min-width="150" show-overflow-tooltip>
+        <template #default="scope">{{ stagePath(scope.row) }}</template>
+      </el-table-column>
+      <el-table-column label="HTTP 链路" min-width="120" show-overflow-tooltip>
+        <template #default="scope">{{ httpPath(scope.row) }}</template>
+      </el-table-column>
+      <el-table-column label="协议结果" min-width="180" show-overflow-tooltip>
+        <template #default="scope">{{ protocolResult(scope.row) }}</template>
+      </el-table-column>
       <el-table-column prop="reason_cn" label="原因" min-width="320" show-overflow-tooltip />
       <el-table-column prop="device_display" label="设备" min-width="210" show-overflow-tooltip />
       <el-table-column label="耗时" width="100"><template #default="scope">{{ elapsed(scope.row.elapsed) }}</template></el-table-column>
@@ -136,7 +155,8 @@ watch(
         <el-button :disabled="offset + pageSize >= total || loading" @click="next">下一页</el-button>
       </div>
     </div>
-    <p class="result-list-note">列表只显示已回传并由总控确认的结果；正在处理的工作包完成后会自动出现。
+    <p class="result-list-note">通用表头兼容历史 GSA、GSA → Web 二次验证和纯 Web 结果；链路值按实际执行顺序显示。
+      列表只显示已回传并由总控确认的结果；正在处理的工作包完成后会自动出现。
     </p>
   </el-card>
 </template>

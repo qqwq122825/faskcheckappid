@@ -1640,10 +1640,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     result = gsa_check(account, password, account_proxy, timeout=timeout,
                                        retries=0 if proxy_pool is not None else retries,
                                        cancel=stop.is_set, identity=identity)
-                # 仅兼容旧总控下发的历史描述；带 _auth_protocol 的新任务
-                # 始终只运行所选主协议。
-                if (auth_protocol == 'gsa' and '_auth_protocol' not in descriptor
-                        and descriptor.get('_web_secondary_auth')):
+                # GSA 主协议可对 au=repair 结果追加 Web 二次验证；
+                # Web 主协议仍全程只运行 Web。
+                if auth_protocol == 'gsa' and descriptor.get('_web_secondary_auth'):
                     def rotate_web(web_attempt):
                         nonlocal account_proxy, lease, current_proxy
                         if proxy_pool is not None:

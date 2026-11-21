@@ -8,6 +8,7 @@ const proxyPoolSize = ref(1000), proxyPoolBusy = ref(false)
 const rotateAfter = ref(0), rotateBusy = ref(false)
 const proxyDebug = ref(false), proxyDebugBusy = ref(false)
 const authProtocol = ref('gsa'), authProtocolBusy = ref(false)
+const webSecondaryAuth = ref(true), webSecondaryBusy = ref(false)
 watch(() => state.value?.settings?.device_rotate_after, value => {
   if (value != null) rotateAfter.value = value
 }, { immediate: true })
@@ -22,6 +23,9 @@ watch(() => state.value?.settings?.proxy_debug, value => {
 }, { immediate: true })
 watch(() => state.value?.settings?.auth_protocol, value => {
   if (value === 'gsa' || value === 'web') authProtocol.value = value
+}, { immediate: true })
+watch(() => state.value?.settings?.web_secondary_auth, value => {
+  if (value != null) webSecondaryAuth.value = Boolean(value)
 }, { immediate: true })
 watch(() => state.value?.settings?.proxy_pool_size, value => {
   if (value != null) proxyPoolSize.value = Number(value)
@@ -94,6 +98,17 @@ async function saveAuthProtocol(value: string | number | boolean) {
     ElMessage.error((e as Error).message)
   } finally { authProtocolBusy.value = false }
 }
+async function saveWebSecondaryAuth(value: string | number | boolean) {
+  const enabled = Boolean(value)
+  webSecondaryBusy.value = true
+  try {
+    await mutate('/api/settings/web-secondary-auth', { web_secondary_auth: enabled },
+                 enabled ? 'GSA 的 Web 二次验证已开启' : 'GSA 将只使用主协议结果')
+  } catch (e) {
+    webSecondaryAuth.value = !enabled
+    ElMessage.error((e as Error).message)
+  } finally { webSecondaryBusy.value = false }
+}
 </script>
 <template>
   <el-card v-if="!isNode" shadow="never" class="section-card">
@@ -115,12 +130,24 @@ async function saveAuthProtocol(value: string | number | boolean) {
           <el-radio-button value="web">Web</el-radio-button>
         </el-radio-group>
         <span class="field-note">
-          选择 GSA 时整个验证过程使用 GSA；选择 Web 时整个验证过程只使用 Web（IDMSA），不会先执行 GSA。
+          选择 GSA 时以 GSA 为主协议，可对 au=repair 结果追加 Web 二次验证；
+          选择 Web 时整个验证过程只使用 Web（IDMSA），不会先执行 GSA。
           协议在创建任务时固定，已有任务和在途工作包不会中途切换。
+        </span>
+      </el-form-item>
+      <el-form-item v-if="authProtocol === 'gsa'" label="GSA 二次验证">
+        <el-switch v-model="webSecondaryAuth" :loading="webSecondaryBusy" :disabled="webSecondaryBusy"
+                   active-text="开启 Web 二次验证" inactive-text="关闭 Web 二次验证"
+                   @change="saveWebSecondaryAuth" />
+        <span class="field-note">
+          开启后仅对 GSA 返回 au=repair 的账号追加一次 Web 校验；其他 GSA 结果不会运行 Web。
         </span>
       </el-form-item>
       <el-descriptions :column="1" border>
         <el-descriptions-item label="当前主协议">{{ authProtocol.toUpperCase() }}</el-descriptions-item>
+        <el-descriptions-item v-if="authProtocol === 'gsa'" label="Web 二次验证">
+          {{ webSecondaryAuth ? '已开启' : '已关闭' }}
+        </el-descriptions-item>
         <el-descriptions-item label="生效范围">新建账号校验任务</el-descriptions-item>
       </el-descriptions>
     </el-form>

@@ -108,7 +108,20 @@ test('Authentication protocol setting selects one primary protocol', () => {
   assert.match(settings, /GSA（默认）/)
   assert.match(settings, /Web（IDMSA）/)
   assert.match(settings, /不会先执行 GSA/)
+  assert.match(settings, /GSA 二次验证/)
+  assert.match(settings, /web_secondary_auth: enabled/)
+  assert.match(settings, /仅对 GSA 返回 au=repair/)
   assert.match(settings, /协议在创建任务时固定/)
+})
+
+test('Result table uses one protocol-neutral header set for all auth paths', () => {
+  const results = source('src/components/ResultList.vue')
+  assert.match(results, /验证路径/)
+  assert.match(results, /结果阶段/)
+  assert.match(results, /HTTP 链路/)
+  assert.match(results, /协议结果/)
+  assert.match(results, /GSA → Web（二次）/)
+  assert.match(results, /row\.protocol \|\| props\.job\?\.auth_protocol \|\| 'gsa'/)
 })
 
 test('Executive-facing pages omit test, demo, preview, and unfinished feature copy', () => {
@@ -235,13 +248,14 @@ test('Task creation uses the saved primary protocol without per-task overrides',
   assert.match(detail, /job\.auth_protocol \|\| 'gsa'/)
 })
 
-test('Result list keeps one result-code column without web recheck fields', () => {
+test('Result list keeps one neutral result column without protocol-specific columns', () => {
   const results = source('src/components/ResultList.vue')
   assert.match(results, /label: '全部结果', value: 'all'/)
   assert.match(results, /const category = ref\('all'\)/)
-  assert.match(results, /prop="code" label="结果码"/)
+  assert.match(results, /label="协议结果"/)
+  assert.match(results, /protocolResult\(scope\.row\)/)
   assert.match(results, /prop="reason_cn" label="原因"/)
-  assert.doesNotMatch(results, /GSA 码|网页码|gsa_code|web_code|网页复检/)
+  assert.doesNotMatch(results, /GSA 码|Web 码|网页码|gsa_code|web_code|网页复检/)
   assert.match(results, /labels\[row\.status\]/)
 })
 

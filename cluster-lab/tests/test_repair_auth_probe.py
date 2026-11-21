@@ -274,7 +274,7 @@ class RepairAuthProbeTests(unittest.TestCase):
             self.assertIsNone(record['device'])
             self.assertIsNone(record['device_usage'])
 
-    def test_gsa_primary_protocol_does_not_run_web_secondary_probe(self):
+    def test_gsa_primary_protocol_runs_enabled_web_secondary_probe_for_repair(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'input.part').write_text(
@@ -285,12 +285,19 @@ class RepairAuthProbeTests(unittest.TestCase):
                 'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 0,
                 '_auth_protocol': 'gsa', '_web_secondary_auth': True,
             }
+            web_calls = []
+            def web_check(*_args, **kwargs):
+                web_calls.append(True)
+                kwargs['trace']({'stage': 'complete', 'http': 200,
+                                 'auth_type': 'sa', 'attempt': 1})
+                return {'status': 'valid', 'stage': 'complete'}
             with patch('clusterlab.executor._load_fastcheck', return_value=(
                     FakePool,
-                    lambda *_args, **_kwargs: {'status': 'valid', 'http': 200},
+                    lambda *_args, **_kwargs: {
+                        'status': 'need_2fa', 'auth_type': 'repair',
+                        'detail': 'au=repair', 'http': 200},
                     lambda result: result['status'])), \
-                 patch('fastcheck.protocols.idmsa.check',
-                       side_effect=AssertionError('Web must not run in GSA mode')), \
+                 patch('fastcheck.protocols.idmsa.check', side_effect=web_check), \
                  patch.dict('sys.modules', {'fastcheck.workers': SimpleNamespace(
                      device_profile=lambda *_args, **_kwargs: {
                          'client_info': 'test', 'user_agent': 'test'})}), \
@@ -300,6 +307,7 @@ class RepairAuthProbeTests(unittest.TestCase):
             record = json.loads((root / 'results.jsonl').read_text('utf-8'))
             self.assertEqual(record['protocol'], 'GSA')
             self.assertEqual(record['status'], 'valid')
+            self.assertEqual(web_calls, [True])
 
     def test_executor_skips_web_probe_when_setting_is_off(self):
         with tempfile.TemporaryDirectory() as temporary:

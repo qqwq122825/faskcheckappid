@@ -1526,7 +1526,9 @@ class Controller:
                                origin=settings.get('origin', 'https://new.ani.sidestore.io'),
                                _proxy_debug=bool(settings.get('proxy_debug')),
                                _auth_protocol=(unit['auth_protocol'] or 'gsa').lower(),
-                               _web_secondary_auth=False)
+                               _web_secondary_auth=(
+                                   (unit['auth_protocol'] or 'gsa').lower() == 'gsa'
+                                   and bool(settings.get('web_secondary_auth'))))
             return payload
 
     def unit_for_node(self, node_id, unit_id, token):

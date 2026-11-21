@@ -322,7 +322,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(unit['proxy_pool_size'], 10000)
         self.assertIs(unit['_proxy_debug'], False)
         self.assertEqual(unit['_auth_protocol'], 'gsa')
-        self.assertIs(unit['_web_secondary_auth'], False)
+        self.assertIs(unit['_web_secondary_auth'], True)
         self.assertNotIn(second, unit['proxy_api'])
 
         settings = self.service.configure_proxy({'action': 'delete', 'index': 0})
