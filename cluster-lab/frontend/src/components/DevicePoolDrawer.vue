@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, fmt, state } from '../composables/useCluster'
 
@@ -28,6 +28,7 @@ const proxyTitle = computed(() => {
   if (proxyState.value === 'checking') return '正在检测代理是否可用'
   return '等待初始化后检测代理'
 })
+const page = ref(1), pageSize = ref(50)
 const rows = computed(() => {
   const reported = pool.value.slots
   if (Array.isArray(reported) && reported.length) {
@@ -55,6 +56,13 @@ const rows = computed(() => {
     proxy: '—', model: '—', at: '—', result: '—', used: 0, recorded: false,
   }))
 })
+const pageRows = computed(() => {
+  const start = (page.value - 1) * pageSize.value
+  return rows.value.slice(start, start + pageSize.value)
+})
+watch([() => rows.value.length, pageSize], () => {
+  page.value = Math.min(page.value, Math.max(1, Math.ceil(rows.value.length / pageSize.value)))
+})
 
 function show(value: any) {
   nodeId.value = value?.id || ''
@@ -63,6 +71,7 @@ function show(value: any) {
   rotateAfter.value = Number(settings.device_rotate_after ?? 20) || 20
   capacity.value = Math.max(1, Number(value?.telemetry?.device_pool?.capacity) || 2)
   error.value = ''
+  page.value = 1
   visible.value = true
 }
 defineExpose({ show })
@@ -159,7 +168,7 @@ async function clearPool() {
       <div class="section-heading device-list-heading"><h2>设备列表</h2>
         <span class="muted">{{ building && pool.current_slots?.length ? `正在并行注册：${pool.current_slots.join('、')}` : '等待中' }}</span>
       </div>
-      <el-table :data="rows" empty-text="尚未初始化设备" stripe max-height="360">
+      <el-table :data="pageRows" empty-text="尚未初始化设备" stripe max-height="360">
         <el-table-column prop="label" label="设备标识" width="145" />
         <el-table-column prop="state" label="状态" width="100" />
         <el-table-column prop="model" label="设备型号" min-width="150" show-overflow-tooltip />
@@ -170,6 +179,22 @@ async function clearPool() {
         </el-table-column>
         <el-table-column prop="at" label="注册时间" width="172" />
       </el-table>
+      <el-pagination
+        v-if="rows.length > pageSize"
+        v-model:current-page="page"
+        v-model:page-size="pageSize"
+        class="device-list-pagination"
+        :page-sizes="[50, 100, 200]"
+        :total="rows.length"
+        layout="total, sizes, prev, pager, next"
+      />
     </section>
   </el-drawer>
 </template>
+
+<style scoped>
+.device-list-pagination {
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+</style>
