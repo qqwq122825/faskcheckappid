@@ -114,12 +114,15 @@ test('Authentication protocol setting selects one primary protocol', () => {
   assert.match(settings, /协议在创建任务时固定/)
 })
 
-test('One-time device mode registers in the worker and retains devices', () => {
+test('Thread mode reuses one expandable shared pool and retires at limit', () => {
   const settings = source('src/views/Settings.vue')
   assert.match(settings, /\/api\/settings\/device-mode/)
-  assert.match(settings, /一次性设备（当前默认）/)
-  assert.match(settings, /每个账号由执行它的线程自行注册独立设备/)
-  assert.match(settings, /设备文件保留在节点，不自动删除/)
+  assert.match(settings, /线程共用设备（当前默认）/)
+  assert.match(settings, /每个节点只有一个共享设备池/)
+  assert.match(settings, /预注册容量可按需设为 1000 或 2000，但不是上限/)
+  assert.match(settings, /没有空闲设备时不等待/)
+  assert.match(settings, /验证完成后放回同一个共享池供其他线程复用/)
+  assert.match(settings, /本次验证结束后删除该设备/)
   assert.match(settings, /等待 10 秒后丢弃旧出口并换 IP/)
 })
 

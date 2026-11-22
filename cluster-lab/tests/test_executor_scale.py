@@ -134,6 +134,29 @@ class ExecutorScaleTests(unittest.TestCase):
             marker = json.loads((pool.slot_directory(1) / '.auth-cooldown.json').read_text())
             self.assertEqual(marker['state'], 'cooldown')
 
+    def test_thread_mode_registers_new_slot_instead_of_waiting_for_busy_device(self):
+        class Pool:
+            def __init__(inner, root):
+                inner.root = Path(root)
+
+            def slot_directory(inner, slot):
+                return inner.root / f'{int(slot):02d}'
+
+            def inspect(inner, slot):
+                return {'state': 'ready' if int(slot) == 1 else 'missing'}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pool = Pool(temporary)
+            stop = threading.Event()
+            busy = DeviceAuthLease.acquire(pool, 1, stop, cooldown=0)
+            started = time.monotonic()
+            extension = DeviceAuthLease.acquire_any(pool, [1, 2], stop, cooldown=0)
+            elapsed = time.monotonic() - started
+            self.assertEqual(extension.slot, 2)
+            self.assertLess(elapsed, .1)
+            extension.release()
+            busy.release()
+
     def test_raw_apple_reason_is_packaged_only_when_debug_is_enabled(self):
         result = {'apple_message': 'Your account information was entered incorrectly.'}
         self.assertEqual(_apple_reason_for_record(result, 'wrong_password'), '')
@@ -484,13 +507,13 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(by_account['second']['attempts'], 0)
             self.assertEqual(shared.discards, ['socks5h://bad-first'])
 
-    def test_one_time_mode_registers_in_worker_keeps_device_and_rotates_once(self):
+    def test_one_time_mode_reuses_thread_pool_then_retires_at_limit(self):
         class OneTimePool(FakePool):
-            roots = []
+            registered_flags = []
 
-            def __init__(self, root, *_args, **_kwargs):
-                super().__init__(root)
-                type(self).roots.append(self.root)
+            @property
+            def base(self):
+                return self.root
 
             def inspect(self, slot):
                 marker = self.slot_directory(slot) / 'registered'
@@ -498,48 +521,56 @@ class ExecutorScaleTests(unittest.TestCase):
                          '00000000-0000-0000-0000-000000000001'}
                         if marker.exists() else {'state': 'missing'})
 
-            def fetch_headers(self, slot, *_args, **_kwargs):
+            def fetch_headers(self, slot, *_args, **kwargs):
+                type(self).registered_flags.append(bool(kwargs.get('registered')))
                 directory = self.slot_directory(slot)
                 directory.mkdir(parents=True, exist_ok=True)
                 (directory / 'registered').write_text('kept', 'utf-8')
-                return {'identity': 'one-time'}
+                return {'identity': 'thread-pool'}
 
         with tempfile.TemporaryDirectory() as temporary:
-            OneTimePool.roots = []
             root = Path(temporary)
-            (root / 'input.part').write_text('account----password\n', encoding='utf-8')
-            descriptor = {'id': 'unit-1', 'job_id': 'job-1', 'rows': 1,
-                          'first_row': 1, 'threads': 1, 'device_pool_capacity': 1,
-                          'device_slots': [1], 'device_root': str(root / 'devices'),
-                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 0,
-                          '_device_mode': 'one_time', '_retry_delay': 0,
-                          '_one_time_min_retries': 1}
-            shared = ScriptedProxyPool(['socks5h://first-exit', 'socks5h://second-exit'])
-            checked = []
+            device_root = root / 'devices'
+            OneTimePool.registered_flags = []
+            records = []
+            releases = []
 
-            def check(_account, _password, proxy, **_kwargs):
-                checked.append(proxy)
-                if len(checked) == 1:
-                    return {'status': 'error', 'kind': 'network', 'http': 0}
+            def check(_account, _password, _proxy, **_kwargs):
                 return {'status': 'valid', 'kind': 'valid', 'http': 200}
 
-            with patch('clusterlab.executor._load_fastcheck', return_value=(
-                    OneTimePool, check, lambda result: result['status'])), \
-                 patch('fastcheck.workers.device_profile',
-                       return_value={'client_info': 'test', 'user_agent': 'test',
-                                     'model': 'OneTime'}), \
-                 patch('clusterlab.executor._bump_usage'):
-                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+            for number in (1, 2):
+                unit = root / f'unit-{number}'
+                unit.mkdir()
+                (unit / 'input.part').write_text(
+                    f'account-{number}----password\n', encoding='utf-8')
+                descriptor = {
+                    'id': f'unit-{number}', 'rows': 1, 'first_row': number,
+                    'threads': 1, 'device_pool_capacity': 1, 'device_slots': [1],
+                    'device_root': str(device_root), 'origin': 'http://127.0.0.1:1',
+                    'timeout': 5, 'retries': 0, '_device_mode': 'one_time',
+                    '_retry_delay': 0, '_one_time_min_retries': 0,
+                    'device_usage_limit': 2,
+                }
+                shared = ScriptedProxyPool([f'socks5h://exit-{number}'])
+                with patch('clusterlab.executor._load_fastcheck', return_value=(
+                        OneTimePool, check, lambda result: result['status'])), \
+                     patch('fastcheck.workers.device_profile',
+                           return_value={'client_info': 'test', 'user_agent': 'test',
+                                         'model': 'ThreadPool'}):
+                    _execute_auth_unit(unit, descriptor, threading.Event(),
+                                       proxy_pool=shared)
+                records.append(json.loads((unit / 'results.jsonl').read_text()))
+                releases.extend(shared.releases)
 
-            record = json.loads((root / 'results.jsonl').read_text())
-            kept = root / 'devices' / 'one-time' / 'job-1' / 'unit-1' / '000000000001'
-            self.assertEqual(checked, ['socks5h://first-exit', 'socks5h://second-exit'])
-            self.assertEqual(record['attempts'], 1)
-            self.assertEqual(record['device_usage'], 1)
-            self.assertTrue((kept / '01' / 'registered').exists())
-            self.assertTrue((kept / 'registrations' / '001.json').exists())
-            self.assertEqual(shared.discards, ['socks5h://first-exit'])
-            self.assertEqual(shared.releases, [('socks5h://second-exit', True)])
+            pooled = device_root
+            self.assertEqual(OneTimePool.registered_flags, [False, True])
+            self.assertEqual([record['device_usage'] for record in records], [1, 2])
+            self.assertEqual([record['device_retired'] for record in records],
+                             [False, True])
+            self.assertFalse((pooled / '01' / 'registered').exists())
+            self.assertFalse((pooled / 'registrations' / '001.json').exists())
+            self.assertEqual(releases, [
+                ('socks5h://exit-1', True), ('socks5h://exit-2', True)])
 
     def test_auth_unit_rotates_proxy_after_http_zero_and_reuses_http_200(self):
         with tempfile.TemporaryDirectory() as temporary:

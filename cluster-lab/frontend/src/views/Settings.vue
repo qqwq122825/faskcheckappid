@@ -119,7 +119,7 @@ async function saveDeviceMode(value: string | number | boolean) {
   deviceModeBusy.value = true
   try {
     await mutate('/api/settings/device-mode', { device_mode: mode },
-                 mode === 'one_time' ? '已启用一次性设备模式' : '已切换为共享设备池')
+                 mode === 'one_time' ? '已启用线程共用设备模式' : '已切换为预注册分配模式')
   } catch (e) {
     deviceMode.value = previous
     ElMessage.error((e as Error).message)
@@ -173,17 +173,18 @@ async function saveDeviceMode(value: string | number | boolean) {
     <el-form label-position="top">
       <el-form-item label="GSA 设备模式">
         <el-radio-group v-model="deviceMode" :disabled="deviceModeBusy" @change="saveDeviceMode">
-          <el-radio-button value="one_time">一次性设备（当前默认）</el-radio-button>
-          <el-radio-button value="pool">共享设备池</el-radio-button>
+          <el-radio-button value="one_time">线程共用设备（当前默认）</el-radio-button>
+          <el-radio-button value="pool">预注册分配</el-radio-button>
         </el-radio-group>
         <span class="field-note">
-          一次性模式下，每个账号由执行它的线程自行注册独立设备后验证；
-          设备文件保留在节点，不自动删除。可重试错误至少重试 1 次，等待 10 秒后丢弃旧出口并换 IP。
-          模式在创建任务时固定。
+          每个节点只有一个共享设备池：预注册容量可按需设为 1000 或 2000，但不是上限。
+          线程先取池中的空闲设备；没有空闲设备时不等待，立即在当前预注册容量之后自行注册，验证完成后放回同一个共享池供其他线程复用。
+          达到下方使用次数阈值后，由当前线程在本次验证结束后删除该设备。
+          可重试错误至少重试 1 次，等待 10 秒后丢弃旧出口并换 IP；模式在创建任务时固定。
         </span>
       </el-form-item>
       <el-descriptions :column="1" border>
-        <el-descriptions-item label="当前模式">{{ deviceMode === 'one_time' ? '一次性设备' : '共享设备池' }}</el-descriptions-item>
+        <el-descriptions-item label="当前模式">{{ deviceMode === 'one_time' ? '线程共用设备' : '预注册分配' }}</el-descriptions-item>
         <el-descriptions-item label="生效范围">新建 GSA 账号校验任务</el-descriptions-item>
       </el-descriptions>
     </el-form>
@@ -193,7 +194,7 @@ async function saveDeviceMode(value: string | number | boolean) {
     <el-form label-position="top" @submit.prevent="saveRotation">
       <el-form-item label="每台设备用满多少条后自动换新">
         <el-input-number v-model="rotateAfter" :min="0" :max="100000" :step="10" :precision="0" :disabled="rotateBusy" />
-        <span class="field-note">0 表示不轮换。此项仅影响“共享设备池”模式；共享设备在节点本地重新注册（约 6–8 秒），旧身份被删除。</span>
+        <span class="field-note">预注册分配中，0 表示不轮换；线程共用模式中，0 按默认 100 次处理。设置 20 或 100 后，设备达到该次数会在本次使用后删除，下个线程在同一池中按需补回。</span>
       </el-form-item>
       <el-descriptions :column="1" border>
         <el-descriptions-item label="当前阈值">

@@ -75,42 +75,71 @@ def _device_id_label(device_id):
 class DeviceAuthLease:
     """One process-safe exclusive device lease followed by a fixed cooldown."""
 
-    def __init__(self, handle, cooldown_path, cooldown):
+    def __init__(self, handle, cooldown_path, cooldown, slot):
         self.handle = handle
         self.cooldown_path = cooldown_path
         self.cooldown = max(0.0, float(cooldown))
+        self.slot = int(slot)
         self.released = False
 
     @classmethod
-    def acquire(cls, pool, slot, stop, cooldown=DEVICE_AUTH_COOLDOWN_SECONDS):
+    def try_acquire(cls, pool, slot, cooldown=DEVICE_AUTH_COOLDOWN_SECONDS):
+        """Try one slot without waiting so callers can scan a shared pool."""
         import portalocker
 
         directory = pool.slot_directory(int(slot))
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         lock_path = directory / '.lease.lock'
         cooldown_path = directory / '.auth-cooldown.json'
-        while not stop.is_set():
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-            handle = os.fdopen(descriptor, 'a+')
-            try:
-                portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
-            except portalocker.exceptions.LockException:
-                handle.close()
-                stop.wait(DEVICE_LEASE_POLL_SECONDS)
-                continue
-            try:
-                state = read_json(cooldown_path, {})
-                remaining = max(0.0, float(state.get('until') or 0) - time.time())
-            except (OSError, TypeError, ValueError):
-                remaining = 0.0
-            if remaining <= 0:
-                atomic_json(cooldown_path,
-                            {'state': 'in_use', 'pid': os.getpid(), 'at': time.time()})
-                return cls(handle, cooldown_path, cooldown)
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        handle = os.fdopen(descriptor, 'a+')
+        try:
+            portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
+        except portalocker.exceptions.LockException:
+            handle.close()
+            return None
+        try:
+            state = read_json(cooldown_path, {})
+            remaining = max(0.0, float(state.get('until') or 0) - time.time())
+        except (OSError, TypeError, ValueError):
+            remaining = 0.0
+        if remaining > 0:
             portalocker.unlock(handle)
             handle.close()
-            stop.wait(min(DEVICE_LEASE_POLL_SECONDS, remaining))
+            return None
+        atomic_json(cooldown_path,
+                    {'state': 'in_use', 'pid': os.getpid(), 'at': time.time()})
+        return cls(handle, cooldown_path, cooldown, slot)
+
+    @classmethod
+    def acquire(cls, pool, slot, stop, cooldown=DEVICE_AUTH_COOLDOWN_SECONDS):
+        while not stop.is_set():
+            lease = cls.try_acquire(pool, slot, cooldown)
+            if lease is not None:
+                return lease
+            stop.wait(DEVICE_LEASE_POLL_SECONDS)
         raise InterruptedError('节点关闭，停止等待设备')
+
+    @classmethod
+    def acquire_any(cls, pool, slots, stop, cooldown=0.0):
+        """Lease any idle identity, preferring registered devices over gaps."""
+        slots = [int(slot) for slot in slots]
+        while not stop.is_set():
+            ready, missing = [], []
+            for slot in slots:
+                try:
+                    state = pool.inspect(slot).get('state')
+                except Exception:                                # noqa: BLE001
+                    state = 'missing'
+                (ready if state == 'ready' else missing).append(slot)
+            # Do not queue behind busy identities: once every ready lease is
+            # occupied, claim a distinct missing slot and register immediately.
+            for slot in ready + missing:
+                lease = cls.try_acquire(pool, slot, cooldown)
+                if lease is not None:
+                    return lease
+            stop.wait(DEVICE_LEASE_POLL_SECONDS)
+        raise InterruptedError('节点关闭，停止等待线程设备')
 
     def release(self):
         if self.released:
@@ -1135,8 +1164,12 @@ def execute_unit_group(directory, descriptor, stop):
             if descriptor.get('mode') == 'auth':
                 assigned = descriptor.get('device_slots') or []
                 if str(descriptor.get('_device_mode') or 'pool').lower() == 'one_time':
-                    child['device_pool_capacity'] = 1
-                    child['device_slots'] = [1]
+                    # Every child sees the same process-safe on-demand pool.
+                    # File leases prevent two threads/processes using one slot.
+                    child['device_pool_capacity'] = int(
+                        descriptor.get('device_pool_capacity') or
+                        (max(assigned) if assigned else 1))
+                    child['device_slots'] = [int(slot) for slot in assigned] or [1]
                     child.pop('device_plan', None)
                     child.pop('device_reset_slots', None)
                 elif plan is not None:
@@ -1154,7 +1187,8 @@ def execute_unit_group(directory, descriptor, stop):
                     child['device_slots'] = _partition_device_slots(
                         assigned or range(1, process_count + 1), process_count, index)
                 child['device_pool_capacity'] = int(
-                    descriptor.get('device_pool_capacity') or max(assigned))
+                    descriptor.get('device_pool_capacity') or
+                    (max(assigned) if assigned else 1))
             atomic_json(child_dir / 'manifest.json', child)
             child_descriptors.append((child_dir, child))
             current_row += count
@@ -1417,6 +1451,60 @@ def record_device_registration(device_root, slot, proxy, model=''):
         return False
 
 
+def _consume_thread_pool_device(pool, device_root, slot, usage_limit):
+    """Count one use and retire the identity exactly at its configured limit.
+
+    The caller still owns the slot lease.  The shared usage lock only protects
+    the durable counter from other processes updating different slots.
+    """
+    import portalocker
+
+    slot = int(slot)
+    usage_limit = max(1, int(usage_limit or 1))
+    root = Path(device_root)
+    path = root / 'usage.json'
+    lock_path = root / 'usage.lock'
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with portalocker.Lock(str(lock_path), mode='a+', timeout=10):
+        try:
+            data = json.loads(path.read_text('utf-8')) if path.exists() else {}
+        except (OSError, TypeError, ValueError):
+            data = {}
+        count = max(0, int(data.get(str(slot)) or 0)) + 1
+        retired = count >= usage_limit
+        if retired:
+            data.pop(str(slot), None)
+        else:
+            data[str(slot)] = count
+        atomic_json(path, data)
+        if retired:
+            directory = pool.slot_directory(slot)
+            if directory.exists():
+                for child in directory.iterdir():
+                    # Keep the live process lock until DeviceAuthLease.release().
+                    if child.name == '.lease.lock':
+                        continue
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+            (root / 'registrations' / f'{slot:03d}.json').unlink(missing_ok=True)
+            health_path = pool.base / 'health.json'
+            health = read_json(health_path, {})
+            if isinstance(health, dict) and health_path.exists():
+                devices = health.get('devices')
+                if isinstance(devices, dict):
+                    devices.pop(str(slot), None)
+                events = health.get('events')
+                if isinstance(events, list):
+                    health['events'] = [
+                        item for item in events
+                        if not (isinstance(item, list) and len(item) > 1
+                                and item[1] == slot)]
+                atomic_json(health_path, health)
+        return count, retired
+
+
 def _replace_device_identity(pool, device_root, slot, base_info, timeout, proxy,
                              device_profile, usage_limit=100):
     """Replace one exhausted identity; restore the old one on any failure."""
@@ -1562,7 +1650,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     processed = 0
     last_progress = time.monotonic()
 
-    pool = DevicePool(device_root, origin, max_devices=capacity)
+    # Both modes use one physical pool. Its configured 1000/2000 pre-registered
+    # slots are tried first; thread mode may extend the same pool past that base.
+    shared_pool_root = Path(device_root)
+    pool = DevicePool(shared_pool_root, origin, max_devices=capacity)
     from fastcheck.workers import device_profile
     if debug_enabled:
         _write_proxy_debug(debug_path, 'worker_start',
@@ -1774,7 +1865,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         account, password = _split_account(line)
         account_started = time.time() if account_started is None else account_started
         if device_mode == 'one_time':
-            slot_id, account_prefix = 1, _slot_for_account(account, [1])[1]
+            slot_id, account_prefix = slot_ids[0], _slot_for_account(account, slot_ids)[1]
         elif device_plan is not None:
             slot_id = int(device_plan[index])
             _ignored, account_prefix = _slot_for_account(account, [slot_id])
@@ -1796,7 +1887,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                                'stage': 'device', 'http': None,
                                'detail': '设备额度已满且替换注册失败',
                                'slot': slot_id, 'device_key': account_prefix, 'elapsed': 0}
-        identity = (identities.get(slot_id) if identity_override is identity_default
+        identity = (None if device_mode == 'one_time' else
+                    identities.get(slot_id) if identity_override is identity_default
                     else identity_override)
         result = None
         previous_proxy = previous_proxy or {'endpoint': '', 'host': '', 'port': None}
@@ -1844,21 +1936,25 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             request_started = time.monotonic() if debug_enabled else None
             device_lease = None
             auth_pool = pool
+            device_usage = None
+            device_retired = False
+            device_used = False
             try:
                 if auth_protocol == 'gsa':
                     if device_mode == 'one_time':
-                        job = re.sub(r'[^A-Za-z0-9._-]', '_',
-                                     str(descriptor.get('job_id') or 'job'))[:80]
-                        unit = re.sub(r'[^A-Za-z0-9._-]', '_',
-                                      str(descriptor.get('id') or 'unit'))[:80]
-                        one_time_root = Path(device_root) / 'one-time' / job / unit / f'{row:012d}'
-                        auth_pool = DevicePool(one_time_root, origin, max_devices=1)
-                    device_lease = DeviceAuthLease.acquire(
-                        auth_pool, slot_id, stop,
-                        cooldown=0.0 if device_mode == 'one_time' else device_cooldown)
+                        # Prefer a registered idle device. If none is idle,
+                        # claim a missing slot and let this thread register it.
+                        device_lease = DeviceAuthLease.acquire_any(
+                            auth_pool, slot_ids, stop, cooldown=0.0)
+                        slot_id = device_lease.slot
+                        identity = None
+                    else:
+                        device_lease = DeviceAuthLease.acquire(
+                            auth_pool, slot_id, stop, cooldown=device_cooldown)
                 if auth_protocol == 'gsa' and identity is None:
-                    # 一次性模式在执行账号的当前线程内注册；重试时
-                    # 只刷新已保留设备的身份，不删目录也不生成替换设备。
+                    # The lease makes inspect/register atomic across all node
+                    # processes. Missing slots are registered by this thread;
+                    # ready slots are refreshed and reused directly.
                     info = auth_pool.info(timeout, proxy=account_proxy, provider_direct=True)
                     ready = auth_pool.inspect(slot_id)['state'] == 'ready'
                     profile = device_profile(auth_pool, slot_id)
@@ -1869,17 +1965,17 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                                                        provider_direct=True)
                     inspected = auth_pool.inspect(slot_id)
                     if not ready and inspected['state'] == 'ready':
-                        history_root = one_time_root if device_mode == 'one_time' else device_root
-                        record_device_registration(history_root, slot_id, account_proxy,
+                        record_device_registration(device_root, slot_id, account_proxy,
                                                    profile.get('model', ''))
                     if device_mode == 'one_time':
-                        device_labels[row] = _device_id_label(inspected.get('device_id'))
+                        device_labels[slot_id] = _device_id_label(inspected.get('device_id'))
                 # 主协议由系统设置固化到任务；Web 模式不先发 GSA 请求。
                 if auth_protocol == 'web':
                     result = _check_web_auth(
                         account, password, account_proxy, timeout,
                         stop.is_set, checker=web_check)
                 else:
+                    device_used = True
                     result = gsa_check(account, password, account_proxy, timeout=timeout,
                                        retries=0 if proxy_pool is not None else retries,
                                        cancel=stop.is_set, identity=identity)
@@ -1916,7 +2012,14 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'stage': 'init', 'detail': str(exc)[:180]}
             finally:
                 if device_lease is not None:
+                    if device_mode == 'one_time' and device_used:
+                        device_usage, device_retired = _consume_thread_pool_device(
+                            auth_pool, shared_pool_root, slot_id,
+                            descriptor.get('device_usage_limit') or 100)
                     device_lease.release()
+            if isinstance(result, dict) and device_mode == 'one_time':
+                result['_device_usage'] = device_usage
+                result['_device_retired'] = device_retired
             request_ms = (round((time.monotonic() - request_started) * 1000, 2)
                           if debug_enabled else None)
             transport_failed = retryable_transport(result)
@@ -1995,21 +2098,22 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 result['_proxy_retries'] = attempt
                 break
             # Return this account to the coordinator's delayed retry heap.
-            # No worker thread sleeps during the five-second backoff.
+            # No worker thread sleeps during the configured backoff (10s in
+            # thread mode); the next attempt acquires a pool device again.
             result.update(_retry_at=time.monotonic() + retry_delay,
                           _retry_attempt=attempt + 1,
                           _retry_started=account_started,
-                          _retry_identity=identity,
+                          _retry_identity=(None if device_mode == 'one_time' else identity),
                           _retry_previous=current_proxy)
             return row, line, result
         if result is None:
             result = {'status': 'error', 'kind': 'proxy', 'http': 0,
                       'stage': 'init', 'detail': '代理池未返回结果', '_proxy_retries': 0}
         result['elapsed'] = round(time.time() - account_started, 2)
-        result['slot'] = row if device_mode == 'one_time' else slot_id
+        result['slot'] = slot_id
         result['device_key'] = account_prefix
         if device_mode == 'one_time':
-            result['device_label'] = device_labels.get(row, '')
+            result['device_label'] = device_labels.get(slot_id, '')
         if debug_enabled and (auth_result_bucket(result) == 'timeout'
                               or (str(result.get('web_status') or '').casefold() == 'error'
                                   and result.get('web_http') in (0, 500, 502, 503, 504))):
@@ -2110,7 +2214,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     usage_counts[device] += 1
                     device_usage = int(usage_start.get(device, 0)) + usage_counts[device]
                 elif auth_protocol == 'gsa':
-                    device_usage = 1
+                    device_usage = result.get('_device_usage')
                 else:
                     device = None
                     device_usage = None
@@ -2124,6 +2228,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'device_label': (result.get('device_label') or
                                            device_labels.get(device, '')) if device else '',
                           'device_usage': device_usage,
+                          'device_retired': (bool(result.get('_device_retired'))
+                                             if device_mode == 'one_time' else False),
                           'elapsed': result.get('elapsed'),
                           'attempts': max(
                               int(result.get('_proxy_retries') or 0),

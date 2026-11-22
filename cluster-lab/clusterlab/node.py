@@ -694,12 +694,24 @@ class Node:
             descriptor.pop('device_reset_slots', None)
             return
         if str(descriptor.get('_device_mode') or 'pool').lower() == 'one_time':
-            # 一次性设备由执行账号的线程在自己的独立目录中注册。
-            # 不预占、不重置、不删除节点的共享设备池。
+            # 线程模式与预注册共用同一个持久池。预注册容量可由用户调成
+            # 1000/2000；线程总是在它后面预留本包并发量作为即时扩容槽位。
+            snapshot = self.builder.snapshot()
+            entries = list(snapshot.get('slots') or [])
+            base_capacity = max(
+                0, int(snapshot.get('capacity') or 0),
+                max((int(item.get('slot') or 0) for item in entries
+                     if isinstance(item, dict)), default=0))
+            active_devices = min(rows, processes * max(
+                1, int(descriptor.get('threads') or 1)))
+            pool_size = base_capacity + active_devices
+            limit = max(1, int(descriptor.get('device_usage_limit') or DEVICE_AUTH_LIMIT))
             descriptor.pop('device_capacity', None)
             descriptor['processes'] = processes
-            descriptor['device_pool_capacity'] = 1
-            descriptor['device_slots'] = [1]
+            descriptor['device_pool_capacity'] = pool_size
+            descriptor['device_slots'] = list(range(1, pool_size + 1))
+            descriptor['device_base_capacity'] = base_capacity
+            descriptor['device_usage_limit'] = limit
             descriptor.pop('device_plan', None)
             descriptor.pop('device_reset_slots', None)
             descriptor.pop('device_usage_base', None)

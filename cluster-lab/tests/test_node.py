@@ -330,15 +330,21 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(descriptor['device_reset_slots'], [])
         self.assertEqual(descriptor['processes'], 4)
 
-    def test_one_time_mode_skips_shared_pool_and_sets_ten_second_retry(self):
+    def test_one_time_mode_extends_configured_shared_pool_and_sets_retry(self):
         descriptor = {'mode': 'auth', 'rows': 50, 'processes': 4, 'threads': 25,
-                      '_auth_protocol': 'gsa', '_device_mode': 'one_time'}
-        with patch.object(self.node.builder, 'snapshot') as snapshot, \
+                      '_auth_protocol': 'gsa', '_device_mode': 'one_time',
+                      'device_registration_workers': 32, 'device_usage_limit': 100}
+        with patch.object(self.node.builder, 'snapshot', return_value={
+                'capacity': 1000, 'slots': [{'slot': index, 'state': 'ready'}
+                                            for index in range(1, 1001)]}) as snapshot, \
              patch.object(self.node.builder, 'reserve_usage') as reserve:
             self.node._prepare_auth_devices(descriptor)
-        snapshot.assert_not_called()
+        snapshot.assert_called_once_with()
         reserve.assert_not_called()
-        self.assertEqual(descriptor['device_slots'], [1])
+        self.assertEqual(descriptor['device_slots'], list(range(1, 1051)))
+        self.assertEqual(descriptor['device_base_capacity'], 1000)
+        self.assertEqual(descriptor['device_pool_capacity'], 1050)
+        self.assertEqual(descriptor['device_usage_limit'], 100)
         self.assertNotIn('device_plan', descriptor)
         self.assertEqual(descriptor['_retry_delay'], 10.0)
         self.assertEqual(descriptor['_one_time_min_retries'], 1)
