@@ -805,6 +805,30 @@ class NodeRecoveryTests(unittest.TestCase):
             self.node._heartbeat()
         start.assert_not_called()
 
+    def test_pending_validation_prevents_background_device_refill(self):
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': [],
+                 'device_request': 2000, 'work_available': True}
+        incomplete = {'running': False, 'capacity': 2000, 'ready': 1200,
+                      'built': 0, 'failed': 0, 'current': 0,
+                      'attempted': 1200, 'slots': []}
+        with patch.object(self.node, '_request', return_value=Response(value)), \
+             patch.object(self.node.builder, 'snapshot', return_value=incomplete), \
+             patch.object(self.node.builder, 'start') as start:
+            self.node._heartbeat()
+        start.assert_not_called()
+
+    def test_active_package_prevents_background_device_refill(self):
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': [],
+                 'device_request': 2000, 'work_available': False}
+        self.node.active['unit'] = (None, threading.Event())
+        with patch.object(self.node, '_request', return_value=Response(value)), \
+             patch.object(self.node.builder, 'start') as start:
+            self.node._heartbeat()
+        self.node.active.pop('unit', None)
+        start.assert_not_called()
+
     def test_legacy_auto_rotation_directive_is_ignored(self):
         value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
                  'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 0,

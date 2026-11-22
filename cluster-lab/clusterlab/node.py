@@ -570,12 +570,17 @@ class Node:
                     self.device_clear_version = clear_version
                     self._save_control()
             requested = value.get('device_request') or 0
-            if requested and not self.builder.state['running']:
+            with self.lock:
+                package_active = bool(self.active)
+            if (requested and not self.builder.state['running']
+                    and not package_active and not value.get('work_available')):
                 try:
                     requested = int(requested)
                     snapshot = self.builder.snapshot()
-                    # device_request is a persistent desired size. Do not restart a
-                    # completed build on every heartbeat; only fill missing slots.
+                    # device_request is a persistent idle-time minimum. During
+                    # validation, threads consume/extend the same pool on demand;
+                    # a parallel background refill would compete for CPU, exits
+                    # and device locks and can delay the next package for minutes.
                     if int(snapshot.get('ready') or 0) < requested:
                         self.builder.start(requested)
                 except (RuntimeError, ValueError) as exc:

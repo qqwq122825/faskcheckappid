@@ -1521,11 +1521,21 @@ class Controller:
                     and int(node['ack_update_generation'] or 0) < int(node['update_generation'] or 0)):
                 update = {'generation': int(node['update_generation']),
                           'ref': node['update_ref'], 'service': 'cluster-node'}
+            # Validation always has priority over background device prefill.
+            # The node uses this bit to keep the persistent minimum-pool
+            # request from racing an account package for CPU, proxies and the
+            # same device slots. Missing identities are still created on
+            # demand by the validation threads.
+            work_available = bool(db.execute(
+                "SELECT 1 FROM units u JOIN jobs j ON j.id=u.job_id "
+                "WHERE u.status='pending' AND j.status='running' LIMIT 1"
+            ).fetchone())
             return {'node_id': node_id, 'name': node['name'], 'enabled': bool(node['enabled']),
                     'processes': min(desired_processes, max_p), 'threads': min(desired_threads, max_t),
                     'desired_processes': desired_processes, 'desired_threads': desired_threads,
                     'rejected': reject, 'confirmed': confirmed, 'interrupted_ack': interrupted_ack,
                     'reported': reported_ack,
+                    'work_available': work_available,
                     'device_request': node['device_request'],
                     'device_clear_version': node['device_clear_version'],
                     'device_rotate_after': self.settings().get('device_rotate_after', 0),

@@ -1106,6 +1106,15 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(Conflict, '仍有 1 个工作包'):
             self.service.clear_devices(self.node['id'])
 
+    def test_heartbeat_marks_pending_validation_as_work_available(self):
+        self.assertFalse(self.heartbeat()['work_available'])
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        self.assertTrue(self.heartbeat()['work_available'])
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertIsNotNone(unit)
+        self.assertFalse(self.heartbeat()['work_available'])
+
     def test_10002_records_balance_packages_and_keep_final_blank_records(self):
         source = b''.join(f'account-{index:05d}\n'.encode() for index in range(10000)) + b'\n\n'
         job = self.service.create_job('10002 records', io.BytesIO(source), 10000)
