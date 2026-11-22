@@ -72,17 +72,36 @@ class DeviceBuilder:
             # the persisted slots so a task can still use the node's complete
             # device pool before any new initialization request is made.
             pool = DevicePool(str(root), self.node.origin, max_devices=DEVICE_POOL_LIMIT)
-            device_root = Path(getattr(pool, 'base', root)) / 'devices'
-            existing = ([int(path.name) for path in device_root.iterdir()
-                         if path.is_dir() and path.name.isdigit()
-                         and 1 <= int(path.name) <= DEVICE_POOL_LIMIT]
-                        if device_root.is_dir() else [])
+            pool_base = getattr(pool, 'base', None)
+            device_root = Path(pool_base if pool_base is not None else root) / 'devices'
+            storage_roots = [device_root]
+            if pool_base is not None:
+                # Older DevicePool layouts stored numbered slots directly
+                # under base rather than base/devices.
+                storage_roots.append(Path(pool_base))
+            existing = sorted({int(path.name) for directory in storage_roots
+                               if directory.is_dir() for path in directory.iterdir()
+                               if path.is_dir() and path.name.isdigit()
+                               and 1 <= int(path.name) <= DEVICE_POOL_LIMIT})
             persisted_capacity = max(existing, default=0)
-            limit = max(1, int(data.get('capacity') or 0), persisted_capacity)
             active_slots = set(data.get('current_slots') or [])
             if not active_slots and data.get('current'):
                 active_slots.add(int(data['current']))
-            for slot in range(1, limit + 1):
+            error_slots = {int(slot) for slot in data['slot_errors']
+                           if str(slot).isdigit() and 1 <= int(slot) <= DEVICE_POOL_LIMIT}
+            # A requested capacity such as 2000 is a target, not 2000
+            # materialized directories.  Heartbeats run every second; walking
+            # every missing slot here repeatedly caused tens of thousands of
+            # stat/open/chmod calls and starved the node agent.  Inspect only
+            # slots that actually exist or currently carry useful state.
+            candidates = set(existing) | active_slots | error_slots
+            if pool_base is None:
+                # Lightweight test/legacy pools may not expose their storage
+                # root.  Preserve the old bounded enumeration for them.
+                limit = min(DEVICE_DETAIL_LIMIT, max(
+                    1, int(data.get('capacity') or 0), persisted_capacity))
+                candidates.update(range(1, limit + 1))
+            for slot in sorted(candidates):
                 inspected = pool.inspect(slot)
                 state = inspected['state']
                 if state == 'ready':

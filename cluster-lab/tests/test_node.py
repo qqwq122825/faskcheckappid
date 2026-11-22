@@ -613,12 +613,15 @@ class NodeRecoveryTests(unittest.TestCase):
 
     def test_snapshot_distinguishes_registering_failed_and_pending_slots(self):
         class Pool:
-            def __init__(inner, *_args, **_kwargs):
-                pass
+            def __init__(inner, root, *_args, **_kwargs):
+                inner.base = Path(root) / 'pool'
 
             def inspect(inner, slot):
                 return {'state': 'pending', 'device_id': f'device-{slot}'}
 
+        for slot in range(1, 4):
+            (self.node.root / 'device-pool' / 'pool' / 'devices' /
+             str(slot)).mkdir(parents=True)
         self.node.builder.state.update(running=True, capacity=3, current=2,
                                        slot_errors={'1': 'AnisetteError: HTTP 503'})
         with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)):
@@ -626,6 +629,37 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual([row['state'] for row in snapshot['slots']],
                          ['failed', 'registering', 'pending'])
         self.assertEqual(snapshot['slots'][0]['error'], 'AnisetteError: HTTP 503')
+
+    def test_snapshot_skips_unmaterialized_large_pool_slots(self):
+        inspected = []
+
+        class Pool:
+            key = 'origin-key'
+
+            def __init__(inner, root, *_args, **_kwargs):
+                inner.base = Path(root) / 'pool'
+
+            def slot_directory(inner, slot):
+                return inner.base / 'devices' / str(slot)
+
+            def inspect(inner, slot):
+                inspected.append(slot)
+                return {'state': 'ready' if slot in (1, 9) else 'missing',
+                        'device_id': f'device-{slot}'}
+
+        for slot in (1, 9):
+            (self.node.root / 'device-pool' / 'pool' / 'devices' /
+             str(slot)).mkdir(parents=True)
+        self.node.builder.state.update(running=True, capacity=2000,
+                                       current_slots=[11],
+                                       slot_errors={'12': 'registration failed'})
+        with patch('clusterlab.device_build._load_fastcheck',
+                   return_value=(Pool, None, None)):
+            snapshot = self.node.builder.snapshot()
+        self.assertEqual(inspected, [1, 9, 11, 12])
+        self.assertEqual(snapshot['capacity'], 2000)
+        self.assertEqual(snapshot['ready'], 2)
+        self.assertEqual([row['slot'] for row in snapshot['slots']], [1, 9, 11, 12])
 
     def test_ready_legacy_device_recovers_model_and_registration_time(self):
         class Pool:
