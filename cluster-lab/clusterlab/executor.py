@@ -1658,6 +1658,22 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     # slots are tried first; thread mode may extend the same pool past that base.
     shared_pool_root = Path(device_root)
     pool = DevicePool(shared_pool_root, origin, max_devices=capacity)
+    # DevicePool.info() owns one pool-global file lock. Hundreds of account
+    # threads must not all queue on that lock while its first network refresh
+    # is still running. One thread per worker process populates this local
+    # cache; at most the node's process count contends on the filesystem lock.
+    shared_info_lock = threading.Lock()
+    shared_info = {}
+
+    def account_device_info(selected_proxy):
+        if device_mode != 'one_time':
+            return pool.info(timeout, proxy=selected_proxy, provider_direct=True)
+        with shared_info_lock:
+            if not shared_info:
+                shared_info.update(pool.info(
+                    max(timeout, 90), proxy=selected_proxy, provider_direct=True))
+            return dict(shared_info)
+
     from fastcheck.workers import device_profile
     if debug_enabled:
         _write_proxy_debug(debug_path, 'worker_start',
@@ -1961,7 +1977,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     # The lease makes inspect/register atomic across all node
                     # processes. Missing slots are registered by this thread;
                     # ready slots are refreshed and reused directly.
-                    info = auth_pool.info(timeout, proxy=account_proxy, provider_direct=True)
+                    info = account_device_info(account_proxy)
                     ready = auth_pool.inspect(slot_id)['state'] == 'ready'
                     profile = device_profile(auth_pool, slot_id)
                     info = dict(info, client_info=profile['client_info'],

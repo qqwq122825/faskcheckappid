@@ -575,6 +575,58 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(releases, [
                 ('socks5h://exit-1', True), ('socks5h://exit-2', True)])
 
+    def test_thread_mode_initializes_pool_info_once_per_worker_process(self):
+        class InfoPool(FakePool):
+            info_calls = 0
+
+            @property
+            def base(self):
+                return self.root
+
+            def info(self, *_args, **_kwargs):
+                type(self).info_calls += 1
+                time.sleep(.02)
+                return {'client_info': 'cached', 'user_agent': 'cached'}
+
+            def inspect(self, slot):
+                marker = self.slot_directory(slot) / 'registered'
+                return {'state': 'ready', 'device_id': str(slot)} if marker.exists() \
+                    else {'state': 'missing'}
+
+            def fetch_headers(self, *_args, **_kwargs):
+                return {'identity': 'shared-info'}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            device_root = root / 'devices'
+            for slot in (1, 2):
+                directory = device_root / f'{slot:02d}'
+                directory.mkdir(parents=True)
+                (directory / 'registered').write_text('ready', 'utf-8')
+            (root / 'input.part').write_text(
+                'one----password\ntwo----password\n', encoding='utf-8')
+            descriptor = {
+                'rows': 2, 'first_row': 1, 'threads': 2,
+                'device_pool_capacity': 2, 'device_slots': [1, 2],
+                'device_root': str(device_root), 'origin': 'http://127.0.0.1:1',
+                'timeout': 5, 'retries': 0, '_device_mode': 'one_time',
+                '_one_time_min_retries': 0, 'device_usage_limit': 10,
+                'device_cooldown_seconds': 0,
+            }
+            InfoPool.info_calls = 0
+            shared = ScriptedProxyPool(['socks5h://one', 'socks5h://two'])
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    InfoPool,
+                    lambda *_args, **_kwargs: {
+                        'status': 'valid', 'kind': 'valid', 'http': 200},
+                    lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test',
+                                     'model': 'SharedInfo'}):
+                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+            self.assertEqual(InfoPool.info_calls, 1)
+            self.assertEqual(len((root / 'results.jsonl').read_text().splitlines()), 2)
+
     def test_auth_unit_rotates_proxy_after_http_zero_and_reuses_http_200(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
