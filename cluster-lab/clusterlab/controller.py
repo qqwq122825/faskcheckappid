@@ -611,8 +611,12 @@ class Controller:
         running = bool(pool.get('running'))
         return {'requested': requested, 'capacity': capacity, 'ready': ready,
                 'running': running,
-                'complete': bool(requested and capacity >= requested
-                                 and ready >= requested and not running)}
+                # Existing nodes created before mandatory pre-registration keep
+                # device_request=0.  Zero means "no minimum", not "forever
+                # incomplete": thread mode must be able to start with an empty
+                # pool and register missing identities on demand.
+                'complete': bool(requested == 0 or (capacity >= requested
+                                 and ready >= requested and not running))}
 
     def _source_path(self, name):
         """输入文件沿用用户给的名字；重名时加 -2、-3，避免覆盖已上传的文件。"""

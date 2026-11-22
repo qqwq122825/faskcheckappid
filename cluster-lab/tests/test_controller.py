@@ -61,6 +61,20 @@ class ControllerTests(unittest.TestCase):
         self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
                                                   'enabled': True})
 
+    def test_existing_node_without_pre_registration_minimum_can_start_empty(self):
+        with self.service.db.transaction() as db:
+            db.execute('UPDATE nodes SET enabled=0,device_request=0 WHERE id=?',
+                       (self.node['id'],))
+        self.heartbeat(devices={'running': False, 'capacity': 0, 'ready': 0,
+                                'built': 0, 'failed': 0, 'attempted': 0})
+        saved = next(value for value in self.service.snapshot()['nodes']
+                     if value['id'] == self.node['id'])
+        self.assertTrue(saved['device_initialization_complete'])
+        self.service.configure_node(self.node['id'], {
+            'processes': 4, 'threads': 250, 'enabled': True})
+        self.assertTrue(next(value for value in self.service.snapshot()['nodes']
+                             if value['id'] == self.node['id'])['enabled'])
+
     def test_rolling_update_drains_limits_parallelism_and_resumes_after_health(self):
         other = self.service.add_node('second-update-node', 2, 4)
         self.service.heartbeat(other['id'], {
