@@ -831,7 +831,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(snapshot['row_counts'], {'pending': 51, 'completed': 50})
         self.assertEqual(sum(snapshot['row_counts'].values()), snapshot['rows'])
 
-    def test_two_accepting_nodes_create_small_dynamic_packages(self):
+    def test_two_accepting_nodes_create_two_dynamic_packages_each(self):
         other = self.service.add_node('second-balanced-node', 2, 4)
         self.service.heartbeat(other['id'], {
             'session': 'second-balanced-session', 'hostname': 'second', 'version': 'test',
@@ -851,10 +851,38 @@ class ControllerTests(unittest.TestCase):
         with self.service.db.connect() as db:
             units = list(db.execute('SELECT seq,first_row,rows FROM units '
                                     'WHERE job_id=? ORDER BY seq', (job,)))
-        self.assertEqual(len(units), 8)
+        self.assertEqual(len(units), 4)
         self.assertEqual([row['rows'] for row in units],
-                         [1251, 1251, 1251, 1251, 1251, 1251, 1251, 1245])
+                         [2501, 2501, 2501, 2499])
         self.assertEqual(units[-1]['first_row'] + units[-1]['rows'] - 1, 10002)
+
+    def test_three_accepting_nodes_create_two_dynamic_packages_each(self):
+        for index in range(2):
+            other = self.service.add_node(f'three-node-{index}', 2, 4)
+            self.service.heartbeat(other['id'], {
+                'session': f'three-node-session-{index}', 'hostname': f'three-{index}',
+                'version': 'test', 'max_processes': 2, 'max_threads': 4,
+                'active': [], 'interrupted': [],
+                'devices': {'running': False, 'capacity': 30, 'ready': 30,
+                            'built': 30, 'failed': 0, 'attempted': 30}})
+            self.service.configure_node(other['id'], {'processes': 2, 'threads': 4,
+                                                       'enabled': True})
+        job = self.service.create_job('balanced-three-nodes',
+                                      io.BytesIO(b'x\n' * 60000), 50000,
+                                      mode='auth')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = next(value for value in self.service.snapshot()['jobs']
+                         if value['id'] == job)
+            if state['status'] != 'preparing':
+                break
+            time.sleep(.01)
+        with self.service.db.connect() as db:
+            units = list(db.execute('SELECT seq,first_row,rows FROM units '
+                                    'WHERE job_id=? ORDER BY seq', (job,)))
+        self.assertEqual(len(units), 6)
+        self.assertEqual([row['rows'] for row in units], [10000] * 6)
+        self.assertEqual(units[-1]['first_row'] + units[-1]['rows'] - 1, 60000)
 
     def test_paused_task_exports_only_confirmed_units(self):
         job = self.job(100)
@@ -1127,17 +1155,17 @@ class ControllerTests(unittest.TestCase):
                 break
             time.sleep(.01)
         self.assertEqual(state['status'], 'ready')
-        self.assertEqual((state['rows'], state['units']), (10002, 4))
+        self.assertEqual((state['rows'], state['units']), (10002, 2))
         with self.service.db.connect() as db:
             units = [dict(row) for row in db.execute(
                 'SELECT first_row,rows,path,byte_start,byte_end FROM units WHERE job_id=? ORDER BY seq',
                 (job,))]
         self.assertEqual([(unit['first_row'], unit['rows']) for unit in units],
-                         [(1, 2501), (2502, 2501), (5003, 2501), (7504, 2499)])
+                         [(1, 5001), (5002, 5001)])
         self.assertTrue(b''.join(self.service.unit_lines(units[-1])).endswith(b'\n\n'))
 
         self.service.job_action(job, 'start')
-        for expected in ((1, 2501), (2502, 2501), (5003, 2501), (7504, 2499)):
+        for expected in ((1, 5001), (5002, 5001)):
             unit = self.service.lease(self.node['id'], 'test-session')
             self.assertEqual((unit['first_row'], unit['rows']), expected)
             self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
