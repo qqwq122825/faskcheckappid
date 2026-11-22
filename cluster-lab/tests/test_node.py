@@ -52,6 +52,46 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(output.value['error'],
                          'RuntimeError: password=*** endpoint failed')
 
+    def test_pre_registration_uses_device_profile_without_public_info_request(self):
+        captured = {}
+
+        class Sink:
+            value = None
+
+            def put(inner, value):
+                inner.value = value
+
+        class Pool:
+            def __init__(inner, *_args, **_kwargs):
+                pass
+
+            def operation(inner, _slot):
+                return Response(None)
+
+            def info(inner, *_args, **_kwargs):
+                raise AssertionError('public info must not be requested')
+
+            def fetch_headers(inner, slot, info, *_args, **kwargs):
+                captured.update(slot=slot, info=info, registered=kwargs.get('registered'))
+                return {'identity': 'registered'}
+
+        output = Sink()
+        payload = {'device_root': '/tmp/probe', 'origin': 'http://127.0.0.1:1',
+                   'capacity': 2000, 'slot': 1001, 'timeout': 90,
+                   'proxy': 'socks5h://proxy'}
+        profile = {'model': 'MacBookPro14,3', 'client_info': '<device-profile>',
+                   'user_agent': 'device-user-agent'}
+        with patch('clusterlab.device_build._load_fastcheck',
+                   return_value=(Pool, None, None)), \
+             patch('fastcheck.workers.device_profile', return_value=profile), \
+             patch('signal.signal'):
+            _register(payload, output)
+        self.assertEqual(output.value, {'ok': True, 'model': 'MacBookPro14,3'})
+        self.assertEqual(captured, {'slot': 1001,
+                                   'info': {'client_info': '<device-profile>',
+                                            'user_agent': 'device-user-agent'},
+                                   'registered': False})
+
     def test_spawned_child_cannot_interrupt_parent_live_task(self):
         with tempfile.TemporaryDirectory() as root:
             primary = Node(root)

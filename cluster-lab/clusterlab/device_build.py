@@ -583,9 +583,12 @@ def _register(payload, output):
         pool = DevicePool(payload['device_root'], payload['origin'],
                           max_devices=payload['capacity'])
         with pool.operation(payload['slot']):
-            info = pool.info(payload['timeout'], proxy=payload['proxy'], provider_direct=True)
             profile = device_profile(pool, payload['slot'])
-            info = dict(info, client_info=profile['client_info'], user_agent=profile['user_agent'])
+            # Every prepared device already owns a complete randomized profile.
+            # Avoid the pool-global /v3/client_info request and its .info.lock;
+            # provisioning only needs this device's own two profile strings.
+            info = {'client_info': profile['client_info'],
+                    'user_agent': profile['user_agent']}
             pool.fetch_headers(payload['slot'], info, payload['timeout'], registered=False,
                                proxy=payload['proxy'], provider_direct=True)
         output.put({'ok': True, 'model': profile['model']})
