@@ -49,9 +49,8 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(saved['enabled'])
         self.assertEqual(response['device_request'], 30)
         self.assertFalse(response['enabled'])
-        with self.assertRaisesRegex(Conflict, '设备初始化完成后'):
-            self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
-                                                       'enabled': True})
+        self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
+                                                  'enabled': True})
         self.service.heartbeat(node['id'], {
             'session': 'auto-device-session', 'hostname': 'new-node', 'version': 'test',
             'max_processes': 4, 'max_threads': 500, 'active': [], 'interrupted': [],
@@ -60,6 +59,19 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(self.service.snapshot()['nodes'][-1]['device_initialization_complete'])
         self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
                                                   'enabled': True})
+
+    def test_shared_pool_mode_still_requires_initialization_before_start(self):
+        self.service.configure_device_mode({'device_mode': 'pool'})
+        node = self.service.add_node('pool-required', 4, 250)
+        self.service.heartbeat(node['id'], {
+            'session': 'pool-required-session', 'hostname': 'pool-required',
+            'version': 'test', 'max_processes': 4, 'max_threads': 500,
+            'active': [], 'interrupted': [],
+            'devices': {'running': True, 'capacity': 30, 'ready': 4,
+                        'built': 4, 'failed': 0, 'attempted': 4}})
+        with self.assertRaisesRegex(Conflict, '设备初始化完成后'):
+            self.service.configure_node(node['id'], {
+                'processes': 4, 'threads': 250, 'enabled': True})
 
     def test_existing_node_without_pre_registration_minimum_can_start_empty(self):
         with self.service.db.transaction() as db:
@@ -99,8 +111,8 @@ class ControllerTests(unittest.TestCase):
             ack_update_generation=first_generation,
             update_status={'generation': first_generation, 'state': 'success',
                            'message': '更新完成，节点已恢复心跳'},
-            devices={'running': False, 'capacity': 30, 'ready': 30,
-                     'built': 30, 'failed': 0, 'attempted': 30})
+            devices={'running': True, 'capacity': 30, 'ready': 4,
+                     'built': 4, 'failed': 0, 'attempted': 4})
         self.assertIsNone(response['update'])
         nodes = {node['id']: node for node in self.service.snapshot()['nodes']}
         self.assertTrue(nodes[self.node['id']]['enabled'])

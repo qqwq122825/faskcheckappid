@@ -521,8 +521,9 @@ class Controller:
             if not node:
                 raise ValueError('节点不存在')
             initialization = self._device_initialization(node)
+            start_allowed = self._device_start_allowed(db, initialization)
             enabled = bool(node['enabled']) if 'enabled' not in data else data['enabled']
-            if enabled and not node['enabled'] and not initialization['complete']:
+            if enabled and not node['enabled'] and not start_allowed:
                 raise Conflict(f'设备初始化完成后才能开始接单（'
                                f'{initialization["ready"]}/{initialization["requested"]}）')
             active = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? AND status IN ('leased','running')", (node_id,)).fetchone()[0]
@@ -617,6 +618,14 @@ class Controller:
                 # pool and register missing identities on demand.
                 'complete': bool(requested == 0 or (capacity >= requested
                                  and ready >= requested and not running))}
+
+    @staticmethod
+    def _device_start_allowed(db, initialization):
+        """一次性模式允许先接单，缺失设备由验证线程即时注册。"""
+        saved = db.execute(
+            "SELECT value FROM controller_settings WHERE key='device_mode'").fetchone()
+        return bool(initialization['complete'] or
+                    str(saved[0] if saved else 'one_time').lower() == 'one_time')
 
     def _source_path(self, name):
         """输入文件沿用用户给的名字；重名时加 -2、-3，避免覆盖已上传的文件。"""
@@ -1505,7 +1514,9 @@ class Controller:
                                 now if final else None, node_id))
                     if update_state == 'success':
                         current = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
-                        if current['update_resume_enabled'] and self._device_initialization(current)['complete']:
+                        initialization = self._device_initialization(current)
+                        if (current['update_resume_enabled'] and
+                                self._device_start_allowed(db, initialization)):
                             db.execute('UPDATE nodes SET enabled=1 WHERE id=?', (node_id,))
                         event(db, 'node_update_success',
                               f'节点更新成功：{current["update_ref"]}', node_id=node_id)
@@ -1809,7 +1820,8 @@ class Controller:
                              device_capacity=initialization['capacity'],
                              device_ready=initialization['ready'],
                              device_initialization_running=initialization['running'],
-                             device_initialization_complete=initialization['complete'])
+                             device_initialization_complete=initialization['complete'],
+                             device_start_allowed=self._device_start_allowed(db, initialization))
                 value['effective_processes'] = min(row['desired_processes'], row['max_processes']) if row['max_processes'] else None
                 value['effective_threads'] = min(row['desired_threads'], row['max_threads']) if row['max_threads'] else None
                 nodes.append(value)
