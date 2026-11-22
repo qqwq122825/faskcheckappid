@@ -677,6 +677,66 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(snapshot['ready'], 2)
         self.assertEqual([row['slot'] for row in snapshot['slots']], [1, 9, 11, 12])
 
+    def test_idle_snapshot_reuses_structural_scan_for_two_thousand_devices(self):
+        inspected = []
+
+        class Pool:
+            key = 'origin-key'
+
+            def __init__(inner, root, *_args, **_kwargs):
+                inner.base = Path(root) / 'pool'
+
+            def slot_directory(inner, slot):
+                return inner.base / 'devices' / str(slot)
+
+            def inspect(inner, slot):
+                inspected.append(slot)
+                return {'state': 'ready', 'device_id': f'device-{slot}'}
+
+        devices = self.node.root / 'device-pool' / 'pool' / 'devices'
+        for slot in range(1, 2001):
+            (devices / str(slot)).mkdir(parents=True)
+        self.node.builder.state.update(running=False, capacity=2000)
+        with patch('clusterlab.device_build._load_fastcheck',
+                   return_value=(Pool, None, None)):
+            first = self.node.builder.snapshot()
+            second = self.node.builder.snapshot()
+            (self.node.root / 'device-pool' / 'usage.json').write_text(
+                '{"1":7}', 'utf-8')
+            third = self.node.builder.snapshot()
+        self.assertEqual(len(inspected), 2000)
+        self.assertEqual((first['ready'], second['ready'], third['ready']),
+                         (2000, 2000, 2000))
+        self.assertEqual(third['slots'][0]['used'], 7)
+
+    def test_registration_change_invalidates_snapshot_cache(self):
+        inspected = []
+
+        class Pool:
+            key = 'origin-key'
+
+            def __init__(inner, root, *_args, **_kwargs):
+                inner.base = Path(root) / 'pool'
+
+            def slot_directory(inner, slot):
+                return inner.base / 'devices' / str(slot)
+
+            def inspect(inner, slot):
+                inspected.append(slot)
+                return {'state': 'ready', 'device_id': f'device-{slot}'}
+
+        device = self.node.root / 'device-pool' / 'pool' / 'devices' / '1'
+        device.mkdir(parents=True)
+        with patch('clusterlab.device_build._load_fastcheck',
+                   return_value=(Pool, None, None)):
+            self.node.builder.snapshot()
+            self.node.builder.snapshot()
+            registrations = self.node.root / 'device-pool' / 'registrations'
+            registrations.mkdir()
+            (registrations / '001.json').write_text('{"slot":1}', 'utf-8')
+            self.node.builder.snapshot()
+        self.assertEqual(inspected, [1, 1])
+
     def test_ready_legacy_device_recovers_model_and_registration_time(self):
         class Pool:
             key = 'origin-key'

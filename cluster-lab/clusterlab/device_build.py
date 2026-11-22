@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 from collections import Counter
+import copy
 import json
 import multiprocessing as mp
 import os
@@ -51,10 +52,59 @@ class DeviceBuilder:
         self.thread = None
         self.stop = threading.Event()
         self.reserved = set()
+        self._snapshot_cache = None
+        self._snapshot_cache_key = None
         self.state = {'running': False, 'capacity': 0, 'ready': 0, 'built': 0,
                       'failed': 0, 'current': 0, 'message': '', 'started_at': None,
                       'proxy_status': 'idle', 'proxy_ip': '', 'slot_errors': {},
                       'workers': 0, 'current_slots': []}
+
+    @staticmethod
+    def _path_stamp(path):
+        try:
+            stat = path.stat()
+            return stat.st_mtime_ns, stat.st_size
+        except OSError:
+            return None
+
+    def _snapshot_fingerprint(self, root, pool_base, data):
+        """Cheap structural fingerprint for the expensive device scan.
+
+        usage.json is deliberately excluded: account usage changes constantly
+        and is merged into cached rows separately. Device registration and
+        retirement create/delete a per-slot registration file, while staged
+        rotation changes the devices directory, so those two directory mtimes
+        invalidate the structural cache without 2,000 per-slot stat calls.
+        """
+        devices = Path(pool_base) / 'devices'
+        structural_root = devices if devices.is_dir() else Path(pool_base)
+        live_state = (
+            bool(data.get('running')),
+            int(data.get('capacity') or 0),
+            int(data.get('current') or 0),
+            tuple(int(slot) for slot in data.get('current_slots') or ()),
+            tuple(sorted((str(key), str(value)) for key, value in
+                         (data.get('slot_errors') or {}).items())),
+        )
+        return (
+            self._path_stamp(structural_root),
+            self._path_stamp(root / 'registrations'),
+            self._path_stamp(root / 'registry.json'),
+            live_state,
+        )
+
+    @staticmethod
+    def _merge_cached_snapshot(cached, data, usage):
+        result = copy.deepcopy(cached)
+        # Operational fields may change without changing the pool structure.
+        # Structural counts and rows remain from the cached scan.
+        for key, value in data.items():
+            if key not in {'ready', 'capacity', 'attempted', 'slots'}:
+                result[key] = copy.deepcopy(value)
+        for entry in result.get('slots') or ():
+            used = usage.get(str(entry.get('slot')), 0)
+            entry['used'] = used if type(used) is int and used >= 0 else 0
+        return result
 
     def snapshot(self):
         root = self.node.root / 'device-pool'
@@ -74,6 +124,13 @@ class DeviceBuilder:
             pool = DevicePool(str(root), self.node.origin, max_devices=DEVICE_POOL_LIMIT)
             pool_base = getattr(pool, 'base', None)
             device_root = Path(pool_base if pool_base is not None else root) / 'devices'
+            fingerprint = self._snapshot_fingerprint(
+                root, pool_base if pool_base is not None else root, data)
+            with self.lock:
+                if (self._snapshot_cache is not None
+                        and fingerprint == self._snapshot_cache_key):
+                    return self._merge_cached_snapshot(
+                        self._snapshot_cache, data, usage)
             storage_roots = [device_root]
             if pool_base is not None:
                 # Older DevicePool layouts stored numbered slots directly
@@ -131,6 +188,10 @@ class DeviceBuilder:
             entry['recorded'] = bool(info)
         data.update(ready=ready, attempted=attempted, slots=slots,
                     capacity=max(int(data.get('capacity') or 0), persisted_capacity, ready))
+        if 'fingerprint' in locals():
+            with self.lock:
+                self._snapshot_cache_key = fingerprint
+                self._snapshot_cache = copy.deepcopy(data)
         return data
 
     @staticmethod
