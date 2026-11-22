@@ -565,6 +565,9 @@ class ExecutorScaleTests(unittest.TestCase):
             pooled = device_root
             self.assertEqual(OneTimePool.registered_flags, [False, True])
             self.assertEqual([record['device_usage'] for record in records], [1, 2])
+            self.assertEqual([record['device_remaining_before'] for record in records],
+                             [2, 1])
+            self.assertEqual([record['device_remaining'] for record in records], [1, 0])
             self.assertEqual([record['device_retired'] for record in records],
                              [False, True])
             self.assertFalse((pooled / '01' / 'registered').exists())

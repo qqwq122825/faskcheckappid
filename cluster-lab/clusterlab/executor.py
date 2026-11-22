@@ -1470,8 +1470,12 @@ def _consume_thread_pool_device(pool, device_root, slot, usage_limit):
             data = json.loads(path.read_text('utf-8')) if path.exists() else {}
         except (OSError, TypeError, ValueError):
             data = {}
-        count = max(0, int(data.get(str(slot)) or 0)) + 1
-        retired = count >= usage_limit
+        previous = max(0, int(data.get(str(slot)) or 0))
+        remaining_before = max(0, usage_limit - previous)
+        count = previous + 1
+        # The thread holding the last visible use owns retirement after its
+        # verification. Other threads see the same durable counter next time.
+        retired = remaining_before <= 1
         if retired:
             data.pop(str(slot), None)
         else:
@@ -1502,7 +1506,7 @@ def _consume_thread_pool_device(pool, device_root, slot, usage_limit):
                         if not (isinstance(item, list) and len(item) > 1
                                 and item[1] == slot)]
                 atomic_json(health_path, health)
-        return count, retired
+        return count, retired, remaining_before, max(0, usage_limit - count)
 
 
 def _replace_device_identity(pool, device_root, slot, base_info, timeout, proxy,
@@ -1938,6 +1942,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             auth_pool = pool
             device_usage = None
             device_retired = False
+            device_remaining_before = None
+            device_remaining = None
             device_used = False
             try:
                 if auth_protocol == 'gsa':
@@ -1945,7 +1951,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                         # Prefer a registered idle device. If none is idle,
                         # claim a missing slot and let this thread register it.
                         device_lease = DeviceAuthLease.acquire_any(
-                            auth_pool, slot_ids, stop, cooldown=0.0)
+                            auth_pool, slot_ids, stop, cooldown=device_cooldown)
                         slot_id = device_lease.slot
                         identity = None
                     else:
@@ -2013,13 +2019,17 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             finally:
                 if device_lease is not None:
                     if device_mode == 'one_time' and device_used:
-                        device_usage, device_retired = _consume_thread_pool_device(
-                            auth_pool, shared_pool_root, slot_id,
-                            descriptor.get('device_usage_limit') or 100)
+                        (device_usage, device_retired,
+                         device_remaining_before, device_remaining) = (
+                            _consume_thread_pool_device(
+                                auth_pool, shared_pool_root, slot_id,
+                                descriptor.get('device_usage_limit') or 100))
                     device_lease.release()
             if isinstance(result, dict) and device_mode == 'one_time':
                 result['_device_usage'] = device_usage
                 result['_device_retired'] = device_retired
+                result['_device_remaining_before'] = device_remaining_before
+                result['_device_remaining'] = device_remaining
             request_ms = (round((time.monotonic() - request_started) * 1000, 2)
                           if debug_enabled else None)
             transport_failed = retryable_transport(result)
@@ -2228,6 +2238,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'device_label': (result.get('device_label') or
                                            device_labels.get(device, '')) if device else '',
                           'device_usage': device_usage,
+                          'device_remaining_before': result.get('_device_remaining_before'),
+                          'device_remaining': result.get('_device_remaining'),
                           'device_retired': (bool(result.get('_device_retired'))
                                              if device_mode == 'one_time' else False),
                           'elapsed': result.get('elapsed'),

@@ -123,6 +123,8 @@ test('Thread mode reuses one expandable shared pool and retires at limit', () =>
   assert.match(settings, /没有空闲设备时不等待/)
   assert.match(settings, /验证完成后放回同一个共享池供其他线程复用/)
   assert.match(settings, /本次验证结束后删除该设备/)
+  assert.match(settings, /拿到最后 1 次的线程用完后负责删除/)
+  assert.match(settings, /每台设备使用后冷却 3 秒/)
   assert.match(settings, /等待 10 秒后丢弃旧出口并换 IP/)
 })
 

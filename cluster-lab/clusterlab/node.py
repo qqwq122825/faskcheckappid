@@ -716,6 +716,7 @@ class Node:
             descriptor.pop('device_reset_slots', None)
             descriptor.pop('device_usage_base', None)
             descriptor.pop('device_usage_reserved', None)
+            descriptor['device_cooldown_seconds'] = DEVICE_AUTH_COOLDOWN_SECONDS
             descriptor['_retry_delay'] = 10.0
             descriptor['_one_time_min_retries'] = 1
             return

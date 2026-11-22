@@ -345,6 +345,7 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(descriptor['device_base_capacity'], 1000)
         self.assertEqual(descriptor['device_pool_capacity'], 1050)
         self.assertEqual(descriptor['device_usage_limit'], 100)
+        self.assertEqual(descriptor['device_cooldown_seconds'], 3.0)
         self.assertNotIn('device_plan', descriptor)
         self.assertEqual(descriptor['_retry_delay'], 10.0)
         self.assertEqual(descriptor['_one_time_min_retries'], 1)
