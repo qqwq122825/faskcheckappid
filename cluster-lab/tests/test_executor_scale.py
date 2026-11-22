@@ -374,7 +374,7 @@ class ExecutorScaleTests(unittest.TestCase):
                 lease = pool.acquire(wait=.5)
                 self.assertIsNotNone(lease)
                 busy = pool.snapshot()
-                self.assertEqual(busy['available'], 0)
+                self.assertEqual(busy['available'], 1)
                 self.assertEqual(busy['in_use'], 1)
                 self.assertEqual(busy['known'], 1)
                 pool.release(lease, healthy=False)
@@ -404,7 +404,7 @@ class ExecutorScaleTests(unittest.TestCase):
         finally:
             pool.close()
 
-    def test_node_proxy_pool_never_leases_an_exit_that_is_already_in_use(self):
+    def test_node_proxy_pool_allows_concurrent_ip_reuse(self):
         context = mp.get_context('spawn')
         pool = NodeProxyPool(context, concurrency=2, ttl=50, target=2)
         try:
@@ -413,14 +413,35 @@ class ExecutorScaleTests(unittest.TestCase):
             second = pool.acquire(wait=.5)
             self.assertEqual({first[0], second[0]},
                              {'socks5h://one', 'socks5h://two'})
-            self.assertIsNone(pool.acquire(wait=.05))
-            pool.discard(first)
-            # The other worker still owns `second`; it cannot be leased again.
-            self.assertIsNone(pool.acquire(wait=.05))
+            third = pool.acquire(wait=.05)
+            self.assertIn(third[0], {'socks5h://one', 'socks5h://two'})
+            self.assertEqual(pool.snapshot()['known'], 2)
+            self.assertEqual(pool.snapshot()['in_use'], 3)
+            pool.release(first, healthy=True)
             pool.release(second, healthy=True)
-            available = pool.acquire(wait=.5)
-            self.assertEqual(available[0], second[0])
-            pool.release(available, healthy=True)
+            pool.release(third, healthy=True)
+            self.assertEqual(pool.snapshot()['available'], 2)
+        finally:
+            pool.close()
+
+    def test_twenty_ips_can_feed_one_thousand_inflight_requests(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=1000, ttl=50, target=1000)
+        leases = []
+        try:
+            endpoints = [f'socks5h://shared-{index}' for index in range(20)]
+            self.assertEqual(pool.add_fresh(endpoints), 20)
+            for _ in range(1000):
+                lease = pool.acquire(wait=.05)
+                self.assertIsNotNone(lease)
+                leases.append(lease)
+            self.assertEqual(pool.snapshot()['available'], 20)
+            self.assertEqual(pool.snapshot()['known'], 20)
+            self.assertEqual(pool.snapshot()['in_use'], 1000)
+            self.assertGreaterEqual(pool.snapshot()['reused'], 980)
+            for lease in leases:
+                pool.release(lease, healthy=True)
+            self.assertEqual(pool.snapshot()['in_use'], 0)
         finally:
             pool.close()
 
@@ -431,13 +452,15 @@ class ExecutorScaleTests(unittest.TestCase):
             pool.add_fresh(['socks5h://one', 'socks5h://two'])
             first = pool.acquire(wait=.5)
             second = pool.acquire(wait=.5)
-            self.assertEqual(pool.add_fresh(['socks5h://three']), 0)
+            # IPs are shared, so an idle queue token remains rotatable even
+            # while requests using the old endpoint are still in flight.
+            self.assertEqual(pool.add_fresh(['socks5h://three']), 1)
             self.assertEqual(pool.snapshot()['known'], 2)
             pool.release(first, healthy=True)
             pool.release(second, healthy=True)
-            self.assertEqual(pool.add_fresh(['socks5h://three']), 1)
+            self.assertEqual(pool.add_fresh(['socks5h://four']), 1)
             self.assertEqual(pool.snapshot()['known'], 2)
-            self.assertEqual(pool.snapshot()['refreshed'], 1)
+            self.assertEqual(pool.snapshot()['refreshed'], 2)
         finally:
             pool.close()
 
@@ -489,6 +512,25 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertTrue(pool.ready.is_set())
             self.assertEqual(pool.snapshot()['available'], 200)
             self.assertEqual(pool.snapshot()['target'], 1000)
+        finally:
+            pool.close()
+
+    def test_ready_shared_pool_refills_in_small_batches(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=1000, ttl=50, target=1000)
+        stop = threading.Event()
+        calls = []
+
+        def fetcher(_url, count, scheme=None):
+            calls.append(count)
+            stop.set()
+            return [f'{scheme}://rolling-{index}' for index in range(count)]
+
+        try:
+            pool.add_fresh(['socks5h://existing'])
+            proxy_supplier_loop(pool, 'http://proxy.test/list', 'socks5h',
+                                stop, fetcher)
+            self.assertEqual(calls, [20])
         finally:
             pool.close()
 

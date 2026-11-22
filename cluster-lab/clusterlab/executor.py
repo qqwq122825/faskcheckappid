@@ -626,7 +626,14 @@ class _ProxyExitIpDebug:
 
 
 class NodeProxyPool:
-    """Fresh-first proxy pool shared by every process in one node package."""
+    """Fresh-first, concurrently reusable proxy pool for one node package.
+
+    Device identities remain exclusive, but an exit IP is only transport and
+    may serve multiple account requests at the same time.  Keeping the proxy
+    token queued while requests are in flight also lets the supplier rotate
+    exits continuously instead of dropping from 1,000 exits to zero when a
+    same-age batch reaches its TTL.
+    """
 
     def __init__(self, context, concurrency, ttl=PROXY_TTL_SECONDS, target=None):
         concurrency = max(1, int(concurrency or 1))
@@ -745,8 +752,40 @@ class NodeProxyPool:
                 return item
             self._add(self.discarded, 1)
 
+    def _publish(self, channel, counter, lease):
+        """Return one shared token to a queue before the request starts."""
+        self._add(counter, 1)
+        try:
+            channel.put_nowait(lease)
+            return True
+        except queue.Full:
+            self._add(counter, -1)
+            self._add(self.discarded, 1)
+            self.refill.set()
+            return False
+
+    def _remove_endpoint(self, endpoint):
+        """Best-effort removal of one queued shared endpoint."""
+        removed = 0
+        for channel, counter in ((self.fresh, self.fresh_count),
+                                 (self.reusable, self.reusable_count)):
+            keep = []
+            for _ in range(self._value(counter)):
+                lease = self._take(channel, counter, 0.02)
+                if lease is None:
+                    break
+                if not removed and lease[0] == endpoint:
+                    removed = 1
+                    continue
+                keep.append(lease)
+            for lease in keep:
+                self._publish(channel, counter, lease)
+        return bool(removed)
+
     def acquire(self, wait=1.0):
         # Never wait for a new API response while a healthy queued exit exists.
+        # The token is republished before returning, so independent device
+        # requests may share the IP without sharing device state.
         lease = self._take(self.fresh, self.fresh_count)
         # multiprocessing.Queue publishes through a feeder thread.  Its shared
         # count can therefore become visible a few milliseconds before get()
@@ -758,14 +797,20 @@ class NodeProxyPool:
         if lease is not None:
             if self._value(self.fresh_count) < self.low_water:
                 self.refill.set()
+            self._publish(self.reusable, self.reusable_count,
+                          (lease[0], lease[1], int(lease[2]) + 1,
+                           int(lease[3]) if len(lease) > 3 else 0))
             self._add(self.in_use_count, 1)
             return lease
         self.refill.set()
         lease = self._take(self.reusable, self.reusable_count)
         if lease is not None:
             self._add(self.reused, 1)
+            self._publish(self.reusable, self.reusable_count,
+                          (lease[0], lease[1], int(lease[2]) + 1,
+                           int(lease[3]) if len(lease) > 3 else 0))
             self._add(self.in_use_count, 1)
-            return (lease[0], lease[1], int(lease[2]) + 1,
+            return (lease[0], lease[1], int(lease[2]),
                     int(lease[3]) if len(lease) > 3 else 0)
         # Queue feeder visibility can lag its published count. Only when both
         # queues are empty do we allow the caller's bounded resource wait.
@@ -775,13 +820,19 @@ class NodeProxyPool:
             lease = self._take(self.fresh, self.fresh_count,
                                min(0.01, max(0.0, deadline - time.monotonic())))
             if lease is not None:
+                self._publish(self.reusable, self.reusable_count,
+                              (lease[0], lease[1], int(lease[2]) + 1,
+                               int(lease[3]) if len(lease) > 3 else 0))
                 self._add(self.in_use_count, 1)
                 return lease
             lease = self._take(self.reusable, self.reusable_count)
             if lease is not None:
                 self._add(self.reused, 1)
+                self._publish(self.reusable, self.reusable_count,
+                              (lease[0], lease[1], int(lease[2]) + 1,
+                               int(lease[3]) if len(lease) > 3 else 0))
                 self._add(self.in_use_count, 1)
-                return (lease[0], lease[1], int(lease[2]) + 1,
+                return (lease[0], lease[1], int(lease[2]),
                         int(lease[3]) if len(lease) > 3 else 0)
         return None
 
@@ -789,30 +840,22 @@ class NodeProxyPool:
         if lease is None:
             return
         self._add(self.in_use_count, -1)
-        if float(lease[1]) <= time.monotonic():
-            self._add(self.discarded, 1)
-            return
-        failures = int(lease[3]) if len(lease) > 3 else 0
+        # acquire() already returned the shared token to the queue.  A bad
+        # transport removes that token; successful requests need no queue IO.
         if not healthy:
-            failures += 1
+            failures = int(lease[3]) + 1 if len(lease) > 3 else 1
             self._add(self.soft_failures, 1)
+            self._remove_endpoint(lease[0])
             if failures >= PROXY_FAILURE_LIMIT:
                 self._add(self.discarded, 1)
-                self.refill.set()
-                return
-        else:
-            failures = 0
-        reusable = (lease[0], lease[1], int(lease[2]), failures)
-        self._add(self.reusable_count, 1)
-        try:
-            self.reusable.put_nowait(reusable)
-        except queue.Full:
-            self._add(self.reusable_count, -1)
-            self._add(self.discarded, 1)
-            return
+            elif float(lease[1]) > time.monotonic():
+                self._publish(self.reusable, self.reusable_count,
+                              (lease[0], lease[1], int(lease[2]), failures))
+            self.refill.set()
+        return
 
     def discard(self, lease):
-        """Remove a leased exit immediately and request a replacement.
+        """Remove a shared exit immediately and request a replacement.
 
         The supplier's recent-exit history still remembers the endpoint until
         its original TTL, so an HTTP 0/503 exit cannot be fetched straight back
@@ -821,7 +864,8 @@ class NodeProxyPool:
         if lease is None:
             return
         self._add(self.in_use_count, -1)
-        self._add(self.discarded, 1)
+        if self._remove_endpoint(lease[0]):
+            self._add(self.discarded, 1)
         self.refill.set()
 
     def prune_expired(self):
@@ -863,7 +907,8 @@ class NodeProxyPool:
         return {
             'available': available,
             'in_use': in_use,
-            'known': available + in_use,
+            # in_use counts active requests, not exclusive IP ownership.
+            'known': available,
             'fresh': self._value(self.fresh_count),
             'reusable': self._value(self.reusable_count),
             'target': self.target,
@@ -880,6 +925,7 @@ class NodeProxyPool:
             'refreshed': self._value(self.refreshed),
             'last_fetch_ms': round(last_fetch_ms, 1),
             'ttl_seconds': self.ttl,
+            'concurrent_reuse': True,
             'ready': self.ready.is_set(),
         }
 
@@ -923,7 +969,15 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
             # the initial batch expire at once. The supplier API accepts at
             # most 1,000 exits per call; larger node pools fill incrementally.
             refresh_batch = max(1, math.ceil(pool.target / pool.ttl))
-            count = min(PROXY_FETCH_LIMIT, max(refresh_batch, needed))
+            # The first call still fills the configured pool quickly.  Once
+            # any IP is usable, concurrent reuse means a large catch-up call
+            # only blocks the sole supplier thread; replenish in small rolling
+            # batches instead.  This avoids the observed 979-exit/66-second
+            # refill cliff while account workers keep using current exits.
+            count = min(
+                PROXY_FETCH_LIMIT,
+                refresh_batch if pool.ready.is_set()
+                else max(refresh_batch, needed))
             started = time.monotonic()
             before = _proxy_pool_snapshot(pool) if debug_path else {}
             try:
