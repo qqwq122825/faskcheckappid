@@ -381,6 +381,9 @@ class Controller:
             # The shared thread pool is now the only GSA device strategy.
             # Upgrade older controllers that were switched to legacy pool mode.
             db.execute("UPDATE controller_settings SET value='one_time' WHERE key='device_mode'")
+            # Thread workers now own registration, retirement and cooldown.
+            # Disable the legacy background replacement loop on upgrade.
+            db.execute("UPDATE controller_settings SET value='0' WHERE key='device_auto_rotate'")
             unit_columns = {row['name'] for row in db.execute('PRAGMA table_info(units)')}
             if 'result_counts' not in unit_columns:
                 db.execute('ALTER TABLE units ADD COLUMN result_counts TEXT')
@@ -703,7 +706,7 @@ class Controller:
                 'proxy_scheme': values.get('proxy_scheme', 'socks5h'),
                 'device_rotate_after': int(values.get('device_rotate_after', 0) or 0),
                 # column 声明是 INTEGER，存 '1' 会读回整数 1，比较时统一转字符串
-                'device_auto_rotate': str(values.get('device_auto_rotate', '0')) in ('1', 'True', 'true'),
+                'device_auto_rotate': False,
                 'proxy_ttl': int(values.get('proxy_ttl', 50) or 50),
                 'proxy_pool_size': int(values.get('proxy_pool_size', 1000) or 1000),
                 'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true'),
@@ -792,27 +795,20 @@ class Controller:
             current = {row['key']: row['value'] for row in db.execute(
                 "SELECT key,value FROM controller_settings "
                 "WHERE key IN ('device_rotate_after','device_auto_rotate')")}
-            # This endpoint accepts partial updates. Saving a threshold must
-            # not implicitly disable the separately saved refill switch.
             limit_value = data.get('device_rotate_after', current.get('device_rotate_after', 0))
             limit = integer(int(limit_value or 0), '设备轮换阈值', 0, 100000)
             if 'device_auto_rotate' in data:
                 if type(data['device_auto_rotate']) is not bool:
                     raise ValueError('设备自动补充开关应为布尔值')
-                auto = '1' if data['device_auto_rotate'] else '0'
-            else:
-                auto = '1' if str(current.get('device_auto_rotate', '0')) in ('1', 'True', 'true') else '0'
+                if data['device_auto_rotate']:
+                    raise ValueError('共享线程模式不启用后台自动补充')
             for key_name, key_value in (('device_rotate_after', str(limit)),
-                                        ('device_auto_rotate', auto)):
+                                        ('device_auto_rotate', '0')):
                 db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                            (key_name, key_value))
-            if auto == '1':
-                event(db, 'controller_config',
-                      f'设备自动补充已开启：每台用满 {limit or 20} 条后换新并补齐' if limit
-                      else '设备自动补充已开启（轮换阈值 0 时只补缺不换新）')
-            else:
-                event(db, 'controller_config', '设备自动补充已关闭')
+            event(db, 'controller_config',
+                  '设备轮换阈值已保存；后台自动补充保持关闭')
         return self.settings()
 
     def configure_proxy(self, data):

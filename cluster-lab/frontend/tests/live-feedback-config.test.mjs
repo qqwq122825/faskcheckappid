@@ -271,16 +271,11 @@ test('Result list keeps one neutral result column without protocol-specific colu
 })
 
 
-test('Device refill switch reopens from persisted settings and publishes save immediately', () => {
+test('Device pool omits legacy background refill and keeps explicit initialization', () => {
   const drawer = source('src/components/DevicePoolDrawer.vue')
-  assert.match(drawer, /const settings = state\.value\?\.settings/)
-  assert.match(drawer, /Boolean\(settings\.device_auto_rotate/)
-  assert.doesNotMatch(drawer, /telemetry\?\.device_auto_rotate/)
-  assert.match(drawer, /const saved = await api\('\/api\/settings\/rotation'/)
-  assert.match(drawer, /state\.value\.settings =/)
-  assert.match(drawer, /:disabled="building \|\| savingAuto"/)
-  assert.match(drawer, /先注册一台替换设备/)
-  assert.match(drawer, /新设备成功后才移除出生日期最早且空闲的旧设备/)
+  assert.doesNotMatch(drawer, /device_auto_rotate|toggleAuto|savingAuto|自动补充|持续先增后换并补齐/)
+  assert.match(drawer, /开始初始化设备池/)
+  assert.match(drawer, /0 表示不预注册，池空时由验证线程自行注册/)
 })
 
 test('Task detail shows one node-reported traffic card with the 1 GB estimate', () => {

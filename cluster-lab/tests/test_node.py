@@ -805,7 +805,7 @@ class NodeRecoveryTests(unittest.TestCase):
             self.node._heartbeat()
         start.assert_not_called()
 
-    def test_auto_rotation_registers_one_replacement_before_removing_any_device(self):
+    def test_legacy_auto_rotation_directive_is_ignored(self):
         value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
                  'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 0,
                  'device_auto_rotate': True, 'device_rotate_after': 20}
@@ -813,52 +813,11 @@ class NodeRecoveryTests(unittest.TestCase):
                     'failed': 0, 'current': 0, 'attempted': 30, 'slots': []}
         with patch.object(self.node, '_request', return_value=Response(value)), \
              patch.object(self.node.builder, 'snapshot', return_value=complete), \
-             patch.object(self.node.builder, 'reserved_slots', return_value=set()), \
-             patch.object(self.node.builder, 'retirable', return_value=[7]) as retirable, \
-             patch.object(self.node.builder, 'oldest', return_value=[1]) as oldest, \
-             patch.object(self.node.builder, 'rotate') as rotate, \
-             patch.object(self.node.builder, 'retire') as retire, \
-             patch.object(self.node.builder, 'start') as start:
-            self.node._heartbeat()
-        retirable.assert_called_once_with(20, exclude=set())
-        oldest.assert_called_once_with(1, candidates=list(range(1, 31)))
-        rotate.assert_called_once_with(30, 1)
-        retire.assert_not_called()
-        start.assert_not_called()
-
-    def test_auto_rotation_keeps_all_reserved_devices_untouched(self):
-        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
-                 'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 0,
-                 'device_auto_rotate': True, 'device_rotate_after': 20}
-        complete = {'running': False, 'capacity': 30, 'ready': 30, 'built': 0,
-                    'failed': 0, 'current': 0, 'attempted': 30, 'slots': []}
-        reserved = set(range(1, 31))
-        with patch.object(self.node, '_request', return_value=Response(value)), \
-             patch.object(self.node.builder, 'snapshot', return_value=complete), \
-             patch.object(self.node.builder, 'reserved_slots', return_value=reserved), \
-             patch.object(self.node.builder, 'retirable', return_value=[]) as retirable, \
              patch.object(self.node.builder, 'rotate') as rotate, \
              patch.object(self.node.builder, 'start') as start:
             self.node._heartbeat()
-        retirable.assert_called_once_with(20, exclude=reserved)
         rotate.assert_not_called()
         start.assert_not_called()
-
-    def test_auto_rotation_fills_an_existing_gap_before_starting_a_replacement(self):
-        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
-                 'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 0,
-                 'device_auto_rotate': True, 'device_rotate_after': 20}
-        incomplete = {'running': False, 'capacity': 30, 'ready': 29, 'built': 0,
-                      'failed': 0, 'current': 0, 'attempted': 30, 'slots': []}
-        with patch.object(self.node, '_request', return_value=Response(value)), \
-             patch.object(self.node.builder, 'snapshot', return_value=incomplete), \
-             patch.object(self.node.builder, 'retirable') as retirable, \
-             patch.object(self.node.builder, 'rotate') as rotate, \
-             patch.object(self.node.builder, 'start') as start:
-            self.node._heartbeat()
-        start.assert_called_once_with(30)
-        retirable.assert_not_called()
-        rotate.assert_not_called()
 
     def test_failed_staged_rotation_keeps_the_live_device(self):
         live = self.node.root / 'device-pool' / 'origin' / 'devices' / '01'

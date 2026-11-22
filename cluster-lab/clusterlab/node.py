@@ -581,34 +581,6 @@ class Node:
                 except (RuntimeError, ValueError) as exc:
                     # 不能静默吞：面板上看不到原因会以为节点没响应
                     self.builder._update(message=str(exc))
-            # 自动补充：先补缺口；满池轮换时先在隔离目录注册新设备，
-            # 成功后才替换一台最老且未被任务占用的旧设备。
-            auto = bool(value.get('device_auto_rotate'))
-            limit = int(value.get('device_rotate_after') or 0)
-            if auto and not self.builder.state['running']:
-                snapshot = self.builder.snapshot()
-                capacity = int(snapshot.get('capacity') or self.builder.state['capacity'] or 0)
-                if capacity:
-                    try:
-                        if int(snapshot.get('ready') or 0) < capacity:
-                            # 先补既有缺口，不再额外淘汰。
-                            self.builder.start(capacity)
-                        elif limit:
-                            reserved = self.builder.reserved_slots()
-                            stale = self.builder.retirable(limit, exclude=reserved)
-                            if stale:
-                                candidates = [int(item['slot'])
-                                              for item in snapshot.get('slots') or []
-                                              if item.get('state') == 'ready'
-                                              and int(item['slot']) not in reserved]
-                                if not candidates:
-                                    candidates = [slot for slot in range(1, capacity + 1)
-                                                  if slot not in reserved]
-                                oldest = self.builder.oldest(1, candidates=candidates)
-                                if oldest:
-                                    self.builder.rotate(capacity, oldest[0])
-                    except (RuntimeError, ValueError):
-                        pass
             for unit_id in value['rejected']:
                 if unit_id in self.active:
                     self.active[unit_id][1].set()

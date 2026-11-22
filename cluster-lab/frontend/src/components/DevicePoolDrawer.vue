@@ -4,7 +4,6 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, fmt, state } from '../composables/useCluster'
 
 const visible = ref(false), nodeId = ref(''), capacity = ref(2), error = ref('')
-const autoRotate = ref(false), savingAuto = ref(false), rotateAfter = ref(20)
 // 每次刷新都从全局状态里取最新节点，设备池进度才会跟着心跳走
 const node = computed(() => state.value?.nodes?.find((n: any) => n.id === nodeId.value))
 const busy = ref(false), clearing = ref(false), timer = 0 as any
@@ -66,9 +65,6 @@ watch([() => rows.value.length, pageSize], () => {
 
 function show(value: any) {
   nodeId.value = value?.id || ''
-  const settings = state.value?.settings || {}
-  autoRotate.value = Boolean(settings.device_auto_rotate ?? false)
-  rotateAfter.value = Number(settings.device_rotate_after ?? 20) || 20
   capacity.value = Math.max(0, Number(value?.telemetry?.device_pool?.capacity) || 0)
   error.value = ''
   page.value = 1
@@ -91,18 +87,6 @@ async function initialize() {
   } catch (exc: any) {
     error.value = exc?.message || '请求失败'
   } finally { busy.value = false }
-}
-async function toggleAuto(next: boolean) {
-  savingAuto.value = true
-  try {
-    const saved = await api('/api/settings/rotation', { device_rotate_after: rotateAfter.value || 20,
-                                                        device_auto_rotate: next }, 'POST')
-    if (state.value) state.value.settings = { ...(state.value.settings || {}), ...saved }
-    ElMessage.success(next ? '已开启自动补充：任务运行中持续换新设备' : '已关闭自动补充')
-  } catch (exc: any) {
-    autoRotate.value = !next
-    error.value = exc?.message || '保存失败'
-  } finally { savingAuto.value = false }
 }
 async function cancelBuild() {
   try { await api(`/api/nodes/${node.value.id}/devices`, { capacity: 0 }, 'POST'); ElMessage.success('已请求停止') }
@@ -139,16 +123,8 @@ async function clearPool() {
           <el-input-number v-model="capacity" :min="0" :max="10000" :step="1" :precision="0" :disabled="building || busy" />
           <span class="field-note">0 表示不预注册，池空时由验证线程自行注册；也可预先初始化 1–10000 台。</span>
         </el-form-item>
-        <el-form-item label="自动补充">
-          <el-switch v-model="autoRotate" :loading="savingAuto" :disabled="savingAuto"
-                     @change="toggleAuto" active-text="持续先增后换并补齐" />
-          <span class="field-note">
-            开启后，原有设备保持可用；节点先注册一台替换设备，
-            只有新设备成功后才移除出生日期最早且空闲的旧设备。
-          </span>
-        </el-form-item>
         <div class="actions">
-          <el-button type="primary" native-type="submit" :loading="busy" :disabled="building || savingAuto">开始初始化设备池</el-button>
+          <el-button type="primary" native-type="submit" :loading="busy" :disabled="building">开始初始化设备池</el-button>
           <el-button v-if="building" @click="cancelBuild">停止</el-button>
           <el-tooltip :disabled="!node?.active" content="节点仍有工作包在执行，请先停止任务" placement="top">
             <span><el-button type="danger" plain :loading="clearing"
