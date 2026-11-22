@@ -876,6 +876,55 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(shared.discards, ['socks5h://first-exit'])
             self.assertEqual(stop.waits, [])
 
+    def test_debug_sample_records_phase_and_device_timings_without_credentials(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # Row 20 is the deterministic five-percent performance sample.
+            (root / 'input.part').write_text(
+                'account----password\n', encoding='utf-8')
+            descriptor = {'rows': 1, 'first_row': 20, 'threads': 1,
+                          'device_capacity': 1,
+                          'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1',
+                          'timeout': 5, 'retries': 0,
+                          '_proxy_debug': True}
+            shared = ScriptedProxyPool(
+                ['socks5h://bootstrap', 'socks5h://account-exit'])
+            stop = RecordingStop()
+
+            def check(_account, _password, _proxy, **kwargs):
+                diagnostics = kwargs.get('diagnostics')
+                self.assertIsNotNone(diagnostics)
+                diagnostics({'event': 'phase_end', 'phase': 'srp_challenge',
+                             'ms': 12.5, 'cpu_ms': 7.25})
+                diagnostics({'event': 'phase_end', 'phase': 'http_complete',
+                             'ms': 45.0, 'cpu_ms': 1.0})
+                return {'status': 'wrong_password', 'stage': 'complete',
+                        'http': 200, 'apple_ec': -22406,
+                        'detail': 'synthetic wrong password'}
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool, check, lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, stop, proxy_pool=shared)
+
+            events = [json.loads(line) for line in
+                      (root / 'proxy-debug.jsonl').read_text().splitlines()]
+            timing = next(item for item in events
+                          if item.get('event') == 'auth_timing')
+            self.assertTrue(timing['sampled'])
+            self.assertEqual(timing['phase_ms'], {
+                'http_complete': 45.0, 'srp_challenge': 12.5})
+            self.assertEqual(timing['phase_cpu_ms'], {
+                'http_complete': 1.0, 'srp_challenge': 7.25})
+            self.assertIn('device_lease_ms', timing)
+            self.assertIn('device_identity_ms', timing)
+            serialized = json.dumps(timing)
+            self.assertNotIn('account----password', serialized)
+            self.assertNotIn('socks5h://account-exit', serialized)
+
     def test_auth_unit_uses_configured_two_retries_for_apple_try_again_later(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

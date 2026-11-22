@@ -707,8 +707,13 @@ def _once(email: str, password: str, proxy: str | None, timeout: float,
                        kind="anisette", stage="init")
     try:
         with phase(diagnostics, "srp_init"):
-            with _SRP_CPU_LANE:
-                srp = SRPClient(email, password)
+            with phase(diagnostics, "srp_init_lane_wait"):
+                _SRP_CPU_LANE.acquire()
+            try:
+                with phase(diagnostics, "srp_init_compute"):
+                    srp = SRPClient(email, password)
+            finally:
+                _SRP_CPU_LANE.release()
     except Exception as exc:                          # noqa: BLE001
         return _result("error", f"srp init: {exc}", started, kind="protocol", stage="init")
     with phase(diagnostics, "client_setup"):
@@ -752,9 +757,15 @@ def _once(email: str, password: str, proxy: str | None, timeout: float,
             raise KeyError("c")
         with phase(diagnostics, "srp_challenge") as timing:
             timing["iterations"] = response["i"]
-            with _SRP_CPU_LANE:
-                m1 = srp.process_challenge(response["s"], response["B"], response["i"],
-                                           response["sp"])
+            with phase(diagnostics, "srp_challenge_lane_wait"):
+                _SRP_CPU_LANE.acquire()
+            try:
+                with phase(diagnostics, "srp_challenge_compute"):
+                    m1 = srp.process_challenge(
+                        response["s"], response["B"], response["i"],
+                        response["sp"])
+            finally:
+                _SRP_CPU_LANE.release()
     except KeyError as exc:
         return _result("error", f"init missing {exc}", started, kind="protocol", stage="init")
     except Exception as exc:                          # noqa: BLE001

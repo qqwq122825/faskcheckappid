@@ -34,6 +34,8 @@ DEVICE_AUTH_COOLDOWN_SECONDS = 3.0
 DEVICE_LEASE_POLL_SECONDS = 0.05
 MIN_STALL_TIMEOUT_SECONDS = 180.0
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
+PERFORMANCE_TRACE_SAMPLE_EVERY = 20
+PERFORMANCE_TRACE_SLOW_MS = 30000.0
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
 PROXY_EXIT_IP_TIMEOUT = 4.0
 PROXY_EXIT_IP_MAX = 2048
@@ -1988,6 +1990,28 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            if device_mode == 'one_time' else 0)
         attempt_limit = max(retries, minimum_retries) + 1
         for attempt in range(start_attempt, attempt_limit):
+            # Full transport tracing is deliberately sampled.  Enabling it for
+            # every one of hundreds of account threads changes the workload we
+            # are trying to measure and creates very large JSONL files.  Slow
+            # unsampled rows still emit their outer proxy/device/request times.
+            trace_sampled = (debug_enabled
+                             and row % PERFORMANCE_TRACE_SAMPLE_EVERY == 0)
+            phase_ms = Counter()
+            phase_cpu_ms = Counter()
+
+            def collect_phase(event):
+                if event.get('event') != 'phase_end':
+                    return
+                phase = str(event.get('phase') or '')
+                if not phase:
+                    return
+                try:
+                    phase_ms[phase] += max(0.0, float(event.get('ms') or 0))
+                    phase_cpu_ms[phase] += max(
+                        0.0, float(event.get('cpu_ms') or 0))
+                except (TypeError, ValueError):
+                    return
+
             acquire_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
             acquire_started = time.monotonic() if debug_enabled else None
             account_proxy, lease = proxy_for(index + attempt)
@@ -2032,7 +2056,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             device_remaining = None
             device_used_at = None
             device_used = False
+            device_lease_ms = None
+            device_identity_ms = None
+            device_was_ready = None
+            device_registered = False
             try:
+                device_started = time.monotonic() if debug_enabled else None
                 if auth_protocol == 'gsa':
                     if device_mode == 'one_time':
                         # Prefer a registered idle device. If none is idle,
@@ -2046,11 +2075,16 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     else:
                         device_lease = DeviceAuthLease.acquire(
                             auth_pool, slot_id, stop, cooldown=device_cooldown)
+                if debug_enabled:
+                    device_lease_ms = round(
+                        (time.monotonic() - device_started) * 1000, 2)
                 if auth_protocol == 'gsa' and identity is None:
                     # The lease makes inspect/register atomic across all node
                     # processes. Missing slots are registered by this thread;
                     # ready slots are refreshed and reused directly.
+                    identity_started = time.monotonic() if debug_enabled else None
                     ready = auth_pool.inspect(slot_id)['state'] == 'ready'
+                    device_was_ready = ready
                     profile = device_profile(auth_pool, slot_id)
                     # Thread mode already owns a complete per-device profile;
                     # do not fetch the pool-global client_info/user_agent only
@@ -2067,8 +2101,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                                                        provider_direct=True)
                     inspected = auth_pool.inspect(slot_id)
                     if not ready and inspected['state'] == 'ready':
+                        device_registered = True
                         record_device_registration(device_root, slot_id, account_proxy,
                                                    profile.get('model', ''))
+                    if debug_enabled:
+                        device_identity_ms = round(
+                            (time.monotonic() - identity_started) * 1000, 2)
                     if device_mode == 'one_time':
                         device_labels[slot_id] = _device_id_label(inspected.get('device_id'))
                 # 主协议由系统设置固化到任务；Web 模式不先发 GSA 请求。
@@ -2080,7 +2118,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     device_used = True
                     result = gsa_check(account, password, account_proxy, timeout=timeout,
                                        retries=0 if proxy_pool is not None else retries,
-                                       cancel=stop.is_set, identity=identity)
+                                       cancel=stop.is_set, identity=identity,
+                                       diagnostics=(collect_phase if trace_sampled else None))
                 # GSA 主协议可对 au=repair 结果追加 Web 二次验证；
                 # Web 主协议仍全程只运行 Web。
                 if auth_protocol == 'gsa' and descriptor.get('_web_secondary_auth'):
@@ -2163,6 +2202,24 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 web_http = None
             web_failed = (str(result.get('web_status') or '').casefold() == 'error'
                           and web_http in (0, 500, 502, 503, 504))
+            if debug_enabled and (trace_sampled
+                                  or (request_ms or 0) >= PERFORMANCE_TRACE_SLOW_MS):
+                _write_proxy_debug(
+                    debug_path, 'auth_timing', row=row, slot=slot_id,
+                    attempt=attempt, sampled=trace_sampled,
+                    proxy_acquire_ms=acquire_ms,
+                    device_lease_ms=device_lease_ms,
+                    device_identity_ms=device_identity_ms,
+                    request_ms=request_ms,
+                    phase_ms={key: round(value, 3)
+                              for key, value in sorted(phase_ms.items())},
+                    phase_cpu_ms={key: round(value, 3)
+                                  for key, value in sorted(phase_cpu_ms.items())},
+                    device_was_ready=device_was_ready,
+                    device_registered=device_registered,
+                    http=result_http, apple_ec=apple_ec,
+                    status=str(result.get('status') or ''),
+                    stage=str(result.get('stage') or ''))
             # HTTP 0 and transient 5xx are retry outcomes: remove that exact lease now,
             # wait five seconds, then acquire an available (never in-use) exit.
             # Proxy-auth 407 and other transport failures retain the general

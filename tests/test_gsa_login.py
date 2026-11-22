@@ -158,6 +158,22 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(state['peak'], 1)
         self.assertEqual(len(results), 16)
 
+    def test_srp_diagnostics_split_lane_wait_from_compute(self):
+        events = []
+        server = SyntheticServer()
+        with patch.object(gsa, "_session_for", return_value=server):
+            result = gsa.check(
+                "owned@example.invalid", "synthetic-password", None,
+                retries=0, identity=self.identity, diagnostics=events.append)
+
+        self.assertEqual(result["status"], "valid")
+        phases = {event.get("phase") for event in events
+                  if event.get("event") == "phase_end"}
+        self.assertTrue({
+            "srp_init_lane_wait", "srp_init_compute",
+            "srp_challenge_lane_wait", "srp_challenge_compute",
+        } <= phases)
+
     def test_missing_and_tampered_server_proofs_are_rejected(self):
         for proof in ("missing", "tampered"):
             with self.subTest(proof=proof):
