@@ -530,7 +530,7 @@ class ExecutorScaleTests(unittest.TestCase):
             pool.add_fresh(['socks5h://existing'])
             proxy_supplier_loop(pool, 'http://proxy.test/list', 'socks5h',
                                 stop, fetcher)
-            self.assertEqual(calls, [20])
+            self.assertEqual(calls, [999])
         finally:
             pool.close()
 

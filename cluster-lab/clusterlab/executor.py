@@ -969,15 +969,12 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
             # the initial batch expire at once. The supplier API accepts at
             # most 1,000 exits per call; larger node pools fill incrementally.
             refresh_batch = max(1, math.ceil(pool.target / pool.ttl))
-            # The first call still fills the configured pool quickly.  Once
-            # any IP is usable, concurrent reuse means a large catch-up call
-            # only blocks the sole supplier thread; replenish in small rolling
-            # batches instead.  This avoids the observed 979-exit/66-second
-            # refill cliff while account workers keep using current exits.
-            count = min(
-                PROXY_FETCH_LIMIT,
-                refresh_batch if pool.ready.is_set()
-                else max(refresh_batch, needed))
+            # Fill shortages quickly, then rotate one TTL-window gradually.
+            # Maintain a full TTL window.  For the 10,000-exit default this
+            # requests 200 exits every second; IPs remain concurrently reusable.
+            # If inventory falls behind, catch up by the actual shortage, capped
+            # at the provider's per-request limit.
+            count = min(PROXY_FETCH_LIMIT, max(refresh_batch, needed))
             started = time.monotonic()
             before = _proxy_pool_snapshot(pool) if debug_path else {}
             try:

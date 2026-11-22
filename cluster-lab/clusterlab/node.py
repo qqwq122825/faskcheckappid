@@ -167,7 +167,7 @@ class Node:
         self.telemetry = HostTelemetry()
         self.proxy_api, self.proxy_scheme = '', 'socks5h'
         self.proxy_ttl = 50
-        self.proxy_pool_size = 1000
+        self.proxy_pool_size = 10000
         self.origin = 'https://new.ani.sidestore.io'
         from .device_build import DeviceBuilder
         self.builder = DeviceBuilder(self)
@@ -559,9 +559,9 @@ class Node:
                 self.proxy_ttl = 50
             try:
                 self.proxy_pool_size = max(1, min(10000, int(
-                    value.get('proxy_pool_size') or 1000)))
+                    value.get('proxy_pool_size') or 10000)))
             except (TypeError, ValueError):
-                self.proxy_pool_size = 1000
+                self.proxy_pool_size = 10000
             clear_version = int(value.get('device_clear_version') or 0)
             if clear_version > self.device_clear_version:
                 self.builder.cancel()

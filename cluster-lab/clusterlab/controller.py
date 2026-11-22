@@ -87,7 +87,7 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('origin','https://ne
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_rotate_after','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_auto_rotate','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
-INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_pool_size','1000');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_pool_size','10000');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('web_secondary_auth','1');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('auth_protocol','gsa');
@@ -708,7 +708,7 @@ class Controller:
                 # column 声明是 INTEGER，存 '1' 会读回整数 1，比较时统一转字符串
                 'device_auto_rotate': False,
                 'proxy_ttl': int(values.get('proxy_ttl', 50) or 50),
-                'proxy_pool_size': int(values.get('proxy_pool_size', 1000) or 1000),
+                'proxy_pool_size': int(values.get('proxy_pool_size', 10000) or 10000),
                 'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true'),
                 'web_secondary_auth': str(values.get('web_secondary_auth', '1')) in
                                       ('1', 'True', 'true'),
@@ -824,7 +824,7 @@ class Controller:
             raise ValueError('代理协议应为 socks5h / socks5 / http / https')
         try:
             pool_value = int(data.get('proxy_pool_size') or
-                             current.get('proxy_pool_size') or 1000)
+                             current.get('proxy_pool_size') or 10000)
         except (TypeError, ValueError):
             raise ValueError('单节点代理池容量应为 1–10000 的整数') from None
         pool_size = integer(pool_value, '单节点代理池容量', 1, 10000)
@@ -1541,7 +1541,7 @@ class Controller:
                     'device_rotate_after': self.settings().get('device_rotate_after', 0),
                     'device_auto_rotate': bool(self.settings().get('device_auto_rotate')),
                     'proxy_ttl': int(self.settings().get('proxy_ttl') or 50),
-                    'proxy_pool_size': int(self.settings().get('proxy_pool_size') or 1000),
+                    'proxy_pool_size': int(self.settings().get('proxy_pool_size') or 10000),
                     'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds,
                     'update': update,
                     'server_time': now,
@@ -1606,7 +1606,7 @@ class Controller:
                 settings = self.settings()
                 device_mode = (unit['device_mode'] or 'one_time').lower()
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
-                               proxy_pool_size=int(settings.get('proxy_pool_size') or 1000),
+                               proxy_pool_size=int(settings.get('proxy_pool_size') or 10000),
                                device_registration_workers=32,
                                device_usage_limit=(10 if device_mode == 'one_time' else
                                                    max(1, int(settings.get(
