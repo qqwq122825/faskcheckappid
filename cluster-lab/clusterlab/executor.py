@@ -39,6 +39,7 @@ PERFORMANCE_TRACE_SLOW_MS = 30000.0
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
 PROXY_EXIT_IP_TIMEOUT = 4.0
 PROXY_EXIT_IP_MAX = 2048
+PROXY_QUARANTINE_SLOTS = 65536
 
 
 def stall_timeout_seconds(descriptor, minimum=MIN_STALL_TIMEOUT_SECONDS,
@@ -55,6 +56,29 @@ def _partition_device_slots(slot_ids, process_count, process_index):
     count = max(1, int(process_count))
     index = max(0, int(process_index))
     return slots[index::count] or [index + 1]
+
+
+def _partition_one_time_device_slots(ready_slots, overflow_slots,
+                                     process_count, process_index):
+    """Give one auth process a disjoint ready/overflow pool shard.
+
+    File leases remain authoritative, but the common case no longer makes all
+    CPU-sized worker processes scan the same few thousand lock files. Tiny
+    pools still fall back to a shared slot so every configured process can run.
+    """
+    ready = [int(value) for value in ready_slots]
+    overflow = [int(value) for value in overflow_slots]
+    count = max(1, int(process_count))
+    index = max(0, int(process_index))
+    ready_part = ready[index::count]
+    overflow_part = overflow[index::count]
+    if ready_part or overflow_part:
+        return ready_part, overflow_part
+    combined = ready + overflow
+    if not combined:
+        return [], [index + 1]
+    fallback = combined[index % len(combined)]
+    return ([fallback], []) if fallback in set(ready) else ([], [fallback])
 
 
 def _slot_for_account(account, slot_ids):
@@ -655,6 +679,15 @@ class NodeProxyPool:
         self.waits = context.Value('q', 0)
         self.duplicates = context.Value('q', 0)
         self.refreshed = context.Value('q', 0)
+        # Immediate transport failures used to scan and rebuild the complete
+        # multiprocessing queue. Under 1,000 workers that made every other
+        # acquire wait behind an O(pool-size) operation. A shared direct-map
+        # quarantine lets consumers discard that token lazily in O(1).
+        self.quarantine_hashes = context.Array(
+            'Q', PROXY_QUARANTINE_SLOTS, lock=False)
+        self.quarantine_until = context.Array(
+            'd', PROXY_QUARANTINE_SLOTS, lock=False)
+        self.quarantined_count = context.Value('i', 0)
         # Supplier-local history: no Manager/RPC on the worker hot path.
         self._recent_exits = {}
         self.last_fetch_ms = context.Value('d', 0.0)
@@ -677,6 +710,28 @@ class NodeProxyPool:
     def _exit_key(value):
         parsed = urlsplit(str(value))
         return ((parsed.hostname or str(value)).lower(), parsed.port)
+
+    @staticmethod
+    def _quarantine_hash(value):
+        digest = hashlib.blake2b(str(value).encode('utf-8'), digest_size=8).digest()
+        return int.from_bytes(digest, 'big') or 1
+
+    def _quarantine(self, endpoint, until):
+        value = self._quarantine_hash(endpoint)
+        index = value % PROXY_QUARANTINE_SLOTS
+        now = time.monotonic()
+        already = (self.quarantine_hashes[index] == value
+                   and self.quarantine_until[index] > now)
+        self.quarantine_until[index] = max(now, float(until))
+        self.quarantine_hashes[index] = value
+        if not already:
+            self._add(self.quarantined_count, 1)
+
+    def _is_quarantined(self, endpoint):
+        value = self._quarantine_hash(endpoint)
+        index = value % PROXY_QUARANTINE_SLOTS
+        return (self.quarantine_hashes[index] == value
+                and self.quarantine_until[index] > time.monotonic())
 
     def add_fresh(self, values, fetched_at=None):
         # Called by the single supplier; remember even in-flight/failed exits
@@ -748,6 +803,9 @@ class NodeProxyPool:
                 return None
             self._add(counter, -1)
             timeout = 0.0
+            if self._is_quarantined(item[0]):
+                self._add(self.quarantined_count, -1)
+                continue
             if float(item[1]) > time.monotonic():
                 return item
             self._add(self.discarded, 1)
@@ -864,8 +922,8 @@ class NodeProxyPool:
         if lease is None:
             return
         self._add(self.in_use_count, -1)
-        if self._remove_endpoint(lease[0]):
-            self._add(self.discarded, 1)
+        self._quarantine(lease[0], lease[1])
+        self._add(self.discarded, 1)
         self.refill.set()
 
     def prune_expired(self):
@@ -879,6 +937,10 @@ class NodeProxyPool:
                 except queue.Empty:
                     break
                 self._add(counter, -1)
+                if self._is_quarantined(lease[0]):
+                    self._add(self.quarantined_count, -1)
+                    removed += 1
+                    continue
                 if float(lease[1]) <= time.monotonic():
                     self._add(self.discarded, 1)
                     removed += 1
@@ -902,7 +964,9 @@ class NodeProxyPool:
     def snapshot(self):
         with self.last_fetch_ms.get_lock():
             last_fetch_ms = self.last_fetch_ms.value
-        available = self._value(self.fresh_count) + self._value(self.reusable_count)
+        queued = self._value(self.fresh_count) + self._value(self.reusable_count)
+        quarantined = self._value(self.quarantined_count)
+        available = max(0, queued - quarantined)
         in_use = self._value(self.in_use_count)
         return {
             'available': available,
@@ -923,6 +987,7 @@ class NodeProxyPool:
             'waits': self._value(self.waits),
             'duplicates': self._value(self.duplicates),
             'refreshed': self._value(self.refreshed),
+            'quarantined': quarantined,
             'last_fetch_ms': round(last_fetch_ms, 1),
             'ttl_seconds': self.ttl,
             'concurrent_reuse': True,
@@ -1257,12 +1322,19 @@ def execute_unit_group(directory, descriptor, stop):
             if descriptor.get('mode') == 'auth':
                 assigned = descriptor.get('device_slots') or []
                 if str(descriptor.get('_device_mode') or 'pool').lower() == 'one_time':
-                    # Every child sees the same process-safe on-demand pool.
-                    # File leases prevent two threads/processes using one slot.
+                    # Give each CPU-sized process a disjoint shard. File leases
+                    # remain authoritative for tiny-pool fallbacks and restarts.
+                    child_ready, child_overflow = _partition_one_time_device_slots(
+                        descriptor.get('device_ready_slots') or [],
+                        descriptor.get('device_overflow_slots') or [],
+                        process_count, index)
+                    child_assigned = child_ready + child_overflow
                     child['device_pool_capacity'] = int(
                         descriptor.get('device_pool_capacity') or
                         (max(assigned) if assigned else 1))
-                    child['device_slots'] = [int(slot) for slot in assigned] or [1]
+                    child['device_slots'] = child_assigned
+                    child['device_ready_slots'] = child_ready
+                    child['device_overflow_slots'] = child_overflow
                     child.pop('device_plan', None)
                     child.pop('device_reset_slots', None)
                 elif plan is not None:

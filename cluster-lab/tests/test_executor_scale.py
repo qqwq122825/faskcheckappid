@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit,
                                  _auth_worker_limit, _consume_thread_pool_device,
                                  _device_id_label, _execute_auth_unit,
-                                 _partition_device_slots, _usage_snapshot,
+                                 _partition_device_slots,
+                                 _partition_one_time_device_slots, _usage_snapshot,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
@@ -185,6 +186,18 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertLess(elapsed, .1)
             extension.release()
             busy.release()
+
+    def test_thread_mode_partitions_ready_and_overflow_slots_by_process(self):
+        partitions = [_partition_one_time_device_slots(
+            range(1, 9), range(9, 13), 4, index) for index in range(4)]
+        self.assertEqual(partitions, [
+            ([1, 5], [9]), ([2, 6], [10]),
+            ([3, 7], [11]), ([4, 8], [12]),
+        ])
+        flattened = [slot for ready, overflow in partitions
+                     for slot in ready + overflow]
+        self.assertEqual(sorted(flattened), list(range(1, 13)))
+        self.assertEqual(len(flattened), len(set(flattened)))
 
     def test_ninth_use_is_verified_then_tenth_use_retires_device(self):
         class Pool:
@@ -397,10 +410,29 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(state['known'], 0)
             self.assertEqual(state['discarded'], 1)
             self.assertTrue(pool.refill.is_set())
+            self.assertEqual(state['quarantined'], 1)
+            self.assertIsNone(pool.acquire(wait=.05))
+            self.assertEqual(pool.snapshot()['quarantined'], 0)
             # The deleted endpoint remains quarantined for its original TTL,
             # while a different available endpoint can fill the empty slot.
             self.assertEqual(pool.add_fresh(['socks5h://http-error']), 0)
             self.assertEqual(pool.add_fresh(['socks5h://replacement']), 1)
+        finally:
+            pool.close()
+
+    def test_proxy_discard_does_not_scan_the_shared_queue(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=1000, ttl=50, target=1000)
+        try:
+            pool.add_fresh([f'socks5h://exit-{index}' for index in range(1000)])
+            lease = pool.acquire(wait=.5)
+            with patch.object(pool, '_remove_endpoint',
+                              side_effect=AssertionError('must not scan queue')):
+                started = time.monotonic()
+                pool.discard(lease)
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, .05)
+            self.assertEqual(pool.snapshot()['known'], 999)
         finally:
             pool.close()
 
