@@ -35,6 +35,15 @@ DEVICE_POOL_LIMIT = 10000
 DEVICE_AUTH_COOLDOWN_SECONDS = 3.0
 
 
+def srp_math_backend():
+    """Expose whether the node really loaded the native GMP accelerator."""
+    try:
+        from fastcheck.protocols.srp_auth import SRP_MATH_BACKEND
+        return SRP_MATH_BACKEND if SRP_MATH_BACKEND in ('gmpy2', 'python') else 'unknown'
+    except (ImportError, OSError):
+        return 'unavailable'
+
+
 def build_device_plan(rows, processes, slots, usage, limit=DEVICE_AUTH_LIMIT,
                       max_slots=DEVICE_POOL_LIMIT, desired_devices=None):
     """Allocate every row without letting one device identity exceed ``limit``.
@@ -526,8 +535,10 @@ class Node:
                            'ack_device_clear_version': self.device_clear_version,
                            'ack_update_generation': self.update_generation,
                            'update_status': self._update_status(),
-                           'telemetry': dict(self.telemetry.latest,
-                                             worker_processes=self._active_worker_count()),
+                           'telemetry': dict(
+                               self.telemetry.latest,
+                               worker_processes=self._active_worker_count(),
+                               srp_math_backend=srp_math_backend()),
                            'devices': self._device_status(),
                            'error': '; '.join(report_errors)[:200]}) as response:
             value = response.json()

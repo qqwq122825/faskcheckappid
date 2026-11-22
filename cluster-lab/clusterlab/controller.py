@@ -325,6 +325,11 @@ class Controller:
     MAX_PROCESSES = 4
     MAX_THREADS = 500
     MAX_ACTIVE_UNITS = 512
+    # Keep enough independently leasable work ahead of heterogeneous nodes.
+    # A fast node can take several small packages instead of idling behind one
+    # slow node that owns half of a large task.
+    DYNAMIC_UNIT_ROWS = 10000
+    DYNAMIC_UNITS_PER_NODE = 4
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'not_found',
                       'timeout', 'undetermined', 'unknown')
@@ -922,6 +927,10 @@ class Controller:
         result.update(received_at=time.time(), scope='host_non_loopback')
         processes = value.get('worker_processes')
         result['worker_processes'] = processes if type(processes) is int and 0 <= processes <= 200 else None
+        backend = str(value.get('srp_math_backend') or '')
+        result['srp_math_backend'] = (backend if backend in
+                                      ('gmpy2', 'python', 'unavailable', 'unknown')
+                                      else 'unknown')
         pool = value.get('device_pool')
         if isinstance(pool, dict):
             result['device_pool'] = {key: pool.get(key) for key in
@@ -1197,8 +1206,12 @@ class Controller:
                     "AND update_state NOT IN ('dispatched','scheduled','fetching',"
                     "'installing','restarting','verifying')",
                     (time.time() - self.offline_seconds,)).fetchone()[0])
-            target_units = max(1, unit_count, accepting)
-            balanced_limit = max(50, math.ceil(rows / target_units))
+            target_units = max(1, unit_count,
+                               accepting * self.DYNAMIC_UNITS_PER_NODE)
+            balanced_limit = max(
+                50,
+                min(int(job['unit_rows']), self.DYNAMIC_UNIT_ROWS,
+                    math.ceil(rows / target_units)))
             if balanced_limit < int(job['unit_rows']):
                 with self.db.transaction() as db:
                     db.execute('DELETE FROM units WHERE job_id=?', (job_id,))

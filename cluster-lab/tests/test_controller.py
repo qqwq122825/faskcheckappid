@@ -831,7 +831,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(snapshot['row_counts'], {'pending': 51, 'completed': 50})
         self.assertEqual(sum(snapshot['row_counts'].values()), snapshot['rows'])
 
-    def test_two_accepting_nodes_balance_10002_rows_as_5001_each(self):
+    def test_two_accepting_nodes_create_small_dynamic_packages(self):
         other = self.service.add_node('second-balanced-node', 2, 4)
         self.service.heartbeat(other['id'], {
             'session': 'second-balanced-session', 'hostname': 'second', 'version': 'test',
@@ -851,8 +851,10 @@ class ControllerTests(unittest.TestCase):
         with self.service.db.connect() as db:
             units = list(db.execute('SELECT seq,first_row,rows FROM units '
                                     'WHERE job_id=? ORDER BY seq', (job,)))
-        self.assertEqual([(row['seq'], row['first_row'], row['rows']) for row in units],
-                         [(1, 1, 5001), (2, 5002, 5001)])
+        self.assertEqual(len(units), 8)
+        self.assertEqual([row['rows'] for row in units],
+                         [1251, 1251, 1251, 1251, 1251, 1251, 1251, 1245])
+        self.assertEqual(units[-1]['first_row'] + units[-1]['rows'] - 1, 10002)
 
     def test_paused_task_exports_only_confirmed_units(self):
         job = self.job(100)
@@ -1125,23 +1127,21 @@ class ControllerTests(unittest.TestCase):
                 break
             time.sleep(.01)
         self.assertEqual(state['status'], 'ready')
-        self.assertEqual((state['rows'], state['units']), (10002, 2))
+        self.assertEqual((state['rows'], state['units']), (10002, 4))
         with self.service.db.connect() as db:
             units = [dict(row) for row in db.execute(
                 'SELECT first_row,rows,path,byte_start,byte_end FROM units WHERE job_id=? ORDER BY seq',
                 (job,))]
         self.assertEqual([(unit['first_row'], unit['rows']) for unit in units],
-                         [(1, 5001), (5002, 5001)])
-        self.assertTrue(b''.join(self.service.unit_lines(units[1])).endswith(b'\n\n'))
+                         [(1, 2501), (2502, 2501), (5003, 2501), (7504, 2499)])
+        self.assertTrue(b''.join(self.service.unit_lines(units[-1])).endswith(b'\n\n'))
 
         self.service.job_action(job, 'start')
-        first = self.service.lease(self.node['id'], 'test-session')
-        self.assertEqual(first['rows'], 5001)
-        self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
-        self.confirm(first)
-        second = self.service.lease(self.node['id'], 'test-session')
-        self.assertEqual((second['first_row'], second['rows']), (5002, 5001))
-        self.confirm(second)
+        for expected in ((1, 2501), (2502, 2501), (5003, 2501), (7504, 2499)):
+            unit = self.service.lease(self.node['id'], 'test-session')
+            self.assertEqual((unit['first_row'], unit['rows']), expected)
+            self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
+            self.confirm(unit)
         self.assertEqual(self.service.snapshot()['jobs'][0]['status'], 'completed')
 
     def test_one_hundred_million_row_high_offset_opens_only_target_shard(self):
@@ -1318,7 +1318,8 @@ class ControllerTests(unittest.TestCase):
                          'proxy': 'user:pass@1.2.3.4:80'})
         value = self.service.clean_telemetry({'cpu_percent':25.2,'memory_percent':float('nan'),
                                              'upload_bps':1024,'download_bps':-1,'network_bytes':123456,
-                                             'worker_processes':2,'secret':'private',
+                                             'worker_processes':2,'srp_math_backend':'gmpy2',
+                                             'secret':'private',
                                              'device_pool': {'proxy_status': 'failed',
                                                              'proxy_ip': 'user:pass@1.2.3.4:80',
                                                              'message': '代理获取失败，请检查白名单',
@@ -1329,6 +1330,9 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(value['network_bytes'], 123456)
         self.assertIsNone(self.service.clean_telemetry({'network_bytes': -1})['network_bytes'])
         self.assertEqual(value['worker_processes'], 2)
+        self.assertEqual(value['srp_math_backend'], 'gmpy2')
+        self.assertEqual(self.service.clean_telemetry(
+            {'srp_math_backend': 'forged'})['srp_math_backend'], 'unknown')
         self.assertNotIn('secret', value)
         self.assertEqual(value['device_pool']['slots'][0]['used'], 1)
         self.assertEqual(value['device_pool']['slots'][0]['label'], 'B64:AbCdEf12')
