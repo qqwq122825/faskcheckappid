@@ -693,6 +693,20 @@ class Node:
             descriptor.pop('device_plan', None)
             descriptor.pop('device_reset_slots', None)
             return
+        if str(descriptor.get('_device_mode') or 'pool').lower() == 'one_time':
+            # 一次性设备由执行账号的线程在自己的独立目录中注册。
+            # 不预占、不重置、不删除节点的共享设备池。
+            descriptor.pop('device_capacity', None)
+            descriptor['processes'] = processes
+            descriptor['device_pool_capacity'] = 1
+            descriptor['device_slots'] = [1]
+            descriptor.pop('device_plan', None)
+            descriptor.pop('device_reset_slots', None)
+            descriptor.pop('device_usage_base', None)
+            descriptor.pop('device_usage_reserved', None)
+            descriptor['_retry_delay'] = 10.0
+            descriptor['_one_time_min_retries'] = 1
+            return
         snapshot = self.builder.snapshot()
         entries = list(snapshot.get('slots') or [])
         limit = max(1, int(descriptor.get('device_usage_limit') or DEVICE_AUTH_LIMIT))

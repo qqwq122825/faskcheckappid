@@ -29,6 +29,7 @@ PROXY_FAILURE_LIMIT = 3
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
 PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
+ONE_TIME_RETRY_DELAY_SECONDS = 10.0
 DEVICE_AUTH_COOLDOWN_SECONDS = 3.0
 DEVICE_LEASE_POLL_SECONDS = 0.05
 MIN_STALL_TIMEOUT_SECONDS = 180.0
@@ -1133,7 +1134,12 @@ def execute_unit_group(directory, descriptor, stop):
             child = dict(descriptor, first_row=current_row, rows=count, processes=1)
             if descriptor.get('mode') == 'auth':
                 assigned = descriptor.get('device_slots') or []
-                if plan is not None:
+                if str(descriptor.get('_device_mode') or 'pool').lower() == 'one_time':
+                    child['device_pool_capacity'] = 1
+                    child['device_slots'] = [1]
+                    child.pop('device_plan', None)
+                    child.pop('device_reset_slots', None)
+                elif plan is not None:
                     child_plan = plan[plan_offset:plan_offset + count]
                     if len(child_plan) != count:
                         raise ValueError('device plan is shorter than package rows')
@@ -1493,6 +1499,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     auth_protocol = str(descriptor.get('_auth_protocol') or 'gsa').strip().lower()
     if auth_protocol not in ('gsa', 'web'):
         auth_protocol = 'gsa'
+    device_mode = str(descriptor.get('_device_mode') or 'pool').strip().lower()
+    if device_mode not in ('pool', 'one_time'):
+        device_mode = 'pool'
     web_check = None
     if auth_protocol == 'web':
         from fastcheck.protocols.idmsa import check as web_check
@@ -1532,8 +1541,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     reset_slots = {int(slot) for slot in descriptor.get('device_reset_slots') or []}
     timeout = float(descriptor.get('timeout') or 20)
     retries = max(0, int(descriptor.get('retries') or 0))
-    retry_delay = max(0.0, float(descriptor.get('_retry_delay',
-                                                PROXY_RETRY_DELAY_SECONDS)))
+    retry_delay = max(0.0, float(descriptor.get(
+        '_retry_delay', ONE_TIME_RETRY_DELAY_SECONDS
+        if device_mode == 'one_time' else PROXY_RETRY_DELAY_SECONDS)))
     device_cooldown = max(0.0, min(60.0, float(
         descriptor.get('device_cooldown_seconds')
         if descriptor.get('device_cooldown_seconds') is not None
@@ -1562,6 +1572,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            worker_nice=int(descriptor.get('_worker_nice') or 0),
                            retries=retries, timeout=timeout,
                            slots=slot_ids, auth_protocol=auth_protocol,
+                           device_mode=device_mode,
                            credentials_recorded=False)
 
     # Device preparation has its own bounded pool.  It never borrows the 250
@@ -1630,12 +1641,13 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     total_registration_workers = max(
         1, min(32, int(descriptor.get('device_registration_workers') or 32)))
     process_count = max(1, int(descriptor.get('_node_process_count') or 1))
+    bootstrap_slots = [] if device_mode == 'one_time' else slot_ids
     registration_workers = min(
-        len(slot_ids), max(1, (total_registration_workers + process_count - 1)
-                            // process_count))
+        max(1, len(bootstrap_slots)), max(1, (total_registration_workers + process_count - 1)
+                                        // process_count))
     with ThreadPoolExecutor(max_workers=registration_workers,
                             thread_name_prefix='device-bootstrap') as registration_pool:
-        for index, info, identity, label, failed in registration_pool.map(bootstrap, slot_ids):
+        for index, info, identity, label, failed in registration_pool.map(bootstrap, bootstrap_slots):
             infos[index], identities[index], device_labels[index] = info, identity, label
             if failed:
                 unusable_slots.add(index)
@@ -1761,7 +1773,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             return row, line, {'status': 'unknown', 'kind': 'stopped'}
         account, password = _split_account(line)
         account_started = time.time() if account_started is None else account_started
-        if device_plan is not None:
+        if device_mode == 'one_time':
+            slot_id, account_prefix = 1, _slot_for_account(account, [1])[1]
+        elif device_plan is not None:
             slot_id = int(device_plan[index])
             _ignored, account_prefix = _slot_for_account(account, [slot_id])
         else:
@@ -1786,9 +1800,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     else identity_override)
         result = None
         previous_proxy = previous_proxy or {'endpoint': '', 'host': '', 'port': None}
-        # 用户设置的重试次数仍是唯一上限；节点池只负责每次重试换出口，
-        # 不会在“0 次重试”时暗中多发请求。
-        attempt_limit = retries + 1
+        # 共享设备模式严格遵守任务重试次数；一次性设备模式
+        # 按模式约定至少重试一次，并在延迟到期后丢弃旧出口。
+        minimum_retries = (max(1, int(descriptor.get('_one_time_min_retries') or 1))
+                           if device_mode == 'one_time' else 0)
+        attempt_limit = max(retries, minimum_retries) + 1
         for attempt in range(start_attempt, attempt_limit):
             acquire_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
             acquire_started = time.monotonic() if debug_enabled else None
@@ -1827,23 +1843,37 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 return row, line, result
             request_started = time.monotonic() if debug_enabled else None
             device_lease = None
+            auth_pool = pool
             try:
                 if auth_protocol == 'gsa':
+                    if device_mode == 'one_time':
+                        job = re.sub(r'[^A-Za-z0-9._-]', '_',
+                                     str(descriptor.get('job_id') or 'job'))[:80]
+                        unit = re.sub(r'[^A-Za-z0-9._-]', '_',
+                                      str(descriptor.get('id') or 'unit'))[:80]
+                        one_time_root = Path(device_root) / 'one-time' / job / unit / f'{row:012d}'
+                        auth_pool = DevicePool(one_time_root, origin, max_devices=1)
                     device_lease = DeviceAuthLease.acquire(
-                        pool, slot_id, stop, cooldown=device_cooldown)
+                        auth_pool, slot_id, stop,
+                        cooldown=0.0 if device_mode == 'one_time' else device_cooldown)
                 if auth_protocol == 'gsa' and identity is None:
-                    # 预取失败的槽位在这里补一次
-                    info = pool.info(timeout, proxy=account_proxy, provider_direct=True)
-                    ready = pool.inspect(slot_id)['state'] == 'ready'
-                    profile = device_profile(pool, slot_id)
+                    # 一次性模式在执行账号的当前线程内注册；重试时
+                    # 只刷新已保留设备的身份，不删目录也不生成替换设备。
+                    info = auth_pool.info(timeout, proxy=account_proxy, provider_direct=True)
+                    ready = auth_pool.inspect(slot_id)['state'] == 'ready'
+                    profile = device_profile(auth_pool, slot_id)
                     info = dict(info, client_info=profile['client_info'],
                                 user_agent=profile['user_agent'])
-                    identity = pool.fetch_headers(slot_id, info, max(timeout, 40),
-                                                  registered=ready, proxy=account_proxy,
-                                                  provider_direct=True)
-                    if not ready and pool.inspect(slot_id)['state'] == 'ready':
-                        record_device_registration(device_root, slot_id, account_proxy,
+                    identity = auth_pool.fetch_headers(slot_id, info, max(timeout, 40),
+                                                       registered=ready, proxy=account_proxy,
+                                                       provider_direct=True)
+                    inspected = auth_pool.inspect(slot_id)
+                    if not ready and inspected['state'] == 'ready':
+                        history_root = one_time_root if device_mode == 'one_time' else device_root
+                        record_device_registration(history_root, slot_id, account_proxy,
                                                    profile.get('model', ''))
+                    if device_mode == 'one_time':
+                        device_labels[row] = _device_id_label(inspected.get('device_id'))
                 # 主协议由系统设置固化到任务；Web 模式不先发 GSA 请求。
                 if auth_protocol == 'web':
                     result = _check_web_auth(
@@ -1976,8 +2006,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             result = {'status': 'error', 'kind': 'proxy', 'http': 0,
                       'stage': 'init', 'detail': '代理池未返回结果', '_proxy_retries': 0}
         result['elapsed'] = round(time.time() - account_started, 2)
-        result['slot'] = slot_id
+        result['slot'] = row if device_mode == 'one_time' else slot_id
         result['device_key'] = account_prefix
+        if device_mode == 'one_time':
+            result['device_label'] = device_labels.get(row, '')
         if debug_enabled and (auth_result_bucket(result) == 'timeout'
                               or (str(result.get('web_status') or '').casefold() == 'error'
                                   and result.get('web_http') in (0, 500, 502, 503, 504))):
@@ -2074,9 +2106,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     business_code = (result.get('detail') or result.get('kind') or '')[:180]
                 reason = (_web_reason_for_record(result) if auth_protocol == 'web'
                           else _apple_reason_for_record(result, status, debug_enabled))
-                if auth_protocol == 'gsa':
+                if auth_protocol == 'gsa' and device_mode != 'one_time':
                     usage_counts[device] += 1
                     device_usage = int(usage_start.get(device, 0)) + usage_counts[device]
+                elif auth_protocol == 'gsa':
+                    device_usage = 1
                 else:
                     device = None
                     device_usage = None
@@ -2087,7 +2121,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'protocol': auth_protocol.upper(),
                           'device': device,
                           'device_key': (result.get('device_key') or '') if device else '',
-                          'device_label': device_labels.get(device, '') if device else '',
+                          'device_label': (result.get('device_label') or
+                                           device_labels.get(device, '')) if device else '',
                           'device_usage': device_usage,
                           'elapsed': result.get('elapsed'),
                           'attempts': max(
@@ -2119,7 +2154,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     if processed != int(descriptor.get('rows') or 0):
         raise ValueError('输入条数和工作包描述不一致')
-    if not descriptor.get('device_usage_reserved'):
+    if device_mode != 'one_time' and not descriptor.get('device_usage_reserved'):
         _bump_usage(device_root, usage_counts)
     atomic_json(directory / 'progress.json',
                 {'processed': processed, 'started': started,

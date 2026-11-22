@@ -114,6 +114,15 @@ test('Authentication protocol setting selects one primary protocol', () => {
   assert.match(settings, /协议在创建任务时固定/)
 })
 
+test('One-time device mode registers in the worker and retains devices', () => {
+  const settings = source('src/views/Settings.vue')
+  assert.match(settings, /\/api\/settings\/device-mode/)
+  assert.match(settings, /一次性设备（当前默认）/)
+  assert.match(settings, /每个账号由执行它的线程自行注册独立设备/)
+  assert.match(settings, /设备文件保留在节点，不自动删除/)
+  assert.match(settings, /等待 10 秒后丢弃旧出口并换 IP/)
+})
+
 test('Result table uses one protocol-neutral header set for all auth paths', () => {
   const results = source('src/components/ResultList.vue')
   assert.match(results, /验证路径/)

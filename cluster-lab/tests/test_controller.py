@@ -166,6 +166,25 @@ class ControllerTests(unittest.TestCase):
         self.service = Controller(self.temp.name)
         self.assertEqual(self.service.settings()['auth_protocol'], 'gsa')
 
+    def test_one_time_device_mode_defaults_on_and_is_frozen_per_new_job(self):
+        self.assertEqual(self.service.settings()['device_mode'], 'one_time')
+        client = create_app('controller', self.service).test_client()
+        csrf = client.get('/api/session').json['csrf']
+        response = client.post('/api/settings/device-mode',
+                               json={'device_mode': 'pool'},
+                               headers={'X-CSRF-Token': csrf})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json['device_mode'], 'pool')
+        with self.assertRaisesRegex(ValueError, '共享设备或一次性设备'):
+            self.service.configure_device_mode({'device_mode': 'temporary'})
+        job = self.job(50)
+        self.service.configure_device_mode({'device_mode': 'one_time'})
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual(unit['_device_mode'], 'pool')
+        state = next(item for item in self.service.snapshot()['jobs'] if item['id'] == job)
+        self.assertEqual(state['device_mode'], 'pool')
+
     def heartbeat(self, **extra):
         return self.service.heartbeat(self.node['id'], dict(session='test-session', max_processes=1,
                                       max_threads=2, active=[], **extra))

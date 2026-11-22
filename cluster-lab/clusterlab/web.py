@@ -115,6 +115,10 @@ def create_app(role, service, password=None):
         def configure_auth_protocol():
             return jsonify(service.configure_auth_protocol(request.get_json() or {}))
 
+        @app.post('/api/settings/device-mode')
+        def configure_device_mode():
+            return jsonify(service.configure_device_mode(request.get_json() or {}))
+
         @app.post('/api/settings/rotation')
         def configure_rotation():
             return jsonify(service.configure_rotation(request.get_json() or {}))
