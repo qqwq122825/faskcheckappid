@@ -18,8 +18,11 @@ from clusterlab.executor import (
 
 
 class FakePool:
-    def __init__(self, *_args, **_kwargs):
-        pass
+    def __init__(self, root, *_args, **_kwargs):
+        self.root = Path(root)
+
+    def slot_directory(self, slot):
+        return self.root / f'{int(slot):02d}'
 
     def info(self, *_args, **_kwargs):
         return {}
@@ -32,6 +35,13 @@ class FakePool:
 
 
 class RepairAuthProbeTests(unittest.TestCase):
+    def setUp(self):
+        # These direct executor fixtures do not pass through Node, which adds
+        # device_cooldown_seconds=3.0 to every production GSA manifest.
+        cooldown = patch('clusterlab.executor.DEVICE_AUTH_COOLDOWN_SECONDS', 0.0)
+        cooldown.start()
+        self.addCleanup(cooldown.stop)
+
     def test_web_complete_response_codes_use_web_specific_verdicts(self):
         self.assertEqual(
             idmsa._verdict(401, {'serviceErrors': [{'code': '-20101'}]}, 'complete')[0],

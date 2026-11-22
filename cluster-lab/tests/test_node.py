@@ -398,6 +398,24 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(set(counts.values()), {10})
         self.assertEqual(descriptor['device_reset_slots'], [])
 
+    def test_four_by_two_hundred_fifty_uses_second_wave_of_two_thousand_devices(self):
+        snapshot = {'slots': [
+            {'slot': slot, 'state': 'ready'} for slot in range(1, 2001)]}
+        descriptor = {'mode': 'auth', 'rows': 20000, 'processes': 4,
+                      'threads': 250, '_auth_protocol': 'gsa',
+                      'device_usage_limit': 100}
+        with patch.object(self.node.builder, 'snapshot', return_value=snapshot):
+            self.node._prepare_auth_devices(descriptor)
+        counts = Counter(descriptor['device_plan'])
+        self.assertEqual(len(counts), 2000)
+        self.assertEqual(set(counts.values()), {10})
+        self.assertEqual(descriptor['device_cooldown_seconds'], 3.0)
+        self.assertEqual(descriptor['device_reset_slots'], [])
+        child_rows = len(descriptor['device_plan']) // 4
+        for process in range(4):
+            child = descriptor['device_plan'][process * child_rows:(process + 1) * child_rows]
+            self.assertTrue(set(child[:250]).isdisjoint(child[250:500]))
+
     def test_quota_replacement_restores_old_device_when_registration_fails(self):
         root = Path(self.temp.name) / 'quota-replace'
 

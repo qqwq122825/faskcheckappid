@@ -29,6 +29,8 @@ PROXY_FAILURE_LIMIT = 3
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
 PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
+DEVICE_AUTH_COOLDOWN_SECONDS = 3.0
+DEVICE_LEASE_POLL_SECONDS = 0.05
 MIN_STALL_TIMEOUT_SECONDS = 180.0
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
@@ -67,6 +69,61 @@ def _device_id_label(device_id):
     raw = str(device_id or '').encode('utf-8')
     return ('B64:' + base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')[:8]
             if raw else '')
+
+
+class DeviceAuthLease:
+    """One process-safe exclusive device lease followed by a fixed cooldown."""
+
+    def __init__(self, handle, cooldown_path, cooldown):
+        self.handle = handle
+        self.cooldown_path = cooldown_path
+        self.cooldown = max(0.0, float(cooldown))
+        self.released = False
+
+    @classmethod
+    def acquire(cls, pool, slot, stop, cooldown=DEVICE_AUTH_COOLDOWN_SECONDS):
+        import portalocker
+
+        directory = pool.slot_directory(int(slot))
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_path = directory / '.lease.lock'
+        cooldown_path = directory / '.auth-cooldown.json'
+        while not stop.is_set():
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            handle = os.fdopen(descriptor, 'a+')
+            try:
+                portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
+            except portalocker.exceptions.LockException:
+                handle.close()
+                stop.wait(DEVICE_LEASE_POLL_SECONDS)
+                continue
+            try:
+                state = read_json(cooldown_path, {})
+                remaining = max(0.0, float(state.get('until') or 0) - time.time())
+            except (OSError, TypeError, ValueError):
+                remaining = 0.0
+            if remaining <= 0:
+                atomic_json(cooldown_path,
+                            {'state': 'in_use', 'pid': os.getpid(), 'at': time.time()})
+                return cls(handle, cooldown_path, cooldown)
+            portalocker.unlock(handle)
+            handle.close()
+            stop.wait(min(DEVICE_LEASE_POLL_SECONDS, remaining))
+        raise InterruptedError('节点关闭，停止等待设备')
+
+    def release(self):
+        if self.released:
+            return
+        import portalocker
+
+        try:
+            atomic_json(self.cooldown_path,
+                        {'state': 'cooldown', 'until': time.time() + self.cooldown,
+                         'cooldown_seconds': self.cooldown})
+        finally:
+            portalocker.unlock(self.handle)
+            self.handle.close()
+            self.released = True
 
 
 def _proxy_debug_enabled(descriptor=None):
@@ -1477,6 +1534,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     retries = max(0, int(descriptor.get('retries') or 0))
     retry_delay = max(0.0, float(descriptor.get('_retry_delay',
                                                 PROXY_RETRY_DELAY_SECONDS)))
+    device_cooldown = max(0.0, min(60.0, float(
+        descriptor.get('device_cooldown_seconds')
+        if descriptor.get('device_cooldown_seconds') is not None
+        else DEVICE_AUTH_COOLDOWN_SECONDS)))
     configured_workers = max(1, int(descriptor.get('threads') or 1))
     workers = max(1, int(descriptor.get('_active_threads_per_process') or
                          _auth_worker_limit(
@@ -1765,7 +1826,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                               _retry_previous=current_proxy)
                 return row, line, result
             request_started = time.monotonic() if debug_enabled else None
+            device_lease = None
             try:
+                if auth_protocol == 'gsa':
+                    device_lease = DeviceAuthLease.acquire(
+                        pool, slot_id, stop, cooldown=device_cooldown)
                 if auth_protocol == 'gsa' and identity is None:
                     # 预取失败的槽位在这里补一次
                     info = pool.info(timeout, proxy=account_proxy, provider_direct=True)
@@ -1819,6 +1884,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             except Exception as exc:                               # noqa: BLE001
                 result = {'status': 'error', 'kind': type(exc).__name__, 'http': 0,
                           'stage': 'init', 'detail': str(exc)[:180]}
+            finally:
+                if device_lease is not None:
+                    device_lease.release()
             request_ms = (round((time.monotonic() - request_started) * 1000, 2)
                           if debug_enabled else None)
             transport_failed = retryable_transport(result)

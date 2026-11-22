@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 DEVICE_AUTH_LIMIT = 100
 DEVICE_POOL_LIMIT = 2000
+DEVICE_AUTH_COOLDOWN_SECONDS = 3.0
 
 
 def build_device_plan(rows, processes, slots, usage, limit=DEVICE_AUTH_LIMIT,
@@ -695,8 +696,14 @@ class Node:
         snapshot = self.builder.snapshot()
         entries = list(snapshot.get('slots') or [])
         limit = max(1, int(descriptor.get('device_usage_limit') or DEVICE_AUTH_LIMIT))
-        desired_devices = min(rows, processes * max(1, int(
-            descriptor.get('threads') or 1)))
+        active_devices = processes * max(1, int(descriptor.get('threads') or 1))
+        ready_devices = sum(1 for item in entries
+                            if isinstance(item, dict) and item.get('state') == 'ready')
+        # Keep the first 1,000 requests fully parallel, then let those workers
+        # consume the second 1,000 prepared identities while the first wave is
+        # cooling down. A smaller prepared pool still uses safe backpressure.
+        desired_devices = min(rows, DEVICE_POOL_LIMIT,
+                              max(active_devices, ready_devices))
         plan, reset_slots = build_device_plan(
             rows, processes, entries, self.builder.usage(), limit=limit,
             desired_devices=desired_devices)
@@ -710,6 +717,7 @@ class Node:
         descriptor['device_plan'] = plan
         descriptor['device_reset_slots'] = reset_slots
         descriptor['device_usage_limit'] = limit
+        descriptor['device_cooldown_seconds'] = DEVICE_AUTH_COOLDOWN_SECONDS
         descriptor['device_usage_base'] = base
         descriptor['device_usage_reserved'] = True
         self.builder.reserve(slots)

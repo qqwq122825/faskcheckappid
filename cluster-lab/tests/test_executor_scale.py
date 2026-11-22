@@ -12,15 +12,18 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (NodeProxyPool, _auth_process_limit, _auth_worker_limit, _device_id_label, _execute_auth_unit, _partition_device_slots,
+from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _device_id_label, _execute_auth_unit, _partition_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
 
 
 class FakePool:
-    def __init__(self, *_args, **_kwargs):
-        pass
+    def __init__(self, root, *_args, **_kwargs):
+        self.root = Path(root)
+
+    def slot_directory(self, slot):
+        return self.root / f'{int(slot):02d}'
 
     def info(self, *_args, **_kwargs):
         return {}
@@ -91,6 +94,46 @@ def use_shared_proxy_pool(pool, output):
 
 
 class ExecutorScaleTests(unittest.TestCase):
+    def setUp(self):
+        # Direct executor fixtures predate node manifests. Production node
+        # manifests explicitly carry the required three-second cooldown.
+        cooldown = patch('clusterlab.executor.DEVICE_AUTH_COOLDOWN_SECONDS', 0.0)
+        cooldown.start()
+        self.addCleanup(cooldown.stop)
+
+    def test_device_lease_is_exclusive_and_enforces_cooldown(self):
+        class Pool:
+            def __init__(inner, root):
+                inner.root = Path(root)
+
+            def slot_directory(inner, slot):
+                return inner.root / f'{int(slot):02d}'
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pool = Pool(temporary)
+            stop = threading.Event()
+            first = DeviceAuthLease.acquire(pool, 1, stop, cooldown=.15)
+            marker = json.loads((pool.slot_directory(1) / '.auth-cooldown.json').read_text())
+            self.assertEqual(marker['state'], 'in_use')
+            acquired = []
+
+            def second_user():
+                lease = DeviceAuthLease.acquire(pool, 1, stop, cooldown=.15)
+                acquired.append(time.monotonic())
+                lease.release()
+
+            thread = threading.Thread(target=second_user)
+            thread.start()
+            time.sleep(.05)
+            self.assertEqual(acquired, [])
+            released = time.monotonic()
+            first.release()
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            self.assertGreaterEqual(acquired[0] - released, .13)
+            marker = json.loads((pool.slot_directory(1) / '.auth-cooldown.json').read_text())
+            self.assertEqual(marker['state'], 'cooldown')
+
     def test_raw_apple_reason_is_packaged_only_when_debug_is_enabled(self):
         result = {'apple_message': 'Your account information was entered incorrectly.'}
         self.assertEqual(_apple_reason_for_record(result, 'wrong_password'), '')
