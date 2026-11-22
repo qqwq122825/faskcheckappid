@@ -23,7 +23,12 @@ from .common import atomic_json, read_json
 
 
 PROXY_TTL_SECONDS = 50.0
-PROXY_FETCH_LIMIT = 1000
+# The provider endpoint becomes a long-tail bottleneck when one request asks
+# for the full 1,000-worker shortage.  Exits are intentionally reusable, so a
+# 200-exit rolling batch is enough to release all workers while the supplier
+# continues replenishing once per second.
+PROXY_FETCH_LIMIT = 200
+PROXY_PREFILL_WAIT_SECONDS = 1.0
 PROXY_POOL_LIMIT = 10000
 PROXY_FAILURE_LIMIT = 3
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
@@ -1093,14 +1098,15 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
             # look like 1,000 missing proxies and triggered needless refills.
             needed = max(0, pool.target - pool.snapshot()['known'])
             # Replace one TTL-window of inventory gradually instead of letting
-            # the initial batch expire at once. The supplier API accepts at
-            # most 1,000 exits per call; larger node pools fill incrementally.
+            # the initial batch expire at once. Keep every provider request
+            # small: one exit may serve concurrent requests, so a 1,000-worker
+            # shortage must not turn into one blocking request for 1,000 IPs.
             refresh_batch = max(1, math.ceil(pool.target / pool.ttl))
             # Fill shortages quickly, then rotate one TTL-window gradually.
             # Maintain a full TTL window.  For the 10,000-exit default this
             # requests 200 exits every second; IPs remain concurrently reusable.
-            # If inventory falls behind, catch up by the actual shortage, capped
-            # at the provider's per-request limit.
+            # If inventory falls behind, catch up incrementally. The next batch
+            # starts on the next tick instead of holding task startup hostage.
             count = min(PROXY_FETCH_LIMIT, max(refresh_batch, needed))
             started = time.monotonic()
             before = _proxy_pool_snapshot(pool) if debug_path else {}
@@ -1308,10 +1314,12 @@ def execute_unit_group(directory, descriptor, stop):
                   None, debug_path),
             name='node-proxy-supplier', daemon=True)
         supplier_thread.start()
-        # Start workers only after the node has begun filling its own pool.
-        # Bound the wait so a broken supplier cannot block task cancellation.
+        # Let the supplier overlap process startup.  Wait at most one second
+        # for its first reusable exit; never wait for the configured pool target.
+        # Individual workers retain their normal bounded acquire/backpressure.
         prefill_started = time.monotonic()
-        prefill_deadline = prefill_started + min(30.0, proxy_pool.ttl)
+        prefill_deadline = prefill_started + min(
+            PROXY_PREFILL_WAIT_SECONDS, proxy_pool.ttl)
         while (not stop.is_set() and not proxy_pool.ready.is_set() and
                time.monotonic() < prefill_deadline):
             proxy_pool.ready.wait(0.1)

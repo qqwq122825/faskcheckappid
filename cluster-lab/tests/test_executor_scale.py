@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit,
+from clusterlab.executor import (PROXY_FETCH_LIMIT, PROXY_PREFILL_WAIT_SECONDS,
+                                 DeviceAuthLease, NodeProxyPool, _auth_process_limit,
                                  _auth_worker_limit, _consume_thread_pool_device,
                                  _device_id_label, _execute_auth_unit,
                                  _partition_device_slots,
@@ -251,6 +252,8 @@ class ExecutorScaleTests(unittest.TestCase):
         self.assertEqual(_auth_worker_limit(100, configured_processes=10,
                                             active_processes=2), 500)
         self.assertEqual(4 * _auth_worker_limit(100, 10, 4), 10 * 100)
+        self.assertEqual(PROXY_FETCH_LIMIT, 200)
+        self.assertEqual(PROXY_PREFILL_WAIT_SECONDS, 1.0)
 
     def test_device_id_uses_short_base64_label(self):
         self.assertEqual(_device_id_label('device-1'), 'B64:ZGV2aWNl')
@@ -582,11 +585,11 @@ class ExecutorScaleTests(unittest.TestCase):
             pool.add_fresh(['socks5h://existing'])
             proxy_supplier_loop(pool, 'http://proxy.test/list', 'socks5h',
                                 stop, fetcher)
-            self.assertEqual(calls, [999])
+            self.assertEqual(calls, [200])
         finally:
             pool.close()
 
-    def test_two_nodes_each_request_1000_then_reuse_sparse_provider_stock(self):
+    def test_two_nodes_request_200_then_reuse_sparse_provider_stock(self):
         context = mp.get_context('spawn')
         observed = []
         for node in (1, 2):
@@ -616,9 +619,9 @@ class ExecutorScaleTests(unittest.TestCase):
                 pool.close()
 
         self.assertEqual(observed, [
-            (1000, 'socks5h://node-1-only-exit:9000',
+            (200, 'socks5h://node-1-only-exit:9000',
              'socks5h://node-1-only-exit:9000', 1),
-            (1000, 'socks5h://node-2-only-exit:9000',
+            (200, 'socks5h://node-2-only-exit:9000',
              'socks5h://node-2-only-exit:9000', 1),
         ])
 
