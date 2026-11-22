@@ -870,7 +870,7 @@ class Controller:
 
     def request_devices(self, node_id, capacity):
         """把设备初始化意图挂到节点上，节点下次心跳取走执行。"""
-        capacity = integer(int(capacity), '设备数量', 0, 2000)
+        capacity = integer(int(capacity), '设备数量', 0, 10000)
         with self.db.transaction() as db:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:

@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 '''
 
 DEVICE_AUTH_LIMIT = 100
-DEVICE_POOL_LIMIT = 2000
+DEVICE_POOL_LIMIT = 10000
 DEVICE_AUTH_COOLDOWN_SECONDS = 3.0
 
 
@@ -695,7 +695,7 @@ class Node:
             return
         if str(descriptor.get('_device_mode') or 'pool').lower() == 'one_time':
             # 线程模式与预注册共用同一个持久池。预注册容量可由用户调成
-            # 1000/2000；线程总是在它后面预留本包并发量作为即时扩容槽位。
+            # 1000/2000 或更高；线程总是在它后面预留本包并发量作为即时扩容槽位。
             snapshot = self.builder.snapshot()
             entries = list(snapshot.get('slots') or [])
             base_capacity = max(

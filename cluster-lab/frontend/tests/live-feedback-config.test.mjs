@@ -119,7 +119,7 @@ test('Thread mode reuses one expandable shared pool and retires at limit', () =>
   assert.match(settings, /\/api\/settings\/device-mode/)
   assert.match(settings, /线程共用设备（当前默认）/)
   assert.match(settings, /每个节点只有一个共享设备池/)
-  assert.match(settings, /预注册容量可按需设为 1000 或 2000，但不是上限/)
+  assert.match(settings, /预注册容量可按需设为 1000、2000 或更高，单节点最高 10000/)
   assert.match(settings, /没有空闲设备时不等待/)
   assert.match(settings, /验证完成后放回同一个共享池供其他线程复用/)
   assert.match(settings, /本次验证结束后删除该设备/)
@@ -164,7 +164,7 @@ test('Large task totals use a non-overlapping responsive feedback grid', () => {
 test('Device pool starts initialization only from its explicit action and shows persisted registration history', () => {
   const drawer = source('src/components/DevicePoolDrawer.vue')
   assert.match(drawer, /开始初始化设备池/)
-  assert.match(drawer, /点击“开始初始化设备池”才会注册设备/)
+  assert.match(drawer, /单节点可初始化 1–10000 台/)
   assert.match(drawer, /代理异常：未获取到可用代理，请确认新节点出口 IP 已加入白名单/)
   assert.match(drawer, /代理正常/)
   assert.match(drawer, /pool\.value\.proxy_ip/)

@@ -20,7 +20,8 @@ from .common import atomic_json, read_json
 from .executor import _load_fastcheck, record_device_registration
 
 REGISTRATION_TIMEOUT = 90
-DEVICE_POOL_LIMIT = 2000
+DEVICE_POOL_LIMIT = 10000
+DEVICE_DETAIL_LIMIT = 2000
 IDLE_BUILD_WORKERS = 32
 BUSY_BUILD_WORKERS = 4
 
@@ -64,6 +65,7 @@ class DeviceBuilder:
             data = dict(self.state)
             data['slot_errors'] = dict(data.get('slot_errors') or {})
         persisted_capacity = 0
+        attempted = 0
         try:
             DevicePool, _, _ = _load_fastcheck()
             # The in-memory builder state resets on a service restart. Discover
@@ -89,12 +91,15 @@ class DeviceBuilder:
                     state = 'registering'
                 elif str(slot) in data['slot_errors']:
                     state = 'failed'
+                if state != 'missing':
+                    attempted += 1
                 used = usage.get(str(slot), 0)
-                slots.append({'slot': slot, 'state': state,
-                              'device_id': inspected.get('device_id', ''),
-                              'label': device_label(inspected.get('device_id')),
-                              'error': data['slot_errors'].get(str(slot), ''),
-                              'used': used if type(used) is int and used >= 0 else 0})
+                if slot <= DEVICE_DETAIL_LIMIT:
+                    slots.append({'slot': slot, 'state': state,
+                                  'device_id': inspected.get('device_id', ''),
+                                  'label': device_label(inspected.get('device_id')),
+                                  'error': data['slot_errors'].get(str(slot), ''),
+                                  'used': used if type(used) is int and used >= 0 else 0})
         except Exception:                                          # noqa: BLE001
             pass
         registry = self.registry()
@@ -105,7 +110,6 @@ class DeviceBuilder:
             entry['model'] = info.get('model', '') or recovered.get('model', '')
             entry['at'] = info.get('at', '') or recovered.get('at', '')
             entry['recorded'] = bool(info)
-        attempted = sum(entry['state'] != 'missing' for entry in slots)
         data.update(ready=ready, attempted=attempted, slots=slots,
                     capacity=max(int(data.get('capacity') or 0), persisted_capacity, ready))
         return data
