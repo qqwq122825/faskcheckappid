@@ -1216,10 +1216,7 @@ def _group_child(directory, descriptor, stop, proxy_pool=None):
     worker_nice = 0
     if mp.parent_process() is not None:
         try:
-            # Keep throughput workers opportunistic: Linux still lets them use
-            # every idle cycle, but the node heartbeat/report threads win as
-            # soon as they become runnable on a saturated host.
-            worker_nice = os.nice(10)
+            worker_nice = os.nice(5)
         except (AttributeError, OSError):
             worker_nice = 0
     descriptor['_worker_nice'] = worker_nice
@@ -1246,20 +1243,11 @@ def _auth_worker_limit(configured, configured_processes=1, active_processes=None
 
 
 def _auth_process_limit(configured, rows, cpu_count=None):
-    """Leave one scheduler lane free only when auth would fill every CPU.
-
-    Network concurrency is preserved by :func:`_auth_worker_limit`, so a
-    4 x 250 node becomes 3 x 334 rather than dropping from 1,000 requests.
-    Nodes already configured below their CPU count keep the requested process
-    count because they already have spare scheduler capacity.
-    """
+    """Use one GMP compute lane per logical CPU."""
     configured = max(1, int(configured or 1))
     rows = max(1, int(rows or 1))
     logical_cpus = max(1, int(cpu_count or os.cpu_count() or 1))
-    cpu_limit = logical_cpus
-    if logical_cpus >= 4 and configured >= logical_cpus:
-        cpu_limit -= 1
-    return min(configured, rows, cpu_limit)
+    return min(configured, rows, logical_cpus)
 
 
 def execute_unit_group(directory, descriptor, stop):
@@ -1268,8 +1256,8 @@ def execute_unit_group(directory, descriptor, stop):
     The controller leases at most one package to a node.  This coordinator
     splits that package locally into contiguous ranges, starts the configured
     process count, aggregates their progress, and merges ordered results.  The
-    The controller keeps a small, node-count-aware set of package records while
-    each node still uses its complete configured network concurrency.
+    controller therefore keeps only 10,000-row package metadata while a node
+    still uses all of its process and thread capacity.
     """
     directory = Path(directory)
     descriptor = dict(descriptor)
@@ -1296,9 +1284,6 @@ def execute_unit_group(directory, descriptor, stop):
     descriptor['_node_process_count'] = process_count
     descriptor['_node_configured_process_count'] = process_limit
     descriptor['_node_cpu_count'] = node_cpu_count
-    descriptor['_heartbeat_cpu_reserve'] = int(
-        descriptor.get('mode') == 'auth' and node_cpu_count >= 4
-        and process_limit >= node_cpu_count and rows > process_count)
     active_threads_per_process = (
         _auth_worker_limit(descriptor.get('threads'), process_limit, process_count)
         if descriptor.get('mode') == 'auth'
@@ -1480,8 +1465,6 @@ def execute_unit_group(directory, descriptor, stop):
                             {'processed': processed, 'started': started,
                              'workers': active, 'worker_limit': process_count,
                              'configured_process_limit': process_limit,
-                             'heartbeat_cpu_reserve': int(
-                                 descriptor.get('_heartbeat_cpu_reserve') or 0),
                              'threads_per_process': int(descriptor.get('threads') or 1),
                              'active_threads_per_process': active_threads_per_process,
                              'counts': live_counts,
@@ -1525,8 +1508,6 @@ def execute_unit_group(directory, descriptor, stop):
                     {'processed': processed, 'started': started, 'workers': 0,
                      'worker_limit': process_count,
                      'configured_process_limit': process_limit,
-                     'heartbeat_cpu_reserve': int(
-                         descriptor.get('_heartbeat_cpu_reserve') or 0),
                      'threads_per_process': int(descriptor.get('threads') or 1),
                      'active_threads_per_process': active_threads_per_process,
                      'counts': merged_counts,
@@ -1536,8 +1517,6 @@ def execute_unit_group(directory, descriptor, stop):
                      'checksum': output_digest.hexdigest(),
                      'workers': process_count, 'elapsed': time.time() - started,
                      'configured_process_limit': process_limit,
-                     'heartbeat_cpu_reserve': int(
-                         descriptor.get('_heartbeat_cpu_reserve') or 0),
                      'active_threads_per_process': active_threads_per_process,
                      **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
     except Exception as exc:                                      # noqa: BLE001

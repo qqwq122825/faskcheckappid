@@ -4,16 +4,15 @@ import { useRouter } from 'vue-router'
 import { UploadFilled } from '@element-plus/icons-vue'
 import { api, busy, createTaskOpen, refresh, session, state } from '../composables/useCluster'
 const router = useRouter()
-const name = ref(''), unitRows = ref(50000), file = ref<File>(), error = ref('')
+const name = ref(''), unitRows = ref(10000), file = ref<File>(), error = ref('')
 const files = ref<any[]>([]), chosen = ref(''), mode = ref<'new' | 'reuse'>('new')
 const timeout = ref(20), retries = ref(0)
 const uploadPercent = ref<number | null>(null)
 const maxUnitRows = computed(() => state.value?.settings?.max_unit_rows || 10000)
-const defaultUnitRows = computed(() => state.value?.settings?.default_unit_rows || Math.min(50000, maxUnitRows.value))
 watch(createTaskOpen, open => {
   if (open) {
     error.value = ''; file.value = undefined; name.value = ''
-    unitRows.value = Math.min(defaultUnitRows.value, maxUnitRows.value)
+    unitRows.value = Math.min(10000, maxUnitRows.value)
     timeout.value = 20; retries.value = 0
     uploadPercent.value = null
     chosen.value = ''; mode.value = 'new'
@@ -125,7 +124,7 @@ async function submit() {
         <el-input-number v-model="retries" :min="0" :max="5" :step="1" :precision="0" :disabled="busy" />
         <span class="field-note">0 表示不重试；对超时、TLS、5xx，以及 Apple 返回“Try again later”生效；密码错误、锁定等明确结论不重试。</span>
       </el-form-item>
-      <el-alert title="总控按在线节点均衡为每节点约 2 个长工作包；节点领包后使用全部进程和线程，减少包尾慢请求造成的换包空档。" type="info" :closable="false" show-icon />
+      <el-alert title="总控自动按每包最多 10,000 条建立字节索引；节点领包后使用全部进程和线程处理。" type="info" :closable="false" show-icon />
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
       <p class="muted">创建后自动加入执行队列；前一个任务全部确认后，轮到本任务自动开始。</p>
     </el-form>

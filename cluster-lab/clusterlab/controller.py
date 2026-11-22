@@ -328,12 +328,8 @@ class Controller:
     # Keep enough independently leasable work ahead of heterogeneous nodes.
     # A fast node can take several small packages instead of idling behind one
     # slow node that owns half of a large task.
-    # Two long-lived packages per accepting node keep enough work available
-    # for rebalancing without forcing every node through four slow-tail
-    # barriers.  A package still owns the node's complete process/thread
-    # budget, so this changes hand-off frequency rather than concurrency.
-    DYNAMIC_UNIT_ROWS = 50000
-    DYNAMIC_UNITS_PER_NODE = 2
+    DYNAMIC_UNIT_ROWS = 10000
+    DYNAMIC_UNITS_PER_NODE = 4
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'not_found',
                       'timeout', 'undetermined', 'unknown')
@@ -706,7 +702,7 @@ class Controller:
             values = {row['key']: row['value'] for row in db.execute('SELECT key,value FROM controller_settings')}
         maximum = int(values.get('max_unit_rows', 100000))
         proxy_parts = [part for part in str(values.get('proxy_api', '')).split() if part]
-        return {'max_unit_rows': maximum, 'default_unit_rows': min(50000, maximum),
+        return {'max_unit_rows': maximum, 'default_unit_rows': min(10000, maximum),
                 'unit_byte_limit': 32 * 1024 * 1024,
                 'proxy_api': mask_api(values.get('proxy_api', '')),
                 'proxy_apis': [mask_api(part) for part in proxy_parts],
@@ -1943,7 +1939,7 @@ class Controller:
         """Merge completed package files with heartbeat-confirmed live rows.
 
         Only active packages occupy ``live_result_rows`` (normally one per
-        node, dynamically balanced across accepting nodes). Completed packages keep using the
+        node, at most 10,000 rows each).  Completed packages keep using the
         scalable file/index path.  Iterating package metadata preserves row
         order without retaining an unbounded per-account database table.
         """
