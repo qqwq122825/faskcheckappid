@@ -550,9 +550,32 @@ class DeviceBuilder:
     def usage(self):
         path = self.node.root / 'device-pool' / 'usage.json'
         try:
-            return json.loads(path.read_text('utf-8'))
+            data = json.loads(path.read_text('utf-8'))
         except (OSError, ValueError):
-            return {}
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        # Thread mode stores each counter in that device's registration so
+        # unrelated devices never contend on one global lock.  These values
+        # override the legacy usage.json during lazy migration.
+        directory = self.node.root / 'device-pool' / 'registrations'
+        for registration in directory.glob('*.json') if directory.exists() else ():
+            try:
+                value = json.loads(registration.read_text('utf-8'))
+                if isinstance(value, dict) and 'usage' in value:
+                    slot = int(value.get('slot') or registration.stem)
+                    data[str(slot)] = max(0, int(value.get('usage') or 0))
+            except (OSError, TypeError, ValueError):
+                continue
+        counters = self.node.root / 'device-pool' / 'usage-slots'
+        for counter in counters.glob('*.json') if counters.exists() else ():
+            try:
+                value = json.loads(counter.read_text('utf-8'))
+                if isinstance(value, dict):
+                    slot = int(value.get('slot') or counter.stem)
+                    data[str(slot)] = max(0, int(value.get('usage') or 0))
+            except (OSError, TypeError, ValueError):
+                continue
+        return data
 
     def reserve_usage(self, plan, limit=100, reset_slots=()):
         """Atomically reserve a complete package before any Apple request.

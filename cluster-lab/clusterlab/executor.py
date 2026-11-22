@@ -1463,6 +1463,27 @@ def _usage_snapshot(device_root):
             result[int(slot)] = max(0, int(count or 0))
         except (TypeError, ValueError):
             continue
+    # Thread mode writes usage beside each registration.  A device lease is
+    # already exclusive per slot, so this avoids making every account on the
+    # node serialize through the legacy global usage.json lock.  Registration
+    # values override legacy counters while old pools migrate lazily.
+    registrations = Path(device_root) / 'registrations'
+    for registration in registrations.glob('*.json') if registrations.exists() else ():
+        try:
+            value = json.loads(registration.read_text('utf-8'))
+            slot = int(value.get('slot') or registration.stem)
+            if 'usage' in value:
+                result[slot] = max(0, int(value.get('usage') or 0))
+        except (OSError, TypeError, ValueError):
+            continue
+    counters = Path(device_root) / 'usage-slots'
+    for counter in counters.glob('*.json') if counters.exists() else ():
+        try:
+            value = json.loads(counter.read_text('utf-8'))
+            slot = int(value.get('slot') or counter.stem)
+            result[slot] = max(0, int(value.get('usage') or 0))
+        except (OSError, TypeError, ValueError):
+            continue
     return result
 
 
@@ -1481,9 +1502,13 @@ def record_device_registration(device_root, slot, proxy, model=''):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         value = {'slot': int(slot), 'proxy': str(proxy or ''), 'model': str(model or ''),
-                 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'ts': time.time()}
+                 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'ts': time.time(),
+                 'usage': 0}
         with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
             json.dump(value, handle, ensure_ascii=False, separators=(',', ':'))
+        counter = Path(device_root) / 'usage-slots' / f'{int(slot):03d}.json'
+        counter.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_json(counter, {'slot': int(slot), 'usage': 0})
         return True
     except FileExistsError:
         return False
@@ -1494,68 +1519,74 @@ def record_device_registration(device_root, slot, proxy, model=''):
 def _consume_thread_pool_device(pool, device_root, slot, usage_limit):
     """Count one use and retire the identity exactly at its configured limit.
 
-    The caller still owns the slot lease.  The shared usage lock only protects
-    the durable counter from other processes updating different slots.
+    The caller still owns the exclusive slot lease, so the slot registration
+    is itself the synchronization boundary.  Do not use the legacy global
+    usage lock here: 800 account workers updating different devices must not
+    queue behind one JSON file.
     """
-    import portalocker
-
     slot = int(slot)
     usage_limit = max(1, int(usage_limit or 1))
     root = Path(device_root)
-    path = root / 'usage.json'
-    lock_path = root / 'usage.lock'
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with portalocker.Lock(str(lock_path), mode='a+', timeout=10):
-        try:
-            data = json.loads(path.read_text('utf-8')) if path.exists() else {}
-        except (OSError, TypeError, ValueError):
-            data = {}
-        previous = max(0, int(data.get(str(slot)) or 0))
-        remaining_before = max(0, usage_limit - previous)
-        count = previous + 1
-        used_ts = time.time()
-        used_at = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(used_ts))
-        # The thread holding the last visible use owns retirement after its
-        # verification. Other threads see the same durable counter next time.
-        retired = remaining_before <= 1
-        if retired:
-            data.pop(str(slot), None)
-        else:
-            data[str(slot)] = count
-        atomic_json(path, data)
-        registration = root / 'registrations' / f'{slot:03d}.json'
-        registration_info = read_json(registration, {})
-        if isinstance(registration_info, dict) and registration.exists() and not retired:
-            registration_info.update(last_used_at=used_at, last_used_ts=used_ts,
-                                     usage=count,
-                                     remaining=max(0, usage_limit - count))
-            atomic_json(registration, registration_info)
-        if retired:
-            directory = pool.slot_directory(slot)
-            if directory.exists():
-                for child in directory.iterdir():
-                    # Keep the live process lock until DeviceAuthLease.release().
-                    if child.name == '.lease.lock':
-                        continue
-                    if child.is_dir() and not child.is_symlink():
-                        shutil.rmtree(child, ignore_errors=True)
-                    else:
-                        child.unlink(missing_ok=True)
-            (root / 'registrations' / f'{slot:03d}.json').unlink(missing_ok=True)
-            health_path = pool.base / 'health.json'
-            health = read_json(health_path, {})
-            if isinstance(health, dict) and health_path.exists():
-                devices = health.get('devices')
-                if isinstance(devices, dict):
-                    devices.pop(str(slot), None)
-                events = health.get('events')
-                if isinstance(events, list):
-                    health['events'] = [
-                        item for item in events
-                        if not (isinstance(item, list) and len(item) > 1
-                                and item[1] == slot)]
-                atomic_json(health_path, health)
-        return count, retired, remaining_before, max(0, usage_limit - count), used_at
+    registration = root / 'registrations' / f'{slot:03d}.json'
+    registration_info = read_json(registration, {})
+    registration_info = registration_info if isinstance(registration_info, dict) else {}
+    counter = root / 'usage-slots' / f'{slot:03d}.json'
+    counter_info = read_json(counter, {})
+    counter_info = counter_info if isinstance(counter_info, dict) else {}
+    if 'usage' in counter_info:
+        previous = max(0, int(counter_info.get('usage') or 0))
+    elif 'usage' in registration_info:
+        previous = max(0, int(registration_info.get('usage') or 0))
+    else:
+        legacy = read_json(root / 'usage.json', {})
+        legacy = legacy if isinstance(legacy, dict) else {}
+        previous = max(0, int(legacy.get(str(slot)) or 0))
+    remaining_before = max(0, usage_limit - previous)
+    count = previous + 1
+    used_ts = time.time()
+    used_at = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(used_ts))
+    # The thread holding the last visible use owns retirement after its
+    # verification. Other threads cannot lease this slot until release.
+    retired = remaining_before <= 1
+    counter.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    atomic_json(counter, {'slot': slot, 'usage': 0 if retired else count,
+                          'retired': retired, 'updated_ts': used_ts})
+    if not retired:
+        registration_info.setdefault('slot', slot)
+        registration_info.setdefault('at', used_at)
+        registration_info.setdefault('ts', used_ts)
+        registration_info.update(last_used_at=used_at, last_used_ts=used_ts,
+                                 usage=count,
+                                 remaining=max(0, usage_limit - count))
+        registration.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_json(registration, registration_info)
+    if retired:
+        directory = pool.slot_directory(slot)
+        if directory.exists():
+            for child in directory.iterdir():
+                # Keep the live process lock until DeviceAuthLease.release().
+                if child.name == '.lease.lock':
+                    continue
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+        registration.unlink(missing_ok=True)
+        health_path = pool.base / 'health.json'
+        health = read_json(health_path, {})
+        if isinstance(health, dict) and health_path.exists():
+            devices = health.get('devices')
+            if isinstance(devices, dict):
+                devices.pop(str(slot), None)
+            events = health.get('events')
+            if isinstance(events, list):
+                health['events'] = [
+                    item for item in events
+                    if not (isinstance(item, list) and len(item) > 1
+                            and item[1] == slot)]
+            atomic_json(health_path, health)
+    return count, retired, remaining_before, max(0, usage_limit - count), used_at
 
 
 def _replace_device_identity(pool, device_root, slot, base_info, timeout, proxy,
@@ -2083,14 +2114,32 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'stage': 'init', 'detail': str(exc)[:180]}
             finally:
                 if device_lease is not None:
-                    if device_mode == 'one_time' and device_used:
-                        (device_usage, device_retired,
-                         device_remaining_before, device_remaining,
-                         device_used_at) = (
-                            _consume_thread_pool_device(
-                                auth_pool, shared_pool_root, slot_id,
-                                descriptor.get('device_usage_limit') or 10))
-                    device_lease.release()
+                    cleanup_error = None
+                    try:
+                        if device_mode == 'one_time' and device_used:
+                            (device_usage, device_retired,
+                             device_remaining_before, device_remaining,
+                             device_used_at) = (
+                                _consume_thread_pool_device(
+                                    auth_pool, shared_pool_root, slot_id,
+                                    descriptor.get('device_usage_limit') or 10))
+                    except Exception as exc:                       # noqa: BLE001
+                        cleanup_error = exc
+                    finally:
+                        try:
+                            device_lease.release()
+                        except Exception as exc:                   # noqa: BLE001
+                            cleanup_error = cleanup_error or exc
+                    if cleanup_error is not None:
+                        # Never let bookkeeping skip both device unlock and IP
+                        # return.  The row remains an explicit internal error,
+                        # not a guessed credential result.
+                        result = {
+                            'status': 'error', 'kind': 'device_accounting',
+                            'http': 0, 'stage': 'device',
+                            'detail': f'{type(cleanup_error).__name__}: '
+                                      f'{cleanup_error}'[:180],
+                        }
             if isinstance(result, dict) and device_mode == 'one_time':
                 result['_device_usage'] = device_usage
                 result['_device_retired'] = device_retired

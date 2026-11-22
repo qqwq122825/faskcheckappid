@@ -12,7 +12,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _consume_thread_pool_device, _device_id_label, _execute_auth_unit, _partition_device_slots,
+from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit,
+                                 _auth_worker_limit, _consume_thread_pool_device,
+                                 _device_id_label, _execute_auth_unit,
+                                 _partition_device_slots, _usage_snapshot,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
@@ -210,7 +213,12 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertTrue(used_at)
             self.assertFalse((slot / 'registered').exists())
             self.assertFalse((registrations / '001.json').exists())
-            self.assertEqual(json.loads((root / 'usage.json').read_text()), {})
+            # The hot path is per slot; the legacy global file is left intact
+            # and the zero tombstone overrides it until a replacement is born.
+            self.assertEqual(json.loads((root / 'usage.json').read_text()), {'1': 9})
+            counter = json.loads((root / 'usage-slots' / '001.json').read_text())
+            self.assertEqual((counter['usage'], counter['retired']), (0, True))
+            self.assertEqual(_usage_snapshot(root)[1], 0)
 
     def test_raw_apple_reason_is_packaged_only_when_debug_is_enabled(self):
         result = {'apple_message': 'Your account information was entered incorrectly.'}
@@ -638,6 +646,56 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertFalse((pooled / 'registrations' / '001.json').exists())
             self.assertEqual(releases, [
                 ('socks5h://exit-1', True), ('socks5h://exit-2', True)])
+
+    def test_device_accounting_failure_still_unlocks_device_and_settles_proxy(self):
+        class AccountingPool(FakePool):
+            @property
+            def base(self):
+                return self.root
+
+            def inspect(self, slot):
+                marker = self.slot_directory(slot) / 'registered'
+                return {'state': 'ready', 'device_id': str(slot)} if marker.exists() \
+                    else {'state': 'missing'}
+
+            def fetch_headers(self, slot, *_args, **_kwargs):
+                directory = self.slot_directory(slot)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'registered').write_text('ready', 'utf-8')
+                return {'identity': 'accounting-test'}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            device_root = root / 'devices'
+            (root / 'input.part').write_text('account----password\n', encoding='utf-8')
+            descriptor = {
+                'rows': 1, 'first_row': 1, 'threads': 1,
+                'device_pool_capacity': 1, 'device_slots': [1],
+                'device_root': str(device_root), 'origin': 'http://127.0.0.1:1',
+                'timeout': 5, 'retries': 0, '_device_mode': 'one_time',
+                '_retry_delay': 0, '_one_time_min_retries': 0,
+                'device_usage_limit': 10,
+                'device_cooldown_seconds': 0,
+            }
+            shared = ScriptedProxyPool(['socks5h://one', 'socks5h://two'])
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    AccountingPool,
+                    lambda *_args, **_kwargs: {
+                        'status': 'valid', 'kind': 'valid', 'http': 200},
+                    lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile', return_value={
+                     'client_info': 'test', 'user_agent': 'test', 'model': 'test'}), \
+                 patch('clusterlab.executor._consume_thread_pool_device',
+                       side_effect=TimeoutError('simulated usage contention')):
+                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+
+            done = json.loads((root / 'done.json').read_text())
+            self.assertEqual((done['ok'], done['processed']), (True, 1))
+            self.assertEqual(shared.discards, ['socks5h://one', 'socks5h://two'])
+            # The bookkeeping exception must not strand the device lock.
+            lease = DeviceAuthLease.try_acquire(AccountingPool(device_root), 1, cooldown=0)
+            self.assertIsNotNone(lease)
+            lease.release()
 
     def test_thread_mode_uses_device_profile_without_pool_info_request(self):
         class InfoPool(FakePool):
