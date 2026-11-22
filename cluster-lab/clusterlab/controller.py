@@ -378,6 +378,9 @@ class Controller:
                     db.execute(f'ALTER TABLE nodes ADD COLUMN {name} {definition}')
             db.execute("INSERT OR IGNORE INTO controller_settings(key,value) VALUES('update_parallel','2')")
             db.execute("INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_mode','one_time')")
+            # The shared thread pool is now the only GSA device strategy.
+            # Upgrade older controllers that were switched to legacy pool mode.
+            db.execute("UPDATE controller_settings SET value='one_time' WHERE key='device_mode'")
             unit_columns = {row['name'] for row in db.execute('PRAGMA table_info(units)')}
             if 'result_counts' not in unit_columns:
                 db.execute('ALTER TABLE units ADD COLUMN result_counts TEXT')
@@ -623,18 +626,9 @@ class Controller:
 
     @staticmethod
     def _device_start_allowed(db, initialization):
-        """一次性模式允许先接单，缺失设备由验证线程即时注册。"""
-        saved = db.execute(
-            "SELECT value FROM controller_settings WHERE key='device_mode'").fetchone()
-        mode = str(saved[0] if saved else 'one_time').lower()
-        if mode == 'one_time':
-            return True
-        # Legacy shared-pool mode cannot register in the verification thread.
-        # A zero minimum therefore means "use an existing ready pool", not
-        # "start empty". Explicit non-zero targets must be fully complete.
-        if initialization['requested']:
-            return bool(initialization['complete'])
-        return bool(initialization['ready'] > 0 and not initialization['running'])
+        """固定线程共享池可先接单，缺失设备由验证线程即时注册。"""
+        _ = db, initialization
+        return True
 
     def _source_path(self, name):
         """输入文件沿用用户给的名字；重名时加 -2、-3，避免覆盖已上传的文件。"""
@@ -675,7 +669,7 @@ class Controller:
         _ = dual_recheck
         auth_protocol = ((settings.get('auth_protocol') or 'gsa')
                          if mode == 'auth' else 'gsa')
-        device_mode = ((settings.get('device_mode') or 'one_time')
+        device_mode = ('one_time'
                        if mode == 'auth' and auth_protocol == 'gsa' else 'pool')
         job_id = uuid.uuid4().hex
         target = self._source_path(name).resolve()
@@ -718,9 +712,7 @@ class Controller:
                 'auth_protocol': (str(values.get('auth_protocol', 'gsa')).lower()
                                   if str(values.get('auth_protocol', 'gsa')).lower()
                                   in ('gsa', 'web') else 'gsa'),
-                'device_mode': (str(values.get('device_mode', 'one_time')).lower()
-                                if str(values.get('device_mode', 'one_time')).lower()
-                                in ('pool', 'one_time') else 'one_time')}
+                'device_mode': 'one_time'}
 
     def proxy_for_node(self, node):
         """节点专属出口：按创建顺序把链接分给各节点，避免所有节点抢同一条配额。"""
@@ -791,16 +783,8 @@ class Controller:
 
     def configure_device_mode(self, data):
         mode = str(data.get('device_mode') or '').strip().lower()
-        if mode not in ('pool', 'one_time'):
-            raise ValueError('设备模式应为共享设备或一次性设备')
-        with self.db.transaction() as db:
-            db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
-                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                       ('device_mode', mode))
-            event(db, 'controller_config',
-                  '设备模式已切换为一次性设备；每个账号由当前线程自行注册，失败 10 秒后换 IP 重试'
-                  if mode == 'one_time' else
-                  '设备模式已切换为共享设备池')
+        if mode != 'one_time':
+            raise ValueError('设备模式固定为线程共享设备池')
         return self.settings()
 
     def configure_rotation(self, data):
@@ -1169,7 +1153,7 @@ class Controller:
         _ = dual_recheck
         auth_protocol = ((settings.get('auth_protocol') or 'gsa')
                          if mode == 'auth' else 'gsa')
-        device_mode = ((settings.get('device_mode') or 'one_time')
+        device_mode = ('one_time'
                        if mode == 'auth' and auth_protocol == 'gsa' else 'pool')
         path = Path(str(source))
         if not path.exists():

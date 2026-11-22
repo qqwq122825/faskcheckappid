@@ -60,18 +60,16 @@ class ControllerTests(unittest.TestCase):
         self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
                                                   'enabled': True})
 
-    def test_shared_pool_mode_still_requires_initialization_before_start(self):
-        self.service.configure_device_mode({'device_mode': 'pool'})
-        node = self.service.add_node('pool-required', 4, 250)
+    def test_fixed_thread_pool_mode_can_start_while_devices_initialize(self):
+        node = self.service.add_node('pool-filling', 4, 250)
         self.service.heartbeat(node['id'], {
             'session': 'pool-required-session', 'hostname': 'pool-required',
             'version': 'test', 'max_processes': 4, 'max_threads': 500,
             'active': [], 'interrupted': [],
             'devices': {'running': True, 'capacity': 30, 'ready': 4,
                         'built': 4, 'failed': 0, 'attempted': 4}})
-        with self.assertRaisesRegex(Conflict, '设备初始化完成后'):
-            self.service.configure_node(node['id'], {
-                'processes': 4, 'threads': 250, 'enabled': True})
+        self.service.configure_node(node['id'], {
+            'processes': 4, 'threads': 250, 'enabled': True})
 
     def test_existing_node_without_pre_registration_minimum_can_start_empty(self):
         with self.service.db.transaction() as db:
@@ -192,24 +190,22 @@ class ControllerTests(unittest.TestCase):
         self.service = Controller(self.temp.name)
         self.assertEqual(self.service.settings()['auth_protocol'], 'gsa')
 
-    def test_one_time_device_mode_defaults_on_and_is_frozen_per_new_job(self):
+    def test_device_mode_is_fixed_to_thread_shared_pool_for_new_jobs(self):
         self.assertEqual(self.service.settings()['device_mode'], 'one_time')
         client = create_app('controller', self.service).test_client()
         csrf = client.get('/api/session').json['csrf']
         response = client.post('/api/settings/device-mode',
                                json={'device_mode': 'pool'},
                                headers={'X-CSRF-Token': csrf})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json['device_mode'], 'pool')
-        with self.assertRaisesRegex(ValueError, '共享设备或一次性设备'):
-            self.service.configure_device_mode({'device_mode': 'temporary'})
+        self.assertEqual(response.status_code, 400)
+        with self.assertRaisesRegex(ValueError, '固定为线程共享设备池'):
+            self.service.configure_device_mode({'device_mode': 'pool'})
         job = self.job(50)
-        self.service.configure_device_mode({'device_mode': 'one_time'})
         self.service.job_action(job, 'start')
         unit = self.service.lease(self.node['id'], 'test-session')
-        self.assertEqual(unit['_device_mode'], 'pool')
+        self.assertEqual(unit['_device_mode'], 'one_time')
         state = next(item for item in self.service.snapshot()['jobs'] if item['id'] == job)
-        self.assertEqual(state['device_mode'], 'pool')
+        self.assertEqual(state['device_mode'], 'one_time')
 
     def heartbeat(self, **extra):
         return self.service.heartbeat(self.node['id'], dict(session='test-session', max_processes=1,

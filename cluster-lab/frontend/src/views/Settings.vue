@@ -8,7 +8,6 @@ const proxyPoolSize = ref(1000), proxyPoolBusy = ref(false)
 const rotateAfter = ref(0), rotateBusy = ref(false)
 const proxyDebug = ref(false), proxyDebugBusy = ref(false)
 const authProtocol = ref('gsa'), authProtocolBusy = ref(false)
-const deviceMode = ref('one_time'), deviceModeBusy = ref(false)
 const webSecondaryAuth = ref(true), webSecondaryBusy = ref(false)
 watch(() => state.value?.settings?.device_rotate_after, value => {
   if (value != null) rotateAfter.value = value
@@ -27,9 +26,6 @@ watch(() => state.value?.settings?.auth_protocol, value => {
 }, { immediate: true })
 watch(() => state.value?.settings?.web_secondary_auth, value => {
   if (value != null) webSecondaryAuth.value = Boolean(value)
-}, { immediate: true })
-watch(() => state.value?.settings?.device_mode, value => {
-  if (value === 'pool' || value === 'one_time') deviceMode.value = value
 }, { immediate: true })
 watch(() => state.value?.settings?.proxy_pool_size, value => {
   if (value != null) proxyPoolSize.value = Number(value)
@@ -113,18 +109,6 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
     ElMessage.error((e as Error).message)
   } finally { webSecondaryBusy.value = false }
 }
-async function saveDeviceMode(value: string | number | boolean) {
-  const mode = String(value)
-  const previous = state.value?.settings?.device_mode || 'one_time'
-  deviceModeBusy.value = true
-  try {
-    await mutate('/api/settings/device-mode', { device_mode: mode },
-                 mode === 'one_time' ? '已启用线程共用设备模式' : '已切换为预注册分配模式')
-  } catch (e) {
-    deviceMode.value = previous
-    ElMessage.error((e as Error).message)
-  } finally { deviceModeBusy.value = false }
-}
 </script>
 <template>
   <el-card v-if="!isNode" shadow="never" class="section-card">
@@ -169,33 +153,11 @@ async function saveDeviceMode(value: string | number | boolean) {
     </el-form>
   </el-card>
   <el-card v-if="!isNode" shadow="never" class="section-card">
-    <template #header><h2>设备验证模式</h2></template>
-    <el-form label-position="top">
-      <el-form-item label="GSA 设备模式">
-        <el-radio-group v-model="deviceMode" :disabled="deviceModeBusy" @change="saveDeviceMode">
-          <el-radio-button value="one_time">线程共用设备（当前默认）</el-radio-button>
-          <el-radio-button value="pool">预注册分配</el-radio-button>
-        </el-radio-group>
-        <span class="field-note">
-          每个节点只有一个共享设备池：预注册容量可按需设为 1000、2000 或更高，单节点最高 10000。
-          线程先取池中的空闲设备；没有空闲设备时不等待，立即在当前预注册容量之后自行注册，验证完成后放回同一个共享池供其他线程复用。
-          达到下方使用次数阈值后，由当前线程在本次验证结束后删除该设备。
-          所有线程共享剩余次数；拿到最后 1 次的线程用完后负责删除。每台设备使用后冷却 3 秒。
-          可重试错误至少重试 1 次，等待 10 秒后丢弃旧出口并换 IP；模式在创建任务时固定。
-        </span>
-      </el-form-item>
-      <el-descriptions :column="1" border>
-        <el-descriptions-item label="当前模式">{{ deviceMode === 'one_time' ? '线程共用设备' : '预注册分配' }}</el-descriptions-item>
-        <el-descriptions-item label="生效范围">新建 GSA 账号校验任务</el-descriptions-item>
-      </el-descriptions>
-    </el-form>
-  </el-card>
-  <el-card v-if="!isNode" shadow="never" class="section-card">
     <template #header><h2>设备轮换</h2></template>
     <el-form label-position="top" @submit.prevent="saveRotation">
       <el-form-item label="每台设备用满多少条后自动换新">
         <el-input-number v-model="rotateAfter" :min="0" :max="100000" :step="10" :precision="0" :disabled="rotateBusy" />
-        <span class="field-note">预注册分配中，0 表示不轮换；线程共用模式中，0 按默认 100 次处理。设置 20 或 100 后，设备达到该次数会在本次使用后删除，下个线程在同一池中按需补回。</span>
+        <span class="field-note">固定使用节点共享设备池；一个设备同一时刻只租给一个工作线程，用完冷却 3 秒。设备达到使用次数后由当前线程删除，缺设备时验证线程会立即注册并放回共享池。</span>
       </el-form-item>
       <el-descriptions :column="1" border>
         <el-descriptions-item label="当前阈值">

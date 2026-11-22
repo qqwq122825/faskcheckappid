@@ -114,18 +114,14 @@ test('Authentication protocol setting selects one primary protocol', () => {
   assert.match(settings, /协议在创建任务时固定/)
 })
 
-test('Thread mode reuses one expandable shared pool and retires at limit', () => {
+test('GSA uses one fixed exclusive shared device pool with cooldown', () => {
   const settings = source('src/views/Settings.vue')
-  assert.match(settings, /\/api\/settings\/device-mode/)
-  assert.match(settings, /线程共用设备（当前默认）/)
-  assert.match(settings, /每个节点只有一个共享设备池/)
-  assert.match(settings, /预注册容量可按需设为 1000、2000 或更高，单节点最高 10000/)
-  assert.match(settings, /没有空闲设备时不等待/)
-  assert.match(settings, /验证完成后放回同一个共享池供其他线程复用/)
-  assert.match(settings, /本次验证结束后删除该设备/)
-  assert.match(settings, /拿到最后 1 次的线程用完后负责删除/)
-  assert.match(settings, /每台设备使用后冷却 3 秒/)
-  assert.match(settings, /等待 10 秒后丢弃旧出口并换 IP/)
+  assert.doesNotMatch(settings, /\/api\/settings\/device-mode/)
+  assert.doesNotMatch(settings, /GSA 设备模式|预注册分配/)
+  assert.match(settings, /固定使用节点共享设备池/)
+  assert.match(settings, /一个设备同一时刻只租给一个工作线程/)
+  assert.match(settings, /用完冷却 3 秒/)
+  assert.match(settings, /缺设备时验证线程会立即注册并放回共享池/)
 })
 
 test('Result table uses one protocol-neutral header set for all auth paths', () => {

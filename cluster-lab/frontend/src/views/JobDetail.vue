@@ -17,6 +17,7 @@ const exportOptions = [
   { label: '密码错误', value: 'wrong_password' },
   { label: '双重验证', value: 'need_2fa' },
   { label: '锁定', value: 'locked' },
+  { label: '未激活', value: 'invalid' },
   { label: '不存在', value: 'not_found' },
   { label: '请重试', value: 'timeout' },
   { label: '其他错误', value: 'undetermined' },
