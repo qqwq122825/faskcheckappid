@@ -329,7 +329,9 @@ class Controller:
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'not_found',
                       'timeout', 'undetermined', 'unknown')
     RESULT_CLASSIFICATION_VERSION = 15
-    DEFAULT_DEVICE_REQUEST = 30
+    # New nodes may start with an empty pool. Operators can still pre-register
+    # any explicit target (for example 100 or 2,000) before or during work.
+    DEFAULT_DEVICE_REQUEST = 0
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')
     UPDATE_REF_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$')
@@ -624,8 +626,15 @@ class Controller:
         """一次性模式允许先接单，缺失设备由验证线程即时注册。"""
         saved = db.execute(
             "SELECT value FROM controller_settings WHERE key='device_mode'").fetchone()
-        return bool(initialization['complete'] or
-                    str(saved[0] if saved else 'one_time').lower() == 'one_time')
+        mode = str(saved[0] if saved else 'one_time').lower()
+        if mode == 'one_time':
+            return True
+        # Legacy shared-pool mode cannot register in the verification thread.
+        # A zero minimum therefore means "use an existing ready pool", not
+        # "start empty". Explicit non-zero targets must be fully complete.
+        if initialization['requested']:
+            return bool(initialization['complete'])
+        return bool(initialization['ready'] > 0 and not initialization['running'])
 
     def _source_path(self, name):
         """输入文件沿用用户给的名字；重名时加 -2、-3，避免覆盖已上传的文件。"""
@@ -1605,15 +1614,17 @@ class Controller:
                 # 串成一个地址交给执行器。
                 config = self.proxy_for_node(node)
                 settings = self.settings()
+                device_mode = (unit['device_mode'] or 'one_time').lower()
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
                                proxy_pool_size=int(settings.get('proxy_pool_size') or 1000),
                                device_registration_workers=32,
-                               device_usage_limit=max(1, int(
-                                   settings.get('device_rotate_after') or 100)),
+                               device_usage_limit=(10 if device_mode == 'one_time' else
+                                                   max(1, int(settings.get(
+                                                       'device_rotate_after') or 100))),
                                origin=settings.get('origin', 'https://new.ani.sidestore.io'),
                                _proxy_debug=bool(settings.get('proxy_debug')),
                                _auth_protocol=(unit['auth_protocol'] or 'gsa').lower(),
-                               _device_mode=(unit['device_mode'] or 'one_time').lower(),
+                               _device_mode=device_mode,
                                _web_secondary_auth=(
                                    (unit['auth_protocol'] or 'gsa').lower() == 'gsa'
                                    and bool(settings.get('web_secondary_auth'))))

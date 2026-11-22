@@ -69,7 +69,7 @@ function show(value: any) {
   const settings = state.value?.settings || {}
   autoRotate.value = Boolean(settings.device_auto_rotate ?? false)
   rotateAfter.value = Number(settings.device_rotate_after ?? 20) || 20
-  capacity.value = Math.max(1, Number(value?.telemetry?.device_pool?.capacity) || 2)
+  capacity.value = Math.max(0, Number(value?.telemetry?.device_pool?.capacity) || 0)
   error.value = ''
   page.value = 1
   visible.value = true
@@ -79,13 +79,15 @@ defineExpose({ show })
 async function initialize() {
   error.value = ''
   if (!node.value?.id) { error.value = '节点不可用'; return }
-  if (!Number.isInteger(capacity.value) || capacity.value < 1 || capacity.value > 10000) {
-    error.value = '设备数量应为 1–10000 的整数'; return
+  if (!Number.isInteger(capacity.value) || capacity.value < 0 || capacity.value > 10000) {
+    error.value = '设备数量应为 0–10000 的整数'; return
   }
   busy.value = true
   try {
     await api(`/api/nodes/${node.value.id}/devices`, { capacity: capacity.value }, 'POST')
-    ElMessage.success(`已通知节点开始初始化设备池，共 ${capacity.value} 台`)
+    ElMessage.success(capacity.value
+      ? `已通知节点开始初始化设备池，共 ${capacity.value} 台`
+      : '已设为 0 台预注册设备，验证线程将在池空时自行注册')
   } catch (exc: any) {
     error.value = exc?.message || '请求失败'
   } finally { busy.value = false }
@@ -134,8 +136,8 @@ async function clearPool() {
       </div>
       <el-form label-position="top" @submit.prevent="initialize">
         <el-form-item label="设备数量">
-          <el-input-number v-model="capacity" :min="1" :max="10000" :step="1" :precision="0" :disabled="building || busy" />
-          <span class="field-note">单节点可初始化 1–10000 台；点击“开始初始化设备池”后才会注册。</span>
+          <el-input-number v-model="capacity" :min="0" :max="10000" :step="1" :precision="0" :disabled="building || busy" />
+          <span class="field-note">0 表示不预注册，池空时由验证线程自行注册；也可预先初始化 1–10000 台。</span>
         </el-form-item>
         <el-form-item label="自动补充">
           <el-switch v-model="autoRotate" :loading="savingAuto" :disabled="savingAuto"

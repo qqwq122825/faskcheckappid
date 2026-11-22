@@ -24,13 +24,13 @@ test('Task creation exposes retries and node settings allow up to 4 x 500', () =
   assert.doesNotMatch(nodes, /active-text="允许领取新工作包"/)
 })
 
-test('New nodes stay paused until all default devices are initialized', () => {
+test('New nodes can start with zero pre-registered devices in one-time mode', () => {
   const nodes = source('src/views/Nodes.vue')
   const dialogs = source('src/components/NodeDialogs.vue')
   assert.match(nodes, /!node\.enabled && !node\.device_initialization_complete/)
-  assert.match(nodes, /设备初始化 \{\{ node\.device_ready \|\| 0 \}\}\/\{\{ node\.device_request \|\| 30 \}\}/)
+  assert.match(nodes, /设备初始化 \{\{ node\.device_ready \|\| 0 \}\}\/\{\{ node\.device_request \|\| 0 \}\}/)
   assert.match(nodes, /开始接单/)
-  assert.match(dialogs, /新节点先暂停接单并自动初始化 30 台设备/)
+  assert.match(dialogs, /一次性模式可立即接单，缺失设备由验证线程补充/)
   assert.doesNotMatch(dialogs, /允许领取新工作包/)
 })
 
@@ -164,7 +164,8 @@ test('Large task totals use a non-overlapping responsive feedback grid', () => {
 test('Device pool starts initialization only from its explicit action and shows persisted registration history', () => {
   const drawer = source('src/components/DevicePoolDrawer.vue')
   assert.match(drawer, /开始初始化设备池/)
-  assert.match(drawer, /单节点可初始化 1–10000 台/)
+  assert.match(drawer, /0 表示不预注册/)
+  assert.match(drawer, /:min="0"/)
   assert.match(drawer, /代理异常：未获取到可用代理，请确认新节点出口 IP 已加入白名单/)
   assert.match(drawer, /代理正常/)
   assert.match(drawer, /pool\.value\.proxy_ip/)

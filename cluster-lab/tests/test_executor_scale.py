@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _device_id_label, _execute_auth_unit, _partition_device_slots,
+from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _consume_thread_pool_device, _device_id_label, _execute_auth_unit, _partition_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
@@ -133,6 +133,32 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertGreaterEqual(acquired[0] - released, .13)
             marker = json.loads((pool.slot_directory(1) / '.auth-cooldown.json').read_text())
             self.assertEqual(marker['state'], 'cooldown')
+            self.assertEqual(marker['slot'], 1)
+            self.assertIn('last_used_at', marker)
+            self.assertIn('available_at', marker)
+
+    def test_thread_mode_prefers_ready_pool_then_uses_registration_gap(self):
+        class Pool:
+            def __init__(inner, root):
+                inner.root = Path(root)
+                inner.base = inner.root
+
+            def slot_directory(inner, slot):
+                return inner.root / f'{int(slot):02d}'
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pool = Pool(temporary)
+            stop = threading.Event()
+            first = DeviceAuthLease.acquire_any(
+                pool, [1, 2], stop, cooldown=0,
+                ready_slots=[1], overflow_slots=[2])
+            self.assertEqual(first.slot, 1)
+            second = DeviceAuthLease.acquire_any(
+                pool, [1, 2], stop, cooldown=0,
+                ready_slots=[1], overflow_slots=[2])
+            self.assertEqual(second.slot, 2)
+            second.release()
+            first.release()
 
     def test_thread_mode_registers_new_slot_instead_of_waiting_for_busy_device(self):
         class Pool:
@@ -156,6 +182,35 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertLess(elapsed, .1)
             extension.release()
             busy.release()
+
+    def test_ninth_use_is_verified_then_tenth_use_retires_device(self):
+        class Pool:
+            def __init__(inner, root):
+                inner.root = Path(root)
+                inner.base = inner.root
+
+            def slot_directory(inner, slot):
+                return inner.root / f'{int(slot):02d}'
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pool = Pool(root)
+            slot = pool.slot_directory(1)
+            slot.mkdir(parents=True)
+            (slot / 'registered').write_text('identity', 'utf-8')
+            (root / 'usage.json').write_text('{"1":9}', 'utf-8')
+            registrations = root / 'registrations'
+            registrations.mkdir()
+            (registrations / '001.json').write_text('{"slot":1}', 'utf-8')
+
+            count, retired, before, after, used_at = (
+                _consume_thread_pool_device(pool, root, 1, 10))
+
+            self.assertEqual((count, retired, before, after), (10, True, 1, 0))
+            self.assertTrue(used_at)
+            self.assertFalse((slot / 'registered').exists())
+            self.assertFalse((registrations / '001.json').exists())
+            self.assertEqual(json.loads((root / 'usage.json').read_text()), {})
 
     def test_raw_apple_reason_is_packaged_only_when_debug_is_enabled(self):
         result = {'apple_message': 'Your account information was entered incorrectly.'}
@@ -534,6 +589,7 @@ class ExecutorScaleTests(unittest.TestCase):
             OneTimePool.registered_flags = []
             records = []
             releases = []
+            first_registration = None
 
             def check(_account, _password, _proxy, **_kwargs):
                 return {'status': 'valid', 'kind': 'valid', 'http': 200}
@@ -561,6 +617,9 @@ class ExecutorScaleTests(unittest.TestCase):
                                        proxy_pool=shared)
                 records.append(json.loads((unit / 'results.jsonl').read_text()))
                 releases.extend(shared.releases)
+                if number == 1:
+                    first_registration = json.loads(
+                        (device_root / 'registrations' / '001.json').read_text())
 
             pooled = device_root
             self.assertEqual(OneTimePool.registered_flags, [False, True])
@@ -570,6 +629,11 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual([record['device_remaining'] for record in records], [1, 0])
             self.assertEqual([record['device_retired'] for record in records],
                              [False, True])
+            self.assertTrue(records[0]['device_used_at'])
+            self.assertEqual(first_registration['usage'], 1)
+            self.assertEqual(first_registration['remaining'], 1)
+            self.assertEqual(first_registration['last_used_at'],
+                             records[0]['device_used_at'])
             self.assertFalse((pooled / '01' / 'registered').exists())
             self.assertFalse((pooled / 'registrations' / '001.json').exists())
             self.assertEqual(releases, [

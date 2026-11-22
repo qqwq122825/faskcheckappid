@@ -382,9 +382,11 @@ class NodeRecoveryTests(unittest.TestCase):
         snapshot.assert_called_once_with()
         reserve.assert_not_called()
         self.assertEqual(descriptor['device_slots'], list(range(1, 1051)))
+        self.assertEqual(descriptor['device_ready_slots'], list(range(1, 1001)))
+        self.assertEqual(descriptor['device_overflow_slots'], list(range(1001, 1051)))
         self.assertEqual(descriptor['device_base_capacity'], 1000)
         self.assertEqual(descriptor['device_pool_capacity'], 1050)
-        self.assertEqual(descriptor['device_usage_limit'], 100)
+        self.assertEqual(descriptor['device_usage_limit'], 10)
         self.assertEqual(descriptor['device_cooldown_seconds'], 3.0)
         self.assertNotIn('device_plan', descriptor)
         self.assertEqual(descriptor['_retry_delay'], 10.0)
@@ -402,7 +404,21 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(descriptor['device_pool_capacity'], 2800)
         self.assertEqual(descriptor['device_slots'][0], 1)
         self.assertEqual(descriptor['device_slots'][-1], 2800)
+        self.assertEqual(descriptor['device_ready_slots'], list(range(1, 2001)))
+        self.assertEqual(descriptor['device_overflow_slots'], list(range(2001, 2801)))
         self.assertEqual(descriptor['device_cooldown_seconds'], 3.0)
+        self.assertEqual(descriptor['device_usage_limit'], 10)
+
+    def test_zero_device_pool_gives_every_active_thread_a_registration_slot(self):
+        descriptor = {'mode': 'auth', 'rows': 1000, 'processes': 4, 'threads': 250,
+                      '_auth_protocol': 'gsa', '_device_mode': 'one_time'}
+        with patch.object(self.node.builder, 'snapshot', return_value={
+                'capacity': 0, 'slots': []}), \
+             patch.object(self.node.builder, 'usage', return_value={}):
+            self.node._prepare_auth_devices(descriptor)
+        self.assertEqual(descriptor['device_base_capacity'], 0)
+        self.assertEqual(descriptor['device_ready_slots'], [])
+        self.assertEqual(descriptor['device_overflow_slots'], list(range(1, 1001)))
         self.assertEqual(descriptor['device_usage_limit'], 10)
 
     def test_web_task_does_not_require_or_reserve_devices(self):

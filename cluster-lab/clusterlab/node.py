@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 '''
 
 DEVICE_AUTH_LIMIT = 100
+ONE_TIME_DEVICE_AUTH_LIMIT = 10
 DEVICE_POOL_LIMIT = 10000
 DEVICE_AUTH_COOLDOWN_SECONDS = 3.0
 
@@ -694,10 +695,11 @@ class Node:
             descriptor.pop('device_reset_slots', None)
             return
         if str(descriptor.get('_device_mode') or 'pool').lower() == 'one_time':
-            # 线程模式与预注册共用同一个持久池。预注册容量可由用户调成
-            # 1000/2000 或更高；线程总是在它后面预留本包并发量作为即时扩容槽位。
+            # 一次性模式和预注册共用一个持久池：先借已就绪设备，
+            # 没有空闲设备时，线程再在缺口/扩容槽上自己注册。
             snapshot = self.builder.snapshot()
             entries = list(snapshot.get('slots') or [])
+            usage = self.builder.usage()
             base_capacity = max(
                 0, int(snapshot.get('capacity') or 0),
                 max((int(item.get('slot') or 0) for item in entries
@@ -705,11 +707,22 @@ class Node:
             active_devices = min(rows, processes * max(
                 1, int(descriptor.get('threads') or 1)))
             pool_size = base_capacity + active_devices
-            limit = max(1, int(descriptor.get('device_usage_limit') or DEVICE_AUTH_LIMIT))
+            limit = ONE_TIME_DEVICE_AUTH_LIMIT
+            ready_slots = sorted({int(item.get('slot') or 0) for item in entries
+                                  if isinstance(item, dict)
+                                  and item.get('state') == 'ready'
+                                  and 1 <= int(item.get('slot') or 0) <= base_capacity
+                                  and max(0, int(usage.get(
+                                      str(int(item.get('slot') or 0))) or 0)) < limit})
+            ready_set = set(ready_slots)
+            overflow_slots = [slot for slot in range(1, pool_size + 1)
+                              if slot not in ready_set]
             descriptor.pop('device_capacity', None)
             descriptor['processes'] = processes
             descriptor['device_pool_capacity'] = pool_size
-            descriptor['device_slots'] = list(range(1, pool_size + 1))
+            descriptor['device_slots'] = ready_slots + overflow_slots
+            descriptor['device_ready_slots'] = ready_slots
+            descriptor['device_overflow_slots'] = overflow_slots
             descriptor['device_base_capacity'] = base_capacity
             descriptor['device_usage_limit'] = limit
             descriptor.pop('device_plan', None)
