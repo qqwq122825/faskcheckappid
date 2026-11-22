@@ -341,7 +341,7 @@ class Controller:
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')
     UPDATE_REF_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$')
 
-    def __init__(self, root, lease_seconds=120, offline_seconds=12, dispatch_per_second=0):
+    def __init__(self, root, lease_seconds=120, offline_seconds=30, dispatch_per_second=0):
         self.root = private_dir(root)
         self.inputs = private_dir(self.root / 'inputs')
         self.units_dir = private_dir(self.root / 'units')

@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 from clusterlab.node import Node
 from clusterlab.device_build import REGISTRATION_TIMEOUT, _register
-from clusterlab.executor import _replace_device_identity
+from clusterlab.executor import (_partition_one_time_device_slots,
+                                 _replace_device_identity)
 
 
 class Response:
@@ -420,6 +421,38 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(descriptor['device_ready_slots'], [])
         self.assertEqual(descriptor['device_overflow_slots'], list(range(1, 1001)))
         self.assertEqual(descriptor['device_usage_limit'], 10)
+
+    def test_two_nodes_with_one_hundred_ready_devices_send_nine_hundred_threads_to_registration(self):
+        snapshot = {'capacity': 100, 'slots': [
+            {'slot': slot, 'state': 'ready'} for slot in range(1, 101)]}
+        observed = []
+        node_keys = []
+        for node_index in range(2):
+            descriptor = {'mode': 'auth', 'rows': 10000, 'processes': 4,
+                          'threads': 250, '_auth_protocol': 'gsa',
+                          '_device_mode': 'one_time'}
+            with patch.object(self.node.builder, 'snapshot', return_value=snapshot), \
+                 patch.object(self.node.builder, 'usage', return_value={}):
+                self.node._prepare_auth_devices(descriptor)
+            ready_taken = registration_taken = waiting = 0
+            keys = set()
+            for process_index in range(4):
+                ready, overflow = _partition_one_time_device_slots(
+                    descriptor['device_ready_slots'],
+                    descriptor['device_overflow_slots'], 4, process_index)
+                ready_now = min(250, len(ready))
+                register_now = min(250 - ready_now, len(overflow))
+                ready_taken += ready_now
+                registration_taken += register_now
+                waiting += 250 - ready_now - register_now
+                keys.update((node_index, slot) for slot in ready[:ready_now])
+                keys.update((node_index, slot) for slot in overflow[:register_now])
+            observed.append((ready_taken, registration_taken, waiting,
+                             len(descriptor['device_overflow_slots'])))
+            node_keys.append(keys)
+        self.assertEqual(observed, [(100, 900, 0, 1000),
+                                    (100, 900, 0, 1000)])
+        self.assertTrue(node_keys[0].isdisjoint(node_keys[1]))
 
     def test_web_task_does_not_require_or_reserve_devices(self):
         descriptor = {'mode': 'auth', 'rows': 50, 'processes': 4,

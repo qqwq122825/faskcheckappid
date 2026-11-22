@@ -23,12 +23,9 @@ from .common import atomic_json, read_json
 
 
 PROXY_TTL_SECONDS = 50.0
-# The provider endpoint becomes a long-tail bottleneck when one request asks
-# for the full 1,000-worker shortage.  Exits are intentionally reusable, so a
-# 200-exit rolling batch is enough to release all workers while the supplier
-# continues replenishing once per second.
+PROXY_INITIAL_FETCH = 1000
 PROXY_FETCH_LIMIT = 200
-PROXY_PREFILL_WAIT_SECONDS = 1.0
+PROXY_PREFILL_WAIT_SECONDS = 10.0
 PROXY_POOL_LIMIT = 10000
 PROXY_FAILURE_LIMIT = 3
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
@@ -805,6 +802,11 @@ class NodeProxyPool:
             self._add(self.discarded, sum(bool(value) for value in values))
             return 0
         added = 0
+        # Moving a reusable token between queues does not change logical
+        # inventory. Reading all multiprocessing counters for every incoming
+        # exit made the 1,000-exit prefill fight 1,000 account workers for the
+        # same locks. Take one conservative snapshot and update it locally.
+        known = self.snapshot()['known']
         for value in values:
             if not value:
                 continue
@@ -819,7 +821,7 @@ class NodeProxyPool:
             # The two physical queues share one logical capacity. Without this
             # guard, a full reusable queue plus scheduled fresh rotation could
             # silently grow a target=10,000 pool toward 20,000 entries.
-            if self.snapshot()['known'] >= self.target:
+            if known >= self.target:
                 oldest = self._take(self.fresh, self.fresh_count, 0.02)
                 if oldest is None:
                     oldest = self._take(self.reusable, self.reusable_count, 0.02)
@@ -827,6 +829,7 @@ class NodeProxyPool:
                     continue
                 self._add(self.discarded, 1)
                 self._add(self.refreshed, 1)
+                known = max(0, known - 1)
             self._add(self.fresh_count, 1)
             try:
                 self.fresh.put_nowait((str(value), expires_at, 0, 0))
@@ -846,6 +849,7 @@ class NodeProxyPool:
                     continue
             self._recent_exits[key] = expires_at
             added += 1
+            known += 1
         self._add(self.fetched, added)
         # A rate-limited provider may return fewer exits than the requested
         # target (for example 200 per minute for 1,000 workers).  Start work as
@@ -1096,18 +1100,19 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
             # Busy leases are still valid inventory and will return to the
             # reusable queue. Counting only queued exits made 1,000 workers
             # look like 1,000 missing proxies and triggered needless refills.
-            needed = max(0, pool.target - pool.snapshot()['known'])
+            snapshot = pool.snapshot()
+            needed = max(0, pool.target - snapshot['known'])
             # Replace one TTL-window of inventory gradually instead of letting
-            # the initial batch expire at once. Keep every provider request
-            # small: one exit may serve concurrent requests, so a 1,000-worker
-            # shortage must not turn into one blocking request for 1,000 IPs.
+            # the initial batch expire at once.
             refresh_batch = max(1, math.ceil(pool.target / pool.ttl))
             # Fill shortages quickly, then rotate one TTL-window gradually.
             # Maintain a full TTL window.  For the 10,000-exit default this
             # requests 200 exits every second; IPs remain concurrently reusable.
-            # If inventory falls behind, catch up incrementally. The next batch
-            # starts on the next tick instead of holding task startup hostage.
-            count = min(PROXY_FETCH_LIMIT, max(refresh_batch, needed))
+            # Task start performs one provider-supported 1,000-exit prefill;
+            # after ready, fill/rotate at most 200 exits per second.
+            count = (min(PROXY_INITIAL_FETCH, max(1, needed))
+                     if not snapshot['ready'] else
+                     min(PROXY_FETCH_LIMIT, max(refresh_batch, needed)))
             started = time.monotonic()
             before = _proxy_pool_snapshot(pool) if debug_path else {}
             try:

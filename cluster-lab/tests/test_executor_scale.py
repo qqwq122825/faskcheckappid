@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (PROXY_FETCH_LIMIT, PROXY_PREFILL_WAIT_SECONDS,
+from clusterlab.executor import (PROXY_FETCH_LIMIT, PROXY_INITIAL_FETCH,
+                                 PROXY_PREFILL_WAIT_SECONDS,
                                  DeviceAuthLease, NodeProxyPool, _auth_process_limit,
                                  _auth_worker_limit, _consume_thread_pool_device,
                                  _device_id_label, _execute_auth_unit,
@@ -253,7 +254,8 @@ class ExecutorScaleTests(unittest.TestCase):
                                             active_processes=2), 500)
         self.assertEqual(4 * _auth_worker_limit(100, 10, 4), 10 * 100)
         self.assertEqual(PROXY_FETCH_LIMIT, 200)
-        self.assertEqual(PROXY_PREFILL_WAIT_SECONDS, 1.0)
+        self.assertEqual(PROXY_INITIAL_FETCH, 1000)
+        self.assertEqual(PROXY_PREFILL_WAIT_SECONDS, 10.0)
 
     def test_device_id_uses_short_base64_label(self):
         self.assertEqual(_device_id_label('device-1'), 'B64:ZGV2aWNl')
@@ -589,7 +591,7 @@ class ExecutorScaleTests(unittest.TestCase):
         finally:
             pool.close()
 
-    def test_two_nodes_request_200_then_reuse_sparse_provider_stock(self):
+    def test_two_nodes_request_1000_then_reuse_sparse_provider_stock(self):
         context = mp.get_context('spawn')
         observed = []
         for node in (1, 2):
@@ -619,11 +621,23 @@ class ExecutorScaleTests(unittest.TestCase):
                 pool.close()
 
         self.assertEqual(observed, [
-            (200, 'socks5h://node-1-only-exit:9000',
+            (1000, 'socks5h://node-1-only-exit:9000',
              'socks5h://node-1-only-exit:9000', 1),
-            (200, 'socks5h://node-2-only-exit:9000',
+            (1000, 'socks5h://node-2-only-exit:9000',
              'socks5h://node-2-only-exit:9000', 1),
         ])
+
+    def test_thousand_exit_prefill_reads_logical_inventory_once(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=1000, ttl=50, target=10000)
+        try:
+            values = [f'socks5h://prefill-{index}:9000' for index in range(1000)]
+            with patch.object(pool, 'snapshot', wraps=pool.snapshot) as snapshot:
+                self.assertEqual(pool.add_fresh(values), 1000)
+            self.assertEqual(snapshot.call_count, 1)
+            self.assertEqual(pool.snapshot()['known'], 1000)
+        finally:
+            pool.close()
 
     def test_retry_delay_queue_frees_single_worker_for_next_account(self):
         with tempfile.TemporaryDirectory() as temporary:
