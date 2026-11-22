@@ -477,6 +477,26 @@ class ExecutorScaleTests(unittest.TestCase):
         finally:
             pool.close()
 
+    def test_process_local_proxy_cache_avoids_queue_on_hot_path(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=1000, ttl=50, target=1000)
+        leases = []
+        try:
+            pool.add_fresh([f'socks5h://cached-{index}' for index in range(20)])
+            for _ in range(8):
+                leases.append(pool.acquire(wait=.5))
+            self.assertEqual(pool._local_observations, 8)
+            with patch.object(pool, '_take',
+                              side_effect=AssertionError('hot path must be local')):
+                cached = pool.acquire(wait=.5)
+            self.assertIsNotNone(cached)
+            self.assertIn(cached[0], {lease[0] for lease in leases})
+            pool.release(cached, healthy=True)
+            for lease in leases:
+                pool.release(lease, healthy=True)
+        finally:
+            pool.close()
+
     def test_node_proxy_pool_never_exceeds_configured_logical_capacity(self):
         context = mp.get_context('spawn')
         pool = NodeProxyPool(context, concurrency=2, ttl=30, target=2)

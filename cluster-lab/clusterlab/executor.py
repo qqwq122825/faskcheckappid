@@ -40,6 +40,9 @@ PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
 PROXY_EXIT_IP_TIMEOUT = 4.0
 PROXY_EXIT_IP_MAX = 2048
 PROXY_QUARANTINE_SLOTS = 65536
+PROXY_LOCAL_CACHE_SIZE = 32
+PROXY_LOCAL_CACHE_WARMUP = 8
+PROXY_LOCAL_CACHE_RESAMPLE = 256
 
 
 def stall_timeout_seconds(descriptor, minimum=MIN_STALL_TIMEOUT_SECONDS,
@@ -694,6 +697,15 @@ class NodeProxyPool:
         self.refill = context.Event()
         self.refill.set()
         self.ready = context.Event()
+        # Every account used to cross the multiprocessing Queue twice (get +
+        # republish), even though exits are intentionally reusable.  Keep a
+        # small process-local read cache after a short shared-pool warm-up.
+        # Quarantine remains process-shared, so a 503 invalidates cached copies
+        # in all auth processes without another queue scan.
+        self._local_pid = 0
+        self._local_leases = []
+        self._local_observations = 0
+        self._local_calls = 0
 
     @staticmethod
     def _add(counter, delta):
@@ -732,6 +744,49 @@ class NodeProxyPool:
         index = value % PROXY_QUARANTINE_SLOTS
         return (self.quarantine_hashes[index] == value
                 and self.quarantine_until[index] > time.monotonic())
+
+    def _local_reset_if_forked(self):
+        pid = os.getpid()
+        if self._local_pid != pid:
+            self._local_pid = pid
+            self._local_leases = []
+            self._local_observations = 0
+            self._local_calls = 0
+
+    def _remember_local(self, lease):
+        self._local_reset_if_forked()
+        self._local_observations += 1
+        endpoint = lease[0]
+        for index, existing in enumerate(self._local_leases):
+            if existing[0] == endpoint:
+                self._local_leases[index] = lease
+                return
+        if len(self._local_leases) < PROXY_LOCAL_CACHE_SIZE:
+            self._local_leases.append(lease)
+        else:
+            self._local_leases[self._local_observations % len(
+                self._local_leases)] = lease
+
+    def _take_local(self):
+        self._local_reset_if_forked()
+        if self._local_observations < PROXY_LOCAL_CACHE_WARMUP:
+            return None
+        self._local_calls += 1
+        if self._local_calls % PROXY_LOCAL_CACHE_RESAMPLE == 0:
+            return None
+        now = time.monotonic()
+        usable = [lease for lease in self._local_leases
+                  if float(lease[1]) > now
+                  and not self._is_quarantined(lease[0])]
+        if len(usable) != len(self._local_leases):
+            self._local_leases = usable
+        if not usable:
+            return None
+        lease = usable[self._local_calls % len(usable)]
+        self._add(self.reused, 1)
+        self._add(self.in_use_count, 1)
+        return (lease[0], lease[1], int(lease[2]),
+                int(lease[3]) if len(lease) > 3 else 0)
 
     def add_fresh(self, values, fetched_at=None):
         # Called by the single supplier; remember even in-flight/failed exits
@@ -844,6 +899,9 @@ class NodeProxyPool:
         # Never wait for a new API response while a healthy queued exit exists.
         # The token is republished before returning, so independent device
         # requests may share the IP without sharing device state.
+        lease = self._take_local()
+        if lease is not None:
+            return lease
         lease = self._take(self.fresh, self.fresh_count)
         # multiprocessing.Queue publishes through a feeder thread.  Its shared
         # count can therefore become visible a few milliseconds before get()
@@ -858,6 +916,7 @@ class NodeProxyPool:
             self._publish(self.reusable, self.reusable_count,
                           (lease[0], lease[1], int(lease[2]) + 1,
                            int(lease[3]) if len(lease) > 3 else 0))
+            self._remember_local(lease)
             self._add(self.in_use_count, 1)
             return lease
         self.refill.set()
@@ -867,6 +926,7 @@ class NodeProxyPool:
             self._publish(self.reusable, self.reusable_count,
                           (lease[0], lease[1], int(lease[2]) + 1,
                            int(lease[3]) if len(lease) > 3 else 0))
+            self._remember_local(lease)
             self._add(self.in_use_count, 1)
             return (lease[0], lease[1], int(lease[2]),
                     int(lease[3]) if len(lease) > 3 else 0)
@@ -881,6 +941,7 @@ class NodeProxyPool:
                 self._publish(self.reusable, self.reusable_count,
                               (lease[0], lease[1], int(lease[2]) + 1,
                                int(lease[3]) if len(lease) > 3 else 0))
+                self._remember_local(lease)
                 self._add(self.in_use_count, 1)
                 return lease
             lease = self._take(self.reusable, self.reusable_count)
@@ -889,6 +950,7 @@ class NodeProxyPool:
                 self._publish(self.reusable, self.reusable_count,
                               (lease[0], lease[1], int(lease[2]) + 1,
                                int(lease[3]) if len(lease) > 3 else 0))
+                self._remember_local(lease)
                 self._add(self.in_use_count, 1)
                 return (lease[0], lease[1], int(lease[2]),
                         int(lease[3]) if len(lease) > 3 else 0)
