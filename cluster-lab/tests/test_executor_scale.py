@@ -575,7 +575,7 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(releases, [
                 ('socks5h://exit-1', True), ('socks5h://exit-2', True)])
 
-    def test_thread_mode_initializes_pool_info_once_per_worker_process(self):
+    def test_thread_mode_uses_device_profile_without_pool_info_request(self):
         class InfoPool(FakePool):
             info_calls = 0
 
@@ -624,7 +624,7 @@ class ExecutorScaleTests(unittest.TestCase):
                        return_value={'client_info': 'test', 'user_agent': 'test',
                                      'model': 'SharedInfo'}):
                 _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
-            self.assertEqual(InfoPool.info_calls, 1)
+            self.assertEqual(InfoPool.info_calls, 0)
             self.assertEqual(len((root / 'results.jsonl').read_text().splitlines()), 2)
 
     def test_auth_unit_rotates_proxy_after_http_zero_and_reuses_http_200(self):
