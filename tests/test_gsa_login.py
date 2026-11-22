@@ -1,10 +1,13 @@
 """Offline protocol validation with an independent synthetic SRP server."""
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import os
 import plistlib
 import socket
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -123,6 +126,37 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(native_client.A_bytes, python_client.A_bytes)
         self.assertEqual(native_m1, python_m1)
         self.assertEqual(native_client.M2_expected, python_client.M2_expected)
+
+    def test_srp_cpu_stage_is_bounded_per_process(self):
+        lock = threading.Lock()
+        state = {'active': 0, 'peak': 0}
+
+        class SlowSRP:
+            A_bytes = b'A'
+
+            def __init__(self, *_args):
+                with lock:
+                    state['active'] += 1
+                    state['peak'] = max(state['peak'], state['active'])
+                time.sleep(.02)
+                with lock:
+                    state['active'] -= 1
+
+        class InitRejectServer:
+            def post(self, *_args, **_kwargs):
+                return gsa.HttpOutcome({'Response': {'Status': {'ec': -20970}}})
+
+        with patch.object(gsa, 'SRPClient', SlowSRP), \
+             patch.object(gsa, '_session_for', return_value=InitRejectServer()):
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                results = list(executor.map(
+                    lambda index: gsa.check(
+                        f'bounded-{index}@example.invalid', 'password', None,
+                        retries=0, identity=self.identity),
+                    range(16)))
+
+        self.assertEqual(state['peak'], 1)
+        self.assertEqual(len(results), 16)
 
     def test_missing_and_tampered_server_proofs_are_rejected(self):
         for proof in ("missing", "tampered"):

@@ -44,6 +44,12 @@ except Exception:                      # pragma: no cover - fallback path
 
 GSA_URL = "https://gsa.apple.com/grandslam/GsService2"
 
+# Each node process is already CPU-sized by clusterlab.executor.  Letting its
+# hundreds of network threads enter GMP/PBKDF2 together only oversubscribes the
+# same CPU lane and delays the first completed accounts.  Keep network I/O
+# fully concurrent while serializing the two short CPU-heavy SRP sections.
+_SRP_CPU_LANE = threading.Semaphore(1)
+
 # Native-library providers from SideStore's server list (2026-11-11).
 # Legacy Android-library providers were returning parameters that GSA rejected.
 # Source: github.com/SideStore/anisette-servers/blob/main/servers.json
@@ -701,7 +707,8 @@ def _once(email: str, password: str, proxy: str | None, timeout: float,
                        kind="anisette", stage="init")
     try:
         with phase(diagnostics, "srp_init"):
-            srp = SRPClient(email, password)
+            with _SRP_CPU_LANE:
+                srp = SRPClient(email, password)
     except Exception as exc:                          # noqa: BLE001
         return _result("error", f"srp init: {exc}", started, kind="protocol", stage="init")
     with phase(diagnostics, "client_setup"):
@@ -745,8 +752,9 @@ def _once(email: str, password: str, proxy: str | None, timeout: float,
             raise KeyError("c")
         with phase(diagnostics, "srp_challenge") as timing:
             timing["iterations"] = response["i"]
-            m1 = srp.process_challenge(response["s"], response["B"], response["i"],
-                                       response["sp"])
+            with _SRP_CPU_LANE:
+                m1 = srp.process_challenge(response["s"], response["B"], response["i"],
+                                           response["sp"])
     except KeyError as exc:
         return _result("error", f"init missing {exc}", started, kind="protocol", stage="init")
     except Exception as exc:                          # noqa: BLE001
