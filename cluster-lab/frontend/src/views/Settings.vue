@@ -127,7 +127,7 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
     <template #header><h2>设备使用上限</h2></template>
     <el-form label-position="top" @submit.prevent="saveDeviceUseLimit">
       <el-form-item label="每台设备最多使用次数">
-        <el-input-number v-model="deviceUseLimit" :min="1" :max="100000" :step="10" :precision="0" :disabled="deviceUseLimitBusy" />
+        <el-input-number v-model="deviceUseLimit" :min="1" :max="100000" :step="1" :precision="0" :disabled="deviceUseLimitBusy" />
         <span class="field-note">达到上限后由工作线程退役该设备；后续线程缺设备时自行注册。</span>
       </el-form-item>
       <el-descriptions :column="1" border>

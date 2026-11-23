@@ -251,6 +251,12 @@ test('Result list keeps one result-code column without web recheck fields', () =
 })
 
 
+test('Device use limit accepts every integer from 1 through 100000', () => {
+  const settings = source('src/views/Settings.vue')
+  assert.match(settings, /v-model="deviceUseLimit"[^>]*:min="1"[^>]*:max="100000"[^>]*:step="1"/)
+  assert.doesNotMatch(settings, /v-model="deviceUseLimit"[^>]*:step="10"/)
+})
+
 test('Device pool exposes only explicit initialization without background refill controls', () => {
   const drawer = source('src/components/DevicePoolDrawer.vue')
   const settings = source('src/views/Settings.vue')
