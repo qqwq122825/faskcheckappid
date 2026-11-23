@@ -854,6 +854,29 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual([(row['seq'], row['first_row'], row['rows']) for row in units],
                          [(1, 1, 5001), (2, 5002, 5001)])
 
+    def test_four_by_250_node_caps_every_package_at_1000_rows(self):
+        node = self.service.add_node('capacity-4x250', 4, 250)
+        self.service.heartbeat(node['id'], {
+            'session': 'capacity-session', 'hostname': 'capacity-node', 'version': 'test',
+            'max_processes': 4, 'max_threads': 250, 'active': [], 'interrupted': [],
+            'devices': {'running': False, 'capacity': 30, 'ready': 30,
+                        'built': 30, 'failed': 0, 'attempted': 30}})
+        self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
+                                                  'enabled': True})
+        job = self.service.create_job('capacity-2501', io.BytesIO(b'x\n' * 2501),
+                                      10000, mode='auth')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = next(value for value in self.service.snapshot()['jobs'] if value['id'] == job)
+            if state['status'] != 'preparing':
+                break
+            time.sleep(.01)
+        with self.service.db.connect() as db:
+            packages = [int(row['rows']) for row in db.execute(
+                'SELECT rows FROM units WHERE job_id=? ORDER BY seq', (job,))]
+        self.assertEqual(sum(packages), 2501)
+        self.assertLessEqual(max(packages), 4 * 250)
+
     def test_paused_task_exports_only_confirmed_units(self):
         job = self.job(100)
         self.service.job_action(job, 'start')

@@ -1184,22 +1184,33 @@ class Controller:
             # 字节预算必须提到循环外：每行调一次 settings() 就是每行一次数据库查询，
             # 10 万行会被这种写法拖到 30 秒以上。
             byte_limit = self.settings()['unit_byte_limit']
-            # First respect the configured maximum.  If that creates lopsided
-            # work (for example 10,000 + 2), rebuild the byte index once with a
-            # balanced row limit derived from the currently accepting nodes.
-            built = self._build_units(job, int(job['unit_rows']), byte_limit)
+            # One package runs across all local workers, so its row ceiling must
+            # not exceed the accepting node's configured process/thread capacity.
+            # Capacities below the controller's 50-row minimum retain that minimum.
+            with self.db.connect() as db:
+                accepting_nodes = list(db.execute(
+                    "SELECT desired_processes,desired_threads,max_processes,max_threads "
+                    "FROM nodes WHERE enabled=1 AND last_seen>? "
+                    "AND update_state NOT IN ('dispatched','scheduled','fetching',"
+                    "'installing','restarting','verifying')",
+                    (time.time() - self.offline_seconds,)))
+            capacities = [min(row['desired_processes'], row['max_processes'] or 1)
+                          * min(row['desired_threads'], row['max_threads'] or 1)
+                          for row in accepting_nodes]
+            eligible_capacities = [capacity for capacity in capacities if capacity >= 50]
+            row_limit = min(int(job['unit_rows']),
+                            min(eligible_capacities, default=int(job['unit_rows'])))
+            # First respect both configured and node-derived maxima. If that
+            # creates lopsided work (for example 10,000 + 2), rebuild once with
+            # a balanced row limit derived from the currently accepting nodes.
+            built = self._build_units(job, row_limit, byte_limit)
             if built is None:
                 return
             rows, unit_count = built
-            with self.db.connect() as db:
-                accepting = int(db.execute(
-                    "SELECT COUNT(*) FROM nodes WHERE enabled=1 AND last_seen>? "
-                    "AND update_state NOT IN ('dispatched','scheduled','fetching',"
-                    "'installing','restarting','verifying')",
-                    (time.time() - self.offline_seconds,)).fetchone()[0])
+            accepting = len(accepting_nodes)
             target_units = max(1, unit_count, accepting)
             balanced_limit = max(50, math.ceil(rows / target_units))
-            if balanced_limit < int(job['unit_rows']):
+            if balanced_limit < row_limit:
                 with self.db.transaction() as db:
                     db.execute('DELETE FROM units WHERE job_id=?', (job_id,))
                     db.execute('UPDATE jobs SET rows=0 WHERE id=?', (job_id,))
