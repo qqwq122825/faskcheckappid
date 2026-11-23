@@ -241,6 +241,25 @@ class NodeRecoveryTests(unittest.TestCase):
                         'identity_registration_ms_max': 1000.0,
                         'identity_cache_ttl': 30,
                         'credentials_recorded': False}),
+            json.dumps({'event': 'thread_cpu_summary',
+                        'thread_cpu_scope':
+                            'additive_worker_thread_cpu_excludes_waiting',
+                        'thread_cpu_attempts': 3,
+                        'worker_thread_cpu_ms_total': 120.0,
+                        'worker_thread_cpu_ms_max': 50.0,
+                        'proxy_acquire_thread_cpu_ms_total': 3.0,
+                        'proxy_acquire_thread_cpu_ms_max': 2.0,
+                        'device_lease_thread_cpu_ms_total': 6.0,
+                        'device_lease_thread_cpu_ms_max': 3.0,
+                        'device_identity_thread_cpu_ms_total': 30.0,
+                        'device_identity_thread_cpu_ms_max': 15.0,
+                        'auth_check_thread_cpu_ms_total': 72.0,
+                        'auth_check_thread_cpu_ms_max': 30.0,
+                        'device_accounting_thread_cpu_ms_total': 6.0,
+                        'device_accounting_thread_cpu_ms_max': 3.0,
+                        'unattributed_thread_cpu_ms_total': 3.0,
+                        'unattributed_thread_cpu_ms_max': 2.0,
+                        'credentials_recorded': False}),
             json.dumps({'event': 'device_identity_summary',
                         'identity_samples': 2, 'identity_cache_hits': 0,
                         'identity_ready_refreshes': 2,
@@ -292,6 +311,18 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(value['debug']['identity']['ready_refresh_ms'], {
             'samples': 3, 'average': 199.333, 'maximum': 250.0,
             'total': 598.0})
+        self.assertEqual(value['debug']['thread_cpu']['attempts'], 3)
+        self.assertEqual(value['debug']['thread_cpu']['scope'],
+                         'additive_worker_thread_cpu_excludes_waiting')
+        self.assertEqual(value['debug']['thread_cpu']['worker_ms'], {
+            'samples': 3, 'average': 40.0, 'maximum': 50.0,
+            'total': 120.0, 'share_percent': 100.0})
+        self.assertEqual(value['debug']['thread_cpu']['device_identity_ms'], {
+            'samples': 3, 'average': 10.0, 'maximum': 15.0,
+            'total': 30.0, 'share_percent': 25.0})
+        self.assertEqual(value['debug']['thread_cpu']['auth_check_ms'], {
+            'samples': 3, 'average': 24.0, 'maximum': 30.0,
+            'total': 72.0, 'share_percent': 60.0})
         encoded = json.dumps(value)
         for secret in ('top-secret-lease', 'user:password', 'hunter2',
                        '10.0.0.1', '/private/device-pool', 'proxy.invalid'):

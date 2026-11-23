@@ -2117,6 +2117,13 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         key: {'samples': 0, 'total': 0.0, 'maximum': 0.0}
         for key in ('all', 'cache_hit', 'ready_refresh', 'registration')
     }
+    thread_cpu_timing_lock = threading.Lock()
+    thread_cpu_timing = {
+        key: {'samples': 0, 'total': 0.0, 'maximum': 0.0}
+        for key in ('worker', 'proxy_acquire', 'device_lease',
+                    'device_identity', 'auth_check', 'device_accounting',
+                    'unattributed')
+    }
     processed = 0
     last_progress = time.monotonic()
 
@@ -2128,6 +2135,16 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         with identity_timing_lock:
             for key in ('all', category):
                 item = identity_timing[key]
+                item['samples'] += 1
+                item['total'] += value
+                item['maximum'] = max(item['maximum'], value)
+
+    def record_thread_cpu_timing(**phases):
+        """Aggregate additive per-thread CPU without process-wide overlap."""
+        with thread_cpu_timing_lock:
+            for key, milliseconds in phases.items():
+                value = max(0.0, float(milliseconds or 0))
+                item = thread_cpu_timing[key]
                 item['samples'] += 1
                 item['total'] += value
                 item['maximum'] = max(item['maximum'], value)
@@ -2417,9 +2434,13 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
             acquire_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
             acquire_started = time.monotonic() if debug_enabled else None
+            acquire_thread_cpu_started = time.thread_time() if debug_enabled else None
             account_proxy, lease = proxy_for(index + attempt)
             acquire_ms = (round((time.monotonic() - acquire_started) * 1000, 2)
                           if debug_enabled else None)
+            proxy_acquire_thread_cpu_ms = (
+                round((time.thread_time() - acquire_thread_cpu_started) * 1000, 3)
+                if debug_enabled else None)
             current_proxy = (_proxy_identity(account_proxy) if debug_enabled else
                              {'endpoint': '', 'host': '', 'port': None})
             switch = {
@@ -2463,11 +2484,17 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             device_used = False
             device_lease_ms = None
             device_identity_ms = None
+            device_lease_thread_cpu_ms = None
+            device_identity_thread_cpu_ms = None
+            auth_check_ms = None
+            auth_check_thread_cpu_ms = None
+            device_accounting_thread_cpu_ms = None
             identity_cache_hit = None
             device_was_ready = None
             device_registered = False
             try:
                 device_started = time.monotonic() if debug_enabled else None
+                device_thread_cpu_started = time.thread_time() if debug_enabled else None
                 if auth_protocol == 'gsa':
                     if device_mode == 'one_time':
                         # Prefer a registered idle device. If none is idle,
@@ -2484,11 +2511,15 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 if debug_enabled:
                     device_lease_ms = round(
                         (time.monotonic() - device_started) * 1000, 2)
+                    device_lease_thread_cpu_ms = round(
+                        (time.thread_time() - device_thread_cpu_started) * 1000, 3)
                 if auth_protocol == 'gsa' and identity is None:
                     # The lease makes inspect/register atomic across all node
                     # processes. Missing slots are registered by this thread;
                     # ready slots are refreshed and reused directly.
                     identity_started = time.monotonic() if debug_enabled else None
+                    identity_thread_cpu_started = (
+                        time.thread_time() if debug_enabled else None)
                     ready = auth_pool.inspect(slot_id)['state'] == 'ready'
                     device_was_ready = ready
                     profile = device_profile(auth_pool, slot_id)
@@ -2519,6 +2550,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     if debug_enabled:
                         device_identity_ms = round(
                             (time.monotonic() - identity_started) * 1000, 2)
+                        device_identity_thread_cpu_ms = round(
+                            (time.thread_time() - identity_thread_cpu_started) * 1000, 3)
                         record_identity_timing(
                             device_identity_ms, ready, identity_cache_hit)
                         if (trace_sampled or
@@ -2529,11 +2562,15 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                                 identity_cache_hit=identity_cache_hit,
                                 identity_cache_ttl=30,
                                 identity_ms=device_identity_ms,
+                                identity_thread_cpu_ms=device_identity_thread_cpu_ms,
                                 credentials_recorded=False,
                                 **_identity_debug_shape(identity))
                     if device_mode == 'one_time':
                         device_labels[slot_id] = _device_id_label(inspected.get('device_id'))
                 # 主协议由系统设置固化到任务；Web 模式不先发 GSA 请求。
+                auth_check_started = time.monotonic() if debug_enabled else None
+                auth_check_thread_cpu_started = (
+                    time.thread_time() if debug_enabled else None)
                 if auth_protocol == 'web':
                     result = _check_web_auth(
                         account, password, account_proxy, timeout,
@@ -2572,10 +2609,17 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                         result = _refine_repair_auth(
                             result, account, password, account_proxy, timeout,
                             stop.is_set, retries=retries)
+                if debug_enabled:
+                    auth_check_ms = round(
+                        (time.monotonic() - auth_check_started) * 1000, 2)
+                    auth_check_thread_cpu_ms = round(
+                        (time.thread_time() - auth_check_thread_cpu_started) * 1000, 3)
             except Exception as exc:                               # noqa: BLE001
                 result = {'status': 'error', 'kind': type(exc).__name__, 'http': 0,
                           'stage': 'init', 'detail': str(exc)[:180]}
             finally:
+                accounting_thread_cpu_started = (
+                    time.thread_time() if debug_enabled else None)
                 if device_lease is not None:
                     cleanup_error = None
                     try:
@@ -2603,6 +2647,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             'detail': f'{type(cleanup_error).__name__}: '
                                       f'{cleanup_error}'[:180],
                         }
+                if debug_enabled:
+                    device_accounting_thread_cpu_ms = round(
+                        (time.thread_time() - accounting_thread_cpu_started) * 1000, 3)
             if isinstance(result, dict) and device_mode == 'one_time':
                 result['_device_usage'] = device_usage
                 result['_device_retired'] = device_retired
@@ -2617,6 +2664,24 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             process_cpu_ms_during_request = (
                 round((time.process_time() - request_process_cpu_started) * 1000, 3)
                 if debug_enabled else None)
+            measured_phase_thread_cpu_ms = sum(value or 0.0 for value in (
+                device_lease_thread_cpu_ms, device_identity_thread_cpu_ms,
+                auth_check_thread_cpu_ms, device_accounting_thread_cpu_ms))
+            request_unattributed_thread_cpu_ms = (
+                round(max(0.0, request_thread_cpu_ms - measured_phase_thread_cpu_ms), 3)
+                if debug_enabled else None)
+            worker_thread_cpu_ms = (
+                round((proxy_acquire_thread_cpu_ms or 0.0) + request_thread_cpu_ms, 3)
+                if debug_enabled else None)
+            if debug_enabled:
+                record_thread_cpu_timing(
+                    worker=worker_thread_cpu_ms,
+                    proxy_acquire=proxy_acquire_thread_cpu_ms,
+                    device_lease=device_lease_thread_cpu_ms,
+                    device_identity=device_identity_thread_cpu_ms,
+                    auth_check=auth_check_thread_cpu_ms,
+                    device_accounting=device_accounting_thread_cpu_ms,
+                    unattributed=request_unattributed_thread_cpu_ms)
             transport_failed = retryable_transport(result)
             try:
                 result_http = int(result.get('http'))
@@ -2638,10 +2703,19 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     debug_path, 'auth_timing', row=row, slot=slot_id,
                     attempt=attempt, sampled=trace_sampled,
                     proxy_acquire_ms=acquire_ms,
+                    proxy_acquire_thread_cpu_ms=proxy_acquire_thread_cpu_ms,
                     device_lease_ms=device_lease_ms,
+                    device_lease_thread_cpu_ms=device_lease_thread_cpu_ms,
                     device_identity_ms=device_identity_ms,
+                    device_identity_thread_cpu_ms=device_identity_thread_cpu_ms,
+                    auth_check_ms=auth_check_ms,
+                    auth_check_thread_cpu_ms=auth_check_thread_cpu_ms,
+                    device_accounting_thread_cpu_ms=device_accounting_thread_cpu_ms,
                     request_ms=request_ms,
                     request_thread_cpu_ms=request_thread_cpu_ms,
+                    request_unattributed_thread_cpu_ms=(
+                        request_unattributed_thread_cpu_ms),
+                    worker_thread_cpu_ms=worker_thread_cpu_ms,
                     request_non_cpu_ms=round(max(
                         0.0, request_ms - request_thread_cpu_ms), 3),
                     request_timing_scope='request_including_device_lease_and_identity',
@@ -2926,6 +3000,21 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             identity_registration_ms_total=round(registration_timing['total'], 3),
             identity_registration_ms_max=round(registration_timing['maximum'], 3),
             identity_cache_ttl=30, credentials_recorded=False)
+        with thread_cpu_timing_lock:
+            thread_cpu_snapshot = {
+                key: dict(value) for key, value in thread_cpu_timing.items()
+            }
+        thread_cpu_fields = {'thread_cpu_attempts':
+                             thread_cpu_snapshot['worker']['samples']}
+        for key, value in thread_cpu_snapshot.items():
+            thread_cpu_fields[f'{key}_thread_cpu_ms_total'] = round(
+                value['total'], 3)
+            thread_cpu_fields[f'{key}_thread_cpu_ms_max'] = round(
+                value['maximum'], 3)
+        _write_proxy_debug(
+            debug_path, 'thread_cpu_summary',
+            thread_cpu_scope='additive_worker_thread_cpu_excludes_waiting',
+            credentials_recorded=False, **thread_cpu_fields)
         _write_proxy_debug(debug_path, 'worker_stop', ok=True, processed=processed,
                            counts=dict(counters), pool=_proxy_pool_snapshot(proxy_pool),
                            exit_ip_probe=exit_ip_debug.snapshot())

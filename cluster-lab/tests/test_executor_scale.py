@@ -1129,6 +1129,24 @@ class ExecutorScaleTests(unittest.TestCase):
                 'http_complete': 1.0, 'srp_challenge': 7.25})
             self.assertIn('device_lease_ms', timing)
             self.assertIn('device_identity_ms', timing)
+            for field in ('proxy_acquire_thread_cpu_ms',
+                          'device_lease_thread_cpu_ms',
+                          'device_identity_thread_cpu_ms',
+                          'auth_check_thread_cpu_ms',
+                          'device_accounting_thread_cpu_ms',
+                          'request_unattributed_thread_cpu_ms',
+                          'worker_thread_cpu_ms'):
+                self.assertIn(field, timing)
+                if timing[field] is not None:
+                    self.assertGreaterEqual(timing[field], 0)
+            cpu_summary = next(item for item in events
+                               if item.get('event') == 'thread_cpu_summary')
+            self.assertEqual(cpu_summary['thread_cpu_attempts'], 1)
+            self.assertEqual(
+                cpu_summary['thread_cpu_scope'],
+                'additive_worker_thread_cpu_excludes_waiting')
+            self.assertGreaterEqual(
+                cpu_summary['worker_thread_cpu_ms_total'], 0)
             serialized = json.dumps(timing)
             self.assertNotIn('account----password', serialized)
             self.assertNotIn('socks5h://account-exit', serialized)

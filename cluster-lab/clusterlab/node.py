@@ -952,6 +952,11 @@ class Node:
         srp_states, math_backends = Counter(), Counter()
         identity_counts, identity_totals, identity_maximums = (
             Counter(), Counter(), Counter())
+        thread_cpu_attempts = 0
+        thread_cpu_totals, thread_cpu_maximums = Counter(), Counter()
+        thread_cpu_keys = ('worker', 'proxy_acquire', 'device_lease',
+                           'device_identity', 'auth_check',
+                           'device_accounting', 'unattributed')
         metrics = {key: [] for key in (
             'compute_cpu_ms', 'compute_wall_ms', 'lane_wait_ms',
             'local_lane_wait_ms', 'global_lane_wait_ms',
@@ -959,7 +964,12 @@ class Node:
         allowed = (
             'at', 'event', 'pid', 'thread', 'row', 'slot', 'attempt',
             'attempt_limit', 'sampled', 'proxy_acquire_ms', 'device_lease_ms',
-            'device_identity_ms', 'request_ms', 'request_thread_cpu_ms',
+            'proxy_acquire_thread_cpu_ms', 'device_lease_thread_cpu_ms',
+            'device_identity_ms', 'device_identity_thread_cpu_ms',
+            'auth_check_ms', 'auth_check_thread_cpu_ms',
+            'device_accounting_thread_cpu_ms', 'request_ms',
+            'request_thread_cpu_ms', 'request_unattributed_thread_cpu_ms',
+            'worker_thread_cpu_ms',
             'request_non_cpu_ms', 'process_cpu_ms_during_request',
             'process_core_equivalents_during_request', 'http', 'apple_ec',
             'status', 'stage', 'kind', 'retryable', 'release',
@@ -981,6 +991,8 @@ class Node:
                              'identity_refresh_ms_total', 'identity_refresh_ms_max',
                              'identity_registration_ms_total',
                              'identity_registration_ms_max',
+                             'identity_thread_cpu_ms',
+                             'thread_cpu_scope', 'thread_cpu_attempts',
                              'credentials_recorded')
         for raw in raw_lines:
             try:
@@ -1010,6 +1022,21 @@ class Node:
                         identity_maximums[key] = max(
                             identity_maximums[key],
                             max(0.0, float(item.get(key + '_max') or 0)))
+                    except (TypeError, ValueError):
+                        pass
+            if event == 'thread_cpu_summary':
+                try:
+                    thread_cpu_attempts += max(
+                        0, int(item.get('thread_cpu_attempts') or 0))
+                except (TypeError, ValueError):
+                    pass
+                for key in thread_cpu_keys:
+                    try:
+                        thread_cpu_totals[key] += max(0.0, float(
+                            item.get(f'{key}_thread_cpu_ms_total') or 0))
+                        thread_cpu_maximums[key] = max(
+                            thread_cpu_maximums[key], max(0.0, float(
+                                item.get(f'{key}_thread_cpu_ms_max') or 0)))
                     except (TypeError, ValueError):
                         pass
             srp = item.get('srp') if isinstance(item.get('srp'), dict) else None
@@ -1052,6 +1079,17 @@ class Node:
         cache_hits = identity_counts['identity_cache_hits']
         ready_refreshes = identity_counts['identity_ready_refreshes']
         registrations = identity_counts['identity_registrations']
+        def thread_cpu_metric(key):
+            total = thread_cpu_totals[key]
+            worker_total = thread_cpu_totals['worker']
+            return {'samples': thread_cpu_attempts,
+                    'average': round(total / thread_cpu_attempts, 3)
+                    if thread_cpu_attempts else None,
+                    'maximum': round(thread_cpu_maximums[key], 3),
+                    'total': round(total, 3),
+                    'share_percent': round(total * 100 / worker_total, 3)
+                    if worker_total else None}
+
         return {
             'available': True, 'file_bytes': size, 'tail_bytes': min(size, byte_limit),
             'lines_scanned': len(raw_lines), 'malformed_lines': malformed,
@@ -1069,6 +1107,12 @@ class Node:
                     'identity_refresh_ms', ready_refreshes),
                 'registration_ms': identity_metric(
                     'identity_registration_ms', registrations),
+            },
+            'thread_cpu': {
+                'scope': 'additive_worker_thread_cpu_excludes_waiting',
+                'attempts': thread_cpu_attempts,
+                **{key + '_ms': thread_cpu_metric(key)
+                   for key in thread_cpu_keys},
             },
             'srp': {
                 'samples': sum(srp_states.values()),
