@@ -463,6 +463,47 @@ def _check_web_auth(email, password, proxy, timeout, cancel, checker=None):
     return result
 
 
+def _srp_timing_summary(phase_ms, phase_cpu_ms, phase_counts, sampled):
+    """Summarize leaf SRP phases only; absent measurements are not zero cost."""
+    stages = {}
+    for name in ('init', 'challenge'):
+        compute = f'srp_{name}_compute'
+        wait = f'srp_{name}_lane_wait'
+        compute_calls = int(phase_counts.get(compute, 0))
+        wait_calls = int(phase_counts.get(wait, 0))
+        stages[name] = {
+            'compute_calls': compute_calls if sampled else None,
+            'compute_wall_ms': (round(phase_ms.get(compute, 0), 3)
+                                if compute_calls else None),
+            'compute_cpu_ms': (round(phase_cpu_ms.get(compute, 0), 3)
+                               if compute_calls else None),
+            'lane_wait_calls': wait_calls if sampled else None,
+            'lane_wait_ms': (round(phase_ms.get(wait, 0), 3)
+                             if wait_calls else None),
+            'lane_wait_cpu_ms': (round(phase_cpu_ms.get(wait, 0), 3)
+                                 if wait_calls else None),
+        }
+    observed = any(value['compute_calls'] for value in stages.values())
+    return {
+        'scope': 'sampled_attempt_leaf_phases',
+        'state': ('observed' if observed else
+                  'no_compute_events' if sampled else 'not_sampled'),
+        'challenge_observed': (bool(stages['challenge']['compute_calls'])
+                               if sampled else None),
+        'compute_cpu_ms': (round(sum(value['compute_cpu_ms'] or 0
+                                    for value in stages.values()), 3)
+                           if observed else None),
+        'compute_wall_ms': (round(sum(value['compute_wall_ms'] or 0
+                                     for value in stages.values()), 3)
+                            if observed else None),
+        'lane_wait_ms': (round(sum(value['lane_wait_ms'] or 0
+                                  for value in stages.values()), 3)
+                         if any(value['lane_wait_calls'] for value in stages.values())
+                         else None),
+        **stages,
+    }
+
+
 def _write_proxy_debug(path, event, **fields):
     """Append one bounded JSONL event without ever persisting proxy credentials."""
     if not path:
@@ -1954,6 +1995,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            retries=retries, timeout=timeout,
                            slots=slot_ids, auth_protocol=auth_protocol,
                            device_mode=device_mode,
+                           srp_math_backend=getattr(
+                               sys.modules.get('fastcheck.protocols.srp_auth'),
+                               'SRP_MATH_BACKEND', 'unknown'),
+                           performance_sample_every=PERFORMANCE_TRACE_SAMPLE_EVERY,
+                           performance_first_row_sampled=True,
                            credentials_recorded=False)
 
     # Device preparation has its own bounded pool.  It never borrows the 250
@@ -2192,10 +2238,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             # every one of hundreds of account threads changes the workload we
             # are trying to measure and creates very large JSONL files.  Slow
             # unsampled rows still emit their outer proxy/device/request times.
-            trace_sampled = (debug_enabled
-                             and row % PERFORMANCE_TRACE_SAMPLE_EVERY == 0)
+            trace_sampled = (debug_enabled and (
+                row == int(descriptor.get('first_row') or 1)
+                or row % PERFORMANCE_TRACE_SAMPLE_EVERY == 0))
             phase_ms = Counter()
             phase_cpu_ms = Counter()
+            phase_counts = Counter()
 
             def collect_phase(event):
                 if event.get('event') != 'phase_end':
@@ -2207,6 +2255,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     phase_ms[phase] += max(0.0, float(event.get('ms') or 0))
                     phase_cpu_ms[phase] += max(
                         0.0, float(event.get('cpu_ms') or 0))
+                    phase_counts[phase] += 1
                 except (TypeError, ValueError):
                     return
 
@@ -2246,6 +2295,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                               _retry_previous=current_proxy)
                 return row, line, result
             request_started = time.monotonic() if debug_enabled else None
+            request_thread_cpu_started = time.thread_time() if debug_enabled else None
+            request_process_cpu_started = time.process_time() if debug_enabled else None
             device_lease = None
             auth_pool = pool
             device_usage = None
@@ -2385,6 +2436,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 result['_device_used_at'] = device_used_at
             request_ms = (round((time.monotonic() - request_started) * 1000, 2)
                           if debug_enabled else None)
+            request_thread_cpu_ms = (
+                round((time.thread_time() - request_thread_cpu_started) * 1000, 3)
+                if debug_enabled else None)
+            process_cpu_ms_during_request = (
+                round((time.process_time() - request_process_cpu_started) * 1000, 3)
+                if debug_enabled else None)
             transport_failed = retryable_transport(result)
             try:
                 result_http = int(result.get('http'))
@@ -2409,6 +2466,20 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     device_lease_ms=device_lease_ms,
                     device_identity_ms=device_identity_ms,
                     request_ms=request_ms,
+                    request_thread_cpu_ms=request_thread_cpu_ms,
+                    request_non_cpu_ms=round(max(
+                        0.0, request_ms - request_thread_cpu_ms), 3),
+                    request_timing_scope='request_including_device_lease_and_identity',
+                    process_cpu_ms_during_request=process_cpu_ms_during_request,
+                    process_core_equivalents_during_request=(
+                        round(process_cpu_ms_during_request / request_ms, 3)
+                        if request_ms > 0 else None),
+                    process_cpu_scope='whole_process_overlapping_interval_not_additive',
+                    trace_sample_every=PERFORMANCE_TRACE_SAMPLE_EVERY,
+                    phase_counts=dict(sorted(phase_counts.items())),
+                    phase_totals_scope='nested_phases_do_not_sum',
+                    srp=_srp_timing_summary(
+                        phase_ms, phase_cpu_ms, phase_counts, trace_sampled),
                     phase_ms={key: round(value, 3)
                               for key, value in sorted(phase_ms.items())},
                     phase_cpu_ms={key: round(value, 3)
