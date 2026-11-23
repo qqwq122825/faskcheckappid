@@ -123,6 +123,16 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '合法'):
             self.service.request_updates([self.node['id']], '../main', 1)
 
+    def test_device_use_limit_migrates_legacy_rotation_threshold(self):
+        self.service.close()
+        database = Path(self.temp.name) / 'controller.sqlite3'
+        with sqlite3.connect(database) as db:
+            db.execute("DELETE FROM controller_settings WHERE key='device_use_limit'")
+            db.execute("INSERT OR REPLACE INTO controller_settings(key,value) "
+                       "VALUES('device_rotate_after','100000')")
+        self.service = Controller(self.temp.name)
+        self.assertEqual(self.service.settings()['device_use_limit'], 100000)
+
     def test_device_use_limit_persists(self):
         result = self.service.configure_device_use_limit({'device_use_limit': 37})
         self.assertEqual(result['device_use_limit'], 37)

@@ -80,7 +80,12 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('max_unit_rows',1000
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_api','');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_scheme','socks5h');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('origin','https://new.ani.sidestore.io');
-INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_use_limit','20');
+INSERT OR IGNORE INTO controller_settings(key,value)
+SELECT 'device_use_limit', CASE
+ WHEN CAST(COALESCE((SELECT value FROM controller_settings
+                     WHERE key='device_rotate_after'),'0') AS INTEGER) > 0
+ THEN (SELECT value FROM controller_settings WHERE key='device_rotate_after')
+ ELSE '20' END;
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_pool_size','1000');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
