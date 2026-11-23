@@ -17,19 +17,20 @@ function renderDevices(state){
   renderDevicePool(devicePoolState);
 }
 
-function deviceStateText(value){return ({ready:'就绪',idle:'就绪',in_use:'使用中',missing:'未注册',registering:'注册中',retired:'已退役',invalid:'不可用',failed:'注册失败'})[value]||value||'未知'}
+function deviceStateText(value){return ({ready:'就绪',idle:'就绪',in_use:'使用中',missing:'未注册',pending:'注册中',registering:'注册中',retired:'已退役',invalid:'不可用',failed:'注册失败'})[value]||value||'未知'}
 function renderDevicePool(snapshot){
   if(snapshot)devicePoolState=snapshot;
   const data=devicePoolState||{},slots=Array.isArray(data.slots)?data.slots:[];
   const gsa=$('protocol').value==='gsa'||job?.protocol==='gsa';
   const ready=Number(data.ready_now??data.ready??slots.filter(v=>['ready','idle'].includes(v.state)).length);
-  const registered=slots.filter(v=>!['missing','invalid'].includes(v.state)).length;
-  if(gsa)$('devices').textContent=`设备池：就绪 ${ready} · 已登记 ${registered}`;
+  const registering=slots.filter(v=>['pending','registering'].includes(v.state)).length,total=slots.length;
+  $('device-total').textContent=total;$('device-ready').textContent=ready;$('device-registering').textContent=registering;
+  if(gsa)$('devices').textContent=`设备池：总数 ${total} · 就绪 ${ready} · 注册中 ${registering}`;
   const box=$('device-report');box.hidden=!gsa&&!slots.length;
   if(!box.open)return;
   $('device-rows').replaceChildren();
   for(const value of slots){
-    if(['missing','pending','retired'].includes(value.state)&&!value.error)continue;
+    if(['missing','retired'].includes(value.state)&&!value.error)continue;
     const row=document.createElement('tr');
     cell(row,value.label||value.device_id||`#${value.slot}`);
     cell(row,Number(value.used||value.uses||0));

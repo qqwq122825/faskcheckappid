@@ -60,6 +60,8 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn('每次休息 / 秒',page)
         self.assertIn('当前设备池',page)
         self.assertIn('实时显示节点同核设备池',page)
+        self.assertIn('id="device-total"',page)
+        self.assertIn('id="device-registering"',page)
 
     def test_live_worker_results_are_visible_deduplicated_and_credential_free(self):
         from fastcheck.devices import save_json
@@ -208,6 +210,10 @@ class ServerTests(unittest.TestCase):
         builder=LocalNodeDeviceBuilder(self.root,'https://new.ani.sidestore.io')
         self.assertEqual(builder.builder.__class__.__module__,'clusterlab.device_build')
         self.assertEqual(builder.snapshot()['ready'],0)
+        pending={'ready':0,'slots':[{'slot':1,'state':'pending','device_id':'','error':''}]}
+        with patch.object(builder.builder,'snapshot',return_value=pending):
+            self.assertEqual(builder.snapshot()['slots'],[])
+            self.assertEqual(builder.snapshot(include_pending=True)['slots'],pending['slots'])
 
     def test_stop_and_second_task_conflict(self):
         self.login();headers={'X-CSRF-Token':self.csrf}

@@ -42,14 +42,14 @@ class LocalNodeDeviceBuilder:
         self.node.max_processes=max(1,int(processes));self.node.max_threads=max(1,int(threads))
         self.builder.start(capacity)
 
-    def snapshot(self):
+    def snapshot(self,include_pending=False):
         value=self.builder.snapshot()
         # The node builder scans up to the highest historical slot so it can
         # discover persisted identities.  The console needs the current pool,
         # not hundreds of empty placeholders on every two-second poll.
+        ignored={'missing','retired'}|({'pending'} if not include_pending else set())
         value['slots']=[item for item in value.get('slots',[])
-                        if item.get('state') not in ('missing','pending','retired')
-                        or item.get('error')]
+                        if item.get('state') not in ignored or item.get('error')]
         return value
     def cancel(self):return self.builder.cancel()
 
@@ -246,7 +246,8 @@ def create_app(data_dir=None):
     @app.get('/api/devices/build')
     def devices_build_status():
         selected = options({})
-        return jsonify(builder.snapshot() if local_node else
+        active=any(item.get('state') not in TERMINAL for item in manager.history())
+        return jsonify(builder.snapshot(include_pending=active) if local_node else
                        builder.snapshot(selected.device_capacity))
 
     @app.post('/api/devices/build/cancel')
