@@ -51,6 +51,14 @@ class ServerTests(unittest.TestCase):
         saved=self.client.get('/api/settings').json['settings']
         self.assertEqual((saved['processes'],saved['threads']),(100,250))
 
+    def test_device_settings_use_plain_node_semantics(self):
+        response=self.client.get('/');page=response.get_data(as_text=True);response.close()
+        self.assertIn('提前注册设备数',page)
+        self.assertIn('每台设备最多使用次数',page)
+        self.assertIn('设备不休息，用完立即回到设备池',page)
+        self.assertNotIn('休息前使用轮数',page)
+        self.assertNotIn('每次休息 / 秒',page)
+
     def test_spawned_demo_status_exports_and_credential_free_logs(self):
         self.login()
         options={'protocol':'gsa','processes':2,'threads':2,'device_capacity':2,'device_parallelism':0,'debug':True,'max_attempts':1}
@@ -135,7 +143,7 @@ class ServerTests(unittest.TestCase):
                 'elapsed':2.5,'active_threads_total':2,
                 'active_threads_by_process':[2]})
         progress=[]
-        settings=Settings(protocol='gsa',processes=4,threads=250,
+        settings=Settings(protocol='gsa',processes=4,threads=250,device_use_limit=7,
                           device_capacity=0,warmup_devices=0)
         with patch('fastcheck.web.runtime._node_executor',return_value=fake_node_executor):
             summary=runtime.run_node_auth_job(
@@ -143,6 +151,7 @@ class ServerTests(unittest.TestCase):
                 progress.append)
         self.assertEqual((captured['processes'],captured['threads']),(4,250))
         self.assertEqual(captured['device_slots'],[1,2])
+        self.assertEqual(captured['device_use_limit'],7)
         self.assertEqual((directory/'input.part').read_text().splitlines(),[
             'same@example.com----one','SAME@example.com----two'])
         self.assertEqual(summary['executor_backend'],'clusterlab.executor')
@@ -151,6 +160,12 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(rows[0]['device_display'],'B64:device-1 · 第 2 次')
         self.assertEqual(rows[0]['result_code'],'-20970')
         self.assertEqual(rows[0]['retry_count'],1)
+
+    def test_local_prebuild_adapter_uses_node_device_builder(self):
+        from fastcheck.web.app import LocalNodeDeviceBuilder
+        builder=LocalNodeDeviceBuilder(self.root,'https://new.ani.sidestore.io')
+        self.assertEqual(builder.builder.__class__.__module__,'clusterlab.device_build')
+        self.assertEqual(builder.snapshot()['ready'],0)
 
     def test_stop_and_second_task_conflict(self):
         self.login();headers={'X-CSRF-Token':self.csrf}

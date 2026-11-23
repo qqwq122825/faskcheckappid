@@ -8,6 +8,7 @@ import secrets
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import zipfile
 
 from flask import Flask,jsonify,request,session,send_file
@@ -21,8 +22,28 @@ from fastcheck.settings_store import load_api,save_api
 from fastcheck.status import result_bucket
 from fastcheck.version import VERSION
 from .bootstrap import ROOT,data_root
-from .runtime import JobManager
+from .runtime import JobManager,TERMINAL
 from fastcheck.device_build import DeviceBuilder
+
+
+class LocalNodeDeviceBuilder:
+    """Expose the deployed node device builder through the local page."""
+    def __init__(self, root, origin):
+        import sys
+        cluster=ROOT/'cluster-lab'
+        if str(cluster) not in sys.path:sys.path.insert(0,str(cluster))
+        from clusterlab.device_build import DeviceBuilder as NodeDeviceBuilder
+        self.node=SimpleNamespace(root=Path(root),origin=origin,proxy_api='',
+                                  proxy_scheme='socks5h',max_processes=200,max_threads=512)
+        self.builder=NodeDeviceBuilder(self.node)
+
+    def start(self, capacity, api_url, scheme, processes, threads):
+        self.node.proxy_api=api_url;self.node.proxy_scheme=scheme
+        self.node.max_processes=max(1,int(processes));self.node.max_threads=max(1,int(threads))
+        self.builder.start(capacity)
+
+    def snapshot(self):return self.builder.snapshot()
+    def cancel(self):return self.builder.cancel()
 
 
 def create_app(data_dir=None):
@@ -37,15 +58,27 @@ def create_app(data_dir=None):
                       SESSION_COOKIE_SECURE=os.environ.get('GSA_COOKIE_SECURE')=='1',
                       PERMANENT_SESSION_LIFETIME=timedelta(hours=8))
     manager=JobManager(root);app.extensions['jobs']=manager
-    builder=DeviceBuilder(root,Settings().origin,root/'config/batch-device-pool')
+    local_node=os.environ.get('FASTCHECK_LOCAL_NODE_EXECUTOR')=='1'
+    builder=(LocalNodeDeviceBuilder(root,Settings().origin) if local_node else
+             DeviceBuilder(root,Settings().origin,root/'config/batch-device-pool'))
     app.extensions['builder']=builder
     login_attempts={};login_lock=threading.Lock()
 
     def defaults():
         path=root/'config/web-settings.json'
-        if path.exists():return json.loads(path.read_text())
+        if path.exists():
+            value=json.loads(path.read_text())
+            if 'device_use_limit' not in value:
+                value.update(device_capacity=0,device_use_limit=20,
+                             device_rest_after=0,device_rest_seconds=0)
+            return value
         path=ROOT/'examples/auth_settings.json'
-        return json.loads(path.read_text()) if path.exists() else asdict(Settings(max_attempts=1,device_parallelism=1,device_selection='prefer_new'))
+        value=(json.loads(path.read_text()) if path.exists() else
+               asdict(Settings(max_attempts=1,device_parallelism=1,
+                               device_selection='prefer_new')))
+        value.update(device_capacity=0,device_use_limit=20,
+                     device_rest_after=0,device_rest_seconds=0)
+        return value
 
     def options(data):
         if not isinstance(data,dict):raise ValueError('任务配置字段无效。')
@@ -188,6 +221,16 @@ def create_app(data_dir=None):
         api = (data.get('api_url') or '').strip() or load_api(root)
         if not api:
             raise ValueError('请先填写或保存代理 API 地址。')
+        if selected.device_capacity == 0:
+            snapshot=builder.snapshot() if local_node else builder.snapshot(0)
+            snapshot['message']='提前注册数量为 0；任务开始后按需注册'
+            return jsonify(snapshot)
+        if any(item.get('state') not in TERMINAL for item in manager.history()):
+            raise RuntimeError('任务正在执行，不能同时提前注册设备。')
+        if local_node:
+            builder.start(selected.device_capacity,api,selected.proxy_scheme,
+                          selected.processes,selected.threads)
+            return jsonify(builder.snapshot()),202
         builder.start(selected.device_capacity, api, selected.proxy_scheme,
                       (data.get('proxy_auth') or '').strip())
         return jsonify(builder.snapshot(selected.device_capacity)), 202
@@ -195,7 +238,8 @@ def create_app(data_dir=None):
     @app.get('/api/devices/build')
     def devices_build_status():
         selected = options({})
-        return jsonify(builder.snapshot(selected.device_capacity))
+        return jsonify(builder.snapshot() if local_node else
+                       builder.snapshot(selected.device_capacity))
 
     @app.post('/api/devices/build/cancel')
     def devices_build_cancel():

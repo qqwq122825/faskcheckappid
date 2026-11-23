@@ -23,6 +23,7 @@ class Settings:
     processes: int = 2
     threads: int = 10
     device_capacity: int = 10
+    device_use_limit: int = 20
     device_parallelism: int = 1
     device_selection: str = 'prefer_new'
     warmup_devices: int = 2
@@ -55,7 +56,8 @@ class Settings:
         if type(self.anisette_proxy) is not bool:
             raise ValueError('anisette_proxy 必须是布尔值。')
         for name, low, high in (('processes', 1, None), ('threads', 1, None),
-                                ('device_capacity', 0, None), ('proxy_target', 0, None),
+                                ('device_capacity', 0, None), ('device_use_limit', 1, None),
+                                ('proxy_target', 0, None),
                                 ('device_parallelism',0,None),
                                 ('device_rest_after', 0, None), ('device_rest_slots', 1, None),
                                 ('warmup_devices', 0, None), ('max_attempts', 1, 6)):

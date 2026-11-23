@@ -74,7 +74,7 @@ def run_node_auth_job(root,directory,accounts,settings,api,progress):
         'proxy_pool_size':1000,
         'origin':settings.origin,'device_root':str(private_directory(Path(root)/'device-pool')),
         'device_pool_capacity':capacity,'device_slots':list(range(1,capacity+1)),
-        'device_use_limit':20,'_proxy_debug':bool(settings.debug),
+        'device_use_limit':settings.device_use_limit,'_proxy_debug':bool(settings.debug),
         '_web_secondary_auth':True,
     }
     save_json(directory/'manifest.json',descriptor)
