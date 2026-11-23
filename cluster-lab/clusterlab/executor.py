@@ -1319,14 +1319,16 @@ def _auth_worker_limit(configured, configured_processes=1, active_processes=None
 
 
 def _auth_process_limit(configured, rows, cpu_count=None):
-    """Use bounded GMP lanes while reserving one CPU for node coordination."""
+    """Honor the configured process count up to the host CPU count.
+
+    Each authentication process owns one serialized SRP lane while its account
+    threads remain free to wait on network I/O.  Do not silently turn a 4 x 250
+    node into 3 x 333: the operator-selected four processes are the CPU budget.
+    """
     configured = max(1, int(configured or 1))
     rows = max(1, int(rows or 1))
     logical_cpus = max(1, int(cpu_count or os.cpu_count() or 1))
-    usable_cpus = logical_cpus
-    if logical_cpus >= 4 and configured >= logical_cpus:
-        usable_cpus -= 1
-    return min(configured, rows, usable_cpus)
+    return min(configured, rows, logical_cpus)
 
 
 def execute_unit_group(directory, descriptor, stop):
