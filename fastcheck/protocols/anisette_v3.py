@@ -27,7 +27,7 @@ import uuid
 
 import requests
 
-from .apple_trust import gsa_ca_file
+from .apple_trust import AppleTrustAdapter
 from .timing import phase
 
 LIMIT = 1024 * 1024
@@ -174,6 +174,8 @@ class Client:
         self.deadline=time.monotonic()+timeout
         self.session=requests.Session()
         self.session.trust_env=False
+        self.session.mount('https://gsa.apple.com/',AppleTrustAdapter(max_retries=0))
+        self.session.mount('https://gsas.apple.com/',AppleTrustAdapter(max_retries=0))
         self.proxy=proxy
         self.diagnostics=diagnostics
         self.provider_direct=provider_direct
@@ -203,7 +205,7 @@ class Client:
         if self.provider_direct and not apple:
             kwargs['proxies']={'http':'','https':''}
         with self.session.request(method,url,timeout=self.remaining(),allow_redirects=False,
-                                  verify=gsa_ca_file() if apple else True,stream=True,**kwargs) as response:
+                                  verify=True,stream=True,**kwargs) as response:
             if response.status_code!=200:
                 raise AnisetteError(stage,http=response.status_code)
             body=bytearray()

@@ -1,5 +1,6 @@
 Flask==3.1.3
 requests==2.34.2
+truststore==0.10.5
 # requests 的 SOCKS 适配器依赖 PySocks；python-socks 只供 websockets 使用。
 # 缺少它会在设备注册时对 socks5h:// 直接抛 InvalidSchema。
 PySocks==1.7.1

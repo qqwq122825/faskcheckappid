@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from itertools import count
 
 from .srp_auth import GrandSlamSRPClient as SRPClient
-from .apple_trust import gsa_ca_file, gsa_context
+from .apple_trust import AppleTrustAdapter, gsa_context
 from .timing import emit, phase
 
 try:                                   # optional: nicer pooling/proxy behaviour
@@ -362,10 +362,10 @@ class _Session:
         self._trace = None
         if _HAS_REQUESTS:
             sess = requests.Session()
-            sess.verify = gsa_ca_file()
+            sess.verify = True
             sess.trust_env = False
-            adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4,
-                                                    max_retries=0)
+            adapter = AppleTrustAdapter(pool_connections=4, pool_maxsize=4,
+                                        max_retries=0)
             sess.mount("http://", adapter)
             sess.mount("https://", adapter)
             if self.proxy:
