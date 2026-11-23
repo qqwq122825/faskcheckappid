@@ -479,6 +479,51 @@ class ExecutorScaleTests(unittest.TestCase):
         finally:
             pool.close()
 
+    def test_proxy_pool_marks_exits_aging_at_45_seconds(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=2, ttl=50, target=2)
+        try:
+            now = time.monotonic()
+            pool.add_fresh(['socks5h://young'], fetched_at=now - 44)
+            pool.add_fresh(['socks5h://aging'], fetched_at=now - 46)
+            time.sleep(.05)
+            self.assertEqual(pool.count_aging(now=now), 1)
+            self.assertEqual(pool.snapshot()['aging_45s'], 1)
+            self.assertEqual(pool.snapshot()['known'], 2)
+        finally:
+            pool.close()
+
+    def test_supplier_prefetches_replacements_for_45_second_old_exits(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=2, ttl=50, target=2)
+        stop = threading.Event()
+        calls = []
+        try:
+            pool.add_fresh(['socks5h://old-one', 'socks5h://old-two'],
+                           fetched_at=time.monotonic() - 46)
+            time.sleep(.05)
+
+            def fetcher(_url, count, scheme=None):
+                calls.append(count)
+                return [f'{scheme}://replacement-{index}' for index in range(count)]
+
+            thread = threading.Thread(
+                target=proxy_supplier_loop,
+                args=(pool, 'http://proxy.test/list', 'socks5h', stop, fetcher))
+            thread.start()
+            deadline = time.monotonic() + 1
+            while pool.snapshot()['refreshed'] < 2 and time.monotonic() < deadline:
+                time.sleep(.01)
+            stop.set()
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(calls, [2])
+            self.assertEqual(pool.snapshot()['known'], 2)
+            self.assertEqual(pool.snapshot()['refreshed'], 2)
+        finally:
+            stop.set()
+            pool.close()
+
     def test_proxy_supplier_prefills_pool_and_reports_fetch_metrics(self):
         context = mp.get_context('spawn')
         pool = NodeProxyPool(context, concurrency=4, ttl=30)

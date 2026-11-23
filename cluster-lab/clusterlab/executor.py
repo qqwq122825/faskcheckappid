@@ -25,6 +25,7 @@ PROXY_TTL_SECONDS = 50.0
 PROXY_FETCH_LIMIT = 1000
 PROXY_POOL_LIMIT = 10000
 PROXY_FAILURE_LIMIT = 3
+PROXY_AGING_SECONDS = 45.0
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
 PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
@@ -719,6 +720,7 @@ class NodeProxyPool:
         # Supplier-local history: no Manager/RPC on the worker hot path.
         self._recent_exits = {}
         self.last_fetch_ms = context.Value('d', 0.0)
+        self.aging_inventory = context.Value('i', 0)
         self.refill = context.Event()
         self.refill.set()
         self.ready = context.Event()
@@ -916,6 +918,38 @@ class NodeProxyPool:
                     removed += 1
         return removed
 
+    def count_aging(self, now=None):
+        """Count queued exits aged 45 seconds without leasing them."""
+        current = time.monotonic() if now is None else float(now)
+        aging = 0
+        remaining = max(0.0, self.ttl - PROXY_AGING_SECONDS)
+        for channel, counter in ((self.fresh, self.fresh_count),
+                                 (self.reusable, self.reusable_count)):
+            visible = []
+            for _ in range(self._value(counter)):
+                try:
+                    # multiprocessing.Queue publishes its shared count before
+                    # the feeder has necessarily made the item readable.  A
+                    # short bounded wait keeps the 45-second rotation scan
+                    # deterministic without entering the worker hot path.
+                    lease = channel.get(timeout=0.02)
+                except queue.Empty:
+                    break
+                self._add(counter, -1)
+                visible.append(lease)
+                if float(lease[1]) - current <= remaining:
+                    aging += 1
+            for lease in visible:
+                self._add(counter, 1)
+                try:
+                    channel.put_nowait(lease)
+                except queue.Full:
+                    self._add(counter, -1)
+                    self._add(self.discarded, 1)
+        with self.aging_inventory.get_lock():
+            self.aging_inventory.value = aging
+        return aging
+
     def note_fetch(self, milliseconds, error=False):
         self._add(self.fetch_calls, 1)
         if error:
@@ -928,6 +962,8 @@ class NodeProxyPool:
             last_fetch_ms = self.last_fetch_ms.value
         available = self._value(self.fresh_count) + self._value(self.reusable_count)
         in_use = self._value(self.in_use_count)
+        with self.aging_inventory.get_lock():
+            aging = self.aging_inventory.value
         return {
             'available': available,
             'in_use': in_use,
@@ -949,6 +985,7 @@ class NodeProxyPool:
             'last_fetch_ms': round(last_fetch_ms, 1),
             'ttl_seconds': self.ttl,
             'ready': self.ready.is_set(),
+            'aging_45s': aging,
         }
 
     def close(self):
@@ -963,7 +1000,7 @@ class NodeProxyPool:
 
 
 def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=None):
-    """Fetch every second, rotate when full; workers use queued exits first."""
+    """Fill shortages and prefetch replacements once exits are 45s old."""
     if fetcher is None:
         from fastcheck.proxy_pool import fetch_proxies
         fetcher = fetch_proxies
@@ -987,11 +1024,13 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
             # reusable queue. Counting only queued exits made 1,000 workers
             # look like 1,000 missing proxies and triggered needless refills.
             needed = max(0, pool.target - pool.snapshot()['known'])
-            # Replace one TTL-window of inventory gradually instead of letting
-            # the initial batch expire at once. The supplier API accepts at
-            # most 1,000 exits per call; larger node pools fill incrementally.
-            refresh_batch = max(1, math.ceil(pool.target / pool.ttl))
-            count = min(PROXY_FETCH_LIMIT, max(refresh_batch, needed))
+            # Fill shortages immediately. Once full, fetch replacements only
+            # when exits reach age 45s, before the default 50s expiry.
+            aging = pool.count_aging()
+            count = min(PROXY_FETCH_LIMIT, max(needed, aging))
+            if count <= 0:
+                next_tick += 1.0
+                continue
             started = time.monotonic()
             before = _proxy_pool_snapshot(pool) if debug_path else {}
             try:

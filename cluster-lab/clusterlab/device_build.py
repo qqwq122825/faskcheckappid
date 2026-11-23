@@ -48,6 +48,10 @@ class DeviceBuilder:
                       'failed': 0, 'current': 0, 'message': '', 'started_at': None,
                       'proxy_status': 'idle', 'proxy_ip': '', 'slot_errors': {}}
 
+    def slot_limit(self):
+        """Initialization may fill every slot allowed by node concurrency."""
+        return max(1, int(self.node.max_processes) * int(self.node.max_threads))
+
     def snapshot(self):
         root = self.node.root / 'device-pool'
         ready = 0
@@ -68,11 +72,13 @@ class DeviceBuilder:
             # The in-memory builder state resets on a service restart. Discover
             # the persisted slots so a task can still use the node's complete
             # device pool before any new initialization request is made.
-            pool = DevicePool(str(root), self.node.origin, max_devices=200)
+            pool = DevicePool(str(root), self.node.origin,
+                              max_devices=max(self.slot_limit(), configured_capacity, 1))
             device_root = Path(getattr(pool, 'base', root)) / 'devices'
             existing = [int(path.name) for path in device_root.iterdir()
                         if path.is_dir() and path.name.isdigit()
-                        and 1 <= int(path.name) <= 200] if device_root.is_dir() else []
+                        and 1 <= int(path.name) <= self.slot_limit()
+                        ] if device_root.is_dir() else []
             persisted_capacity = max(existing, default=0)
             limit = max(1, int(data.get('capacity') or 0), persisted_capacity,
                         configured_capacity)
@@ -129,8 +135,8 @@ class DeviceBuilder:
         with self.lock:
             if self.state['running']:
                 raise RuntimeError('正在初始化设备，请等待本轮结束')
-            if not 1 <= int(capacity) <= 200:
-                raise ValueError('设备数量应为 1–200')
+            if not 1 <= int(capacity) <= self.slot_limit():
+                raise ValueError(f'设备数量应为 1–{self.slot_limit()}')
             # 设备注册会连 Apple；没有代理就变成用机房 IP 注册，出生地不可改，
             # 宁可拒绝也不留这种设备。
             if not (self.node.proxy_api or '').strip():
@@ -202,7 +208,7 @@ class DeviceBuilder:
         with self.lock:
             if self.state['running']:
                 raise RuntimeError('正在初始化设备，请等待本轮结束')
-            if not 1 <= capacity <= 200 or not 1 <= slot <= capacity:
+            if not 1 <= capacity <= self.slot_limit() or not 1 <= slot <= capacity:
                 raise ValueError('轮换设备编号无效')
             if slot in self.reserved:
                 raise RuntimeError('设备正在执行任务，本轮不轮换')

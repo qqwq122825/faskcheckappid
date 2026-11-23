@@ -36,15 +36,15 @@ class NodeRecoveryTests(unittest.TestCase):
     def test_device_registration_allows_realistic_provisioning_time(self):
         self.assertGreaterEqual(REGISTRATION_TIMEOUT, 90)
 
-    def test_auth_device_slots_bound_four_by_250_to_thirty(self):
+    def test_auth_device_slots_follow_four_by_250_regardless_of_initial_target(self):
         with tempfile.TemporaryDirectory() as root:
             node = Node(root)
             try:
                 descriptor = {'rows': 10000, 'processes': 4, 'threads': 250,
                               'device_slot_limit': 30, 'device_use_limit': 20}
                 node._prepare_auth_devices(descriptor)
-                self.assertEqual(descriptor['device_pool_capacity'], 30)
-                self.assertEqual(descriptor['device_slots'], list(range(1, 31)))
+                self.assertEqual(descriptor['device_pool_capacity'], 1000)
+                self.assertEqual(descriptor['device_slots'], list(range(1, 1001)))
                 self.assertEqual(descriptor['device_use_limit'], 20)
             finally:
                 node.close()
@@ -402,15 +402,15 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(descriptor['device_slots'], list(range(1, 51)))
         self.assertEqual(descriptor['processes'], 2)
 
-    def test_four_processes_by_250_threads_bound_dynamic_pool_to_200_slots(self):
+    def test_four_processes_by_250_threads_expose_1000_configured_slots(self):
         with patch.object(self.node.builder, 'snapshot', return_value={'slots': []}):
             descriptor = {'mode': 'auth', 'rows': 1000,
                           'processes': 4, 'threads': 250}
             self.node._prepare_auth_devices(descriptor)
-        self.assertEqual(descriptor['device_pool_capacity'], 200)
-        self.assertEqual(len(descriptor['device_slots']), 200)
+        self.assertEqual(descriptor['device_pool_capacity'], 1000)
+        self.assertEqual(len(descriptor['device_slots']), 1000)
         self.assertEqual(descriptor['device_slots'][0], 1)
-        self.assertEqual(descriptor['device_slots'][-1], 200)
+        self.assertEqual(descriptor['device_slots'][-1], 1000)
 
     def test_background_builder_never_registers_without_a_proxy(self):
         class Pool:

@@ -612,16 +612,10 @@ class Node:
         rows = max(1, int(descriptor.get('rows') or 1))
         processes = max(1, min(int(descriptor.get('processes') or 1), rows))
         threads = max(1, int(descriptor.get('threads') or 1))
-        # 4×250 仅是配置上限。实际并发由设备槽位数收敛；
-        # 默认30台时是 8/8/7/7，不再创建1000个等待线程。
-        explicit_target = int(descriptor.get('device_slot_limit') or 0)
-        saved_target = int(snapshot.get('target_capacity') or 0)
-        # A saved initialization target is authoritative (for example 30 or
-        # 200).  Legacy pools without a saved target may grow on demand to
-        # 200 slots instead of reverting to 4×250=1000 waiting threads.
-        pool_target = max(1, explicit_target or saved_target or
-                          max(int(snapshot.get('capacity') or 0), 200))
-        requested = min(200, rows, processes * threads, pool_target)
+        # 总控数量只决定预注册多少台。设备槽位不再单独设上限：
+        # 它直接跟随节点配置，4×250 就是1000个互斥槽位。未预注册
+        # 的空槽位由拿不到READY设备的工作线程按需注册。
+        requested = min(rows, processes * threads)
         capacity = max(requested, 1)
         slots = list(range(1, capacity + 1))
         descriptor.pop('device_capacity', None)

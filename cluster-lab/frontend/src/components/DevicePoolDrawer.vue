@@ -13,6 +13,9 @@ const busy = ref(false), clearing = ref(false), timer = 0 as any
 const pool = computed(() => node.value?.telemetry?.device_pool || {})
 const building = computed(() => Boolean(pool.value.running))
 const ready = computed(() => pool.value.ready || 0)
+const slotLimit = computed(() => Math.max(1,
+  Math.min(Number(node.value?.desired_processes) || 1, Number(node.value?.max_processes) || 1) *
+  Math.min(Number(node.value?.desired_threads) || 1, Number(node.value?.max_threads) || 1)))
 const completed = computed(() => (Number(pool.value.built) || 0) + (Number(pool.value.failed) || 0))
 // 节点扫描会提前生成 20 个 pending 身份，后端 attempted 因而可能瞬间变成 20。
 // 初始化进行中以当前槽位为准：正在注册第 9 台，代表前 8 台已经尝试。
@@ -70,8 +73,8 @@ defineExpose({ show })
 async function initialize() {
   error.value = ''
   if (!node.value?.id) { error.value = '节点不可用'; return }
-  if (!Number.isInteger(capacity.value) || capacity.value < 1 || capacity.value > 200) {
-    error.value = '设备数量应为 1–200 的整数'; return
+  if (!Number.isInteger(capacity.value) || capacity.value < 1 || capacity.value > slotLimit.value) {
+    error.value = `设备数量应为 1–${slotLimit.value} 的整数`; return
   }
   busy.value = true
   try {
@@ -125,8 +128,8 @@ async function clearPool() {
       </div>
       <el-form label-position="top" @submit.prevent="initialize">
         <el-form-item label="设备数量">
-          <el-input-number v-model="capacity" :min="1" :max="200" :step="1" :precision="0" :disabled="building || busy" />
-          <span class="field-note">选择数量后，点击“开始初始化设备池”才会注册设备。</span>
+          <el-input-number v-model="capacity" :min="1" :max="slotLimit" :step="1" :precision="0" :disabled="building || busy" />
+          <span class="field-note">预注册数量由总控设置；点击“开始初始化设备池”才会注册设备。槽位自动跟随节点并发（当前 {{ slotLimit }}），缺失设备由工作线程按需注册。</span>
         </el-form-item>
         <el-form-item label="自动补充">
           <el-switch v-model="autoRotate" :loading="savingAuto" :disabled="savingAuto"

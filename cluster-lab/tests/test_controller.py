@@ -61,6 +61,18 @@ class ControllerTests(unittest.TestCase):
         self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
                                                   'enabled': True})
 
+    def test_initial_device_target_follows_controller_node_concurrency(self):
+        node = self.service.add_node('large-device-pool', 4, 250)
+        self.service.heartbeat(node['id'], {
+            'session': 'large-device-session', 'hostname': 'large', 'version': 'test',
+            'max_processes': 4, 'max_threads': 500, 'active': [], 'interrupted': []})
+        self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
+                                                  'enabled': False})
+        self.assertEqual(self.service.request_devices(node['id'], 1000),
+                         {'requested': 1000})
+        with self.assertRaisesRegex(ValueError, '0–1000'):
+            self.service.request_devices(node['id'], 1001)
+
     def test_rolling_update_drains_limits_parallelism_and_resumes_after_health(self):
         other = self.service.add_node('second-update-node', 2, 4)
         self.service.heartbeat(other['id'], {
@@ -995,7 +1007,7 @@ class ControllerTests(unittest.TestCase):
                                        io.BytesIO(payload), checksum)
 
     def test_clear_device_pool_is_persistent_and_requires_an_idle_node(self):
-        self.service.request_devices(self.node['id'], 30)
+        self.service.request_devices(self.node['id'], 2)
         requested = self.service.clear_devices(self.node['id'])
         self.assertEqual(requested, {'requested': True, 'version': 1})
         response = self.service.heartbeat(self.node['id'], {

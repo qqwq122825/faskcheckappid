@@ -779,11 +779,15 @@ class Controller:
 
     def request_devices(self, node_id, capacity):
         """把设备初始化意图挂到节点上，节点下次心跳取走执行。"""
-        capacity = integer(int(capacity), '设备数量', 0, 200)
         with self.db.transaction() as db:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:
                 raise ValueError('节点不存在')
+            slot_limit = max(1, min(int(node['desired_processes']),
+                                    int(node['max_processes'] or 1)) *
+                                min(int(node['desired_threads']),
+                                    int(node['max_threads'] or 1)))
+            capacity = integer(int(capacity), '设备数量', 0, slot_limit)
             if not node['last_seen'] or time.time() - node['last_seen'] > self.offline_seconds:
                 raise Conflict('节点离线，无法初始化设备')
             db.execute('UPDATE nodes SET device_request=? WHERE id=?', (capacity, node_id))
