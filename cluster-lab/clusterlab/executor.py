@@ -327,6 +327,9 @@ class DeviceLeaseAllocator:
 
     def reset_registered(self, lease):
         """Publish a freshly registered slot for ready-first reuse."""
+        # Persist the new generation's zero before publishing it to other
+        # threads and to the live device-pool API.
+        _set_device_usage(self.device_root, lease.slot, 0)
         with self.lock:
             self.usage[lease.slot] = 0
             self.dirty_usage.add(lease.slot)
@@ -1740,11 +1743,11 @@ def _usage_snapshot(device_root):
 
 
 def record_device_registration(device_root, slot, proxy, model=''):
-    """Persist the first observed registration facts for one device slot.
+    """Persist registration facts for the slot's current identity generation.
 
-    Each slot owns a separate file, so worker processes cannot overwrite one
-    another's history. O_EXCL also preserves the original time and proxy when
-    the same device is reused by later tasks.
+    The caller owns the slot's exclusive device lease. Re-registration means
+    the old identity was retired, so its timestamp and proxy must be replaced
+    rather than displayed beside the new identity.
     """
     if not device_root:
         return False
@@ -1752,14 +1755,10 @@ def record_device_registration(device_root, slot, proxy, model=''):
     path = directory / f'{int(slot):03d}.json'
     try:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         value = {'slot': int(slot), 'proxy': str(proxy or ''), 'model': str(model or ''),
                  'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'ts': time.time()}
-        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
-            json.dump(value, handle, ensure_ascii=False, separators=(',', ':'))
+        atomic_json(path, value)
         return True
-    except FileExistsError:
-        return False
     except (OSError, TypeError, ValueError):
         return False
 

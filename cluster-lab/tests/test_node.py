@@ -468,11 +468,19 @@ class NodeRecoveryTests(unittest.TestCase):
 
         self.node.builder.state.update(running=True, capacity=3, current=2,
                                        slot_errors={'1': 'AnisetteError: HTTP 503'})
-        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)):
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)), \
+             patch.object(self.node.builder, 'usage', return_value={'1': 11, '2': 17, '3': 9}), \
+             patch.object(self.node.builder, 'registry', return_value={
+                 '1': {'at': '2026-01-01 01:02:03'},
+                 '2': {'at': '2026-01-01 01:02:04'},
+                 '3': {'at': '2026-01-01 01:02:05'},
+             }):
             snapshot = self.node.builder.snapshot()
         self.assertEqual([row['state'] for row in snapshot['slots']],
                          ['failed', 'registering', 'pending'])
         self.assertEqual(snapshot['slots'][0]['error'], 'AnisetteError: HTTP 503')
+        self.assertEqual([row['used'] for row in snapshot['slots']], [0, 0, 0])
+        self.assertEqual([row['at'] for row in snapshot['slots']], ['', '', ''])
 
     def test_ready_legacy_device_recovers_model_and_registration_time(self):
         class Pool:

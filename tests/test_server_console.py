@@ -65,6 +65,8 @@ class ServerTests(unittest.TestCase):
         script=(Path(__file__).parents[1]/'fastcheck/web/static/app.js').read_text()
         self.assertIn('if(devicePoolRequest)return devicePoolRequest',script)
         self.assertIn('applyDevicePoolSnapshot(data,revision)',script)
+        self.assertIn("const currentIdentity=['ready','idle','in_use'].includes(value.state)",script)
+        self.assertIn("currentIdentity?Number(value.used||value.uses||0):0",script)
 
     def test_live_worker_results_are_visible_deduplicated_and_credential_free(self):
         from fastcheck.devices import save_json

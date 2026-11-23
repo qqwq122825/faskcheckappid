@@ -91,7 +91,8 @@ class DeviceBuilder:
                     state = 'registering'
                 elif str(slot) in data['slot_errors']:
                     state = 'failed'
-                used = usage.get(str(slot), 0)
+                current_identity = state in ('ready', 'idle', 'in_use')
+                used = usage.get(str(slot), 0) if current_identity else 0
                 slots.append({'slot': slot, 'state': state,
                               'device_id': inspected.get('device_id', ''),
                               'label': device_label(inspected.get('device_id')),
@@ -101,6 +102,11 @@ class DeviceBuilder:
             pass
         registry = self.registry()
         for entry in slots:
+            if entry['state'] not in ('ready', 'idle', 'in_use'):
+                # A pending/failed slot belongs to the next identity generation.
+                # Never combine it with the retired identity's usage or history.
+                entry.update(proxy='', model='', at='', recorded=False)
+                continue
             info = registry.get(str(entry['slot'])) or {}
             recovered = self._recover_slot(pool, entry['slot']) if entry['state'] == 'ready' else {}
             entry['proxy'] = info.get('proxy', '') or ('历史未记录' if entry['state'] == 'ready' else '')

@@ -31,11 +31,12 @@ function renderDevicePool(snapshot){
   $('device-rows').replaceChildren();
   for(const value of slots){
     if(['missing','retired'].includes(value.state)&&!value.error)continue;
+    const currentIdentity=['ready','idle','in_use'].includes(value.state);
     const row=document.createElement('tr');
     cell(row,value.label||value.device_id||`#${value.slot}`);
-    cell(row,Number(value.used||value.uses||0));
+    cell(row,currentIdentity?Number(value.used||value.uses||0):0);
     cell(row,deviceStateText(value.state));
-    cell(row,value.at||value.recorded||'—');
+    cell(row,currentIdentity?(value.at||value.recorded||'—'):'—');
     $('device-rows').append(row);
   }
   if(!$('device-rows').children.length){const row=document.createElement('tr'),value=cell(row,'当前还没有已登记设备','empty');value.colSpan=4;$('device-rows').append(row)}

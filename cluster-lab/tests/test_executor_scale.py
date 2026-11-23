@@ -979,16 +979,36 @@ class ExecutorScaleTests(unittest.TestCase):
                 self.assertEqual(shared.discards,
                                  ['socks5h://first-exit', 'socks5h://second-exit'])
 
-    def test_registration_history_keeps_the_first_time_and_proxy_per_slot(self):
+    def test_registration_history_tracks_the_current_identity_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
             self.assertTrue(record_device_registration(temporary, 3, 'socks5h://first:9000',
                                                        'MacBookPro14,3'))
-            self.assertFalse(record_device_registration(temporary, 3, 'socks5h://later:9001',
-                                                        'iMac17,1'))
+            self.assertTrue(record_device_registration(temporary, 3, 'socks5h://later:9001',
+                                                       'iMac17,1'))
             value = json.loads((Path(temporary) / 'registrations' / '003.json').read_text())
-            self.assertEqual(value['proxy'], 'socks5h://first:9000')
-            self.assertEqual(value['model'], 'MacBookPro14,3')
+            self.assertEqual(value['proxy'], 'socks5h://later:9001')
+            self.assertEqual(value['model'], 'iMac17,1')
             self.assertRegex(value['at'], r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
+
+    def test_newly_registered_generation_persists_zero_before_publish(self):
+        class MissingPool:
+            def inspect(self, _slot):
+                return {'state': 'missing'}
+
+        class Lease:
+            slot = 3
+            uses = 17
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            atomic_json(root / 'usage.json', {'3': 17})
+            allocator = DeviceLeaseAllocator(MissingPool(), [3], root, use_limit=20)
+            lease = Lease()
+            allocator.reset_registered(lease)
+            persisted = json.loads((root / 'usage.json').read_text('utf-8'))
+            self.assertEqual(persisted['3'], 0)
+            self.assertEqual(allocator.usage[3], 0)
+            self.assertEqual(lease.uses, 0)
 
     def test_debug_uses_five_percent_timing_samples_not_full_account_logging(self):
         with tempfile.TemporaryDirectory() as temporary:
