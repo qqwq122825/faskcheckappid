@@ -87,8 +87,17 @@ class DeviceBuilder:
             for slot in range(1, limit + 1):
                 inspected = pool.inspect(slot)
                 state = inspected['state']
+                lease = self._active_task_lease(pool, slot)
                 if state == 'ready':
                     ready += 1
+                    if lease:
+                        state = 'in_use'
+                elif state in ('pending', 'invalid') and lease:
+                    # Work threads register missing identities under the same
+                    # exclusive slot lease used for requests.  The standalone
+                    # builder is not running in that path, so infer the live
+                    # registration from its process-safe lease marker.
+                    state = 'registering'
                 elif data.get('running') and slot == data.get('current'):
                     state = 'registering'
                 elif str(slot) in data['slot_errors']:
@@ -116,11 +125,31 @@ class DeviceBuilder:
             entry['at'] = info.get('at', '') or recovered.get('at', '')
             entry['recorded'] = bool(info)
         attempted = sum(entry['state'] != 'missing' for entry in slots)
-        data.update(ready=ready, attempted=attempted, slots=slots,
+        registering = sum(entry['state'] == 'registering' for entry in slots)
+        in_use = sum(entry['state'] == 'in_use' for entry in slots)
+        pending = sum(entry['state'] in ('missing', 'pending') for entry in slots)
+        failed_slots = sum(entry['state'] == 'failed' for entry in slots)
+        data.update(ready=ready, attempted=attempted, registering=registering,
+                    in_use=in_use, pending=pending, failed_slots=failed_slots, slots=slots,
                     capacity=max(int(data.get('capacity') or 0), persisted_capacity,
                                  configured_capacity, ready),
                     target_capacity=configured_capacity)
         return data
+
+    @staticmethod
+    def _active_task_lease(pool, slot):
+        """Return true only for a live worker that still owns this slot."""
+        try:
+            lease = read_json(pool.slot_directory(int(slot)) / '.lease-state.json', {})
+            if lease.get('state') != 'in_use':
+                return False
+            pid = lease.get('pid')
+            if type(pid) is not int or pid <= 0:
+                return False
+            os.kill(pid, 0)
+            return True
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
 
     @staticmethod
     def _recover_slot(pool, slot):

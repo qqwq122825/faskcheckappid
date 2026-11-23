@@ -837,7 +837,8 @@ class Controller:
         if isinstance(pool, dict):
             result['device_pool'] = {key: pool.get(key) for key in
                                      ('running', 'capacity', 'ready', 'built', 'failed',
-                                      'current', 'attempted')}
+                                      'current', 'attempted', 'registering', 'in_use',
+                                      'pending', 'failed_slots')}
             proxy_status = str(pool.get('proxy_status') or 'idle')
             result['device_pool']['proxy_status'] = (proxy_status if proxy_status in
                                                       ('idle', 'checking', 'ok', 'failed') else 'idle')

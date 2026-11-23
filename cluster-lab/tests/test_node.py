@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import multiprocessing as mp
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -509,6 +510,40 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(snapshot['slots'][0]['error'], 'AnisetteError: HTTP 503')
         self.assertEqual([row['used'] for row in snapshot['slots']], [0, 0, 0])
         self.assertEqual([row['at'] for row in snapshot['slots']], ['', '', ''])
+
+    def test_snapshot_reports_task_registration_and_use_counts(self):
+        class Pool:
+            def __init__(inner, root, *_args, **_kwargs):
+                inner.root = Path(root)
+
+            def slot_directory(inner, slot):
+                path = inner.root / 'devices' / str(slot)
+                path.mkdir(parents=True, exist_ok=True)
+                return path
+
+            def inspect(inner, slot):
+                states = {1: 'ready', 2: 'pending', 3: 'missing'}
+                return {'state': states[slot], 'device_id': f'device-{slot}'}
+
+        root = self.node.root / 'device-pool'
+        for slot in (1, 2):
+            path = root / 'devices' / str(slot)
+            path.mkdir(parents=True, exist_ok=True)
+            (path / '.lease-state.json').write_text(json.dumps({
+                'state': 'in_use', 'pid': os.getpid(), 'slot': slot,
+            }))
+        self.node.builder.state['capacity'] = 3
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)), \
+             patch.object(self.node.builder, 'usage', return_value={}), \
+             patch.object(self.node.builder, 'registry', return_value={}):
+            snapshot = self.node.builder.snapshot()
+        self.assertEqual([row['state'] for row in snapshot['slots']],
+                         ['in_use', 'registering', 'missing'])
+        self.assertEqual(snapshot['ready'], 1)
+        self.assertEqual(snapshot['in_use'], 1)
+        self.assertEqual(snapshot['registering'], 1)
+        self.assertEqual(snapshot['pending'], 1)
+        self.assertEqual(snapshot['failed_slots'], 0)
 
     def test_ready_legacy_device_recovers_model_and_registration_time(self):
         class Pool:

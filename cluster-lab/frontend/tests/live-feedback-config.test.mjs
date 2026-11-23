@@ -212,6 +212,11 @@ test('Device pool has a guarded one-click clear action', () => {
   assert.match(drawer, /所有设备身份、注册记录和使用计数都会删除/)
   assert.match(drawer, /Boolean\(node\?\.active\)/)
   assert.match(drawer, /pool\.capacity \?\? capacity/)
+  assert.match(drawer, /pool\.value\.registering/)
+  assert.match(drawer, /pool\.value\.in_use/)
+  assert.match(drawer, />\u6ce8\u518c\u4e2d</)
+  assert.match(drawer, />\u4f7f\u7528\u4e2d</)
+  assert.match(drawer, />\u5f85\u6ce8\u518c</)
 })
 
 test('GSA result categories expose invalid and locked business states', () => {

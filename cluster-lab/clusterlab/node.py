@@ -335,7 +335,8 @@ class Node:
             snapshot['slots'] = []
         return {key: snapshot.get(key) for key in
                 ('running', 'capacity', 'ready', 'built', 'failed',
-                 'current', 'attempted', 'proxy_status', 'proxy_ip',
+                 'current', 'attempted', 'registering', 'in_use',
+                 'pending', 'failed_slots', 'proxy_status', 'proxy_ip',
                  'message', 'slots')}
 
     def _live_result_paths(self, unit_id):
