@@ -84,12 +84,28 @@ _IDENTITY_LOCK = threading.Lock()
 _IDENTITY_TTL = 30.0
 
 
-def cached_identity(pool, slot, prepare_timeout, proxy, diagnostic, direct=True):
+def _report_identity_cache(cache_status, hit):
+    if cache_status is not None:
+        try:
+            cache_status(bool(hit))
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+def remember_identity(slot, identity):
+    """Seed the short cache with headers returned during device registration."""
+    with _IDENTITY_LOCK:
+        _IDENTITY_CACHE[int(slot)] = (time.monotonic(), identity)
+
+
+def cached_identity(pool, slot, prepare_timeout, proxy, diagnostic, direct=True,
+                    cache_status=None, info=None):
     """30 秒内同一设备复用设备参数，省掉一次 anisette 往返。"""
     now = time.monotonic()
     with _IDENTITY_LOCK:
         hit = _IDENTITY_CACHE.get(slot)
         if hit and now-hit[0] < _IDENTITY_TTL:
+            _report_identity_cache(cache_status, True)
             return hit[1]
         # 同一台设备同一时刻只放一个线程去刷新：200 个线程抢一台设备时，
         # 缓存一过期就会同时冲出去把 anisette 服务打超时（HTTP 0 / 5s）。
@@ -98,19 +114,27 @@ def cached_identity(pool, slot, prepare_timeout, proxy, diagnostic, direct=True)
         with _IDENTITY_LOCK:
             hit = _IDENTITY_CACHE.get(slot)
             if hit and time.monotonic()-hit[0] < _IDENTITY_TTL:
+                _report_identity_cache(cache_status, True)
                 return hit[1]
         # anisette 是第三方参数服务（sidestore.io），不是 Apple：直连更快（1.8s vs 2.5s），
         # 也不占用任务用的出口隧道。真正打 Apple 的请求由 gsa/idmsa 各自走代理。
         with phase(diagnostic, 'device_headers_refresh'):
-            info = pool.info(prepare_timeout, proxy=proxy, diagnostics=diagnostic,
-                             provider_direct=direct)
-            profile = device_profile(pool, slot)
-            info = dict(info, client_info=profile['client_info'], user_agent=profile['user_agent'])
-            identity = pool.fetch_headers(slot, info, prepare_timeout,
+            if info is None:
+                request_info = pool.info(
+                    prepare_timeout, proxy=proxy, diagnostics=diagnostic,
+                    provider_direct=direct)
+                profile = device_profile(pool, slot)
+                request_info = dict(
+                    request_info, client_info=profile['client_info'],
+                    user_agent=profile['user_agent'])
+            else:
+                request_info = dict(info)
+            identity = pool.fetch_headers(slot, request_info, prepare_timeout,
                                           proxy=proxy, diagnostics=diagnostic,
                                           provider_direct=direct)
         with _IDENTITY_LOCK:
             _IDENTITY_CACHE[slot] = (time.monotonic(), identity)
+        _report_identity_cache(cache_status, False)
         return identity
 
 

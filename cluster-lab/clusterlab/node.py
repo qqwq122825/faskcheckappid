@@ -968,6 +968,7 @@ class Node:
                              'identity_ms', 'identity_type', 'identity_valid',
                              'identity_field_count', 'identity_keys',
                              'identity_value_bytes', 'identity_max_value_bytes',
+                             'identity_cache_hit', 'identity_cache_ttl',
                              'credentials_recorded')
         for raw in raw_lines:
             try:

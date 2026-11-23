@@ -278,6 +278,50 @@ class ExecutorScaleTests(unittest.TestCase):
         self.assertNotIn('secret-md-value', str(value))
         self.assertGreater(value['identity_value_bytes'], 0)
 
+    def test_registered_identity_cache_hits_then_expires_after_thirty_seconds(self):
+        from fastcheck import workers
+
+        class Pool:
+            def __init__(inner, root):
+                inner.root = Path(root)
+                inner.fetches = 0
+
+            def slot_directory(inner, slot):
+                return inner.root / str(slot)
+
+            def info(inner, *_args, **_kwargs):
+                return {'client_info': 'unused', 'user_agent': 'unused'}
+
+            def fetch_headers(inner, *_args, **_kwargs):
+                inner.fetches += 1
+                return {'X-Mme-Device-Id': f'device-{inner.fetches}'}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pool = Pool(temporary)
+            states = []
+            with workers._IDENTITY_LOCK:
+                workers._IDENTITY_CACHE.clear()
+                workers._IDENTITY_LOCKS.clear()
+            try:
+                first = workers.cached_identity(
+                    pool, 1, 40, None, None, cache_status=states.append)
+                second = workers.cached_identity(
+                    pool, 1, 40, None, None, cache_status=states.append)
+                self.assertIs(first, second)
+                self.assertEqual((pool.fetches, states), (1, [False, True]))
+                with workers._IDENTITY_LOCK:
+                    workers._IDENTITY_CACHE[1] = (
+                        time.monotonic() - workers._IDENTITY_TTL - 0.01, first)
+                third = workers.cached_identity(
+                    pool, 1, 40, None, None, cache_status=states.append)
+                self.assertEqual(pool.fetches, 2)
+                self.assertIsNot(third, second)
+                self.assertEqual(states[-1], False)
+            finally:
+                with workers._IDENTITY_LOCK:
+                    workers._IDENTITY_CACHE.clear()
+                    workers._IDENTITY_LOCKS.clear()
+
     def test_full_device_pool_is_partitioned_without_overlap(self):
         groups = [_partition_device_slots(range(1, 31), 10, index)
                   for index in range(10)]
@@ -775,7 +819,9 @@ class ExecutorScaleTests(unittest.TestCase):
                         (device_root / 'registrations' / '001.json').read_text())
 
             pooled = device_root
-            self.assertEqual(OneTimePool.registered_flags, [False, True])
+            # The second package uses the same ready device within the
+            # 30-second TTL, so it must not call fetch_headers again.
+            self.assertEqual(OneTimePool.registered_flags, [False])
             self.assertEqual([record['device_usage'] for record in records], [1, 2])
             self.assertEqual([record['device_remaining_before'] for record in records],
                              [2, 1])

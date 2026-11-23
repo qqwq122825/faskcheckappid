@@ -225,6 +225,8 @@ class NodeRecoveryTests(unittest.TestCase):
                         'identity_keys': 'X-Apple-I-MD,X-Apple-I-Client-Time',
                         'identity_value_bytes': 512,
                         'identity_max_value_bytes': 128,
+                        'identity_cache_hit': True,
+                        'identity_cache_ttl': 30,
                         'credentials_recorded': False}),
         )) + '\n', 'utf-8')
         self.node.telemetry.latest = {'cpu_percent': 81.2, 'memory_percent': 33.0}
@@ -250,6 +252,8 @@ class NodeRecoveryTests(unittest.TestCase):
         identity_event = next(row for row in value['debug']['recent']
                               if row.get('event') == 'device_identity_result')
         self.assertEqual(identity_event['identity_field_count'], 9)
+        self.assertTrue(identity_event['identity_cache_hit'])
+        self.assertEqual(identity_event['identity_cache_ttl'], 30)
         self.assertFalse(identity_event['credentials_recorded'])
         encoded = json.dumps(value)
         for secret in ('top-secret-lease', 'user:password', 'hunter2',

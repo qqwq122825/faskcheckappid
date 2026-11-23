@@ -2119,7 +2119,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     # slots are tried first; thread mode may extend the same pool past that base.
     shared_pool_root = Path(device_root)
     pool = DevicePool(shared_pool_root, origin, max_devices=capacity)
-    from fastcheck.workers import device_profile
+    from fastcheck.workers import cached_identity, device_profile, remember_identity
     if debug_enabled:
         _write_proxy_debug(debug_path, 'worker_start',
                            rows=int(descriptor.get('rows') or 0),
@@ -2446,6 +2446,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             device_used = False
             device_lease_ms = None
             device_identity_ms = None
+            identity_cache_hit = None
             device_was_ready = None
             device_registered = False
             try:
@@ -2474,19 +2475,25 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     ready = auth_pool.inspect(slot_id)['state'] == 'ready'
                     device_was_ready = ready
                     profile = device_profile(auth_pool, slot_id)
-                    # Thread mode already owns a complete per-device profile;
-                    # do not fetch the pool-global client_info/user_agent only
-                    # to overwrite both values immediately afterwards.
-                    info = ({'client_info': profile['client_info'],
-                             'user_agent': profile['user_agent']}
-                            if device_mode == 'one_time' else
-                            dict(auth_pool.info(
-                                timeout, proxy=account_proxy, provider_direct=True),
-                                 client_info=profile['client_info'],
-                                 user_agent=profile['user_agent']))
-                    identity = auth_pool.fetch_headers(slot_id, info, max(timeout, 40),
-                                                       registered=ready, proxy=account_proxy,
-                                                       provider_direct=True)
+                    info = {'client_info': profile['client_info'],
+                            'user_agent': profile['user_agent']}
+                    if ready:
+                        cache_state = {}
+                        identity = cached_identity(
+                            auth_pool, slot_id, max(timeout, 40), account_proxy,
+                            collect_phase if trace_sampled else None, direct=True,
+                            cache_status=lambda hit: cache_state.update(hit=hit),
+                            info=info)
+                        identity_cache_hit = bool(cache_state.get('hit'))
+                    else:
+                        # A missing device must provision once. Reuse the
+                        # resulting headers immediately instead of making the
+                        # next account call /v3/get_headers again.
+                        identity = auth_pool.fetch_headers(
+                            slot_id, info, max(timeout, 40), registered=False,
+                            proxy=account_proxy, provider_direct=True)
+                        remember_identity(slot_id, identity)
+                        identity_cache_hit = False
                     inspected = auth_pool.inspect(slot_id)
                     if not ready and inspected['state'] == 'ready':
                         device_registered = True
@@ -2500,6 +2507,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             _write_proxy_debug(
                                 debug_path, 'device_identity_result', row=row,
                                 slot=slot_id, registered_before=ready,
+                                identity_cache_hit=identity_cache_hit,
+                                identity_cache_ttl=30,
                                 identity_ms=device_identity_ms,
                                 credentials_recorded=False,
                                 **_identity_debug_shape(identity))
