@@ -32,6 +32,7 @@ PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
 DEVICE_LEASE_POLL_SECONDS = 0.05
 DEVICE_IDENTITY_TTL_SECONDS = 30.0
+DEVICE_REGISTRATION_TIMEOUT_SECONDS = 20.0
 DEVICE_USE_LIMIT = 20
 LOCAL_QUEUE_LOW_WATER = 100
 LOCAL_QUEUE_TARGET = 300
@@ -1962,7 +1963,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     identity_default = object()
 
     def one(row, index, line, start_attempt=0, account_started=None,
-            identity_override=identity_default, previous_proxy=None):
+            identity_override=identity_default, previous_proxy=None,
+            registration_retries=0):
         if stop.is_set():
             return row, line, {'status': 'unknown', 'kind': 'stopped'}
         account, password = _split_account(line)
@@ -2012,7 +2014,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
             acquire_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
             acquire_started = time.monotonic() if debug_enabled else None
-            account_proxy, lease = proxy_for(index + attempt)
+            account_proxy, lease = proxy_for(index + attempt + registration_retries)
             acquire_ms = (round((time.monotonic() - acquire_started) * 1000, 2)
                           if debug_enabled else None)
             current_proxy = (_proxy_identity(account_proxy) if debug_enabled else
@@ -2053,6 +2055,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             device_identity_ms = None
             device_was_ready = None
             device_registered = False
+            registration_failed = False
             try:
                 device_started = time.monotonic() if debug_enabled else None
                 device_lease = device_allocator.acquire(stop)
@@ -2079,15 +2082,25 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                         identity = _cached_device_identity(
                             identities, identity_fetched_at, slot_id)
                         if identity is None:
-                            info = pool.info(timeout, proxy=account_proxy,
-                                             provider_direct=True)
                             ready = pool.inspect(slot_id)['state'] == 'ready'
+                            registration_deadline = (
+                                time.monotonic() + DEVICE_REGISTRATION_TIMEOUT_SECONDS
+                                if not ready else None)
+                            info_timeout = (max(0.1, registration_deadline - time.monotonic())
+                                            if registration_deadline is not None else timeout)
+                            info = pool.info(info_timeout, proxy=account_proxy,
+                                             provider_direct=True)
                             device_was_ready = ready
                             profile = device_profile(pool, slot_id)
                             info = dict(info, client_info=profile['client_info'],
                                         user_agent=profile['user_agent'])
+                            identity_timeout = (
+                                max(0.1, registration_deadline - time.monotonic())
+                                if registration_deadline is not None else max(timeout, 40))
+                            if registration_deadline is not None and identity_timeout <= 0.1:
+                                raise TimeoutError('设备注册超过20秒')
                             identity = pool.fetch_headers(
-                                slot_id, info, max(timeout, 40), registered=ready,
+                                slot_id, info, identity_timeout, registered=ready,
                                 proxy=account_proxy, provider_direct=True)
                             identities[slot_id] = identity
                             identity_fetched_at[slot_id] = time.monotonic()
@@ -2139,6 +2152,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             result, account, password, account_proxy, timeout,
                             stop.is_set, retries=retries)
             except Exception as exc:                               # noqa: BLE001
+                registration_failed = bool(
+                    device_lease is not None
+                    and device_lease.initial_state != 'ready'
+                    and not device_registered
+                    and pool.inspect(device_lease.slot).get('state') != 'ready')
                 if (device_lease is not None and
                         device_lease.initial_state != 'ready' and
                         device_lease.clear_incomplete_identity()):
@@ -2212,6 +2230,17 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     proxy_pool.discard(lease)
                 else:
                     proxy_pool.release(lease, healthy=healthy_exit)
+            if registration_failed and not stop.is_set():
+                # Registration never sent the account request. Discard this
+                # exit and retry the same account/device acquisition with a
+                # different IP without consuming the user's auth retry count.
+                result.update(_retry_at=time.monotonic() + 0.2,
+                              _retry_attempt=attempt,
+                              _retry_started=account_started,
+                              _retry_identity=None,
+                              _retry_previous=current_proxy,
+                              _registration_retries=registration_retries + 1)
+                return row, line, result
             if debug_enabled and (web_failed or int(result.get('web_attempts') or 0) > 1):
                 _write_proxy_debug(
                     debug_path, 'web_retry_result', row=row, slot=slot_id,
@@ -2261,7 +2290,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           _retry_attempt=attempt + 1,
                           _retry_started=account_started,
                           _retry_identity=None,
-                          _retry_previous=current_proxy)
+                          _retry_previous=current_proxy,
+                          _registration_retries=registration_retries)
             return row, line, result
         if result is None:
             result = {'status': 'error', 'kind': 'proxy', 'http': 0,
@@ -2344,7 +2374,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             int(result.pop('_retry_attempt')),
                             result.pop('_retry_started'),
                             result.pop('_retry_identity'),
-                            result.pop('_retry_previous'))
+                            result.pop('_retry_previous'),
+                            int(result.pop('_registration_retries', 0)))
                     retry_order += 1
                     heapq.heappush(delayed, (float(retry_at), retry_order, work))
                     continue

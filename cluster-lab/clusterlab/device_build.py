@@ -13,9 +13,11 @@ import threading
 import time
 
 from .common import atomic_json, read_json
-from .executor import _load_fastcheck, record_device_registration
+from .executor import (_load_fastcheck, _reset_incomplete_device_slots,
+                       record_device_registration)
 
-REGISTRATION_TIMEOUT = 90
+REGISTRATION_TIMEOUT = 20
+REGISTRATION_PROXY_ATTEMPTS = 2
 
 
 def device_label(device_id):
@@ -257,9 +259,10 @@ class DeviceBuilder:
             started = True
             with self.lock:
                 self.provision_process = process
-            # Residential exits can need 40–60 seconds for the first complete
-            # Apple provisioning exchange. Keep the existing safety margin.
-            deadline = time.monotonic() + payload['timeout'] + 30
+            # One complete registration attempt has a hard 20-second budget.
+            # The child is reaped at the deadline even if a dependency ignores
+            # its own socket timeout.
+            deadline = time.monotonic() + payload['timeout']
             while time.monotonic() < deadline:
                 if self.stop.is_set():
                     result = {'ok': False, 'cancelled': True, 'error': '已取消'}
@@ -301,30 +304,40 @@ class DeviceBuilder:
                     self._update(ready=self.state['ready'] + 1)
                     continue
                 self._update(current=slot, message=f'正在注册第 {slot} 台')
-                proxy = self._proxy()
-                if not proxy:
-                    self._fail_slot(slot, '代理获取失败')
-                    self._update(failed=self.state['failed'] + 1,
-                                 proxy_status='failed', proxy_ip='',
-                                 message=f'第 {slot} 台代理获取失败，已禁止直连注册')
-                    continue
-                self._update(proxy_status='ok', proxy_ip=proxy_endpoint(proxy))
-                payload = {'slot': slot, 'capacity': capacity, 'proxy': proxy,
-                           'device_root': str(root), 'origin': self.node.origin,
-                           'timeout': REGISTRATION_TIMEOUT}
-                result = self._provision(payload)
-                if self.stop.is_set() or (result or {}).get('cancelled'):
-                    self._update(message='已取消')
+                ok = False
+                reason = '代理获取失败'
+                for proxy_attempt in range(REGISTRATION_PROXY_ATTEMPTS):
+                    proxy = self._proxy()
+                    if not proxy:
+                        reason = '代理获取失败'
+                        self._update(proxy_status='failed', proxy_ip='',
+                                     message=f'第 {slot} 台代理获取失败，正在换出口')
+                    else:
+                        self._update(proxy_status='ok', proxy_ip=proxy_endpoint(proxy),
+                                     message=f'正在注册第 {slot} 台（出口 {proxy_attempt + 1}）')
+                        payload = {'slot': slot, 'capacity': capacity, 'proxy': proxy,
+                                   'device_root': str(root), 'origin': self.node.origin,
+                                   'timeout': REGISTRATION_TIMEOUT}
+                        result = self._provision(payload)
+                        if self.stop.is_set() or (result or {}).get('cancelled'):
+                            self._update(message='已取消')
+                            break
+                        ok = (bool(result and result.get('ok'))
+                              and pool.inspect(slot)['state'] == 'ready')
+                        if ok:
+                            self._record(slot, proxy, (result or {}).get('model'))
+                            self._clear_slot_error(slot)
+                            self._update(built=self.state['built'] + 1,
+                                         ready=self.state['ready'] + 1,
+                                         message=f'第 {slot} 台已就绪')
+                            break
+                        reason = (result or {}).get('error') or '20秒超时'
+                    _reset_incomplete_device_slots(pool, [slot])
+                    if proxy_attempt + 1 < REGISTRATION_PROXY_ATTEMPTS:
+                        self._update(message=f'第 {slot} 台失败（{reason}），正在换出口重试')
+                if self.stop.is_set():
                     break
-                ok = bool(result and result.get('ok')) and pool.inspect(slot)['state'] == 'ready'
-                if ok:
-                    self._record(slot, proxy, (result or {}).get('model'))
-                    self._clear_slot_error(slot)
-                    self._update(built=self.state['built'] + 1,
-                                 ready=self.state['ready'] + 1,
-                                 message=f'第 {slot} 台已就绪')
-                else:
-                    reason = (result or {}).get('error') or '超时'
+                if not ok:
                     self._fail_slot(slot, reason)
                     self._update(failed=self.state['failed'] + 1,
                                  message=f'第 {slot} 台失败（{reason}）')

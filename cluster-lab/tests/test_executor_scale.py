@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (DeviceAuthLease, DeviceLeaseAllocator, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots, _reset_incomplete_device_slots,
+from clusterlab.executor import (DEVICE_REGISTRATION_TIMEOUT_SECONDS, DeviceAuthLease, DeviceLeaseAllocator, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots, _reset_incomplete_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
@@ -238,6 +238,11 @@ class ExecutorScaleTests(unittest.TestCase):
                           'device_capacity': 1, 'device_slots': [1],
                           'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5}
+            proxies = ScriptedProxyPool([
+                'socks5h://bad-registration-exit',
+                'socks5h://replacement-registration-exit',
+                'socks5h://second-account-exit',
+            ])
             with patch('clusterlab.executor._load_fastcheck', return_value=(
                     FlakyRegistrationPool,
                     lambda *_args, **_kwargs: {
@@ -247,15 +252,19 @@ class ExecutorScaleTests(unittest.TestCase):
                        return_value={'client_info': 'test', 'user_agent': 'test'}), \
                  patch('clusterlab.executor.record_device_registration'), \
                  patch('clusterlab.executor._bump_usage'):
-                _execute_auth_unit(root, descriptor, threading.Event())
+                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=proxies)
 
             records = [json.loads(line) for line in
                        (root / 'results.jsonl').read_text().splitlines()]
             self.assertEqual(FlakyRegistrationPool.calls, 2)
-            self.assertEqual([record['status'] for record in records], ['timeout', 'valid'])
-            self.assertEqual([record['device_usage'] for record in records], [0, 1])
+            self.assertEqual([record['status'] for record in records], ['valid', 'valid'])
+            self.assertEqual([record['device_usage'] for record in records], [1, 2])
+            self.assertEqual(proxies.discards, ['socks5h://bad-registration-exit'])
             self.assertEqual(
                 FlakyRegistrationPool(root / 'devices').inspect(1)['state'], 'ready')
+
+    def test_device_registration_has_a_twenty_second_total_budget(self):
+        self.assertEqual(DEVICE_REGISTRATION_TIMEOUT_SECONDS, 20.0)
 
     def test_raw_apple_reason_is_packaged_only_when_debug_is_enabled(self):
         result = {'apple_message': 'Your account information was entered incorrectly.'}

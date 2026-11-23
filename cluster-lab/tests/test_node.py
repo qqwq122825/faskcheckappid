@@ -34,7 +34,7 @@ def _construct_node_in_spawned_child(root):
 
 class NodeRecoveryTests(unittest.TestCase):
     def test_device_registration_allows_realistic_provisioning_time(self):
-        self.assertGreaterEqual(REGISTRATION_TIMEOUT, 90)
+        self.assertEqual(REGISTRATION_TIMEOUT, 20)
 
     def test_auth_device_slots_follow_four_by_250_regardless_of_initial_target(self):
         with tempfile.TemporaryDirectory() as root:
@@ -426,11 +426,39 @@ class NodeRecoveryTests(unittest.TestCase):
             self.node.builder._run(1)
         self.assertEqual(self.node.builder.state['ready'], 0)
         self.assertEqual(self.node.builder.state['failed'], 1)
-        self.assertIn('禁止直连注册', self.node.builder.state['message'])
+        self.assertIn('代理获取失败', self.node.builder.state['message'])
         self.assertEqual(self.node.builder.state['proxy_status'], 'failed')
         self.assertEqual(self.node.builder.state['proxy_ip'], '')
         self.assertEqual(self.node.builder.state['slot_errors']['1'], '代理获取失败')
         self.assertFalse((self.node.root / 'device-pool' / 'registrations').exists())
+
+    def test_background_builder_switches_exit_after_registration_failure(self):
+        class Pool:
+            ready = False
+
+            def __init__(inner, *_args, **_kwargs):
+                pass
+
+            def inspect(inner, _slot):
+                return {'state': 'ready' if type(inner).ready else 'missing'}
+
+        proxies = iter(['socks5h://bad-exit', 'socks5h://good-exit'])
+
+        def provision(payload):
+            if payload['proxy'].endswith('good-exit'):
+                Pool.ready = True
+                return {'ok': True, 'model': 'MacBookPro14,3'}
+            return {'ok': False, 'error': '20秒超时'}
+
+        Pool.ready = False
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)), \
+             patch.object(self.node.builder, '_proxy', side_effect=lambda: next(proxies)), \
+             patch.object(self.node.builder, '_provision', side_effect=provision), \
+             patch.object(self.node.builder, '_record', return_value=True) as record:
+            self.node.builder._run(1)
+        self.assertEqual(self.node.builder.state['ready'], 1)
+        self.assertEqual(self.node.builder.state['failed'], 0)
+        record.assert_called_once_with(1, 'socks5h://good-exit', 'MacBookPro14,3')
 
     def test_device_builder_cancel_terminates_current_registration_process(self):
         class Process:
