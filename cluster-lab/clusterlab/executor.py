@@ -2112,8 +2112,25 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                   str(directory / 'proxy-debug.jsonl')) if debug_enabled else None
     exit_ip_debug = _ProxyExitIpDebug(debug_path) if debug_enabled else None
     counters = Counter()
+    identity_timing_lock = threading.Lock()
+    identity_timing = {
+        key: {'samples': 0, 'total': 0.0, 'maximum': 0.0}
+        for key in ('all', 'cache_hit', 'ready_refresh', 'registration')
+    }
     processed = 0
     last_progress = time.monotonic()
+
+    def record_identity_timing(milliseconds, registered_before, cache_hit):
+        """Keep complete per-worker aggregates without logging every account."""
+        value = max(0.0, float(milliseconds or 0))
+        category = ('registration' if not registered_before else
+                    'cache_hit' if cache_hit else 'ready_refresh')
+        with identity_timing_lock:
+            for key in ('all', category):
+                item = identity_timing[key]
+                item['samples'] += 1
+                item['total'] += value
+                item['maximum'] = max(item['maximum'], value)
 
     # Both modes use one physical pool. Its configured 1000/2000 pre-registered
     # slots are tried first; thread mode may extend the same pool past that base.
@@ -2502,6 +2519,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     if debug_enabled:
                         device_identity_ms = round(
                             (time.monotonic() - identity_started) * 1000, 2)
+                        record_identity_timing(
+                            device_identity_ms, ready, identity_cache_hit)
                         if (trace_sampled or
                                 device_identity_ms >= PERFORMANCE_TRACE_SLOW_MS):
                             _write_proxy_debug(
@@ -2884,6 +2903,29 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                  'elapsed': time.time() - started})
     if debug_enabled:
         exit_ip_debug.close()
+        with identity_timing_lock:
+            identity_snapshot = {
+                key: dict(value) for key, value in identity_timing.items()
+            }
+        all_timing = identity_snapshot['all']
+        hit_timing = identity_snapshot['cache_hit']
+        refresh_timing = identity_snapshot['ready_refresh']
+        registration_timing = identity_snapshot['registration']
+        _write_proxy_debug(
+            debug_path, 'device_identity_summary',
+            identity_samples=all_timing['samples'],
+            identity_cache_hits=hit_timing['samples'],
+            identity_ready_refreshes=refresh_timing['samples'],
+            identity_registrations=registration_timing['samples'],
+            identity_ms_total=round(all_timing['total'], 3),
+            identity_ms_max=round(all_timing['maximum'], 3),
+            identity_cache_hit_ms_total=round(hit_timing['total'], 3),
+            identity_cache_hit_ms_max=round(hit_timing['maximum'], 3),
+            identity_refresh_ms_total=round(refresh_timing['total'], 3),
+            identity_refresh_ms_max=round(refresh_timing['maximum'], 3),
+            identity_registration_ms_total=round(registration_timing['total'], 3),
+            identity_registration_ms_max=round(registration_timing['maximum'], 3),
+            identity_cache_ttl=30, credentials_recorded=False)
         _write_proxy_debug(debug_path, 'worker_stop', ok=True, processed=processed,
                            counts=dict(counters), pool=_proxy_pool_snapshot(proxy_pool),
                            exit_ip_probe=exit_ip_debug.snapshot())

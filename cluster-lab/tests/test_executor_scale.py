@@ -786,7 +786,13 @@ class ExecutorScaleTests(unittest.TestCase):
             OneTimePool.registered_flags = []
             records = []
             releases = []
+            identity_summaries = []
             first_registration = None
+
+            from fastcheck import workers as fastcheck_workers
+            with fastcheck_workers._IDENTITY_LOCK:
+                fastcheck_workers._IDENTITY_CACHE.clear()
+                fastcheck_workers._IDENTITY_LOCKS.clear()
 
             def check(_account, _password, _proxy, **_kwargs):
                 return {'status': 'valid', 'kind': 'valid', 'http': 200}
@@ -803,6 +809,8 @@ class ExecutorScaleTests(unittest.TestCase):
                     'timeout': 5, 'retries': 0, '_device_mode': 'one_time',
                     '_retry_delay': 0, '_one_time_min_retries': 0,
                     'device_usage_limit': 2,
+                    '_proxy_debug_mode': 'detailed',
+                    '_proxy_debug': True,
                 }
                 shared = ScriptedProxyPool([f'socks5h://exit-{number}'])
                 with patch('clusterlab.executor._load_fastcheck', return_value=(
@@ -813,6 +821,11 @@ class ExecutorScaleTests(unittest.TestCase):
                     _execute_auth_unit(unit, descriptor, threading.Event(),
                                        proxy_pool=shared)
                 records.append(json.loads((unit / 'results.jsonl').read_text()))
+                debug_rows = [json.loads(line) for line in
+                              (unit / 'proxy-debug.jsonl').read_text().splitlines()]
+                identity_summaries.append(next(
+                    row for row in debug_rows
+                    if row.get('event') == 'device_identity_summary'))
                 releases.extend(shared.releases)
                 if number == 1:
                     first_registration = json.loads(
@@ -822,6 +835,10 @@ class ExecutorScaleTests(unittest.TestCase):
             # The second package uses the same ready device within the
             # 30-second TTL, so it must not call fetch_headers again.
             self.assertEqual(OneTimePool.registered_flags, [False])
+            self.assertEqual(identity_summaries[0]['identity_registrations'], 1)
+            self.assertEqual(identity_summaries[0]['identity_cache_hits'], 0)
+            self.assertEqual(identity_summaries[1]['identity_registrations'], 0)
+            self.assertEqual(identity_summaries[1]['identity_cache_hits'], 1)
             self.assertEqual([record['device_usage'] for record in records], [1, 2])
             self.assertEqual([record['device_remaining_before'] for record in records],
                              [2, 1])

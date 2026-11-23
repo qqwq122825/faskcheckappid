@@ -228,6 +228,32 @@ class NodeRecoveryTests(unittest.TestCase):
                         'identity_cache_hit': True,
                         'identity_cache_ttl': 30,
                         'credentials_recorded': False}),
+            json.dumps({'event': 'device_identity_summary',
+                        'identity_samples': 3, 'identity_cache_hits': 1,
+                        'identity_ready_refreshes': 1,
+                        'identity_registrations': 1,
+                        'identity_ms_total': 1200.0, 'identity_ms_max': 1000.0,
+                        'identity_cache_hit_ms_total': 2.0,
+                        'identity_cache_hit_ms_max': 2.0,
+                        'identity_refresh_ms_total': 198.0,
+                        'identity_refresh_ms_max': 198.0,
+                        'identity_registration_ms_total': 1000.0,
+                        'identity_registration_ms_max': 1000.0,
+                        'identity_cache_ttl': 30,
+                        'credentials_recorded': False}),
+            json.dumps({'event': 'device_identity_summary',
+                        'identity_samples': 2, 'identity_cache_hits': 0,
+                        'identity_ready_refreshes': 2,
+                        'identity_registrations': 0,
+                        'identity_ms_total': 400.0, 'identity_ms_max': 250.0,
+                        'identity_cache_hit_ms_total': 0.0,
+                        'identity_cache_hit_ms_max': 0.0,
+                        'identity_refresh_ms_total': 400.0,
+                        'identity_refresh_ms_max': 250.0,
+                        'identity_registration_ms_total': 0.0,
+                        'identity_registration_ms_max': 0.0,
+                        'identity_cache_ttl': 30,
+                        'credentials_recorded': False}),
         )) + '\n', 'utf-8')
         self.node.telemetry.latest = {'cpu_percent': 81.2, 'memory_percent': 33.0}
 
@@ -255,6 +281,17 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertTrue(identity_event['identity_cache_hit'])
         self.assertEqual(identity_event['identity_cache_ttl'], 30)
         self.assertFalse(identity_event['credentials_recorded'])
+        self.assertEqual(value['debug']['identity']['samples'], 5)
+        self.assertEqual(value['debug']['identity']['cache_hits'], 1)
+        self.assertEqual(value['debug']['identity']['cache_misses'], 4)
+        self.assertEqual(value['debug']['identity']['ready_refreshes'], 3)
+        self.assertEqual(value['debug']['identity']['registrations'], 1)
+        self.assertEqual(value['debug']['identity']['duration_ms'], {
+            'samples': 5, 'average': 320.0, 'maximum': 1000.0,
+            'total': 1600.0})
+        self.assertEqual(value['debug']['identity']['ready_refresh_ms'], {
+            'samples': 3, 'average': 199.333, 'maximum': 250.0,
+            'total': 598.0})
         encoded = json.dumps(value)
         for secret in ('top-secret-lease', 'user:password', 'hunter2',
                        '10.0.0.1', '/private/device-pool', 'proxy.invalid'):

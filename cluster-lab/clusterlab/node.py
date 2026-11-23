@@ -936,7 +936,9 @@ class Node:
         """Read a bounded JSONL tail and expose only an explicit safe schema."""
         if not path.is_file():
             return {'available': False, 'events': {}, 'recent': [],
-                    'srp': {'samples': 0, 'states': {}, 'math_backends': {}}}
+                    'srp': {'samples': 0, 'states': {}, 'math_backends': {}},
+                    'identity': {'samples': 0, 'cache_hits': 0,
+                                 'ready_refreshes': 0, 'registrations': 0}}
         size = path.stat().st_size
         byte_limit = 2 * 1024 * 1024
         with path.open('rb') as stream:
@@ -948,6 +950,8 @@ class Node:
         raw_lines = raw_lines[-2000:]
         events, recent, malformed = Counter(), [], 0
         srp_states, math_backends = Counter(), Counter()
+        identity_counts, identity_totals, identity_maximums = (
+            Counter(), Counter(), Counter())
         metrics = {key: [] for key in (
             'compute_cpu_ms', 'compute_wall_ms', 'lane_wait_ms',
             'local_lane_wait_ms', 'global_lane_wait_ms',
@@ -969,6 +973,14 @@ class Node:
                              'identity_field_count', 'identity_keys',
                              'identity_value_bytes', 'identity_max_value_bytes',
                              'identity_cache_hit', 'identity_cache_ttl',
+                             'identity_samples', 'identity_cache_hits',
+                             'identity_ready_refreshes', 'identity_registrations',
+                             'identity_ms_total', 'identity_ms_max',
+                             'identity_cache_hit_ms_total',
+                             'identity_cache_hit_ms_max',
+                             'identity_refresh_ms_total', 'identity_refresh_ms_max',
+                             'identity_registration_ms_total',
+                             'identity_registration_ms_max',
                              'credentials_recorded')
         for raw in raw_lines:
             try:
@@ -983,6 +995,23 @@ class Node:
             backend = item.get('srp_math_backend')
             if event == 'worker_start' and backend:
                 math_backends[str(backend)[:40]] += 1
+            if event == 'device_identity_summary':
+                for key in ('identity_samples', 'identity_cache_hits',
+                            'identity_ready_refreshes', 'identity_registrations'):
+                    try:
+                        identity_counts[key] += max(0, int(item.get(key) or 0))
+                    except (TypeError, ValueError):
+                        pass
+                for key in ('identity_ms', 'identity_cache_hit_ms',
+                            'identity_refresh_ms', 'identity_registration_ms'):
+                    try:
+                        identity_totals[key] += max(
+                            0.0, float(item.get(key + '_total') or 0))
+                        identity_maximums[key] = max(
+                            identity_maximums[key],
+                            max(0.0, float(item.get(key + '_max') or 0)))
+                    except (TypeError, ValueError):
+                        pass
             srp = item.get('srp') if isinstance(item.get('srp'), dict) else None
             if srp is not None:
                 srp_states[str(srp.get('state') or 'unknown')[:40]] += 1
@@ -1012,11 +1041,35 @@ class Node:
                                     'global_lane_wait_ms')}
                 recent.append(safe)
                 recent = recent[-recent_limit:]
+        def identity_metric(key, samples):
+            total = identity_totals[key]
+            return {'samples': samples,
+                    'average': round(total / samples, 3) if samples else None,
+                    'maximum': round(identity_maximums[key], 3),
+                    'total': round(total, 3)}
+
+        identity_samples = identity_counts['identity_samples']
+        cache_hits = identity_counts['identity_cache_hits']
+        ready_refreshes = identity_counts['identity_ready_refreshes']
+        registrations = identity_counts['identity_registrations']
         return {
             'available': True, 'file_bytes': size, 'tail_bytes': min(size, byte_limit),
             'lines_scanned': len(raw_lines), 'malformed_lines': malformed,
             'truncated': size > byte_limit or len(raw_lines) >= 2000,
             'events': dict(sorted(events.items())), 'recent': recent,
+            'identity': {
+                'samples': identity_samples,
+                'cache_hits': cache_hits,
+                'cache_misses': ready_refreshes + registrations,
+                'ready_refreshes': ready_refreshes,
+                'registrations': registrations,
+                'duration_ms': identity_metric('identity_ms', identity_samples),
+                'cache_hit_ms': identity_metric('identity_cache_hit_ms', cache_hits),
+                'ready_refresh_ms': identity_metric(
+                    'identity_refresh_ms', ready_refreshes),
+                'registration_ms': identity_metric(
+                    'identity_registration_ms', registrations),
+            },
             'srp': {
                 'samples': sum(srp_states.values()),
                 'states': dict(sorted(srp_states.items())),
