@@ -2379,8 +2379,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 if now - last_progress >= 0.25:
                     # The node agent tails this local file once per second and
                     # sends one bounded batch.  Flush here without any network
-                    # work in the worker process.
+                    # work in the worker process.  Persist the disjoint device
+                    # counters at the same cadence so the pool page reports
+                    # live use instead of showing zero until the whole package
+                    # (possibly tens of thousands of rows) finishes.
                     output.flush()
+                    device_allocator.flush_usage()
                     atomic_json(directory / 'progress.json',
                                 {'processed': processed, 'started': started,
                                  'counts': dict(counters),

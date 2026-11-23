@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots, _reset_incomplete_device_slots,
+from clusterlab.executor import (DeviceAuthLease, DeviceLeaseAllocator, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots, _reset_incomplete_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
@@ -1048,6 +1048,11 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5}
+            flushes = []
+            original_flush = DeviceLeaseAllocator.flush_usage
+            def record_flush(allocator):
+                flushes.append(dict(allocator.usage))
+                return original_flush(allocator)
             with patch('clusterlab.executor._load_fastcheck', return_value=(
                     FakePool, lambda *_args, **_kwargs: {'status': 'wrong_password'},
                     lambda result: result['status'])), \
@@ -1056,6 +1061,7 @@ class ExecutorScaleTests(unittest.TestCase):
                  patch('clusterlab.executor._bump_usage'), \
                  patch('clusterlab.executor.time.monotonic',
                        side_effect=[10.0] * 4 + [10.3] * 8), \
+                 patch.object(DeviceLeaseAllocator, 'flush_usage', record_flush), \
                  patch('clusterlab.executor.atomic_json', wraps=atomic_json) as writes:
                 _execute_auth_unit(root, descriptor, threading.Event())
 
@@ -1063,6 +1069,8 @@ class ExecutorScaleTests(unittest.TestCase):
                         if call.args[0].name == 'progress.json']
             self.assertEqual([item['processed'] for item in progress], [1, 1])
             self.assertEqual(progress[0]['counts'], {'wrong_password': 1})
+            self.assertGreaterEqual(len(flushes), 2)
+            self.assertEqual(flushes[0][1], 1)
 
     def test_auth_result_records_device_usage_at_that_account(self):
         with tempfile.TemporaryDirectory() as temporary:
