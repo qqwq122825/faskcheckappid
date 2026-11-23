@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from clusterlab.executor import (PROXY_FETCH_LIMIT, PROXY_INITIAL_FETCH,
                                  PROXY_PREFILL_WAIT_SECONDS,
                                  DeviceAuthLease, NodeProxyPool, _auth_process_limit,
-                                 _auth_worker_limit, _consume_thread_pool_device,
+                                 _auth_worker_limit, _srp_global_limit,
+                                 _consume_thread_pool_device,
                                  _device_id_label, _execute_auth_unit,
                                  _partition_device_slots,
                                  _partition_one_time_device_slots, _usage_snapshot,
@@ -256,6 +257,8 @@ class ExecutorScaleTests(unittest.TestCase):
         self.assertLessEqual(3 * _auth_worker_limit(100, 10, 3), 10 * 100)
         self.assertEqual(_auth_process_limit(4, rows=1000, cpu_count=4), 4)
         self.assertEqual(_auth_worker_limit(250, 4, 4), 250)
+        self.assertEqual(_srp_global_limit(4), 3)
+        self.assertEqual(_srp_global_limit(2), 2)
         self.assertEqual(PROXY_FETCH_LIMIT, 200)
         self.assertEqual(PROXY_INITIAL_FETCH, 1000)
         self.assertEqual(PROXY_PREFILL_WAIT_SECONDS, 10.0)

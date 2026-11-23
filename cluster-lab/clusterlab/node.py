@@ -907,6 +907,17 @@ class Node:
                         pass
             if safe_pool:
                 output['proxy_pool'] = safe_pool
+        gate = value.get('srp_gate')
+        if isinstance(gate, dict):
+            safe_gate = {}
+            for key in ('limit', 'active', 'peak', 'waiters'):
+                if gate.get(key) is not None:
+                    try:
+                        safe_gate[key] = int(gate[key])
+                    except (TypeError, ValueError):
+                        pass
+            if safe_gate:
+                output['srp_gate'] = safe_gate
         if value.get('error'):
             # Executor errors are already bounded.  Return only the exception
             # class so a provider URL or credential can never cross this API.
@@ -939,6 +950,7 @@ class Node:
         srp_states, math_backends = Counter(), Counter()
         metrics = {key: [] for key in (
             'compute_cpu_ms', 'compute_wall_ms', 'lane_wait_ms',
+            'local_lane_wait_ms', 'global_lane_wait_ms',
             'request_ms', 'request_thread_cpu_ms')}
         allowed = (
             'at', 'event', 'pid', 'thread', 'row', 'slot', 'attempt',
@@ -949,6 +961,10 @@ class Node:
             'status', 'stage', 'kind', 'retryable', 'release',
             'port_changed', 'pair_changed', 'recorded_retries',
             'configured_retries', 'ok', 'processed', 'counts')
+        allowed = allowed + ('local_limit', 'global_limit',
+                             'process_start_stagger_ms',
+                             'process_start_delay_ms', 'srp_local_limit',
+                             'srp_global_limit', 'scope')
         for raw in raw_lines:
             try:
                 item = json.loads(raw)
@@ -965,7 +981,8 @@ class Node:
             srp = item.get('srp') if isinstance(item.get('srp'), dict) else None
             if srp is not None:
                 srp_states[str(srp.get('state') or 'unknown')[:40]] += 1
-                for key in ('compute_cpu_ms', 'compute_wall_ms', 'lane_wait_ms'):
+                for key in ('compute_cpu_ms', 'compute_wall_ms', 'lane_wait_ms',
+                            'local_lane_wait_ms', 'global_lane_wait_ms'):
                     try:
                         if srp.get(key) is not None:
                             metrics[key].append(float(srp[key]))
@@ -986,7 +1003,8 @@ class Node:
                     safe['srp'] = {key: srp.get(key) for key in
                                    ('scope', 'state', 'challenge_observed',
                                     'compute_cpu_ms', 'compute_wall_ms',
-                                    'lane_wait_ms')}
+                                    'lane_wait_ms', 'local_lane_wait_ms',
+                                    'global_lane_wait_ms')}
                 recent.append(safe)
                 recent = recent[-recent_limit:]
         return {

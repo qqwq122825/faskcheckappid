@@ -26,7 +26,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import count
 
@@ -49,6 +49,54 @@ GSA_URL = "https://gsa.apple.com/grandslam/GsService2"
 # same CPU lane and delays the first completed accounts.  Keep network I/O
 # fully concurrent while serializing the two short CPU-heavy SRP sections.
 _SRP_CPU_LANE = threading.Semaphore(1)
+_SRP_GLOBAL_GATE = None
+_SRP_GLOBAL_STATE = None
+_SRP_GLOBAL_LIMIT = 1
+
+
+def configure_srp_global_gate(gate=None, state=None, limit=1):
+    """Install the node-wide SRP gate inherited by this worker process."""
+    global _SRP_CPU_LANE, _SRP_GLOBAL_GATE, _SRP_GLOBAL_STATE, _SRP_GLOBAL_LIMIT
+    _SRP_CPU_LANE = threading.Semaphore(1)
+    _SRP_GLOBAL_GATE = gate
+    _SRP_GLOBAL_STATE = state
+    _SRP_GLOBAL_LIMIT = max(1, int(limit or 1))
+
+
+def _change_srp_global_state(index, delta=0, peak=False):
+    state = _SRP_GLOBAL_STATE
+    if state is None:
+        return 0
+    with state.get_lock():
+        if delta:
+            state[index] = max(0, int(state[index]) + int(delta))
+        if peak:
+            state[1] = max(int(state[1]), int(state[0]))
+        return int(state[index])
+
+
+@contextmanager
+def _srp_cpu_slot(diagnostics, name):
+    """Serialize locally, then admit at most the node-wide CPU budget."""
+    with phase(diagnostics, f"srp_{name}_lane_wait"):
+        _SRP_CPU_LANE.acquire()
+    global_acquired = False
+    try:
+        if _SRP_GLOBAL_GATE is not None:
+            _change_srp_global_state(2, 1)
+            try:
+                with phase(diagnostics, f"srp_{name}_global_lane_wait"):
+                    _SRP_GLOBAL_GATE.acquire()
+                global_acquired = True
+            finally:
+                _change_srp_global_state(2, -1)
+            _change_srp_global_state(0, 1, peak=True)
+        yield
+    finally:
+        if global_acquired:
+            _change_srp_global_state(0, -1)
+            _SRP_GLOBAL_GATE.release()
+        _SRP_CPU_LANE.release()
 
 # Native-library providers from SideStore's server list (2026-11-11).
 # Legacy Android-library providers were returning parameters that GSA rejected.
@@ -707,13 +755,9 @@ def _once(email: str, password: str, proxy: str | None, timeout: float,
                        kind="anisette", stage="init")
     try:
         with phase(diagnostics, "srp_init"):
-            with phase(diagnostics, "srp_init_lane_wait"):
-                _SRP_CPU_LANE.acquire()
-            try:
+            with _srp_cpu_slot(diagnostics, "init"):
                 with phase(diagnostics, "srp_init_compute"):
                     srp = SRPClient(email, password)
-            finally:
-                _SRP_CPU_LANE.release()
     except Exception as exc:                          # noqa: BLE001
         return _result("error", f"srp init: {exc}", started, kind="protocol", stage="init")
     with phase(diagnostics, "client_setup"):
@@ -757,15 +801,11 @@ def _once(email: str, password: str, proxy: str | None, timeout: float,
             raise KeyError("c")
         with phase(diagnostics, "srp_challenge") as timing:
             timing["iterations"] = response["i"]
-            with phase(diagnostics, "srp_challenge_lane_wait"):
-                _SRP_CPU_LANE.acquire()
-            try:
+            with _srp_cpu_slot(diagnostics, "challenge"):
                 with phase(diagnostics, "srp_challenge_compute"):
                     m1 = srp.process_challenge(
                         response["s"], response["B"], response["i"],
                         response["sp"])
-            finally:
-                _SRP_CPU_LANE.release()
     except KeyError as exc:
         return _result("error", f"init missing {exc}", started, kind="protocol", stage="init")
     except Exception as exc:                          # noqa: BLE001

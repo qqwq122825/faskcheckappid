@@ -174,6 +174,39 @@ class ProtocolTests(unittest.TestCase):
             "srp_challenge_lane_wait", "srp_challenge_compute",
         } <= phases)
 
+    def test_srp_global_gate_records_wait_and_never_exceeds_limit(self):
+        class SharedState:
+            def __init__(self):
+                self.values = [0, 0, 0]
+                self.lock = threading.RLock()
+
+            def get_lock(self):
+                return self.lock
+
+            def __getitem__(self, index):
+                return self.values[index]
+
+            def __setitem__(self, index, value):
+                self.values[index] = value
+
+        state = SharedState()
+        events = []
+        gsa.configure_srp_global_gate(threading.BoundedSemaphore(2), state, 2)
+        try:
+            def compute(_index):
+                with gsa._srp_cpu_slot(events.append, "init"):
+                    time.sleep(.01)
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(compute, range(8)))
+            self.assertEqual(state[0], 0)
+            self.assertEqual(state[1], 1)  # one process-local lane remains authoritative
+            phases = {event.get("phase") for event in events
+                      if event.get("event") == "phase_end"}
+            self.assertIn("srp_init_global_lane_wait", phases)
+        finally:
+            gsa.configure_srp_global_gate()
+
     def test_missing_and_tampered_server_proofs_are_rejected(self):
         for proof in ("missing", "tampered"):
             with self.subTest(proof=proof):

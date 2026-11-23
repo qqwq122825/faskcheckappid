@@ -491,8 +491,10 @@ def _srp_timing_summary(phase_ms, phase_cpu_ms, phase_counts, sampled):
     for name in ('init', 'challenge'):
         compute = f'srp_{name}_compute'
         wait = f'srp_{name}_lane_wait'
+        global_wait = f'srp_{name}_global_lane_wait'
         compute_calls = int(phase_counts.get(compute, 0))
         wait_calls = int(phase_counts.get(wait, 0))
+        global_wait_calls = int(phase_counts.get(global_wait, 0))
         stages[name] = {
             'compute_calls': compute_calls if sampled else None,
             'compute_wall_ms': (round(phase_ms.get(compute, 0), 3)
@@ -504,6 +506,9 @@ def _srp_timing_summary(phase_ms, phase_cpu_ms, phase_counts, sampled):
                              if wait_calls else None),
             'lane_wait_cpu_ms': (round(phase_cpu_ms.get(wait, 0), 3)
                                  if wait_calls else None),
+            'global_lane_wait_calls': global_wait_calls if sampled else None,
+            'global_lane_wait_ms': (round(phase_ms.get(global_wait, 0), 3)
+                                    if global_wait_calls else None),
         }
     observed = any(value['compute_calls'] for value in stages.values())
     return {
@@ -518,9 +523,20 @@ def _srp_timing_summary(phase_ms, phase_cpu_ms, phase_counts, sampled):
         'compute_wall_ms': (round(sum(value['compute_wall_ms'] or 0
                                      for value in stages.values()), 3)
                             if observed else None),
-        'lane_wait_ms': (round(sum(value['lane_wait_ms'] or 0
+        'local_lane_wait_ms': (round(sum(value['lane_wait_ms'] or 0
+                                        for value in stages.values()), 3)
+                               if any(value['lane_wait_calls'] for value in stages.values())
+                               else None),
+        'global_lane_wait_ms': (round(sum(value['global_lane_wait_ms'] or 0
+                                         for value in stages.values()), 3)
+                                if any(value['global_lane_wait_calls']
+                                       for value in stages.values()) else None),
+        'lane_wait_ms': (round(sum((value['lane_wait_ms'] or 0) +
+                                  (value['global_lane_wait_ms'] or 0)
                                   for value in stages.values()), 3)
-                         if any(value['lane_wait_calls'] for value in stages.values())
+                         if any(value['lane_wait_calls'] or
+                                value['global_lane_wait_calls']
+                                for value in stages.values())
                          else None),
         **stages,
     }
@@ -1284,7 +1300,8 @@ def execute_unit(directory, descriptor, stop):
         atomic_json(directory / 'done.json', {'ok': False, 'processed': processed, 'error': type(exc).__name__})
 
 
-def _group_child(directory, descriptor, stop, proxy_pool=None):
+def _group_child(directory, descriptor, stop, proxy_pool=None,
+                 srp_global_gate=None, srp_global_state=None, srp_global_limit=1):
     # 认证子进程属于吞吐型后台工作。降低它相对节点主进程的调度优先级，
     # 避免 SRP/PBKDF2/TLS 高负载时心跳线程拿不到 CPU 而误丢租约。
     worker_nice = 0
@@ -1302,6 +1319,13 @@ def _group_child(directory, descriptor, stop, proxy_pool=None):
             channel.cancel_join_thread()
     runner = execute_auth_unit if descriptor.get('mode') == 'auth' else execute_unit
     if runner is execute_auth_unit:
+        _load_fastcheck()
+        from fastcheck.protocols.gsa_status import configure_srp_global_gate
+        configure_srp_global_gate(srp_global_gate, srp_global_state,
+                                  srp_global_limit)
+        start_delay_ms = max(0, int(descriptor.get('_process_start_delay_ms') or 0))
+        if start_delay_ms:
+            time.sleep(start_delay_ms / 1000.0)
         runner(directory, descriptor, stop, proxy_pool=proxy_pool)
     else:
         runner(directory, descriptor, stop)
@@ -1329,6 +1353,19 @@ def _auth_process_limit(configured, rows, cpu_count=None):
     rows = max(1, int(rows or 1))
     logical_cpus = max(1, int(cpu_count or os.cpu_count() or 1))
     return min(configured, rows, logical_cpus)
+
+
+def _srp_global_limit(process_count):
+    """Leave one CPU lane for networking, TLS and node heartbeats."""
+    return min(max(1, int(process_count or 1)), 3)
+
+
+def _srp_gate_snapshot(state, limit):
+    if state is None:
+        return {'limit': int(limit), 'active': 0, 'peak': 0, 'waiters': 0}
+    with state.get_lock():
+        return {'limit': int(limit), 'active': int(state[0]),
+                'peak': int(state[1]), 'waiters': int(state[2])}
 
 
 def execute_unit_group(directory, descriptor, stop):
@@ -1375,6 +1412,19 @@ def execute_unit_group(directory, descriptor, stop):
         else max(1, int(descriptor.get('threads') or 1)))
     descriptor['_active_threads_per_process'] = active_threads_per_process
     context = mp.get_context('spawn')
+    srp_global_limit = (_srp_global_limit(process_count)
+                        if descriptor.get('mode') == 'auth' else 0)
+    srp_global_gate = (context.BoundedSemaphore(srp_global_limit)
+                       if descriptor.get('mode') == 'auth' else None)
+    srp_global_state = (context.Array('i', [0, 0, 0], lock=True)
+                        if srp_global_gate is not None else None)
+    descriptor['_srp_global_limit'] = srp_global_limit
+    if debug_path and descriptor.get('mode') == 'auth':
+        _write_proxy_debug(
+            debug_path, 'srp_gate_config', local_limit=1,
+            global_limit=srp_global_limit,
+            process_start_stagger_ms=100,
+            scope='network_threads_unlimited_srp_compute_bounded')
     proxy_pool = None
     supplier_stop = None
     supplier_thread = None
@@ -1409,7 +1459,8 @@ def execute_unit_group(directory, descriptor, stop):
                 pool=_proxy_pool_snapshot(proxy_pool))
     if process_count == 1:
         try:
-            _group_child(directory, descriptor, stop, proxy_pool)
+            _group_child(directory, descriptor, stop, proxy_pool,
+                         srp_global_gate, srp_global_state, srp_global_limit)
         finally:
             if supplier_stop is not None:
                 supplier_stop.set()
@@ -1425,6 +1476,9 @@ def execute_unit_group(directory, descriptor, stop):
                              cpu_reserve=cpu_reserve,
                              threads_per_process=int(descriptor.get('threads') or 1),
                              active_threads_per_process=active_threads_per_process)
+        if descriptor.get('mode') == 'auth':
+            read_progress['srp_gate'] = _srp_gate_snapshot(
+                srp_global_state, srp_global_limit)
         if proxy_pool is not None:
             read_progress['proxy_pool'] = proxy_pool.snapshot()
         atomic_json(directory / 'progress.json', read_progress)
@@ -1432,6 +1486,9 @@ def execute_unit_group(directory, descriptor, stop):
             done = json.loads((directory / 'done.json').read_text('utf-8'))
             if proxy_pool is not None:
                 done['proxy_pool'] = proxy_pool.snapshot()
+            if descriptor.get('mode') == 'auth':
+                done['srp_gate'] = _srp_gate_snapshot(
+                    srp_global_state, srp_global_limit)
             atomic_json(directory / 'done.json', done)
         finally:
             if proxy_pool is not None and debug_path:
@@ -1501,6 +1558,7 @@ def execute_unit_group(directory, descriptor, stop):
                     # Compatibility for packages created before quota planning.
                     child['device_slots'] = _partition_device_slots(
                         assigned or range(1, process_count + 1), process_count, index)
+                child['_process_start_delay_ms'] = index * 100
                 child['device_pool_capacity'] = int(
                     descriptor.get('device_pool_capacity') or
                     (max(assigned) if assigned else 1))
@@ -1516,7 +1574,9 @@ def execute_unit_group(directory, descriptor, stop):
         for index, (child_dir, child) in enumerate(child_descriptors):
             child_stop = context.Event()
             process = context.Process(target=_group_child,
-                                      args=(str(child_dir), child, child_stop, proxy_pool),
+                                      args=(str(child_dir), child, child_stop, proxy_pool,
+                                            srp_global_gate, srp_global_state,
+                                            srp_global_limit),
                                       name=f'package-worker-{index + 1:02d}')
             process.start()
             children.append((process, child_stop, child_dir))
@@ -1556,6 +1616,8 @@ def execute_unit_group(directory, descriptor, stop):
                              'cpu_reserve': cpu_reserve,
                              'threads_per_process': int(descriptor.get('threads') or 1),
                              'active_threads_per_process': active_threads_per_process,
+                             'srp_gate': _srp_gate_snapshot(
+                                 srp_global_state, srp_global_limit),
                              'counts': live_counts,
                              **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
                 last_write = now
@@ -1600,6 +1662,8 @@ def execute_unit_group(directory, descriptor, stop):
                      'cpu_reserve': cpu_reserve,
                      'threads_per_process': int(descriptor.get('threads') or 1),
                      'active_threads_per_process': active_threads_per_process,
+                     'srp_gate': _srp_gate_snapshot(
+                         srp_global_state, srp_global_limit),
                      'counts': merged_counts,
                      **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
         atomic_json(directory / 'done.json',
@@ -1609,6 +1673,8 @@ def execute_unit_group(directory, descriptor, stop):
                      'configured_process_limit': process_limit,
                      'cpu_reserve': cpu_reserve,
                      'active_threads_per_process': active_threads_per_process,
+                     'srp_gate': _srp_gate_snapshot(
+                         srp_global_state, srp_global_limit),
                      **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
     except Exception as exc:                                      # noqa: BLE001
         for process, child_stop, _ in children:
@@ -1633,11 +1699,15 @@ def execute_unit_group(directory, descriptor, stop):
                      'configured_process_limit': process_limit,
                      'threads_per_process': int(descriptor.get('threads') or 1),
                      'active_threads_per_process': active_threads_per_process,
+                     'srp_gate': _srp_gate_snapshot(
+                         srp_global_state, srp_global_limit),
                      'counts': live_counts,
                      **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
         atomic_json(directory / 'done.json',
                     {'ok': False, 'processed': processed,
                      'error': f'{type(exc).__name__}: {exc}'[:300],
+                     'srp_gate': _srp_gate_snapshot(
+                         srp_global_state, srp_global_limit),
                      **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
     finally:
         if supplier_stop is not None:
@@ -2034,6 +2104,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            first_row=int(descriptor.get('first_row') or 1),
                            threads=workers, configured_threads=configured_workers,
                            worker_nice=int(descriptor.get('_worker_nice') or 0),
+                           process_start_delay_ms=int(
+                               descriptor.get('_process_start_delay_ms') or 0),
+                           srp_local_limit=1,
+                           srp_global_limit=int(
+                               descriptor.get('_srp_global_limit') or 1),
                            retries=retries, timeout=timeout,
                            slots=slot_ids, auth_protocol=auth_protocol,
                            device_mode=device_mode,

@@ -203,6 +203,7 @@ class NodeRecoveryTests(unittest.TestCase):
             'processed': 120, 'workers': 3, 'worker_limit': 3,
             'configured_process_limit': 4, 'cpu_reserve': 1,
             'threads_per_process': 250, 'active_threads_per_process': 333,
+            'srp_gate': {'limit': 3, 'active': 2, 'peak': 3, 'waiters': 1},
             'counts': {'wrong_password': 110, 'locked': 10},
             'proxy_pool': {'available': 240, 'endpoint': 'socks5://secret'}}), 'utf-8')
         (directory / 'proxy-debug.jsonl').write_text('\n'.join((
@@ -214,7 +215,9 @@ class NodeRecoveryTests(unittest.TestCase):
                         'detail': 'password=hunter2',
                         'srp': {'scope': 'sampled_attempt_leaf_phases',
                                 'state': 'observed', 'compute_cpu_ms': 8.5,
-                                'compute_wall_ms': 9.0, 'lane_wait_ms': 2.0}}),
+                                'compute_wall_ms': 9.0, 'lane_wait_ms': 2.0,
+                                'local_lane_wait_ms': 0.5,
+                                'global_lane_wait_ms': 1.5}}),
         )) + '\n', 'utf-8')
         self.node.telemetry.latest = {'cpu_percent': 81.2, 'memory_percent': 33.0}
 
@@ -227,11 +230,14 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertTrue(value['public_endpoint'])
         self.assertEqual(value['progress']['worker_limit'], 3)
         self.assertEqual(value['progress']['cpu_reserve'], 1)
+        self.assertEqual(value['progress']['srp_gate'],
+                         {'limit': 3, 'active': 2, 'peak': 3, 'waiters': 1})
         self.assertEqual(value['node']['telemetry']['cpu_percent'], 81.2)
         self.assertEqual(value['configuration']['logging'], {
             'mode': 'sampled', 'sample_every': 37,
             'sampling_strategy': 'stable_hash'})
         self.assertEqual(value['debug']['srp']['compute_cpu_ms']['total'], 8.5)
+        self.assertEqual(value['debug']['srp']['global_lane_wait_ms']['total'], 1.5)
         self.assertEqual(value['debug']['srp']['math_backends'], {'gmpy2': 1})
         encoded = json.dumps(value)
         for secret in ('top-secret-lease', 'user:password', 'hunter2',
