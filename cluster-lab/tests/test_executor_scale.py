@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (DEVICE_REGISTRATION_TIMEOUT_SECONDS, DeviceAuthLease, DeviceLeaseAllocator, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots, _reset_incomplete_device_slots,
+from clusterlab.executor import (DEVICE_REGISTRATION_TIMEOUT_SECONDS, DeviceAuthLease, DeviceLeaseAllocator, NodeProxyPool, StageTelemetry, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots, _reset_incomplete_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
@@ -33,6 +33,31 @@ class FakePool:
 
     def fetch_headers(self, *_args, **_kwargs):
         return {}
+
+
+class StageTelemetryTests(unittest.TestCase):
+    def test_snapshot_reports_active_percentiles_cpu_and_errors(self):
+        telemetry = StageTelemetry(True)
+        token = telemetry.begin('wait_proxy')
+        active = telemetry.snapshot(retry_waiting=3)
+        self.assertEqual(active['stages']['wait_proxy']['active'], 1)
+        telemetry.end(token)
+        telemetry.observe('wait_proxy', 10, 2)
+        telemetry.observe('wait_proxy', 30, 4)
+        telemetry.record_error('tls')
+        snapshot = telemetry.snapshot(retry_waiting=2)
+        stage = snapshot['stages']['wait_proxy']
+        self.assertEqual(stage['active'], 0)
+        self.assertEqual(stage['completed'], 3)
+        self.assertGreaterEqual(stage['p95_ms'], 30)
+        self.assertGreaterEqual(stage['thread_cpu_total_ms'], 6)
+        self.assertEqual(snapshot['errors'], {'tls': 1})
+        self.assertEqual(snapshot['retry_waiting'], 2)
+
+    def test_disabled_snapshot_has_no_stage_payload(self):
+        telemetry = StageTelemetry(False)
+        telemetry.end(telemetry.begin('wait_proxy'))
+        self.assertEqual(telemetry.snapshot(), {'enabled': False})
 
 
 class ScriptedProxyPool:

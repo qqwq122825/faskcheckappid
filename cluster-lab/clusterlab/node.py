@@ -741,6 +741,84 @@ class Node:
         return output
 
     @classmethod
+    def _diagnostic_stage_metrics(cls, value):
+        """Keep only bounded numeric stage aggregates from worker progress."""
+        if not isinstance(value, dict):
+            return None
+        output = {'enabled': bool(value.get('enabled'))}
+        for key in ('retry_waiting', 'elapsed_ms', 'process_cpu_ms',
+                    'process_core_equivalents'):
+            if value.get(key) is None:
+                continue
+            try:
+                number = float(value[key])
+                output[key] = int(number) if key == 'retry_waiting' else round(number, 3)
+            except (TypeError, ValueError):
+                pass
+        output['errors'] = cls._diagnostic_counts(value.get('errors'))
+        stages = {}
+        raw_stages = value.get('stages')
+        if isinstance(raw_stages, dict):
+            for raw_name, raw_stage in list(raw_stages.items())[:80]:
+                if not isinstance(raw_stage, dict):
+                    continue
+                stage = {}
+                for key in ('active', 'completed', 'window_samples'):
+                    try:
+                        stage[key] = max(0, int(raw_stage.get(key) or 0))
+                    except (TypeError, ValueError):
+                        pass
+                for key in ('average_ms', 'p50_ms', 'p95_ms', 'p99_ms',
+                            'maximum_ms', 'wall_total_ms', 'thread_cpu_total_ms'):
+                    try:
+                        stage[key] = round(max(0.0, float(raw_stage.get(key) or 0)), 3)
+                    except (TypeError, ValueError):
+                        pass
+                stages[str(raw_name)[:60]] = stage
+        output['stages'] = stages
+        return output
+
+    @staticmethod
+    def _diagnostic_stage_summary(values):
+        """Merge process snapshots without claiming unobservable global percentiles."""
+        metrics = [value for value in values
+                   if isinstance(value, dict) and value.get('enabled')]
+        if not metrics:
+            return {'enabled': False, 'processes': 0, 'stages': {}, 'errors': {}}
+        stages, errors = {}, {}
+        process_cpu_ms = 0.0
+        for value in metrics:
+            process_cpu_ms += float(value.get('process_cpu_ms') or 0)
+            for key, count in (value.get('errors') or {}).items():
+                errors[key] = errors.get(key, 0) + int(count)
+            for name, stage in (value.get('stages') or {}).items():
+                merged = stages.setdefault(name, {
+                    'active': 0, 'completed': 0, 'wall_total_ms': 0.0,
+                    'thread_cpu_total_ms': 0.0, 'maximum_ms': 0.0,
+                    'p50_ms_max': 0.0, 'p95_ms_max': 0.0, 'p99_ms_max': 0.0})
+                merged['active'] += int(stage.get('active') or 0)
+                merged['completed'] += int(stage.get('completed') or 0)
+                merged['wall_total_ms'] += float(stage.get('wall_total_ms') or 0)
+                merged['thread_cpu_total_ms'] += float(
+                    stage.get('thread_cpu_total_ms') or 0)
+                for source, target in (('maximum_ms', 'maximum_ms'),
+                                       ('p50_ms', 'p50_ms_max'),
+                                       ('p95_ms', 'p95_ms_max'),
+                                       ('p99_ms', 'p99_ms_max')):
+                    merged[target] = max(merged[target], float(stage.get(source) or 0))
+        for stage in stages.values():
+            completed = stage['completed']
+            stage['average_ms'] = round(
+                stage['wall_total_ms'] / completed, 3) if completed else 0.0
+            for key, number in tuple(stage.items()):
+                if isinstance(number, float):
+                    stage[key] = round(number, 3)
+        return {'enabled': True, 'processes': len(metrics),
+                'process_cpu_ms': round(process_cpu_ms, 3),
+                'errors': dict(sorted(errors.items())),
+                'stages': dict(sorted(stages.items()))}
+
+    @classmethod
     def _diagnostic_state(cls, value):
         """Return execution counters without credentials, paths or row content."""
         if not isinstance(value, dict):
@@ -770,6 +848,9 @@ class Node:
                 max(0, int(item)) for item in value['active_threads_by_process'][:32]]
         if value.get('counts') is not None:
             output['counts'] = cls._diagnostic_counts(value.get('counts'))
+        if value.get('stage_metrics') is not None:
+            output['stage_metrics'] = cls._diagnostic_stage_metrics(
+                value.get('stage_metrics'))
         pool = value.get('proxy_pool')
         if isinstance(pool, dict):
             safe_pool = {}
@@ -919,6 +1000,13 @@ class Node:
                     'progress': self._diagnostic_state(read_json(worker / 'progress.json', {})),
                     'done': self._diagnostic_state(read_json(worker / 'done.json', {})),
                 })
+        stage_sources = [entry['progress'].get('stage_metrics')
+                         for entry in worker_states
+                         if isinstance(entry.get('progress'), dict)
+                         and isinstance(entry['progress'].get('stage_metrics'), dict)]
+        if not stage_sources and isinstance(progress, dict):
+            stage_sources = [progress.get('stage_metrics')]
+        stage_summary = self._diagnostic_stage_summary(stage_sources)
         telemetry = {key: self.telemetry.latest.get(key) for key in
                      ('cpu_percent', 'memory_percent', 'upload_bps', 'download_bps',
                       'network_bytes', 'sampled_at', 'scope')
@@ -955,6 +1043,7 @@ class Node:
                 },
             },
             'progress': progress, 'done': done, 'workers': worker_states,
+            'stage_summary': stage_summary,
             'debug': self._diagnostic_debug(directory / 'proxy-debug.jsonl', recent_limit),
             'server_time': time.time(),
         }

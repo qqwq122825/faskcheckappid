@@ -183,6 +183,14 @@ class NodeRecoveryTests(unittest.TestCase):
             'configured_process_limit': 4, 'cpu_reserve': 1,
             'threads_per_process': 250, 'active_threads_per_process': 333,
             'counts': {'wrong_password': 110, 'locked': 10},
+            'stage_metrics': {
+                'enabled': True, 'retry_waiting': 7, 'process_cpu_ms': 900.0,
+                'process_core_equivalents': 0.9, 'errors': {'tls': 4},
+                'stages': {'auth_request': {
+                    'active': 12, 'completed': 120, 'window_samples': 120,
+                    'average_ms': 1500, 'p50_ms': 1100, 'p95_ms': 3000,
+                    'p99_ms': 5000, 'maximum_ms': 7000,
+                    'wall_total_ms': 180000, 'thread_cpu_total_ms': 800}}},
             'proxy_pool': {'available': 240, 'endpoint': 'socks5://secret'}}), 'utf-8')
         (directory / 'proxy-debug.jsonl').write_text('\n'.join((
             json.dumps({'event': 'worker_start', 'srp_math_backend': 'gmpy2',
@@ -212,6 +220,9 @@ class NodeRecoveryTests(unittest.TestCase):
             'sampling_strategy': 'first_and_every_n_plus_slow_and_timeout'})
         self.assertEqual(value['debug']['srp']['compute_cpu_ms']['total'], 8.5)
         self.assertEqual(value['debug']['srp']['math_backends'], {'gmpy2': 1})
+        self.assertEqual(value['stage_summary']['errors'], {'tls': 4})
+        self.assertEqual(value['stage_summary']['stages']['auth_request']['active'], 12)
+        self.assertEqual(value['progress']['stage_metrics']['retry_waiting'], 7)
         encoded = json.dumps(value)
         for secret in ('top-secret-lease', 'user:password', 'hunter2',
                        '10.0.0.1', '/private/device-pool', 'proxy.invalid'):
@@ -555,7 +566,7 @@ class NodeRecoveryTests(unittest.TestCase):
                 return {'state': states[slot], 'device_id': f'device-{slot}'}
 
         root = self.node.root / 'device-pool'
-        for slot in (1, 2):
+        for slot in (1, 2, 3):
             path = root / 'devices' / str(slot)
             path.mkdir(parents=True, exist_ok=True)
             (path / '.lease-state.json').write_text(json.dumps({
@@ -567,11 +578,11 @@ class NodeRecoveryTests(unittest.TestCase):
              patch.object(self.node.builder, 'registry', return_value={}):
             snapshot = self.node.builder.snapshot()
         self.assertEqual([row['state'] for row in snapshot['slots']],
-                         ['in_use', 'registering', 'missing'])
+                         ['in_use', 'registering', 'registering'])
         self.assertEqual(snapshot['ready'], 1)
         self.assertEqual(snapshot['in_use'], 1)
-        self.assertEqual(snapshot['registering'], 1)
-        self.assertEqual(snapshot['pending'], 1)
+        self.assertEqual(snapshot['registering'], 2)
+        self.assertEqual(snapshot['pending'], 0)
         self.assertEqual(snapshot['failed_slots'], 0)
 
     def test_ready_legacy_device_recovers_model_and_registration_time(self):

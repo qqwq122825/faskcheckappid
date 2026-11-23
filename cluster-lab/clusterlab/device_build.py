@@ -92,7 +92,7 @@ class DeviceBuilder:
                     ready += 1
                     if lease:
                         state = 'in_use'
-                elif state in ('pending', 'invalid') and lease:
+                elif state in ('missing', 'pending', 'invalid') and lease:
                     # Work threads register missing identities under the same
                     # exclusive slot lease used for requests.  The standalone
                     # builder is not running in that path, so infer the live

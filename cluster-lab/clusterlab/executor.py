@@ -46,6 +46,112 @@ PERFORMANCE_TRACE_SLOW_MS = 30000.0
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
 PROXY_EXIT_IP_TIMEOUT = 4.0
 PROXY_EXIT_IP_MAX = 2048
+STAGE_SAMPLE_LIMIT = 2048
+
+
+def _percentile(values, percentile):
+    """Return a deterministic nearest-rank percentile for bounded telemetry."""
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return 0.0
+    rank = max(0, min(len(ordered) - 1,
+                      math.ceil((float(percentile) / 100.0) * len(ordered)) - 1))
+    return round(ordered[rank], 3)
+
+
+class StageTelemetry:
+    """Low-volume aggregate timings for the public node task-log API.
+
+    It never stores accounts, proxy endpoints or response bodies.  Debug mode
+    pays two short lock acquisitions per outer stage; normal execution uses a
+    disabled instance and therefore has no shared-lock overhead.
+    """
+
+    def __init__(self, enabled=False):
+        self.enabled = bool(enabled)
+        self.lock = threading.Lock()
+        self.active = {}
+        self.completed = {}
+        self.wall_ms = {}
+        self.cpu_ms = {}
+        self.maximum_ms = {}
+        self.samples = {}
+        self.errors = {}
+        self.started_wall = time.monotonic()
+        self.started_cpu = time.process_time()
+
+    def begin(self, stage):
+        if not self.enabled:
+            return None
+        name = str(stage or 'unknown')[:60]
+        with self.lock:
+            self.active[name] = self.active.get(name, 0) + 1
+        return name, time.monotonic(), time.thread_time()
+
+    def end(self, token):
+        if token is None:
+            return
+        name, wall_started, cpu_started = token
+        self.observe(name, (time.monotonic() - wall_started) * 1000.0,
+                     (time.thread_time() - cpu_started) * 1000.0, active_delta=-1)
+
+    def observe(self, stage, wall_ms, cpu_ms=0.0, active_delta=0):
+        if not self.enabled:
+            return
+        name = str(stage or 'unknown')[:60]
+        wall = max(0.0, float(wall_ms or 0.0))
+        cpu = max(0.0, float(cpu_ms or 0.0))
+        with self.lock:
+            if active_delta:
+                self.active[name] = max(
+                    0, self.active.get(name, 0) + int(active_delta))
+            self.completed[name] = self.completed.get(name, 0) + 1
+            self.wall_ms[name] = self.wall_ms.get(name, 0.0) + wall
+            self.cpu_ms[name] = self.cpu_ms.get(name, 0.0) + cpu
+            self.maximum_ms[name] = max(self.maximum_ms.get(name, 0.0), wall)
+            samples = self.samples.setdefault(name, deque(maxlen=STAGE_SAMPLE_LIMIT))
+            samples.append(wall)
+
+    def record_error(self, category):
+        if not self.enabled:
+            return
+        name = str(category or 'other')[:60]
+        with self.lock:
+            self.errors[name] = self.errors.get(name, 0) + 1
+
+    def snapshot(self, retry_waiting=0):
+        if not self.enabled:
+            return {'enabled': False}
+        with self.lock:
+            names = sorted(set(self.active) | set(self.completed))
+            stages = {}
+            for name in names:
+                values = list(self.samples.get(name, ()))
+                completed = int(self.completed.get(name, 0))
+                total = float(self.wall_ms.get(name, 0.0))
+                stages[name] = {
+                    'active': int(self.active.get(name, 0)),
+                    'completed': completed,
+                    'window_samples': len(values),
+                    'average_ms': round(total / completed, 3) if completed else 0.0,
+                    'p50_ms': _percentile(values, 50),
+                    'p95_ms': _percentile(values, 95),
+                    'p99_ms': _percentile(values, 99),
+                    'maximum_ms': round(float(self.maximum_ms.get(name, 0.0)), 3),
+                    'wall_total_ms': round(total, 3),
+                    'thread_cpu_total_ms': round(float(self.cpu_ms.get(name, 0.0)), 3),
+                }
+            elapsed_ms = max(0.001, (time.monotonic() - self.started_wall) * 1000.0)
+            process_cpu_ms = max(0.0, (time.process_time() - self.started_cpu) * 1000.0)
+            return {
+                'enabled': True,
+                'retry_waiting': max(0, int(retry_waiting or 0)),
+                'elapsed_ms': round(elapsed_ms, 3),
+                'process_cpu_ms': round(process_cpu_ms, 3),
+                'process_core_equivalents': round(process_cpu_ms / elapsed_ms, 3),
+                'errors': dict(sorted(self.errors.items())),
+                'stages': stages,
+            }
 
 
 def stall_timeout_seconds(descriptor, minimum=MIN_STALL_TIMEOUT_SECONDS,
@@ -1827,6 +1933,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         slot_ids, descriptor.get('process_request_budget'))
     use_limit = max(1, int(descriptor.get('device_use_limit') or DEVICE_USE_LIMIT))
     debug_enabled = _proxy_debug_enabled(descriptor)
+    stage_telemetry = StageTelemetry(debug_enabled)
     debug_path = (descriptor.get('_proxy_debug_path') or
                   str(directory / 'proxy-debug.jsonl')) if debug_enabled else None
     exit_ip_debug = _ProxyExitIpDebug(debug_path) if debug_enabled else None
@@ -1868,31 +1975,35 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         pool, slot_ids, device_root=device_root, use_limit=use_limit)
 
     def proxy_for(index):
-        if proxy_pool is not None:
-            # Pool exhaustion is backpressure, not an account result.  A
-            # healthy exit may be busy in another worker and become reusable
-            # after that request finishes, so keep waiting while the pool has
-            # any known (queued or leased) inventory.  Only report an empty
-            # pool after both queues and all active leases have remained empty
-            # for a full supplier window.
-            empty_since = None
-            while not stop.is_set():
-                lease = proxy_pool.acquire(wait=PROXY_ACQUIRE_WAIT_SECONDS)
-                if lease is not None:
-                    return lease[0], lease
-                state = _proxy_pool_snapshot(proxy_pool)
-                if int(state.get('known') or 0) > 0:
-                    empty_since = None
-                    continue
-                now = time.monotonic()
-                if empty_since is None:
-                    empty_since = now
-                if now - empty_since >= PROXY_EMPTY_GRACE_SECONDS:
-                    break
-            return None, None
-        if not proxies:
-            return proxy, None
-        return proxies[index % len(proxies)], None
+        token = stage_telemetry.begin('wait_proxy')
+        try:
+            if proxy_pool is not None:
+                # Pool exhaustion is backpressure, not an account result.  A
+                # healthy exit may be busy in another worker and become reusable
+                # after that request finishes, so keep waiting while the pool has
+                # any known (queued or leased) inventory.  Only report an empty
+                # pool after both queues and all active leases have remained empty
+                # for a full supplier window.
+                empty_since = None
+                while not stop.is_set():
+                    lease = proxy_pool.acquire(wait=PROXY_ACQUIRE_WAIT_SECONDS)
+                    if lease is not None:
+                        return lease[0], lease
+                    state = _proxy_pool_snapshot(proxy_pool)
+                    if int(state.get('known') or 0) > 0:
+                        empty_since = None
+                        continue
+                    now = time.monotonic()
+                    if empty_since is None:
+                        empty_since = now
+                    if now - empty_since >= PROXY_EMPTY_GRACE_SECONDS:
+                        break
+                return None, None
+            if not proxies:
+                return proxy, None
+            return proxies[index % len(proxies)], None
+        finally:
+            stage_telemetry.end(token)
 
     def apple_retry_later(result):
         apple_text = ' '.join(str(result.get(key) or '').strip()
@@ -1984,6 +2095,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     phase_cpu_ms[phase] += max(
                         0.0, float(event.get('cpu_ms') or 0))
                     phase_counts[phase] += 1
+                    stage_telemetry.observe(
+                        'phase_' + phase, event.get('ms') or 0,
+                        event.get('cpu_ms') or 0)
                 except (TypeError, ValueError):
                     return
 
@@ -2034,7 +2148,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             identity_loaded = False
             try:
                 device_started = time.monotonic() if debug_enabled else None
-                device_lease = device_allocator.acquire(stop)
+                device_wait_token = stage_telemetry.begin('wait_device')
+                try:
+                    device_lease = device_allocator.acquire(stop)
+                finally:
+                    stage_telemetry.end(device_wait_token)
                 if debug_enabled:
                     device_lease_ms = round(
                         (time.monotonic() - device_started) * 1000, 3)
@@ -2058,37 +2176,45 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             identities, identity_fetched_at, slot_id)
                         if identity is None:
                             ready = pool.inspect(slot_id)['state'] == 'ready'
+                            identity_stage = ('identity_fetch' if ready
+                                              else 'device_register')
+                            identity_token = stage_telemetry.begin(identity_stage)
                             registration_deadline = (
                                 time.monotonic() + DEVICE_REGISTRATION_TIMEOUT_SECONDS
                                 if not ready else None)
-                            info_timeout = (max(0.1, registration_deadline - time.monotonic())
-                                            if registration_deadline is not None else timeout)
-                            info = pool.info(info_timeout, proxy=account_proxy,
-                                             provider_direct=True)
-                            device_was_ready = ready
-                            profile = device_profile(pool, slot_id)
-                            info = dict(info, client_info=profile['client_info'],
-                                        user_agent=profile['user_agent'])
-                            identity_timeout = (
-                                max(0.1, registration_deadline - time.monotonic())
-                                if registration_deadline is not None else max(timeout, 40))
-                            if registration_deadline is not None and identity_timeout <= 0.1:
-                                raise TimeoutError('设备注册超过20秒')
-                            identity = pool.fetch_headers(
-                                slot_id, info, identity_timeout, registered=ready,
-                                proxy=account_proxy, provider_direct=True)
-                            identity_loaded = True
-                            identities[slot_id] = identity
-                            identity_fetched_at[slot_id] = time.monotonic()
-                            refreshed = pool.inspect(slot_id)
-                            device_labels[slot_id] = _device_id_label(
-                                refreshed.get('device_id'))
-                            if not ready and refreshed['state'] == 'ready':
-                                device_registered = True
-                                device_allocator.reset_registered(device_lease)
-                                record_device_registration(
-                                    device_root, slot_id, account_proxy,
-                                    profile.get('model', ''))
+                            try:
+                                info_timeout = (max(
+                                    0.1, registration_deadline - time.monotonic())
+                                    if registration_deadline is not None else timeout)
+                                info = pool.info(info_timeout, proxy=account_proxy,
+                                                 provider_direct=True)
+                                device_was_ready = ready
+                                profile = device_profile(pool, slot_id)
+                                info = dict(info, client_info=profile['client_info'],
+                                            user_agent=profile['user_agent'])
+                                identity_timeout = (
+                                    max(0.1, registration_deadline - time.monotonic())
+                                    if registration_deadline is not None else max(timeout, 40))
+                                if (registration_deadline is not None
+                                        and identity_timeout <= 0.1):
+                                    raise TimeoutError('设备注册超过20秒')
+                                identity = pool.fetch_headers(
+                                    slot_id, info, identity_timeout, registered=ready,
+                                    proxy=account_proxy, provider_direct=True)
+                                identity_loaded = True
+                                identities[slot_id] = identity
+                                identity_fetched_at[slot_id] = time.monotonic()
+                                refreshed = pool.inspect(slot_id)
+                                device_labels[slot_id] = _device_id_label(
+                                    refreshed.get('device_id'))
+                                if not ready and refreshed['state'] == 'ready':
+                                    device_registered = True
+                                    device_allocator.reset_registered(device_lease)
+                                    record_device_registration(
+                                        device_root, slot_id, account_proxy,
+                                        profile.get('model', ''))
+                            finally:
+                                stage_telemetry.end(identity_token)
                         if debug_enabled:
                             device_identity_ms = round(
                                 (time.monotonic() - identity_started) * 1000, 3)
@@ -2109,10 +2235,15 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 # twentieth request retires this identity in release().
                 device_use = device_allocator.consume(device_lease)
                 # 换 IP 重试由节点池处理，协议层每次只使用当前出口一次。
-                result = gsa_check(account, password, account_proxy, timeout=timeout,
-                                   retries=0 if proxy_pool is not None else retries,
-                                   cancel=stop.is_set, identity=identity,
-                                   diagnostics=(collect_phase if trace_sampled else None))
+                auth_token = stage_telemetry.begin('auth_request')
+                try:
+                    result = gsa_check(
+                        account, password, account_proxy, timeout=timeout,
+                        retries=0 if proxy_pool is not None else retries,
+                        cancel=stop.is_set, identity=identity,
+                        diagnostics=(collect_phase if debug_enabled else None))
+                finally:
+                    stage_telemetry.end(auth_token)
                 result['_device_use'] = device_use
                 if descriptor.get('_web_secondary_auth'):
                     def rotate_web(web_attempt):
@@ -2180,6 +2311,24 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 web_http = None
             web_failed = (str(result.get('web_status') or '').casefold() == 'error'
                           and web_http in (0, 500, 502, 503, 504))
+            if transport_failed or web_failed:
+                error_text = ' '.join(str(result.get(key) or '') for key in
+                                      ('kind', 'detail', 'web_kind', 'web_detail')).casefold()
+                if result_http == 503 or web_http == 503:
+                    error_category = 'http_503'
+                elif 'ssl' in error_text or 'certificate' in error_text:
+                    error_category = 'tls'
+                elif 'socks' in error_text:
+                    error_category = 'socks'
+                elif 'timeout' in error_text or 'timed out' in error_text:
+                    error_category = 'timeout'
+                elif 'connect' in error_text:
+                    error_category = 'connect'
+                elif apple_ec in (-22421, -22410, -332000, -33200, -3000303):
+                    error_category = 'apple_transient'
+                else:
+                    error_category = 'transport_other'
+                stage_telemetry.record_error(error_category)
             if debug_enabled and (trace_sampled
                                   or (request_ms or 0) >= PERFORMANCE_TRACE_SLOW_MS):
                 _write_proxy_debug(
@@ -2353,6 +2502,24 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 finished, _unfinished = wait(pending, timeout=wait_timeout,
                                              return_when=FIRST_COMPLETED)
                 if not finished:
+                    # Debug mode must expose where live threads are blocked even
+                    # before the first account finishes.  Otherwise a 20-second
+                    # proxy/device/request stall looks like an empty log.
+                    now = time.monotonic()
+                    if debug_enabled and now - last_progress >= 0.25:
+                        atomic_json(directory / 'progress.json',
+                                    {'processed': processed, 'started': started,
+                                     'counts': dict(counters),
+                                     'queue_low_water': LOCAL_QUEUE_LOW_WATER,
+                                     'queue_target': LOCAL_QUEUE_TARGET,
+                                     'queued': sum(
+                                         1 for future in pending
+                                         if not future.running() and not future.done()),
+                                     'in_flight': sum(
+                                         1 for future in pending if future.running()),
+                                     'stage_metrics': stage_telemetry.snapshot(
+                                         len(delayed))})
+                        last_progress = now
                     continue
                 future = finished.pop()
                 pending.remove(future)
@@ -2411,9 +2578,13 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             'web_proxy_rotations', 'web_rotation_exhausted'):
                     if result.get(key) not in (None, ''):
                         record[key] = result[key]
-                encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
-                output.write(encoded)
-                output_digest.update(encoded)
+                submit_token = stage_telemetry.begin('result_submit')
+                try:
+                    encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
+                    output.write(encoded)
+                    output_digest.update(encoded)
+                finally:
+                    stage_telemetry.end(submit_token)
                 now = time.monotonic()
                 if now - last_progress >= 0.25:
                     # The node agent tails this local file once per second and
@@ -2432,7 +2603,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                                  'queued': sum(1 for future in pending
                                                if not future.running() and not future.done()),
                                  'in_flight': sum(1 for future in pending
-                                                  if future.running())})
+                                                  if future.running()),
+                                 'stage_metrics': stage_telemetry.snapshot(len(delayed))})
                     last_progress = now
 
     if processed != int(descriptor.get('rows') or 0):
@@ -2443,11 +2615,13 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                  'counts': dict(counters),
                  'queue_low_water': LOCAL_QUEUE_LOW_WATER,
                  'queue_target': LOCAL_QUEUE_TARGET,
-                 'queued': 0, 'in_flight': 0})
+                 'queued': 0, 'in_flight': 0,
+                 'stage_metrics': stage_telemetry.snapshot(0)})
     atomic_json(directory / 'done.json',
                 {'ok': True, 'processed': processed, 'counts': dict(counters),
                  'checksum': output_digest.hexdigest(),
-                 'elapsed': time.time() - started})
+                 'elapsed': time.time() - started,
+                 'stage_metrics': stage_telemetry.snapshot(0)})
     if debug_enabled:
         exit_ip_debug.close()
         _write_proxy_debug(debug_path, 'worker_stop', ok=True, processed=processed,
