@@ -57,6 +57,12 @@ class DeviceBuilder:
             data = dict(self.state)
             data['slot_errors'] = dict(data.get('slot_errors') or {})
         persisted_capacity = 0
+        configured_capacity = 0
+        try:
+            configured_capacity = max(
+                0, int(read_json(root / 'target.json', {}).get('capacity') or 0))
+        except (TypeError, ValueError):
+            configured_capacity = 0
         try:
             DevicePool, _, _ = _load_fastcheck()
             # The in-memory builder state resets on a service restart. Discover
@@ -68,7 +74,8 @@ class DeviceBuilder:
                         if path.is_dir() and path.name.isdigit()
                         and 1 <= int(path.name) <= 200] if device_root.is_dir() else []
             persisted_capacity = max(existing, default=0)
-            limit = max(1, int(data.get('capacity') or 0), persisted_capacity)
+            limit = max(1, int(data.get('capacity') or 0), persisted_capacity,
+                        configured_capacity)
             for slot in range(1, limit + 1):
                 inspected = pool.inspect(slot)
                 state = inspected['state']
@@ -96,7 +103,9 @@ class DeviceBuilder:
             entry['recorded'] = bool(info)
         attempted = sum(entry['state'] != 'missing' for entry in slots)
         data.update(ready=ready, attempted=attempted, slots=slots,
-                    capacity=max(int(data.get('capacity') or 0), persisted_capacity, ready))
+                    capacity=max(int(data.get('capacity') or 0), persisted_capacity,
+                                 configured_capacity, ready),
+                    target_capacity=configured_capacity)
         return data
 
     @staticmethod
@@ -132,6 +141,9 @@ class DeviceBuilder:
                               proxy_status='checking', proxy_ip='',
                               slot_errors={},
                               started_at=time.strftime('%H:%M:%S'))
+            root = self.node.root / 'device-pool'
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            atomic_json(root / 'target.json', {'capacity': int(capacity)})
             self.thread = threading.Thread(target=self._run, args=(int(capacity),),
                                            name='device-builder', daemon=True)
             self.thread.start()

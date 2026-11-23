@@ -605,22 +605,31 @@ class Node:
         return True
 
     def _prepare_auth_devices(self, descriptor):
-        """Expose one candidate slot per worker; missing slots register on demand."""
+        """Expose the configured device slots; missing slots register on demand."""
         snapshot = self.builder.snapshot()
         ready_slots = [int(item['slot']) for item in snapshot.get('slots') or []
                        if item.get('state') == 'ready']
         rows = max(1, int(descriptor.get('rows') or 1))
         processes = max(1, min(int(descriptor.get('processes') or 1), rows))
         threads = max(1, int(descriptor.get('threads') or 1))
-        # 4 进程 × 250 线程得到 1000 个可独占槽位。已有设备先用；
-        # 所有已有设备都在用时，工作线程占用一个缺失槽位并自行注册。
-        requested = min(2000, rows, processes * threads)
-        capacity = max(max(ready_slots, default=0), requested, 1)
+        # 4×250 仅是配置上限。实际并发由设备槽位数收敛；
+        # 默认30台时是 8/8/7/7，不再创建1000个等待线程。
+        explicit_target = int(descriptor.get('device_slot_limit') or 0)
+        saved_target = int(snapshot.get('target_capacity') or 0)
+        # A saved initialization target is authoritative (for example 30 or
+        # 200).  Legacy pools without a saved target may grow on demand to
+        # 200 slots instead of reverting to 4×250=1000 waiting threads.
+        pool_target = max(1, explicit_target or saved_target or
+                          max(int(snapshot.get('capacity') or 0), 200))
+        requested = min(200, rows, processes * threads, pool_target)
+        capacity = max(requested, 1)
         slots = list(range(1, capacity + 1))
         descriptor.pop('device_capacity', None)
         descriptor['processes'] = processes
         descriptor['device_pool_capacity'] = capacity
         descriptor['device_slots'] = slots
+        descriptor['device_use_limit'] = max(
+            1, int(descriptor.get('device_use_limit') or 20))
         self.builder.reserve(slots)
 
     def start(self):
@@ -750,7 +759,8 @@ class Node:
         integer_fields = (
             'processed', 'workers', 'worker_limit', 'configured_process_limit',
             'cpu_reserve', 'threads_per_process', 'active_threads_per_process',
-            'queue_low_water', 'queue_target', 'queued', 'in_flight')
+            'active_threads_total', 'queue_low_water', 'queue_target', 'queued',
+            'in_flight')
         for key in integer_fields:
             if value.get(key) is not None:
                 try:
@@ -765,6 +775,9 @@ class Node:
                     pass
         if 'ok' in value:
             output['ok'] = bool(value.get('ok'))
+        if isinstance(value.get('active_threads_by_process'), list):
+            output['active_threads_by_process'] = [
+                max(0, int(item)) for item in value['active_threads_by_process'][:32]]
         if value.get('counts') is not None:
             output['counts'] = cls._diagnostic_counts(value.get('counts'))
         pool = value.get('proxy_pool')

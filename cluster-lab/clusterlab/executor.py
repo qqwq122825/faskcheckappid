@@ -30,6 +30,7 @@ PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
 DEVICE_LEASE_POLL_SECONDS = 0.05
 DEVICE_IDENTITY_TTL_SECONDS = 30.0
+DEVICE_USE_LIMIT = 20
 LOCAL_QUEUE_LOW_WATER = 100
 LOCAL_QUEUE_TARGET = 300
 MIN_STALL_TIMEOUT_SECONDS = 180.0
@@ -52,7 +53,15 @@ def _partition_device_slots(slot_ids, process_count, process_index):
     slots = [int(value) for value in slot_ids]
     count = max(1, int(process_count))
     index = max(0, int(process_index))
-    return slots[index::count] or [index + 1]
+    return slots[index::count]
+
+
+def _effective_auth_workers(configured, slot_ids, request_budget=None):
+    """Bound real threads by exclusive devices and an optional node budget."""
+    limit = max(1, int(configured or 1))
+    slots = len(list(slot_ids or ()))
+    budget = limit if request_budget is None else max(1, int(request_budget or 1))
+    return max(1, min(limit, slots or 1, budget))
 
 
 def _slot_for_account(account, slot_ids):
@@ -97,11 +106,15 @@ def _local_queue_refill_count(workers, pending, queued):
 class DeviceAuthLease:
     """A process-safe, exclusive lease for one persisted device slot."""
 
-    def __init__(self, handle, state_path, slot, initial_state):
+    def __init__(self, handle, state_path, slot, initial_state, pool):
         self.handle = handle
         self.state_path = state_path
         self.slot = int(slot)
         self.initial_state = str(initial_state or 'missing')
+        self.pool = pool
+        self.uses = 0
+        self.use_limit = DEVICE_USE_LIMIT
+        self.retire_on_release = False
         self.released = False
 
     @classmethod
@@ -132,7 +145,31 @@ class DeviceAuthLease:
             'acquired_at': now,
             'last_used_at': previous.get('last_used_at'),
         })
-        return cls(handle, state_path, slot, initial_state)
+        return cls(handle, state_path, slot, initial_state, pool)
+
+    def reset_registered_usage(self, device_root):
+        """A newly registered identity starts at zero uses."""
+        _set_device_usage(device_root, self.slot, 0)
+        self.uses = 0
+
+    def consume(self, device_root, use_limit=DEVICE_USE_LIMIT):
+        """Atomically consume one use immediately before the external request."""
+        self.use_limit = max(1, int(use_limit or DEVICE_USE_LIMIT))
+        self.uses = _consume_device_use(device_root, self.slot, self.use_limit)
+        self.retire_on_release = self.uses >= self.use_limit
+        return self.uses
+
+    def _retire_identity(self):
+        """Remove identity bytes while retaining the slot's lock files."""
+        directory = self.pool.slot_directory(self.slot)
+        for path in directory.iterdir() if directory.is_dir() else ():
+            if path.name in ('.lease.lock', '.lease-state.json'):
+                continue
+            if path.is_dir():
+                import shutil
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
 
     @classmethod
     def acquire_any(cls, pool, slots, stop):
@@ -163,8 +200,11 @@ class DeviceAuthLease:
 
         now = time.time()
         try:
+            if self.retire_on_release:
+                self._retire_identity()
             atomic_json(self.state_path, {
-                'state': 'idle', 'slot': self.slot,
+                'state': 'retired' if self.retire_on_release else 'idle',
+                'slot': self.slot, 'uses': self.uses,
                 'last_used_at': now,
                 'last_used': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now)),
             })
@@ -177,9 +217,13 @@ class DeviceAuthLease:
 class DeviceLeaseAllocator:
     """Rotate scan starts so hundreds of threads do not hammer slot one."""
 
-    def __init__(self, pool, slots):
+    def __init__(self, pool, slots, device_root=None, use_limit=DEVICE_USE_LIMIT):
         self.pool = pool
+        self.device_root = device_root
+        self.use_limit = max(1, int(use_limit or DEVICE_USE_LIMIT))
         self.lock = threading.Lock()
+        self.usage = _usage_snapshot(device_root)
+        self.dirty_usage = set()
         self.ready = []
         self.missing = []
         for slot in (int(value) for value in slots):
@@ -211,9 +255,54 @@ class DeviceLeaseAllocator:
             for slot in ready + missing:
                 lease = DeviceAuthLease.try_acquire(self.pool, slot)
                 if lease is not None:
+                    with self.lock:
+                        prior = int(self.usage.get(slot, 0))
+                    if lease.initial_state == 'ready' and prior >= self.use_limit:
+                        lease.uses = prior
+                        lease.use_limit = self.use_limit
+                        lease.retire_on_release = True
+                        lease.release()
+                        # The retired identity bytes are gone.  Reset the slot
+                        # counter so the next owner can register a fresh
+                        # identity in this same pool slot.
+                        with self.lock:
+                            self.usage[slot] = 0
+                            self.dirty_usage.add(slot)
+                        continue
                     return lease
             stop.wait(DEVICE_LEASE_POLL_SECONDS)
         raise InterruptedError('节点关闭，停止等待设备')
+
+    def reset_registered(self, lease):
+        """A freshly registered identity begins at zero uses."""
+        with self.lock:
+            self.usage[lease.slot] = 0
+            self.dirty_usage.add(lease.slot)
+        lease.uses = 0
+
+    def consume(self, lease):
+        """Consume once under an in-process lock immediately before sending."""
+        with self.lock:
+            current = max(0, int(self.usage.get(lease.slot, 0)))
+            if current >= self.use_limit:
+                lease.uses = current
+                lease.retire_on_release = True
+                raise RuntimeError(
+                    f'device slot {lease.slot} reached use limit {self.use_limit}')
+            current += 1
+            self.usage[lease.slot] = current
+            self.dirty_usage.add(lease.slot)
+        lease.uses = current
+        lease.use_limit = self.use_limit
+        lease.retire_on_release = current >= self.use_limit
+        return current
+
+    def flush_usage(self):
+        """Persist this process' disjoint slot counters in one locked write."""
+        with self.lock:
+            values = {slot: self.usage[slot] for slot in self.dirty_usage}
+            self.dirty_usage.clear()
+        _merge_device_usage(self.device_root, values)
 
 
 def _proxy_debug_enabled(descriptor=None):
@@ -1085,17 +1174,33 @@ def execute_unit_group(directory, descriptor, stop):
     descriptor['_node_process_count'] = process_count
     descriptor['_node_configured_process_count'] = process_limit
     descriptor['_node_cpu_count'] = node_cpu_count
-    active_threads_per_process = (
-        _auth_worker_limit(descriptor.get('threads'), process_limit, process_count)
-        if descriptor.get('mode') == 'auth'
-        else max(1, int(descriptor.get('threads') or 1)))
+    configured_threads = max(1, int(descriptor.get('threads') or 1))
+    process_slots = []
+    if descriptor.get('mode') == 'auth':
+        assigned_slots = descriptor.get('device_slots') or []
+        process_count = min(process_count, max(1, len(assigned_slots)))
+        process_slots = [_partition_device_slots(assigned_slots, process_count, index)
+                         for index in range(process_count)]
+        active_threads_by_process = [
+            _effective_auth_workers(configured_threads, slots,
+                                    descriptor.get('process_request_budget'))
+            for slots in process_slots]
+        active_threads_per_process = max(active_threads_by_process)
+    else:
+        active_threads_by_process = [configured_threads] * process_count
+        active_threads_per_process = configured_threads
+    descriptor['_node_process_count'] = process_count
+    descriptor['configured_threads'] = configured_threads
     descriptor['_active_threads_per_process'] = active_threads_per_process
+    descriptor['_active_threads_by_process'] = active_threads_by_process
+    if descriptor.get('mode') == 'auth' and process_count == 1:
+        descriptor['threads'] = active_threads_by_process[0]
     context = mp.get_context('spawn')
     proxy_pool = None
     supplier_stop = None
     supplier_thread = None
     if descriptor.get('mode') == 'auth' and descriptor.get('proxy_api'):
-        concurrency = process_count * active_threads_per_process
+        concurrency = sum(active_threads_by_process)
         configured_target = max(1, int(descriptor.get('proxy_pool_size') or concurrency))
         proxy_pool = NodeProxyPool(
             context, concurrency,
@@ -1136,8 +1241,10 @@ def execute_unit_group(directory, descriptor, stop):
             pass
         read_progress.update(workers=0, worker_limit=process_limit,
                              active_process_limit=process_count,
-                             threads_per_process=int(descriptor.get('threads') or 1),
-                             active_threads_per_process=active_threads_per_process)
+                             threads_per_process=configured_threads,
+                             active_threads_per_process=active_threads_per_process,
+                             active_threads_by_process=active_threads_by_process,
+                             active_threads_total=sum(active_threads_by_process))
         if proxy_pool is not None:
             read_progress['proxy_pool'] = proxy_pool.snapshot()
         atomic_json(directory / 'progress.json', read_progress)
@@ -1181,8 +1288,10 @@ def execute_unit_group(directory, descriptor, stop):
                 # 每个进程分到一组不重叠槽位；30 台 / 10 进程时每进程 3 台，
                 # 避免整个子包的账号都累计到同一台设备。
                 assigned = descriptor.get('device_slots') or []
-                child['device_slots'] = _partition_device_slots(
-                    assigned or range(1, process_count + 1), process_count, index)
+                child['device_slots'] = process_slots[index]
+                child['configured_threads'] = configured_threads
+                child['threads'] = active_threads_by_process[index]
+                child['_active_threads_per_process'] = child['threads']
                 child['device_pool_capacity'] = int(
                     descriptor.get('device_pool_capacity') or max(assigned))
             atomic_json(child_dir / 'manifest.json', child)
@@ -1233,8 +1342,10 @@ def execute_unit_group(directory, descriptor, stop):
                             {'processed': processed, 'started': started,
                              'workers': active, 'worker_limit': process_count,
                              'configured_process_limit': process_limit,
-                             'threads_per_process': int(descriptor.get('threads') or 1),
+                             'threads_per_process': configured_threads,
                              'active_threads_per_process': active_threads_per_process,
+                             'active_threads_by_process': active_threads_by_process,
+                             'active_threads_total': sum(active_threads_by_process),
                              'counts': live_counts,
                              **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
                 last_write = now
@@ -1276,8 +1387,10 @@ def execute_unit_group(directory, descriptor, stop):
                     {'processed': processed, 'started': started, 'workers': 0,
                      'worker_limit': process_count,
                      'configured_process_limit': process_limit,
-                     'threads_per_process': int(descriptor.get('threads') or 1),
+                     'threads_per_process': configured_threads,
                      'active_threads_per_process': active_threads_per_process,
+                     'active_threads_by_process': active_threads_by_process,
+                     'active_threads_total': sum(active_threads_by_process),
                      'counts': merged_counts,
                      **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
         atomic_json(directory / 'done.json',
@@ -1286,6 +1399,8 @@ def execute_unit_group(directory, descriptor, stop):
                      'workers': process_count, 'elapsed': time.time() - started,
                      'configured_process_limit': process_limit,
                      'active_threads_per_process': active_threads_per_process,
+                     'active_threads_by_process': active_threads_by_process,
+                     'active_threads_total': sum(active_threads_by_process),
                      **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
     except Exception as exc:                                      # noqa: BLE001
         for process, child_stop, _ in children:
@@ -1308,8 +1423,10 @@ def execute_unit_group(directory, descriptor, stop):
                     {'processed': processed, 'started': started, 'workers': 0,
                      'worker_limit': process_count,
                      'configured_process_limit': process_limit,
-                     'threads_per_process': int(descriptor.get('threads') or 1),
+                     'threads_per_process': configured_threads,
                      'active_threads_per_process': active_threads_per_process,
+                     'active_threads_by_process': active_threads_by_process,
+                     'active_threads_total': sum(active_threads_by_process),
                      'counts': live_counts,
                      **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
         atomic_json(directory / 'done.json',
@@ -1401,6 +1518,66 @@ def _bump_usage(device_root, counts):
             atomic_json(path, data)
     except (OSError, portalocker.exceptions.LockException):
         pass
+
+
+def _merge_device_usage(device_root, values):
+    """Persist absolute counters for disjoint process-owned device slots."""
+    if not device_root or not values:
+        return
+    import portalocker
+    path = Path(device_root) / 'usage.json'
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock = path.with_suffix('.lock')
+    with portalocker.Lock(str(lock), mode='a+', timeout=10):
+        try:
+            data = json.loads(path.read_text('utf-8')) if path.exists() else {}
+        except (OSError, ValueError):
+            data = {}
+        for slot, value in values.items():
+            data[str(int(slot))] = max(0, int(value))
+        atomic_json(path, data)
+
+
+def _set_device_usage(device_root, slot, value):
+    """Set one slot's durable use counter under the shared usage lock."""
+    if not device_root:
+        return int(value)
+    import portalocker
+    path = Path(device_root) / 'usage.json'
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock = path.with_suffix('.lock')
+    with portalocker.Lock(str(lock), mode='a+', timeout=10):
+        try:
+            data = json.loads(path.read_text('utf-8')) if path.exists() else {}
+        except (OSError, ValueError):
+            data = {}
+        data[str(int(slot))] = max(0, int(value))
+        atomic_json(path, data)
+    return max(0, int(value))
+
+
+def _consume_device_use(device_root, slot, use_limit=DEVICE_USE_LIMIT):
+    """Increment a device exactly once before a request, never beyond limit."""
+    if not device_root:
+        raise ValueError('device_root is required for bounded device use')
+    import portalocker
+    path = Path(device_root) / 'usage.json'
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock = path.with_suffix('.lock')
+    with portalocker.Lock(str(lock), mode='a+', timeout=10):
+        try:
+            data = json.loads(path.read_text('utf-8')) if path.exists() else {}
+        except (OSError, ValueError):
+            data = {}
+        key = str(int(slot))
+        current = max(0, int(data.get(key) or 0))
+        limit = max(1, int(use_limit or DEVICE_USE_LIMIT))
+        if current >= limit:
+            raise RuntimeError(f'device slot {slot} reached use limit {limit}')
+        current += 1
+        data[key] = current
+        atomic_json(path, data)
+        return current
 
 
 def _usage_snapshot(device_root):
@@ -1496,12 +1673,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     retries = max(0, int(descriptor.get('retries') or 0))
     retry_delay = max(0.0, float(descriptor.get('_retry_delay',
                                                 PROXY_RETRY_DELAY_SECONDS)))
-    configured_workers = max(1, int(descriptor.get('threads') or 1))
-    workers = max(1, int(descriptor.get('_active_threads_per_process') or
-                         _auth_worker_limit(
-                             configured_workers,
-                             descriptor.get('_node_configured_process_count') or 1,
-                             descriptor.get('_node_process_count') or 1)))
+    configured_workers = max(1, int(descriptor.get('configured_threads') or
+                                    descriptor.get('threads') or 1))
+    workers = _effective_auth_workers(
+        descriptor.get('_active_threads_per_process') or descriptor.get('threads'),
+        slot_ids, descriptor.get('process_request_budget'))
+    use_limit = max(1, int(descriptor.get('device_use_limit') or DEVICE_USE_LIMIT))
     debug_enabled = _proxy_debug_enabled(descriptor)
     debug_path = (descriptor.get('_proxy_debug_path') or
                   str(directory / 'proxy-debug.jsonl')) if debug_enabled else None
@@ -1564,7 +1741,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     # 每个执行进程只让一个线程进入设备/SRP 准备段；
     # 网络认证仍由所有工作线程并发执行。
     device_prepare_gate = threading.Semaphore(1)
-    device_allocator = DeviceLeaseAllocator(pool, slot_ids)
+    device_allocator = DeviceLeaseAllocator(
+        pool, slot_ids, device_root=device_root, use_limit=use_limit)
 
     def proxy_for(index):
         if proxy_pool is not None:
@@ -1701,8 +1879,15 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             try:
                 device_lease = device_allocator.acquire(stop)
                 slot_id = device_lease.slot
-                identity = _cached_device_identity(
-                    identities, identity_fetched_at, slot_id)
+                if device_lease.initial_state == 'ready':
+                    identity = _cached_device_identity(
+                        identities, identity_fetched_at, slot_id)
+                else:
+                    # A retired slot has the same number but a new physical
+                    # identity.  Never reuse the previous device's 30s cache.
+                    identities.pop(slot_id, None)
+                    identity_fetched_at.pop(slot_id, None)
+                    identity = None
                 if identity is None:
                     # 每进程只开一条设备/SRP 准备通道。已有设备刷新头；
                     # 如果租到的是缺失槽位，就由当前工作线程完成注册。
@@ -1725,13 +1910,18 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             device_labels[slot_id] = _device_id_label(
                                 refreshed.get('device_id'))
                             if not ready and refreshed['state'] == 'ready':
+                                device_allocator.reset_registered(device_lease)
                                 record_device_registration(
                                     device_root, slot_id, account_proxy,
                                     profile.get('model', ''))
+                # Only the actual external request consumes one use.  The
+                # twentieth request retires this identity in release().
+                device_use = device_allocator.consume(device_lease)
                 # 换 IP 重试由节点池处理，协议层每次只使用当前出口一次。
                 result = gsa_check(account, password, account_proxy, timeout=timeout,
                                    retries=0 if proxy_pool is not None else retries,
                                    cancel=stop.is_set, identity=identity)
+                result['_device_use'] = device_use
                 if descriptor.get('_web_secondary_auth'):
                     def rotate_web(web_attempt):
                         nonlocal account_proxy, lease, current_proxy
@@ -1949,7 +2139,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     business_code = (result.get('detail') or result.get('kind') or '')[:180]
                 reason = _apple_reason_for_record(result, status, debug_enabled)
                 usage_counts[device] += 1
-                device_usage = int(usage_start.get(device, 0)) + usage_counts[device]
+                device_usage = int(result.get('_device_use') or
+                                   int(usage_start.get(device, 0)) + usage_counts[device])
                 record = {'row': row, 'account': account, 'password': password, 'status': status,
                           'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
                           'stage': result.get('stage') or '', 'http': result.get('http'),
@@ -1995,7 +2186,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     if processed != int(descriptor.get('rows') or 0):
         raise ValueError('输入条数和工作包描述不一致')
-    _bump_usage(device_root, usage_counts)
+    device_allocator.flush_usage()
     atomic_json(directory / 'progress.json',
                 {'processed': processed, 'started': started,
                  'counts': dict(counters),

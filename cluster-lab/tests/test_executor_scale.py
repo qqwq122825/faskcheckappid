@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _device_id_label, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots,
+from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
@@ -211,6 +211,73 @@ class ExecutorScaleTests(unittest.TestCase):
         self.assertEqual(groups[9], [10, 20, 30])
         self.assertEqual(sorted(slot for group in groups for slot in group),
                          list(range(1, 31)))
+
+    def test_four_processes_with_thirty_slots_start_only_thirty_threads(self):
+        groups = [_partition_device_slots(range(1, 31), 4, index)
+                  for index in range(4)]
+        self.assertEqual([len(group) for group in groups], [8, 8, 7, 7])
+        workers = [_effective_auth_workers(250, group) for group in groups]
+        self.assertEqual(workers, [8, 8, 7, 7])
+        self.assertEqual(sum(workers), 30)
+
+    def test_four_processes_with_two_hundred_pool_slots_start_two_hundred_threads(self):
+        groups = [_partition_device_slots(range(1, 201), 4, index)
+                  for index in range(4)]
+        workers = [_effective_auth_workers(250, group) for group in groups]
+        self.assertEqual(workers, [50, 50, 50, 50])
+        self.assertEqual(sum(workers), 200)
+
+    def test_device_use_is_atomic_and_never_exceeds_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            values = [_consume_device_use(temporary, 3, 20) for _ in range(20)]
+            self.assertEqual(values, list(range(1, 21)))
+            with self.assertRaisesRegex(RuntimeError, 'reached use limit 20'):
+                _consume_device_use(temporary, 3, 20)
+            usage = json.loads((Path(temporary) / 'usage.json').read_text())
+            self.assertEqual(usage['3'], 20)
+
+    def test_twentieth_request_retires_identity_and_next_request_registers_fresh(self):
+        class LifecyclePool(FakePool):
+            registrations = 0
+
+            def inspect(self, slot):
+                marker = self.slot_directory(slot) / 'identity.json'
+                return {'state': 'ready' if marker.exists() else 'missing',
+                        'device_id': f'device-{slot}' if marker.exists() else ''}
+
+            def fetch_headers(self, slot, *_args, registered=True, **_kwargs):
+                directory = self.slot_directory(slot)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'identity.json').write_text('{}')
+                if not registered:
+                    type(self).registrations += 1
+                return {'slot': slot}
+
+        LifecyclePool.registrations = 0
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            device_root = root / 'devices'
+            pool = LifecyclePool(device_root)
+            pool.slot_directory(1).mkdir(parents=True)
+            (pool.slot_directory(1) / 'identity.json').write_text('{}')
+            lines = [f'user-{index}@example.com----password' for index in range(21)]
+            (root / 'input.part').write_text('\n'.join(lines) + '\n')
+            descriptor = {'rows': 21, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_slots': [1],
+                          'device_use_limit': 20, 'device_root': str(device_root),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    LifecyclePool, lambda *_args, **_kwargs: {'status': 'valid'},
+                    lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor.record_device_registration'):
+                _execute_auth_unit(root, descriptor, threading.Event())
+            records = [json.loads(line) for line in
+                       (root / 'results.jsonl').read_text().splitlines()]
+            self.assertEqual([item['device_usage'] for item in records],
+                             list(range(1, 21)) + [1])
+            self.assertEqual(LifecyclePool.registrations, 1)
 
     def test_account_hash_balances_and_exposes_base64_prefix(self):
         slots = list(range(1, 31))
@@ -841,7 +908,7 @@ class ExecutorScaleTests(unittest.TestCase):
                        return_value=(FakePool, check, lambda result: result['status'])), \
                  patch('fastcheck.workers.device_profile',
                        return_value={'client_info': 'test', 'user_agent': 'test'}), \
-                 patch('clusterlab.executor._bump_usage',
+                 patch('clusterlab.executor._merge_device_usage',
                        side_effect=lambda _root, counts: usage_calls.append(dict(counts))), \
                  patch.object(Path, 'read_bytes', side_effect=AssertionError('must hash while writing')):
                 _execute_auth_unit(root, descriptor, threading.Event())
@@ -852,8 +919,8 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(json.loads((root / 'progress.json').read_text('utf-8'))['counts'],
                              {'valid': 500})
             self.assertEqual(done['checksum'], hashlib.sha256(payload).hexdigest())
-            self.assertEqual(sum(usage_calls[0].values()), 500)
-            self.assertLess(abs(usage_calls[0][1] - usage_calls[0][2]), 50)
+            self.assertEqual(len(usage_calls), 1)
+            self.assertTrue(all(0 <= value <= 20 for value in usage_calls[0].values()))
             self.assertEqual(len(payload.splitlines()), 500)
 
     def test_auth_progress_is_time_based_instead_of_waiting_for_ten_results(self):
