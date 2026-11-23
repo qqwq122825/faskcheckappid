@@ -209,7 +209,6 @@ class DeviceBuilder:
                 raise RuntimeError('设备正在注册，请先等待停止')
             root = self.node.root / 'device-pool'
             shutil.rmtree(root, ignore_errors=True)
-            shutil.rmtree(self.node.root / 'device-pool-rotation', ignore_errors=True)
             root.mkdir(mode=0o700, parents=True, exist_ok=True)
             self.reserved.clear()
             self.state.update(running=False, capacity=0, ready=0, built=0,
@@ -238,28 +237,6 @@ class DeviceBuilder:
     def _update(self, **fields):
         with self.lock:
             self.state.update(fields)
-
-    def rotate(self, capacity, slot):
-        """Register a replacement first; swap it into one idle old slot later."""
-        capacity, slot = int(capacity), int(slot)
-        with self.lock:
-            if self.state['running']:
-                raise RuntimeError('正在初始化设备，请等待本轮结束')
-            if not 1 <= capacity <= self.slot_limit() or not 1 <= slot <= capacity:
-                raise ValueError('轮换设备编号无效')
-            if slot in self.reserved:
-                raise RuntimeError('设备正在执行任务，本轮不轮换')
-            if not (self.node.proxy_api or '').strip():
-                raise ValueError('总控未下发代理 API，拒绝直连注册设备')
-            self.stop.clear()
-            self.state.update(running=True, capacity=capacity, built=0, failed=0,
-                              current=slot, message=f'正在注册第 {slot} 台的替换设备',
-                              proxy_status='checking', proxy_ip='',
-                              started_at=time.strftime('%H:%M:%S'))
-            self.thread = threading.Thread(
-                target=self._run_rotation, args=(capacity, slot),
-                name='device-rotation', daemon=True)
-            self.thread.start()
 
     @staticmethod
     def _stop_process(process):
@@ -378,116 +355,6 @@ class DeviceBuilder:
         finally:
             self._update(running=False, current=0)
 
-    def _run_rotation(self, capacity, slot):
-        """Build outside the live pool, then replace exactly one idle old slot."""
-        staging_root = self.node.root / 'device-pool-rotation'
-        shutil.rmtree(staging_root, ignore_errors=True)
-        try:
-            DevicePool, _, _ = _load_fastcheck()
-            proxy = self._proxy()
-            if not proxy:
-                self._update(failed=1, proxy_status='failed', proxy_ip='',
-                             message='替换设备代理获取失败，原设备已保留')
-                return
-            self._update(proxy_status='ok', proxy_ip=proxy_endpoint(proxy))
-            payload = {'slot': 1, 'capacity': 1, 'proxy': proxy,
-                       'device_root': str(staging_root), 'origin': self.node.origin,
-                       'timeout': REGISTRATION_TIMEOUT}
-            result = self._provision(payload)
-            if self.stop.is_set() or (result or {}).get('cancelled'):
-                self._update(message='已取消')
-                return
-            staged = DevicePool(str(staging_root), self.node.origin, max_devices=1)
-            ok = bool(result and result.get('ok')) and staged.inspect(1)['state'] == 'ready'
-            if not ok:
-                reason = (result or {}).get('error') or '超时'
-                self._update(failed=1,
-                             message=f'替换设备注册失败（{reason}），原设备已保留')
-                return
-            if not self._commit_rotation(staging_root, slot, capacity, proxy,
-                                         (result or {}).get('model', '')):
-                self._update(message='旧设备正在执行任务，本轮未替换；原设备已保留')
-                return
-            self._clear_slot_error(slot)
-            self._update(built=1, ready=capacity,
-                         message=f'第 {slot} 台替换成功，原设备已移除')
-        except Exception as exc:                                  # noqa: BLE001
-            self._update(failed=1,
-                         message=f'替换失败（{type(exc).__name__}），原设备已保留')
-        finally:
-            shutil.rmtree(staging_root, ignore_errors=True)
-            self._update(running=False, current=0)
-
-    @staticmethod
-    def _restore_file(path, value):
-        if value is None:
-            path.unlink(missing_ok=True)
-        else:
-            data, mode = value
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
-            path.chmod(mode)
-
-    def _commit_rotation(self, staging_root, slot, capacity, proxy, model=''):
-        """Atomically swap a verified staged identity into an unused live slot.
-
-        The old directory is retained as a backup until identity, registration,
-        usage and health metadata for the replacement have all been persisted.
-        """
-        DevicePool, _, _ = _load_fastcheck()
-        live_root = self.node.root / 'device-pool'
-        live = DevicePool(str(live_root), self.node.origin, max_devices=capacity)
-        staged = DevicePool(str(staging_root), self.node.origin, max_devices=1)
-        source = staged.slot_directory(1)
-        target = live.slot_directory(int(slot))
-        if staged.inspect(1)['state'] != 'ready' or not target.is_dir():
-            return False
-        registration = live_root / 'registrations' / f'{int(slot):03d}.json'
-        registry_path = self._registry_path()
-        usage_path = live_root / 'usage.json'
-        health_path = live.base / 'health.json'
-        metadata = {path: (path.read_bytes(), path.stat().st_mode & 0o777)
-                    if path.exists() else None
-                    for path in (registration, registry_path, usage_path, health_path)}
-        backup = target.parent / f'.rotation-backup-{int(slot)}-{time.time_ns()}'
-        with self.lock:
-            if int(slot) in self.reserved:
-                return False
-            os.replace(target, backup)
-            try:
-                os.replace(source, target)
-                registration.unlink(missing_ok=True)
-                if not self._record(slot, proxy, model):
-                    raise OSError('无法保存替换设备注册记录')
-                usage = read_json(usage_path, {})
-                if usage_path.exists() and isinstance(usage, dict):
-                    usage.pop(str(int(slot)), None)
-                    atomic_json(usage_path, usage)
-                legacy = read_json(registry_path, {})
-                if (registry_path.exists() and isinstance(legacy, dict)
-                        and str(int(slot)) in legacy):
-                    legacy.pop(str(int(slot)), None)
-                    atomic_json(registry_path, legacy)
-                health = read_json(health_path, {})
-                if health_path.exists() and isinstance(health, dict):
-                    devices = health.get('devices')
-                    if isinstance(devices, dict):
-                        devices.pop(str(int(slot)), None)
-                    events = health.get('events')
-                    if isinstance(events, list):
-                        health['events'] = [item for item in events
-                                            if not (isinstance(item, list) and len(item) > 1
-                                                    and item[1] == int(slot))]
-                    atomic_json(health_path, health)
-            except Exception:
-                shutil.rmtree(target, ignore_errors=True)
-                os.replace(backup, target)
-                for path, value in metadata.items():
-                    self._restore_file(path, value)
-                raise
-        shutil.rmtree(backup, ignore_errors=True)
-        return True
-
     def _registry_path(self):
         return self.node.root / 'device-pool' / 'registry.json'
 
@@ -532,67 +399,6 @@ class DeviceBuilder:
             return json.loads(path.read_text('utf-8'))
         except (OSError, ValueError):
             return {}
-
-    def retirable(self, limit, exclude=()):
-        """返回使用次数已达上限、可以换新的槽位。"""
-        if not limit:
-            return []
-        excluded = {int(slot) for slot in exclude}
-        counts = self.usage()
-        return sorted(int(slot) for slot, used in counts.items()
-                      if isinstance(used, int) and used >= limit
-                      and int(slot) not in excluded)
-
-    def oldest(self, count=1, candidates=None):
-        """Return the oldest birth record among eligible candidate slots."""
-        registry = self.registry()
-        allowed = ({int(slot) for slot in candidates}
-                   if candidates is not None else None)
-        entries = []
-        keys = allowed if allowed is not None else registry.keys()
-        for key in keys:
-            try:
-                slot = int(key)
-                info = registry.get(str(slot)) or {}
-                entries.append((slot, float(info.get('ts') or 0)))
-            except (TypeError, ValueError):
-                continue
-        entries.sort(key=lambda item: item[1])
-        return [slot for slot, _ in entries[:max(0, int(count))]]
-
-    def retire(self, slots):
-        """删掉这些槽位的设备身份，下次执行会自动重新 provisioning。"""
-        removed = []
-        pool_dir = self.node.root / 'device-pool'
-        for slot in slots:
-            if self._reserved(slot):
-                continue
-            try:
-                DevicePool, _, _ = _load_fastcheck()
-                pool = DevicePool(str(pool_dir), self.node.origin, max_devices=max(1, int(slot)))
-                directory = pool.slot_directory(int(slot))
-            except Exception:                                      # noqa: BLE001
-                continue
-            for name in ('device-profile.json',):
-                (directory / name).unlink(missing_ok=True)
-            for path in directory.glob('*.json'):
-                path.unlink(missing_ok=True)
-            for path in directory.glob('*.lock'):
-                path.unlink(missing_ok=True)
-            removed.append(int(slot))
-        counts = self.usage()
-        registry = self.registry()
-        for slot in removed:
-            counts.pop(str(slot), None)
-            registry.pop(str(slot), None)     # 出生记录一起清，否则 oldest 还会选中它
-            (pool_dir / 'registrations' / f'{int(slot):03d}.json').unlink(missing_ok=True)
-        try:
-            (pool_dir / 'usage.json').write_text(json.dumps(counts), 'utf-8')
-            self._registry_path().write_text(json.dumps(registry), 'utf-8')
-        except OSError:
-            pass
-        self._update(message=f'已轮换 {len(removed)} 台设备')
-        return removed
 
     def _proxy(self):
         """设备注册借用本机出口；配置了代理就用一条，否则直连。"""

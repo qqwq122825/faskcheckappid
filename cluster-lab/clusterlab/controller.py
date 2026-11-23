@@ -80,8 +80,7 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('max_unit_rows',1000
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_api','');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_scheme','socks5h');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('origin','https://new.ani.sidestore.io');
-INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_rotate_after','0');
-INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_auto_rotate','0');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_use_limit','20');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_pool_size','1000');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
@@ -626,9 +625,7 @@ class Controller:
                 'proxy_count': len(proxy_parts),
                 'proxy_configured': bool(proxy_parts),
                 'proxy_scheme': values.get('proxy_scheme', 'socks5h'),
-                'device_rotate_after': int(values.get('device_rotate_after', 0) or 0),
-                # column 声明是 INTEGER，存 '1' 会读回整数 1，比较时统一转字符串
-                'device_auto_rotate': str(values.get('device_auto_rotate', '0')) in ('1', 'True', 'true'),
+                'device_use_limit': max(1, int(values.get('device_use_limit', 20) or 20)),
                 'proxy_ttl': int(values.get('proxy_ttl', 50) or 50),
                 'proxy_pool_size': int(values.get('proxy_pool_size', 1000) or 1000),
                 'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true'),
@@ -690,32 +687,13 @@ class Controller:
                   'Web 二次验证已关闭；新工作包只使用 GSA 结果')
         return self.settings()
 
-    def configure_rotation(self, data):
+    def configure_device_use_limit(self, data):
+        limit = integer(data.get('device_use_limit'), '每台设备最多使用次数', 1, 100000)
         with self.db.transaction() as db:
-            current = {row['key']: row['value'] for row in db.execute(
-                "SELECT key,value FROM controller_settings "
-                "WHERE key IN ('device_rotate_after','device_auto_rotate')")}
-            # This endpoint accepts partial updates. Saving a threshold must
-            # not implicitly disable the separately saved refill switch.
-            limit_value = data.get('device_rotate_after', current.get('device_rotate_after', 0))
-            limit = integer(int(limit_value or 0), '设备轮换阈值', 0, 100000)
-            if 'device_auto_rotate' in data:
-                if type(data['device_auto_rotate']) is not bool:
-                    raise ValueError('设备自动补充开关应为布尔值')
-                auto = '1' if data['device_auto_rotate'] else '0'
-            else:
-                auto = '1' if str(current.get('device_auto_rotate', '0')) in ('1', 'True', 'true') else '0'
-            for key_name, key_value in (('device_rotate_after', str(limit)),
-                                        ('device_auto_rotate', auto)):
-                db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
-                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                           (key_name, key_value))
-            if auto == '1':
-                event(db, 'controller_config',
-                      f'设备自动补充已开启：每台用满 {limit or 20} 条后换新并补齐' if limit
-                      else '设备自动补充已开启（轮换阈值 0 时只补缺不换新）')
-            else:
-                event(db, 'controller_config', '设备自动补充已关闭')
+            db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       ('device_use_limit', str(limit)))
+            event(db, 'controller_config', f'每台设备最多使用次数已设置为 {limit}')
         return self.settings()
 
     def configure_proxy(self, data):
@@ -1444,8 +1422,6 @@ class Controller:
                     'reported': reported_ack,
                     'device_request': node['device_request'],
                     'device_clear_version': node['device_clear_version'],
-                    'device_rotate_after': self.settings().get('device_rotate_after', 0),
-                    'device_auto_rotate': bool(self.settings().get('device_auto_rotate')),
                     'proxy_ttl': int(self.settings().get('proxy_ttl') or 50),
                     'proxy_pool_size': int(self.settings().get('proxy_pool_size') or 1000),
                     'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds,
@@ -1511,7 +1487,7 @@ class Controller:
                 config = self.proxy_for_node(node)
                 settings = self.settings()
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
-                               device_use_limit=max(1, int(settings.get('device_rotate_after') or 20)),
+                               device_use_limit=max(1, int(settings.get('device_use_limit') or 20)),
                                proxy_pool_size=int(settings.get('proxy_pool_size') or 1000),
                                origin=settings.get('origin', 'https://new.ani.sidestore.io'),
                                _proxy_debug=bool(settings.get('proxy_debug')),

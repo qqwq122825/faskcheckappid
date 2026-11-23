@@ -5,11 +5,11 @@ import { session, isNode, state, busy, mutate } from '../composables/useCluster'
 const maxUnitRows = ref(10000), error = ref('')
 const proxyApi = ref(''), proxyScheme = ref('socks5h'), proxyError = ref(''), proxyBusy = ref(false)
 const proxyPoolSize = ref(1000), proxyPoolBusy = ref(false)
-const rotateAfter = ref(0), rotateBusy = ref(false)
+const deviceUseLimit = ref(20), deviceUseLimitBusy = ref(false)
 const proxyDebug = ref(false), proxyDebugBusy = ref(false)
 const webSecondaryAuth = ref(true), webSecondaryAuthBusy = ref(false)
-watch(() => state.value?.settings?.device_rotate_after, value => {
-  if (value != null) rotateAfter.value = value
+watch(() => state.value?.settings?.device_use_limit, value => {
+  if (value != null) deviceUseLimit.value = value
 }, { immediate: true })
 watch(() => state.value?.settings?.max_unit_rows, value => {
   if (value != null) maxUnitRows.value = value
@@ -34,13 +34,13 @@ async function save() {
   try { await mutate('/api/settings', { max_unit_rows: maxUnitRows.value }, '分片上限已保存，仅对新创建的任务生效') }
   catch (e) { error.value = (e as Error).message; ElMessage.error(error.value) }
 }
-async function saveRotation() {
-  rotateBusy.value = true
+async function saveDeviceUseLimit() {
+  deviceUseLimitBusy.value = true
   try {
-    await mutate('/api/settings/rotation', { device_rotate_after: rotateAfter.value },
-                 rotateAfter.value ? `每台设备用满 ${rotateAfter.value} 条后自动换新` : '设备轮换已关闭')
+    await mutate('/api/settings/device-use-limit', { device_use_limit: deviceUseLimit.value },
+                 `每台设备最多使用 ${deviceUseLimit.value} 次`)
   } catch (e) { ElMessage.error((e as Error).message) }
-  finally { rotateBusy.value = false }
+  finally { deviceUseLimitBusy.value = false }
 }
 async function addProxy() {
   proxyError.value = ''
@@ -124,18 +124,18 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
     </el-form>
   </el-card>
   <el-card v-if="!isNode" shadow="never" class="section-card">
-    <template #header><h2>设备轮换</h2></template>
-    <el-form label-position="top" @submit.prevent="saveRotation">
-      <el-form-item label="每台设备用满多少条后自动换新">
-        <el-input-number v-model="rotateAfter" :min="0" :max="100000" :step="10" :precision="0" :disabled="rotateBusy" />
-        <span class="field-note">0 表示不轮换。设备在节点本地重新注册（约 6–8 秒），旧身份被删除。</span>
+    <template #header><h2>设备使用上限</h2></template>
+    <el-form label-position="top" @submit.prevent="saveDeviceUseLimit">
+      <el-form-item label="每台设备最多使用次数">
+        <el-input-number v-model="deviceUseLimit" :min="1" :max="100000" :step="10" :precision="0" :disabled="deviceUseLimitBusy" />
+        <span class="field-note">达到上限后由工作线程退役该设备；后续线程缺设备时自行注册。</span>
       </el-form-item>
       <el-descriptions :column="1" border>
-        <el-descriptions-item label="当前阈值">
-          {{ state?.settings?.device_rotate_after ? state.settings.device_rotate_after + ' 条/台' : '未启用' }}
+        <el-descriptions-item label="当前上限">
+          {{ state?.settings?.device_use_limit + ' 次/台' }}
         </el-descriptions-item>
       </el-descriptions>
-      <el-button type="primary" native-type="submit" :loading="rotateBusy">保存轮换设置</el-button>
+      <el-button type="primary" native-type="submit" :loading="deviceUseLimitBusy">保存使用上限</el-button>
     </el-form>
   </el-card>
   <el-card v-if="!isNode" shadow="never" class="section-card">

@@ -251,16 +251,14 @@ test('Result list keeps one result-code column without web recheck fields', () =
 })
 
 
-test('Device refill switch reopens from persisted settings and publishes save immediately', () => {
+test('Device pool exposes only explicit initialization without background refill controls', () => {
   const drawer = source('src/components/DevicePoolDrawer.vue')
-  assert.match(drawer, /const settings = state\.value\?\.settings/)
-  assert.match(drawer, /Boolean\(settings\.device_auto_rotate/)
-  assert.doesNotMatch(drawer, /telemetry\?\.device_auto_rotate/)
-  assert.match(drawer, /const saved = await api\('\/api\/settings\/rotation'/)
-  assert.match(drawer, /state\.value\.settings =/)
-  assert.match(drawer, /:disabled="building \|\| savingAuto"/)
-  assert.match(drawer, /先注册一台替换设备/)
-  assert.match(drawer, /新设备成功后才移除出生日期最早且空闲的旧设备/)
+  const settings = source('src/views/Settings.vue')
+  assert.doesNotMatch(drawer, /device_auto_rotate|settings\/rotation|自动补充|先增后换/)
+  assert.match(drawer, /点击“开始初始化设备池”才会注册设备/)
+  assert.match(drawer, /缺失设备由工作线程按需注册/)
+  assert.match(settings, /settings\/device-use-limit/)
+  assert.match(settings, /后续线程缺设备时自行注册/)
 })
 
 test('Task detail shows one node-reported traffic card with the 1 GB estimate', () => {

@@ -123,25 +123,18 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '合法'):
             self.service.request_updates([self.node['id']], '../main', 1)
 
-    def test_rotation_partial_updates_preserve_switch_and_restart(self):
-        self.service.configure_rotation({'device_rotate_after': 20, 'device_auto_rotate': True})
-        result = self.service.configure_rotation({'device_rotate_after': 37})
-        self.assertTrue(result['device_auto_rotate'])
+    def test_device_use_limit_persists(self):
+        result = self.service.configure_device_use_limit({'device_use_limit': 37})
+        self.assertEqual(result['device_use_limit'], 37)
         self.service.close()
         self.service = Controller(self.temp.name)
-        self.assertTrue(self.service.settings()['device_auto_rotate'])
-        self.assertEqual(self.service.settings()['device_rotate_after'], 37)
-        for enabled in (False, True):
-            result = self.service.configure_rotation({'device_auto_rotate': enabled})
-            self.assertIs(result['device_auto_rotate'], enabled)
-            self.assertEqual(result['device_rotate_after'], 37)
+        self.assertEqual(self.service.settings()['device_use_limit'], 37)
 
-    def test_rotation_rejects_string_switch_without_changing_saved_state(self):
-        self.service.configure_rotation({'device_rotate_after': 20, 'device_auto_rotate': True})
-        with self.assertRaisesRegex(ValueError, '布尔'):
-            self.service.configure_rotation({'device_auto_rotate': 'false'})
-        self.assertTrue(self.service.settings()['device_auto_rotate'])
-        self.assertEqual(self.service.settings()['device_rotate_after'], 20)
+    def test_device_use_limit_rejects_zero_without_changing_saved_state(self):
+        self.service.configure_device_use_limit({'device_use_limit': 20})
+        with self.assertRaisesRegex(ValueError, '最多使用次数'):
+            self.service.configure_device_use_limit({'device_use_limit': 0})
+        self.assertEqual(self.service.settings()['device_use_limit'], 20)
 
     def test_proxy_debug_switch_defaults_off_persists_and_rejects_non_boolean(self):
         self.assertFalse(self.service.settings()['proxy_debug'])

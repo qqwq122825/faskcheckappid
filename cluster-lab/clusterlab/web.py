@@ -112,9 +112,9 @@ def create_app(role, service, password=None):
         def configure_web_secondary_auth():
             return jsonify(service.configure_web_secondary_auth(request.get_json() or {}))
 
-        @app.post('/api/settings/rotation')
-        def configure_rotation():
-            return jsonify(service.configure_rotation(request.get_json() or {}))
+        @app.post('/api/settings/device-use-limit')
+        def configure_device_use_limit():
+            return jsonify(service.configure_device_use_limit(request.get_json() or {}))
 
         @app.post('/api/settings/proxy')
         def configure_proxy():
