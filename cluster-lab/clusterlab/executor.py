@@ -29,6 +29,9 @@ PROXY_ACQUIRE_WAIT_SECONDS = 5.0
 PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
 DEVICE_LEASE_POLL_SECONDS = 0.05
+DEVICE_IDENTITY_TTL_SECONDS = 30.0
+LOCAL_QUEUE_LOW_WATER = 100
+LOCAL_QUEUE_TARGET = 300
 MIN_STALL_TIMEOUT_SECONDS = 180.0
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
@@ -67,6 +70,28 @@ def _device_id_label(device_id):
     raw = str(device_id or '').encode('utf-8')
     return ('B64:' + base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')[:8]
             if raw else '')
+
+
+def _cached_device_identity(identities, fetched_at, slot, now=None):
+    """Return one device's public headers only while its 30-second TTL is live."""
+    identity = identities.get(slot)
+    timestamp = fetched_at.get(slot)
+    current = time.monotonic() if now is None else float(now)
+    if identity is None or timestamp is None:
+        return None
+    if current - float(timestamp) >= DEVICE_IDENTITY_TTL_SECONDS:
+        return None
+    return identity
+
+
+def _local_queue_refill_count(workers, pending, queued):
+    """Return how many local records to enqueue for a 100/300 refill cycle."""
+    worker_count = max(1, int(workers))
+    pending_count = max(0, int(pending))
+    queued_count = max(0, int(queued))
+    if pending_count and queued_count > LOCAL_QUEUE_LOW_WATER:
+        return 0
+    return max(0, worker_count + LOCAL_QUEUE_TARGET - pending_count)
 
 
 class DeviceAuthLease:
@@ -1498,7 +1523,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     # 只发现已有设备，不在工作线程启动前预注册。身份头也只能
     # 在拿到独占租约后读取，避免两个线程同时使用同一设备。
-    identities, device_labels = {}, {}
+    identities, identity_fetched_at, device_labels = {}, {}, {}
     for index in slot_ids:
         bootstrap_device_lease = None
         bootstrap_lease = None
@@ -1525,8 +1550,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             identities[index] = pool.fetch_headers(
                 index, info, max(timeout, 40), registered=True,
                 proxy=bootstrap_proxy, provider_direct=True)
+            identity_fetched_at[index] = time.monotonic()
         except Exception:                                          # noqa: BLE001
             identities[index] = None
+            identity_fetched_at.pop(index, None)
         finally:
             if proxy_pool is not None and bootstrap_lease is not None:
                 proxy_pool.release(bootstrap_lease,
@@ -1674,12 +1701,14 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             try:
                 device_lease = device_allocator.acquire(stop)
                 slot_id = device_lease.slot
-                identity = identities.get(slot_id)
+                identity = _cached_device_identity(
+                    identities, identity_fetched_at, slot_id)
                 if identity is None:
                     # 每进程只开一条设备/SRP 准备通道。已有设备刷新头；
                     # 如果租到的是缺失槽位，就由当前工作线程完成注册。
                     with device_prepare_gate:
-                        identity = identities.get(slot_id)
+                        identity = _cached_device_identity(
+                            identities, identity_fetched_at, slot_id)
                         if identity is None:
                             info = pool.info(timeout, proxy=account_proxy,
                                              provider_direct=True)
@@ -1691,6 +1720,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                                 slot_id, info, max(timeout, 40), registered=ready,
                                 proxy=account_proxy, provider_direct=True)
                             identities[slot_id] = identity
+                            identity_fetched_at[slot_id] = time.monotonic()
                             refreshed = pool.inspect(slot_id)
                             device_labels[slot_id] = _device_id_label(
                                 refreshed.get('device_id'))
@@ -1804,6 +1834,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 # 同一份无效设备认证数据重复请求。
                 identity = None
                 identities.pop(slot_id, None)
+                identity_fetched_at.pop(slot_id, None)
             previous_proxy = current_proxy
             if not transport_failed or attempt + 1 >= attempt_limit:
                 result['_proxy_retries'] = attempt
@@ -1858,7 +1889,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 while delayed and delayed[0][0] <= now:
                     _at, _order, work = heapq.heappop(delayed)
                     ready.append(work)
-                while len(pending) < workers * 2:
+                queued_count = sum(1 for future in pending
+                                   if not future.running() and not future.done())
+                refill_count = _local_queue_refill_count(
+                    workers, len(pending), queued_count)
+                while refill_count > 0:
                     if ready:
                         work = ready.popleft()
                     elif not exhausted:
@@ -1872,6 +1907,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     else:
                         break
                     pending.add(workers_pool.submit(one, *work))
+                    refill_count -= 1
                 if not pending:
                     if delayed:
                         stop_flag.wait(min(0.05, max(0.0, delayed[0][0] -
@@ -1948,7 +1984,13 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     output.flush()
                     atomic_json(directory / 'progress.json',
                                 {'processed': processed, 'started': started,
-                                 'counts': dict(counters)})
+                                 'counts': dict(counters),
+                                 'queue_low_water': LOCAL_QUEUE_LOW_WATER,
+                                 'queue_target': LOCAL_QUEUE_TARGET,
+                                 'queued': sum(1 for future in pending
+                                               if not future.running() and not future.done()),
+                                 'in_flight': sum(1 for future in pending
+                                                  if future.running())})
                     last_progress = now
 
     if processed != int(descriptor.get('rows') or 0):
@@ -1956,7 +1998,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     _bump_usage(device_root, usage_counts)
     atomic_json(directory / 'progress.json',
                 {'processed': processed, 'started': started,
-                 'counts': dict(counters)})
+                 'counts': dict(counters),
+                 'queue_low_water': LOCAL_QUEUE_LOW_WATER,
+                 'queue_target': LOCAL_QUEUE_TARGET,
+                 'queued': 0, 'in_flight': 0})
     atomic_json(directory / 'done.json',
                 {'ok': True, 'processed': processed, 'counts': dict(counters),
                  'checksum': output_digest.hexdigest(),

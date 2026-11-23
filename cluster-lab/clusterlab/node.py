@@ -749,7 +749,8 @@ class Node:
         output = {}
         integer_fields = (
             'processed', 'workers', 'worker_limit', 'configured_process_limit',
-            'cpu_reserve', 'threads_per_process', 'active_threads_per_process')
+            'cpu_reserve', 'threads_per_process', 'active_threads_per_process',
+            'queue_low_water', 'queue_target', 'queued', 'in_flight')
         for key in integer_fields:
             if value.get(key) is not None:
                 try:

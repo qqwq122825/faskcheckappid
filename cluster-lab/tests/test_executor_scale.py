@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _device_id_label, _execute_auth_unit, _partition_device_slots,
+from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _device_id_label, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
@@ -94,6 +94,20 @@ def use_shared_proxy_pool(pool, output):
 
 
 class ExecutorScaleTests(unittest.TestCase):
+    def test_local_queue_refills_at_low_water_to_three_hundred(self):
+        self.assertEqual(_local_queue_refill_count(1000, 1100, 100), 200)
+        self.assertEqual(_local_queue_refill_count(1000, 1080, 80), 220)
+        self.assertEqual(_local_queue_refill_count(1000, 1260, 260), 0)
+        self.assertEqual(_local_queue_refill_count(1000, 0, 0), 1300)
+
+    def test_device_identity_cache_expires_after_thirty_seconds(self):
+        identities = {7: {'X-Apple-I-MD': 'cached'}}
+        fetched_at = {7: 100.0}
+        self.assertIs(_cached_device_identity(identities, fetched_at, 7, 129.999),
+                      identities[7])
+        self.assertIsNone(_cached_device_identity(identities, fetched_at, 7, 130.0))
+        self.assertIsNone(_cached_device_identity(identities, {}, 7, 101.0))
+
     def test_device_lease_is_exclusive_and_writes_return_timestamp(self):
         with tempfile.TemporaryDirectory() as temporary:
             pool = FakePool(temporary)
@@ -855,7 +869,8 @@ class ExecutorScaleTests(unittest.TestCase):
                  patch('fastcheck.workers.device_profile',
                        return_value={'client_info': 'test', 'user_agent': 'test'}), \
                  patch('clusterlab.executor._bump_usage'), \
-                 patch('clusterlab.executor.time.monotonic', side_effect=[10.0, 10.0, 10.3]), \
+                 patch('clusterlab.executor.time.monotonic',
+                       side_effect=[10.0] * 4 + [10.3] * 8), \
                  patch('clusterlab.executor.atomic_json', wraps=atomic_json) as writes:
                 _execute_auth_unit(root, descriptor, threading.Event())
 
