@@ -31,7 +31,10 @@ PROXY_ACQUIRE_WAIT_SECONDS = 5.0
 PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
 DEVICE_LEASE_POLL_SECONDS = 0.05
-DEVICE_IDENTITY_TTL_SECONDS = 30.0
+# One identity is used at most DEVICE_USE_LIMIT times and then retired. Keep
+# its public headers for that identity's complete lifetime instead of forcing
+# another provider/Apple refresh every 30 seconds.
+DEVICE_IDENTITY_TTL_SECONDS = None
 DEVICE_REGISTRATION_TIMEOUT_SECONDS = 20.0
 DEVICE_USE_LIMIT = 20
 LOCAL_QUEUE_LOW_WATER = 100
@@ -87,15 +90,12 @@ def _device_id_label(device_id):
 
 
 def _cached_device_identity(identities, fetched_at, slot, now=None):
-    """Return one device's public headers only while its 30-second TTL is live."""
+    """Return public headers for the current device identity until retirement."""
     identity = identities.get(slot)
-    timestamp = fetched_at.get(slot)
-    current = time.monotonic() if now is None else float(now)
-    if identity is None or timestamp is None:
-        return None
-    if current - float(timestamp) >= DEVICE_IDENTITY_TTL_SECONDS:
-        return None
-    return identity
+    # `fetched_at`/`now` remain accepted for compatibility with callers and
+    # diagnostics. A fresh physical identity always clears both dictionaries
+    # before this lookup, so no time-based expiry is needed here.
+    return identity if identity is not None else None
 
 
 def _local_queue_refill_count(workers, pending, queued):

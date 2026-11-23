@@ -121,13 +121,17 @@ class ExecutorScaleTests(unittest.TestCase):
         self.assertEqual(_local_queue_refill_count(1000, 1260, 260), 0)
         self.assertEqual(_local_queue_refill_count(1000, 0, 0), 1300)
 
-    def test_device_identity_cache_expires_after_thirty_seconds(self):
+    def test_device_identity_cache_lasts_for_the_device_lifetime(self):
         identities = {7: {'X-Apple-I-MD': 'cached'}}
         fetched_at = {7: 100.0}
         self.assertIs(_cached_device_identity(identities, fetched_at, 7, 129.999),
                       identities[7])
-        self.assertIsNone(_cached_device_identity(identities, fetched_at, 7, 130.0))
-        self.assertIsNone(_cached_device_identity(identities, {}, 7, 101.0))
+        self.assertIs(_cached_device_identity(identities, fetched_at, 7, 100000.0),
+                      identities[7])
+        self.assertIs(_cached_device_identity(identities, {}, 7, 101.0), identities[7])
+        identities.pop(7)
+        fetched_at.pop(7)
+        self.assertIsNone(_cached_device_identity(identities, fetched_at, 7, 101.0))
 
     def test_device_lease_is_exclusive_and_writes_return_timestamp(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1192,7 +1196,7 @@ class ExecutorScaleTests(unittest.TestCase):
                        return_value={'client_info': 'test', 'user_agent': 'test'}), \
                  patch('clusterlab.executor._bump_usage'), \
                  patch('clusterlab.executor.time.monotonic',
-                       side_effect=[10.0] * 4 + [10.3] * 8), \
+                       side_effect=[10.0] * 3 + [10.3] * 8), \
                  patch.object(DeviceLeaseAllocator, 'flush_usage', record_flush), \
                  patch('clusterlab.executor.atomic_json', wraps=atomic_json) as writes:
                 _execute_auth_unit(root, descriptor, threading.Event())
