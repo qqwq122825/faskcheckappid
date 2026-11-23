@@ -214,6 +214,15 @@ class DeviceAuthLease:
             else:
                 path.unlink(missing_ok=True)
 
+    def clear_incomplete_identity(self):
+        """Return a failed registration to a clean, immediately reusable slot."""
+        if self.pool.inspect(self.slot).get('state') not in ('pending', 'invalid'):
+            return False
+        self._retire_identity()
+        self.uses = 0
+        self.retire_on_release = False
+        return True
+
     @classmethod
     def acquire_any(cls, pool, slots, stop):
         """Prefer an idle ready device, then claim one missing slot to register."""
@@ -343,6 +352,10 @@ class DeviceLeaseAllocator:
         lease.use_limit = self.use_limit
         lease.retire_on_release = current >= self.use_limit
         return current
+
+    def current_usage(self, slot):
+        with self.lock:
+            return max(0, int(self.usage.get(int(slot), 0)))
 
     def flush_usage(self):
         """Persist this process' disjoint slot counters in one locked write."""
@@ -2127,6 +2140,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             result, account, password, account_proxy, timeout,
                             stop.is_set, retries=retries)
             except Exception as exc:                               # noqa: BLE001
+                if (device_lease is not None and
+                        device_lease.initial_state != 'ready' and
+                        device_lease.clear_incomplete_identity()):
+                    identities.pop(device_lease.slot, None)
+                    identity_fetched_at.pop(device_lease.slot, None)
+                    device_labels[device_lease.slot] = ''
                 result = {'status': 'error', 'kind': type(exc).__name__, 'http': 0,
                           'stage': 'init', 'detail': str(exc)[:180]}
             finally:
@@ -2266,8 +2285,6 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     stop_flag = stop
     output_digest = hashlib.sha256()
-    usage_counts = Counter()
-    usage_start = _usage_snapshot(device_root)
     with (directory / 'input.part').open('r', encoding='utf-8', errors='replace') as source, output_path.open('wb') as output:
         output_path.chmod(0o600)
         first_row = int(descriptor.get('first_row') or 1)
@@ -2346,9 +2363,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 if business_code is None:
                     business_code = (result.get('detail') or result.get('kind') or '')[:180]
                 reason = _apple_reason_for_record(result, status, debug_enabled)
-                usage_counts[device] += 1
-                device_usage = int(result.get('_device_use') or
-                                   int(usage_start.get(device, 0)) + usage_counts[device])
+                # Registration/format/proxy failures did not send an account
+                # request and must not consume a device use.  A successful
+                # request always carries the exact value returned by consume().
+                device_usage = (int(result['_device_use'])
+                                if result.get('_device_use') is not None else
+                                device_allocator.current_usage(device))
                 record = {'row': row, 'account': account, 'password': password, 'status': status,
                           'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
                           'stage': result.get('stage') or '', 'http': result.get('http'),

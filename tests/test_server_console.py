@@ -62,6 +62,9 @@ class ServerTests(unittest.TestCase):
         self.assertIn('实时显示节点同核设备池',page)
         self.assertIn('id="device-total"',page)
         self.assertIn('id="device-registering"',page)
+        script=(Path(__file__).parents[1]/'fastcheck/web/static/app.js').read_text()
+        self.assertIn('if(devicePoolRequest)return devicePoolRequest',script)
+        self.assertIn('applyDevicePoolSnapshot(data,revision)',script)
 
     def test_live_worker_results_are_visible_deduplicated_and_credential_free(self):
         from fastcheck.devices import save_json
@@ -218,11 +221,12 @@ class ServerTests(unittest.TestCase):
         mixed={'ready':1,'slots':[
             {'slot':1,'state':'ready','device_id':'current','error':''},
             {'slot':2,'state':'pending','device_id':'','error':''},
+            {'slot':3,'state':'missing','device_id':'','error':''},
             {'slot':999,'state':'pending','device_id':'','error':''},
         ]}
         with patch.object(builder.builder,'snapshot',return_value=mixed):
-            current=builder.snapshot(include_pending=True,slot_ids=[1,2])
-            self.assertEqual([item['slot'] for item in current['slots']],[1,2])
+            current=builder.snapshot(include_pending=True,slot_ids=[1,2,3])
+            self.assertEqual([item['slot'] for item in current['slots']],[1,2,3])
             self.assertEqual(current['ready'],1)
 
     def test_stop_and_second_task_conflict(self):

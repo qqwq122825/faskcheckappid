@@ -49,7 +49,8 @@ class LocalNodeDeviceBuilder:
         # not hundreds of empty placeholders on every two-second poll.
         allowed=(None if slot_ids is None else
                  {int(slot) for slot in slot_ids if str(slot).isdigit()})
-        ignored={'missing','retired'}|({'pending'} if not include_pending else set())
+        ignored=({'retired'} if include_pending else
+                 {'missing','pending','retired'})
         value['slots']=[item for item in value.get('slots',[])
                         if (allowed is None or item.get('slot') in allowed) and
                         (item.get('state') not in ignored or item.get('error'))]

@@ -207,6 +207,56 @@ class ExecutorScaleTests(unittest.TestCase):
                 self.assertEqual(state['state'], 'idle')
                 self.assertTrue(state['last_used_at'])
 
+    def test_failed_registration_clears_partial_slot_and_next_account_retries(self):
+        class FlakyRegistrationPool(FakePool):
+            calls = 0
+
+            def inspect(self, slot):
+                directory = self.slot_directory(slot)
+                if (directory / 'ready').exists():
+                    return {'state': 'ready', 'device_id': f'device-{slot}'}
+                if (directory / 'identity.json').exists():
+                    return {'state': 'pending', 'device_id': f'partial-{slot}'}
+                return {'state': 'missing', 'device_id': ''}
+
+            def fetch_headers(self, slot, *_args, **_kwargs):
+                type(self).calls += 1
+                directory = self.slot_directory(slot)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / 'identity.json').write_text('{}')
+                if type(self).calls == 1:
+                    raise RuntimeError('synthetic registration failure')
+                (directory / 'ready').write_text('ok')
+                return {'slot': int(slot)}
+
+        FlakyRegistrationPool.calls = 0
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text(
+                'one@example.com----a\ntwo@example.com----b\n', encoding='utf-8')
+            descriptor = {'rows': 2, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_slots': [1],
+                          'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FlakyRegistrationPool,
+                    lambda *_args, **_kwargs: {
+                        'status': 'valid', 'http': 200, 'stage': 'complete'},
+                    lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor.record_device_registration'), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event())
+
+            records = [json.loads(line) for line in
+                       (root / 'results.jsonl').read_text().splitlines()]
+            self.assertEqual(FlakyRegistrationPool.calls, 2)
+            self.assertEqual([record['status'] for record in records], ['timeout', 'valid'])
+            self.assertEqual([record['device_usage'] for record in records], [0, 1])
+            self.assertEqual(
+                FlakyRegistrationPool(root / 'devices').inspect(1)['state'], 'ready')
+
     def test_raw_apple_reason_is_packaged_only_when_debug_is_enabled(self):
         result = {'apple_message': 'Your account information was entered incorrectly.'}
         self.assertEqual(_apple_reason_for_record(result, 'wrong_password'), '')
@@ -1037,8 +1087,10 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(json.loads((root / 'progress.json').read_text('utf-8'))['counts'],
                              {'valid': 500})
             self.assertEqual(done['checksum'], hashlib.sha256(payload).hexdigest())
-            self.assertEqual(len(usage_calls), 1)
-            self.assertTrue(all(0 <= value <= 20 for value in usage_calls[0].values()))
+            self.assertGreaterEqual(len(usage_calls), 2)
+            self.assertTrue(any(call for call in usage_calls))
+            self.assertTrue(all(0 <= value <= 20 for call in usage_calls
+                                for value in call.values()))
             self.assertEqual(len(payload.splitlines()), 500)
 
     def test_auth_progress_is_time_based_instead_of_waiting_for_ten_results(self):

@@ -1,4 +1,4 @@
-const $=id=>document.getElementById(id);let csrf='',job=null,timer=null,offset=0,totalRows=0,lastCount=-1,watchGeneration=0,resultGeneration=0,devicePoolState=null,devicePoolTimer=null;
+const $=id=>document.getElementById(id);let csrf='',job=null,timer=null,offset=0,totalRows=0,lastCount=-1,watchGeneration=0,resultGeneration=0,devicePoolState=null,devicePoolTimer=null,devicePoolRequest=null,devicePoolRevision=0,devicePoolApplied=0;
 const names={valid:'密码正确',need_2fa:'双重验证',wrong_password:'密码错误',security_lock:'安全锁定',locked:'锁定',timeout:'请重试',init_refused:'初始化拒绝',credentials_rejected:'信息被拒绝',error:'请求失败',invalid:'锁定',not_found:'不存在',unknown:'其他错误',not_started:'未开始',stopped:'已停止',needs_setup:'需后续设置'};
 const numeric=['processes','threads','proxy_target','proxy_ttl','timeout','device_capacity','device_use_limit'];
 let defaults={};
@@ -40,7 +40,15 @@ function renderDevicePool(snapshot){
   }
   if(!$('device-rows').children.length){const row=document.createElement('tr'),value=cell(row,'当前还没有已登记设备','empty');value.colSpan=4;$('device-rows').append(row)}
 }
-async function pollDevicePool(){if(!csrf||$('console').hidden)return;try{const data=await api('/api/devices/build');renderBuild(data);renderDevicePool(data)}catch(e){}}
+function applyDevicePoolSnapshot(data,revision){if(!data||revision<devicePoolApplied)return;devicePoolApplied=revision;renderBuild(data)}
+async function refreshDevicePool(){
+  if(!csrf||$('console').hidden)return null;
+  if(devicePoolRequest)return devicePoolRequest;
+  const revision=++devicePoolRevision;
+  devicePoolRequest=api('/api/devices/build').then(data=>{applyDevicePoolSnapshot(data,revision);return data}).finally(()=>{devicePoolRequest=null});
+  return devicePoolRequest;
+}
+async function pollDevicePool(){try{await refreshDevicePool()}catch(e){}}
 async function watch(id){
   const generation=++watchGeneration;
   if(timer)clearTimeout(timer);
@@ -76,13 +84,13 @@ function renderBuild(s){const box=$('build-status');if(!s)return;
     updateDeviceBuildControl();$('stop-build').hidden=true;
     if(buildTimer){clearInterval(buildTimer);buildTimer=null}}}
 function updateDeviceBuildControl(){if($('build-devices'))$('build-devices').disabled=Number($('device_capacity').value)<=0}
-async function pollBuild(){try{const d=await api('/api/devices/build');renderBuild(d);
+async function pollBuild(){try{const d=await refreshDevicePool();
   if(!d.running&&buildTimer){clearInterval(buildTimer);buildTimer=null}}catch(e){}}
 $('build-devices').onclick=async()=>{
   $('build-devices').disabled=true;
   try{const d=await jsonPost('/api/devices/build',{api_url:$('api-url').value,
       proxy_auth:$('proxy-auth').value,settings:readSettings()});
-    renderBuild(d);
+    applyDevicePoolSnapshot(d,++devicePoolRevision);
     if(buildTimer)clearInterval(buildTimer);
     buildTimer=setInterval(pollBuild,1500);
   }catch(e){notice(e.message);$('build-devices').disabled=false}};
