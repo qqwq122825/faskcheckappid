@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from clusterlab.node import Node
 from clusterlab.device_build import REGISTRATION_TIMEOUT, _register
+from clusterlab.web import create_app
 
 
 class Response:
@@ -141,6 +142,73 @@ class NodeRecoveryTests(unittest.TestCase):
                 self.assertEqual((legacy.max_processes, legacy.max_threads), (4, 500))
             finally:
                 legacy.close()
+
+    def test_public_task_log_returns_bounded_sanitized_json(self):
+        directory = self.node.spool / self.unit
+        descriptor = {
+            'token': 'top-secret-lease', 'rows': 300, 'threads': 250,
+            'processes': 4, 'mode': 'auth', 'timeout': 20, 'retries': 1,
+            'proxy_api': 'https://user:password@proxy.invalid/list',
+            'device_root': '/private/device-pool', 'auth_protocol': 'gsa'}
+        descriptor.update(_proxy_debug=True, _proxy_debug_mode='sampled',
+                          _proxy_debug_sample_every=37)
+        with self.node.db.transaction() as db:
+            db.execute('UPDATE tasks SET descriptor=?,status=?,processed=? WHERE id=?',
+                       (json.dumps(descriptor), 'running', 120, self.unit))
+        (directory / 'manifest.json').write_text(json.dumps(descriptor), 'utf-8')
+        (directory / 'progress.json').write_text(json.dumps({
+            'processed': 120, 'workers': 3, 'worker_limit': 3,
+            'configured_process_limit': 4, 'cpu_reserve': 1,
+            'threads_per_process': 250, 'active_threads_per_process': 333,
+            'counts': {'wrong_password': 110, 'locked': 10},
+            'proxy_pool': {'available': 240, 'endpoint': 'socks5://secret'}}), 'utf-8')
+        (directory / 'proxy-debug.jsonl').write_text('\n'.join((
+            json.dumps({'event': 'worker_start', 'srp_math_backend': 'gmpy2',
+                        'proxy': 'socks5://user:pass@host'}),
+            json.dumps({'event': 'auth_timing', 'row': 7, 'request_ms': 210.0,
+                        'request_thread_cpu_ms': 4.0,
+                        'endpoint': 'user:pass@10.0.0.1:1080',
+                        'detail': 'password=hunter2',
+                        'srp': {'scope': 'sampled_attempt_leaf_phases',
+                                'state': 'observed', 'compute_cpu_ms': 8.5,
+                                'compute_wall_ms': 9.0, 'lane_wait_ms': 2.0}}),
+        )) + '\n', 'utf-8')
+        self.node.telemetry.latest = {'cpu_percent': 81.2, 'memory_percent': 33.0}
+
+        client = create_app('node', self.node, password='not-used-here').test_client()
+        response = client.post('/node-api/task-log', json={
+            'task': {'id': self.unit, 'job_id': 'b' * 32, 'seq': 1},
+            'recent': 10})
+        self.assertEqual(response.status_code, 200)
+        value = response.get_json()
+        self.assertTrue(value['public_endpoint'])
+        self.assertEqual(value['progress']['worker_limit'], 3)
+        self.assertEqual(value['progress']['cpu_reserve'], 1)
+        self.assertEqual(value['node']['telemetry']['cpu_percent'], 81.2)
+        self.assertEqual(value['configuration']['logging'], {
+            'mode': 'timeout_full_trace', 'sample_every': None,
+            'sampling_strategy': 'event_filtered'})
+        self.assertEqual(value['debug']['srp']['compute_cpu_ms']['total'], 8.5)
+        self.assertEqual(value['debug']['srp']['math_backends'], {'gmpy2': 1})
+        encoded = json.dumps(value)
+        for secret in ('top-secret-lease', 'user:password', 'hunter2',
+                       '10.0.0.1', '/private/device-pool', 'proxy.invalid'):
+            self.assertNotIn(secret, encoded)
+
+    def test_task_log_rejects_path_and_identity_mismatch(self):
+        with self.assertRaisesRegex(ValueError, '32 位'):
+            self.node.task_log({'task': {'id': '../../etc/passwd'}})
+        with self.assertRaisesRegex(ValueError, 'job_id'):
+            self.node.task_log({'task': {'id': self.unit, 'job_id': 'c' * 32}})
+        with self.assertRaisesRegex(ValueError, 'lease_token'):
+            self.node.task_log({'task': {'id': self.unit, 'lease_token': 'wrong'}})
+
+    def test_public_task_log_rejects_oversize_body_before_json_decode(self):
+        client = create_app('node', self.node, password='not-used-here').test_client()
+        response = client.post('/node-api/task-log', data=b'{' + b'x' * 20000,
+                               content_type='application/json')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('16 KiB', response.get_json()['error'])
 
     def test_stalled_coordinator_is_terminated_and_reported(self):
         class WedgedProcess:
