@@ -329,7 +329,11 @@ class Controller:
     # A fast node can take several small packages instead of idling behind one
     # slow node that owns half of a large task.
     DYNAMIC_UNIT_ROWS = 10000
-    DYNAMIC_UNITS_PER_NODE = 4
+    DYNAMIC_UNITS_PER_NODE = 2
+    # Node concurrency is an in-flight limit, not a package-size limit.  Keep
+    # several waves in one leased package so threads that finish early can take
+    # another row without waiting for the slowest row in every 4x250 wave.
+    PACKAGE_BUFFER_WAVES = 4
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'not_found',
                       'timeout', 'undetermined', 'unknown')
@@ -1193,26 +1197,43 @@ class Controller:
             # 字节预算必须提到循环外：每行调一次 settings() 就是每行一次数据库查询，
             # 10 万行会被这种写法拖到 30 秒以上。
             byte_limit = self.settings()['unit_byte_limit']
-            # First respect the configured maximum.  If that creates lopsided
-            # work (for example 10,000 + 2), rebuild the byte index once with a
-            # balanced row limit derived from the currently accepting nodes.
-            built = self._build_units(job, int(job['unit_rows']), byte_limit)
+            with self.db.connect() as db:
+                accepting_nodes = list(db.execute(
+                    "SELECT desired_processes,desired_threads,max_processes,max_threads "
+                    "FROM nodes WHERE enabled=1 AND last_seen>? "
+                    "AND update_state NOT IN ('dispatched','scheduled','fetching',"
+                    "'installing','restarting','verifying')",
+                    (time.time() - self.offline_seconds,)))
+            accepting = len(accepting_nodes)
+            node_capacity = max((
+                min(max(1, int(node['desired_processes'] or 1)),
+                    max(1, int(node['max_processes'] or self.MAX_PROCESSES))) *
+                min(max(1, int(node['desired_threads'] or 1)),
+                    max(1, int(node['max_threads'] or self.MAX_THREADS)))
+                for node in accepting_nodes), default=0)
+            requested_limit = int(job['unit_rows'])
+            package_limit = requested_limit
+            if job['mode'] == 'auth' and node_capacity:
+                package_limit = max(
+                    requested_limit,
+                    min(self.DYNAMIC_UNIT_ROWS,
+                        node_capacity * self.PACKAGE_BUFFER_WAVES))
+            # Build with several node-capacity waves.  The worker pool still
+            # limits simultaneous work; extra rows are only a refill buffer.
+            built = self._build_units(job, package_limit, byte_limit)
             if built is None:
                 return
             rows, unit_count = built
-            with self.db.connect() as db:
-                accepting = int(db.execute(
-                    "SELECT COUNT(*) FROM nodes WHERE enabled=1 AND last_seen>? "
-                    "AND update_state NOT IN ('dispatched','scheduled','fetching',"
-                    "'installing','restarting','verifying')",
-                    (time.time() - self.offline_seconds,)).fetchone()[0])
-            target_units = max(1, unit_count,
-                               accepting * self.DYNAMIC_UNITS_PER_NODE)
+            # A task that fits in one buffered package must stay whole.  Larger
+            # tasks keep two packages per live node available for stealing.
+            target_units = (1 if unit_count == 1 else
+                            max(unit_count,
+                                accepting * self.DYNAMIC_UNITS_PER_NODE))
             balanced_limit = max(
                 50,
-                min(int(job['unit_rows']), self.DYNAMIC_UNIT_ROWS,
+                min(package_limit, self.DYNAMIC_UNIT_ROWS,
                     math.ceil(rows / target_units)))
-            if balanced_limit < int(job['unit_rows']):
+            if balanced_limit < package_limit:
                 with self.db.transaction() as db:
                     db.execute('DELETE FROM units WHERE job_id=?', (job_id,))
                     db.execute('UPDATE jobs SET rows=0 WHERE id=?', (job_id,))

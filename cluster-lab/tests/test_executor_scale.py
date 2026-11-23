@@ -246,13 +246,15 @@ class ExecutorScaleTests(unittest.TestCase):
         self.assertEqual(stall_timeout_seconds({'timeout': 60, 'retries': 4}), 360)
 
     def test_native_srp_preserves_total_concurrency_with_cpu_sized_process_pool(self):
-        self.assertEqual(_auth_process_limit(10, rows=1000, cpu_count=4), 4)
+        self.assertEqual(_auth_process_limit(10, rows=1000, cpu_count=4), 3)
         self.assertEqual(_auth_process_limit(10, rows=1000, cpu_count=16), 10)
         self.assertEqual(_auth_worker_limit(100, configured_processes=10,
-                                            active_processes=4), 250)
+                                            active_processes=3), 333)
         self.assertEqual(_auth_worker_limit(100, configured_processes=10,
                                             active_processes=2), 500)
-        self.assertEqual(4 * _auth_worker_limit(100, 10, 4), 10 * 100)
+        self.assertLessEqual(3 * _auth_worker_limit(100, 10, 3), 10 * 100)
+        self.assertEqual(_auth_process_limit(4, rows=1000, cpu_count=4), 3)
+        self.assertEqual(_auth_worker_limit(250, 4, 3), 333)
         self.assertEqual(PROXY_FETCH_LIMIT, 200)
         self.assertEqual(PROXY_INITIAL_FETCH, 1000)
         self.assertEqual(PROXY_PREFILL_WAIT_SECONDS, 10.0)

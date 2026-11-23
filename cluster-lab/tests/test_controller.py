@@ -851,10 +851,35 @@ class ControllerTests(unittest.TestCase):
         with self.service.db.connect() as db:
             units = list(db.execute('SELECT seq,first_row,rows FROM units '
                                     'WHERE job_id=? ORDER BY seq', (job,)))
-        self.assertEqual(len(units), 8)
+        self.assertEqual(len(units), 4)
         self.assertEqual([row['rows'] for row in units],
-                         [1251, 1251, 1251, 1251, 1251, 1251, 1251, 1245])
+                         [2501, 2501, 2501, 2499])
         self.assertEqual(units[-1]['first_row'] + units[-1]['rows'] - 1, 10002)
+
+    def test_node_concurrency_is_not_auth_package_size_limit(self):
+        self.service.heartbeat(self.node['id'], {
+            'session': 'test-session', 'hostname': 'test', 'version': 'test',
+            'max_processes': 4, 'max_threads': 500, 'active': [],
+            'interrupted': [],
+            'devices': {'running': False, 'capacity': 1000, 'ready': 1000,
+                        'built': 1000, 'failed': 0, 'attempted': 1000}})
+        self.service.configure_node(self.node['id'], {
+            'processes': 4, 'threads': 250, 'enabled': True})
+        job = self.service.create_job('buffered-4x250', io.BytesIO(b'x\n' * 10000),
+                                      1000, mode='auth')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = next(value for value in self.service.snapshot()['jobs']
+                         if value['id'] == job)
+            if state['status'] != 'preparing':
+                break
+            time.sleep(.01)
+        with self.service.db.connect() as db:
+            units = [row['rows'] for row in db.execute(
+                'SELECT rows FROM units WHERE job_id=? ORDER BY seq', (job,))]
+        self.assertEqual(units, [3334, 3334, 3332])
+        self.assertGreater(max(units), 4 * 250)
+        self.assertLessEqual(max(units), 4 * 250 * self.service.PACKAGE_BUFFER_WAVES)
 
     def test_paused_task_exports_only_confirmed_units(self):
         job = self.job(100)
@@ -1127,17 +1152,17 @@ class ControllerTests(unittest.TestCase):
                 break
             time.sleep(.01)
         self.assertEqual(state['status'], 'ready')
-        self.assertEqual((state['rows'], state['units']), (10002, 4))
+        self.assertEqual((state['rows'], state['units']), (10002, 2))
         with self.service.db.connect() as db:
             units = [dict(row) for row in db.execute(
                 'SELECT first_row,rows,path,byte_start,byte_end FROM units WHERE job_id=? ORDER BY seq',
                 (job,))]
         self.assertEqual([(unit['first_row'], unit['rows']) for unit in units],
-                         [(1, 2501), (2502, 2501), (5003, 2501), (7504, 2499)])
+                         [(1, 5001), (5002, 5001)])
         self.assertTrue(b''.join(self.service.unit_lines(units[-1])).endswith(b'\n\n'))
 
         self.service.job_action(job, 'start')
-        for expected in ((1, 2501), (2502, 2501), (5003, 2501), (7504, 2499)):
+        for expected in ((1, 5001), (5002, 5001)):
             unit = self.service.lease(self.node['id'], 'test-session')
             self.assertEqual((unit['first_row'], unit['rows']), expected)
             self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))

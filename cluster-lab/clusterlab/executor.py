@@ -1268,7 +1268,7 @@ def _group_child(directory, descriptor, stop, proxy_pool=None):
     worker_nice = 0
     if mp.parent_process() is not None:
         try:
-            worker_nice = os.nice(5)
+            worker_nice = os.nice(10)
         except (AttributeError, OSError):
             worker_nice = 0
     descriptor['_worker_nice'] = worker_nice
@@ -1291,15 +1291,20 @@ def _auth_worker_limit(configured, configured_processes=1, active_processes=None
     configured_processes = max(1, int(configured_processes or 1))
     active_processes = max(1, int(active_processes or configured_processes))
     total_concurrency = configured_processes * configured
-    return (total_concurrency + active_processes - 1) // active_processes
+    # Never exceed the configured node-wide concurrency when redistribution is
+    # uneven (4x250 becomes 3x333, not 3x334).
+    return max(1, total_concurrency // active_processes)
 
 
 def _auth_process_limit(configured, rows, cpu_count=None):
-    """Use one GMP compute lane per logical CPU."""
+    """Use bounded GMP lanes while reserving one CPU for node coordination."""
     configured = max(1, int(configured or 1))
     rows = max(1, int(rows or 1))
     logical_cpus = max(1, int(cpu_count or os.cpu_count() or 1))
-    return min(configured, rows, logical_cpus)
+    usable_cpus = logical_cpus
+    if logical_cpus >= 4 and configured >= logical_cpus:
+        usable_cpus -= 1
+    return min(configured, rows, usable_cpus)
 
 
 def execute_unit_group(directory, descriptor, stop):
@@ -1336,6 +1341,7 @@ def execute_unit_group(directory, descriptor, stop):
     descriptor['_node_process_count'] = process_count
     descriptor['_node_configured_process_count'] = process_limit
     descriptor['_node_cpu_count'] = node_cpu_count
+    cpu_reserve = max(0, min(process_limit, node_cpu_count) - process_count)
     active_threads_per_process = (
         _auth_worker_limit(descriptor.get('threads'), process_limit, process_count)
         if descriptor.get('mode') == 'auth'
@@ -1389,6 +1395,7 @@ def execute_unit_group(directory, descriptor, stop):
             pass
         read_progress.update(workers=0, worker_limit=process_limit,
                              active_process_limit=process_count,
+                             cpu_reserve=cpu_reserve,
                              threads_per_process=int(descriptor.get('threads') or 1),
                              active_threads_per_process=active_threads_per_process)
         if proxy_pool is not None:
@@ -1519,6 +1526,7 @@ def execute_unit_group(directory, descriptor, stop):
                             {'processed': processed, 'started': started,
                              'workers': active, 'worker_limit': process_count,
                              'configured_process_limit': process_limit,
+                             'cpu_reserve': cpu_reserve,
                              'threads_per_process': int(descriptor.get('threads') or 1),
                              'active_threads_per_process': active_threads_per_process,
                              'counts': live_counts,
@@ -1562,6 +1570,7 @@ def execute_unit_group(directory, descriptor, stop):
                     {'processed': processed, 'started': started, 'workers': 0,
                      'worker_limit': process_count,
                      'configured_process_limit': process_limit,
+                     'cpu_reserve': cpu_reserve,
                      'threads_per_process': int(descriptor.get('threads') or 1),
                      'active_threads_per_process': active_threads_per_process,
                      'counts': merged_counts,
@@ -1571,6 +1580,7 @@ def execute_unit_group(directory, descriptor, stop):
                      'checksum': output_digest.hexdigest(),
                      'workers': process_count, 'elapsed': time.time() - started,
                      'configured_process_limit': process_limit,
+                     'cpu_reserve': cpu_reserve,
                      'active_threads_per_process': active_threads_per_process,
                      **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
     except Exception as exc:                                      # noqa: BLE001
