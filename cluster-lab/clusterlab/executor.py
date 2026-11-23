@@ -1852,49 +1852,18 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            performance_first_row_sampled=True,
                            credentials_recorded=False)
 
-    # 只发现已有设备，不在工作线程启动前预注册。身份头也只能
-    # 在拿到独占租约后读取，避免两个线程同时使用同一设备。
+    # 启动阶段只读取本地设备标识，不向第三方刷新公共头。
+    # 公共头由首个取得该设备独占租约的工作线程惰性获取，
+    # 然后在该设备的整个生命周期内复用。这样不会在线程池启动前
+    # 串行等待 250 个网络请求。
     identities, identity_fetched_at, device_labels = {}, {}, {}
     for index in slot_ids:
-        bootstrap_device_lease = None
-        bootstrap_lease = None
         try:
             inspected = pool.inspect(index)
             device_labels[index] = _device_id_label(inspected.get('device_id'))
-            if inspected.get('state') != 'ready':
-                continue
-            # 已有设备保持旧版的包启动缓存行为，但刷新过程也必须先取得
-            # 设备租约。缺失槽位不在这里注册，留给真正拿不到设备的工作线程。
-            bootstrap_device_lease = DeviceAuthLease.try_acquire(pool, index)
-            if bootstrap_device_lease is None:
-                continue
-            bootstrap_lease = (proxy_pool.acquire(wait=2.0)
-                               if proxy_pool is not None else None)
-            bootstrap_proxy = (bootstrap_lease[0]
-                               if bootstrap_lease is not None else proxy)
-            if descriptor.get('proxy_api') and not bootstrap_proxy:
-                continue
-            info = pool.info(timeout, proxy=bootstrap_proxy, provider_direct=True)
-            profile = device_profile(pool, index)
-            info = dict(info, client_info=profile['client_info'],
-                        user_agent=profile['user_agent'])
-            identities[index] = pool.fetch_headers(
-                index, info, max(timeout, 40), registered=True,
-                proxy=bootstrap_proxy, provider_direct=True)
-            identity_fetched_at[index] = time.monotonic()
         except Exception:                                          # noqa: BLE001
-            identities[index] = None
-            identity_fetched_at.pop(index, None)
-        finally:
-            if proxy_pool is not None and bootstrap_lease is not None:
-                proxy_pool.release(bootstrap_lease,
-                                   healthy=identities.get(index) is not None)
-            if bootstrap_device_lease is not None:
-                bootstrap_device_lease.release()
+            device_labels[index] = 'B64:unknown'
 
-    # 已有设备的公共头刷新做单路去重；空设备槽的首次注册
-    # 由各工作线程并行完成，不得在每进程 250 线程前变成串行队列。
-    device_prepare_gate = threading.Semaphore(1)
     device_allocator = DeviceLeaseAllocator(
         pool, slot_ids, device_root=device_root, use_limit=use_limit)
 
@@ -2062,6 +2031,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             device_was_ready = None
             device_registered = False
             registration_failed = False
+            identity_loaded = False
             try:
                 device_started = time.monotonic() if debug_enabled else None
                 device_lease = device_allocator.acquire(stop)
@@ -2079,11 +2049,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     identity_fetched_at.pop(slot_id, None)
                     identity = None
                 if identity is None:
-                    # 已就绪设备刷新头时用单路门去重；缺失槽位不进该门，
-                    # 每个线程可以同时注册自己已独占的设备。
-                    prepare_gate=(device_prepare_gate if device_lease.initial_state=='ready'
-                                  else nullcontext())
-                    with prepare_gate:
+                    # device_lease 已经保证同一设备只能被一个线程使用，
+                    # 不能再用进程级 Semaphore(1) 把 250 台不同设备的
+                    # 公共头获取串行化。
+                    with nullcontext():
                         identity_started = time.monotonic() if debug_enabled else None
                         identity = _cached_device_identity(
                             identities, identity_fetched_at, slot_id)
@@ -2108,6 +2077,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             identity = pool.fetch_headers(
                                 slot_id, info, identity_timeout, registered=ready,
                                 proxy=account_proxy, provider_direct=True)
+                            identity_loaded = True
                             identities[slot_id] = identity
                             identity_fetched_at[slot_id] = time.monotonic()
                             refreshed = pool.inspect(slot_id)
@@ -2122,6 +2092,19 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                         if debug_enabled:
                             device_identity_ms = round(
                                 (time.monotonic() - identity_started) * 1000, 3)
+                if (identity_loaded and start_attempt == 0 and attempt == 0
+                        and proxy_pool is not None and lease is not None):
+                    # 公共头请求与账号认证使用两次独立租约。这不会
+                    # 重新请求代理 API，只是将头生成所用出口归还内存池，
+                    # 然后为真实认证取一条当前可用出口。
+                    proxy_pool.release(lease, healthy=True)
+                    lease = None
+                    account_proxy, lease = proxy_for(
+                        index + attempt + registration_retries)
+                    if not account_proxy:
+                        raise RuntimeError('公共头已生成，但代理池暂时无认证出口')
+                    if debug_enabled:
+                        current_proxy = _proxy_identity(account_proxy)
                 # Only the actual external request consumes one use.  The
                 # twentieth request retires this identity in release().
                 device_use = device_allocator.consume(device_lease)

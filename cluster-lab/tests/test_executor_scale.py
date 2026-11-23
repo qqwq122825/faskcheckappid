@@ -211,6 +211,47 @@ class ExecutorScaleTests(unittest.TestCase):
                 self.assertEqual(state['state'], 'idle')
                 self.assertTrue(state['last_used_at'])
 
+    def test_ready_device_headers_are_loaded_lazily_and_in_parallel(self):
+        class ReadyPool(FakePool):
+            calls = []
+            barrier = None
+
+            def inspect(self, slot):
+                return {'state': 'ready', 'device_id': f'device-{slot}'}
+
+            def fetch_headers(self, slot, *_args, **_kwargs):
+                type(self).calls.append((int(slot), threading.current_thread().name))
+                type(self).barrier.wait(1)
+                return {'slot': int(slot)}
+
+        ReadyPool.calls = []
+        ReadyPool.barrier = threading.Barrier(2)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text(
+                'one@example.com----a\ntwo@example.com----b\n', encoding='utf-8')
+            descriptor = {'rows': 2, 'first_row': 1, 'threads': 2,
+                          'device_capacity': 2, 'device_slots': [1, 2],
+                          'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    ReadyPool,
+                    lambda *_args, **_kwargs: {
+                        'status': 'valid', 'http': 200, 'stage': 'complete'},
+                    lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event())
+
+            self.assertEqual(sorted(slot for slot, _thread in ReadyPool.calls), [1, 2])
+            self.assertTrue(all('ThreadPoolExecutor' in thread
+                                for _slot, thread in ReadyPool.calls))
+            records = [json.loads(line) for line in
+                       (root / 'results.jsonl').read_text().splitlines()]
+            self.assertEqual(len(records), 2)
+
     def test_failed_registration_clears_partial_slot_and_next_account_retries(self):
         class FlakyRegistrationPool(FakePool):
             calls = 0
