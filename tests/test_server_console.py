@@ -58,6 +58,48 @@ class ServerTests(unittest.TestCase):
         self.assertIn('设备不休息，用完立即回到设备池',page)
         self.assertNotIn('休息前使用轮数',page)
         self.assertNotIn('每次休息 / 秒',page)
+        self.assertIn('当前设备池',page)
+        self.assertIn('实时显示节点同核设备池',page)
+
+    def test_live_worker_results_are_visible_deduplicated_and_credential_free(self):
+        from fastcheck.devices import save_json
+        job='b'*32;directory=self.root/'jobs'/job
+        save_json(directory/'state.json',{'id':job,'state':'running','accounts':2})
+        save_json(directory/'accounts-index.json',[
+            {'row':1,'email':'first@example.invalid'},
+            {'row':2,'email':'second@example.invalid'},
+        ])
+        worker=directory/'workers/001';worker.mkdir(parents=True)
+        first=json.dumps({
+            'row':1,'account':'first@example.invalid','password':'secret-one',
+            'status':'wrong_password','protocol':'GSA','code':'-22406',
+            'stage':'complete','http':200,'device':7,
+            'device_label':'B64:live-one','device_usage':3,
+            'elapsed':2.5,'attempts':0,
+        },separators=(',',':'))+'\n'
+        second=json.dumps({
+            'row':2,'account':'second@example.invalid','password':'secret-two',
+            'status':'locked','protocol':'GSA','code':'-21669',
+            'stage':'complete','http':200,'device':8,
+            'device_label':'B64:live-two','device_usage':1,
+            'elapsed':3.5,'attempts':0,
+        },separators=(',',':'))+'\n'
+        path=worker/'results.jsonl';path.write_text(first+second[:12])
+        manager=self.app.extensions['jobs']
+        live=manager.read_results(job)
+        self.assertEqual(live['total'],1)
+        self.assertNotIn('password',live['rows'][0])
+        self.assertNotIn('account',live['rows'][0])
+        self.assertEqual(live['rows'][0]['device_display'],'B64:live-one · 第 3 次')
+        with path.open('a') as output:output.write(second[12:])
+        self.assertEqual(manager.read_results(job)['total'],2)
+        # The final merged log repeats worker records.  Row-keyed ingestion
+        # must replace rather than duplicate them.
+        (directory/'results.jsonl').write_text(first+second)
+        final=manager.read_results(job)
+        self.assertEqual(final['total'],2)
+        self.assertNotIn('secret-one',json.dumps(final))
+        self.assertNotIn('secret-two',json.dumps(final))
 
     def test_spawned_demo_status_exports_and_credential_free_logs(self):
         self.login()

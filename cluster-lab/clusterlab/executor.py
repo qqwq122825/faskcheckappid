@@ -4,6 +4,7 @@ No plugin loading, account authentication, shell commands or target URLs.
 """
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import base64
 import hashlib
 import ipaddress
@@ -277,10 +278,14 @@ class DeviceLeaseAllocator:
         raise InterruptedError('节点关闭，停止等待设备')
 
     def reset_registered(self, lease):
-        """A freshly registered identity begins at zero uses."""
+        """Publish a freshly registered slot for ready-first reuse."""
         with self.lock:
             self.usage[lease.slot] = 0
             self.dirty_usage.add(lease.slot)
+            if lease.slot not in self.ready:
+                self.ready.append(lease.slot)
+            if lease.slot in self.missing:
+                self.missing.remove(lease.slot)
         lease.uses = 0
 
     def consume(self, lease):
@@ -1828,8 +1833,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             if bootstrap_device_lease is not None:
                 bootstrap_device_lease.release()
 
-    # 每个执行进程只让一个线程进入设备/SRP 准备段；
-    # 网络认证仍由所有工作线程并发执行。
+    # 已有设备的公共头刷新做单路去重；空设备槽的首次注册
+    # 由各工作线程并行完成，不得在每进程 250 线程前变成串行队列。
     device_prepare_gate = threading.Semaphore(1)
     device_allocator = DeviceLeaseAllocator(
         pool, slot_ids, device_root=device_root, use_limit=use_limit)
@@ -2013,9 +2018,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     identity_fetched_at.pop(slot_id, None)
                     identity = None
                 if identity is None:
-                    # 每进程只开一条设备/SRP 准备通道。已有设备刷新头；
-                    # 如果租到的是缺失槽位，就由当前工作线程完成注册。
-                    with device_prepare_gate:
+                    # 已就绪设备刷新头时用单路门去重；缺失槽位不进该门，
+                    # 每个线程可以同时注册自己已独占的设备。
+                    prepare_gate=(device_prepare_gate if device_lease.initial_state=='ready'
+                                  else nullcontext())
+                    with prepare_gate:
                         identity_started = time.monotonic() if debug_enabled else None
                         identity = _cached_device_identity(
                             identities, identity_fetched_at, slot_id)

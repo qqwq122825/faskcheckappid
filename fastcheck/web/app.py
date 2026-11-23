@@ -42,7 +42,15 @@ class LocalNodeDeviceBuilder:
         self.node.max_processes=max(1,int(processes));self.node.max_threads=max(1,int(threads))
         self.builder.start(capacity)
 
-    def snapshot(self):return self.builder.snapshot()
+    def snapshot(self):
+        value=self.builder.snapshot()
+        # The node builder scans up to the highest historical slot so it can
+        # discover persisted identities.  The console needs the current pool,
+        # not hundreds of empty placeholders on every two-second poll.
+        value['slots']=[item for item in value.get('slots',[])
+                        if item.get('state') not in ('missing','pending','retired')
+                        or item.get('error')]
+        return value
     def cancel(self):return self.builder.cancel()
 
 

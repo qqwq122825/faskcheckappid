@@ -211,27 +211,54 @@ class JobManager:
             return removed
 
     def read_results(self,job_id,category='all',offset=0,limit=100):
-        """Read only appended complete records; never reread the whole log each poll."""
+        """Read live worker records and the final merged log without duplicates.
+
+        The node executor writes one ``workers/*/results.jsonl`` file per child
+        while a job is running and only creates the top-level merged file when
+        all children finish.  Track every source independently so the console
+        can display completed rows immediately.  The final merged file may
+        contain the same rows, therefore the public result set is keyed by the
+        original account row rather than appended blindly.
+        """
         directory=self.directory(job_id)
         with self.result_lock:
             cached=self.result_cache.get(job_id)
-            if cached is None:
+            if cached is None or cached.get('version')!=2:
                 index={v['row']:v['email'] for v in json.loads((directory/'accounts-index.json').read_text())}
-                cached={'index':index,'position':0,'rows':defaultdict(list)}
+                cached={'version':2,'index':index,'sources':{},'by_row':{},'rows':defaultdict(list),'dirty':False}
                 self.result_cache[job_id]=cached
             self.result_cache.move_to_end(job_id)
             while len(self.result_cache)>4:self.result_cache.popitem(last=False)
-            path=directory/'results.jsonl'
-            if path.exists():
+
+            sources=[]
+            root_result=directory/'results.jsonl'
+            if root_result.exists():sources.append(root_result)
+            workers=directory/'workers'
+            if workers.exists():sources.extend(sorted(workers.glob('*/results.jsonl')))
+
+            for path in sources:
+                key=str(path)
+                position=int(cached['sources'].get(key,0))
+                try:size=path.stat().st_size
+                except OSError:continue
+                if size<position:position=0
                 with path.open('rb') as stream:
-                    stream.seek(cached['position'])
+                    stream.seek(position)
                     while True:
                         line=stream.readline()
                         if not line or not line.endswith(b'\n'):break
-                        cached['position']=stream.tell()
+                        cached['sources'][key]=stream.tell()
                         try:value=json.loads(line)
                         except ValueError:continue
-                        value['email']=cached['index'].get(value['row'],'')
+                        try:row=int(value['row'])
+                        except (KeyError,TypeError,ValueError):continue
+                        value['row']=row
+                        value['email']=cached['index'].get(row,'')
+                        # Worker logs contain the submitted credential so that
+                        # final exports can be built.  It must never cross the
+                        # JSON result endpoint into the browser.
+                        value.pop('password',None)
+                        value.pop('account',None)
                         if value.get('protocol')=='GSA' and 'code' in value:
                             # Node records already contain their final bucket.  Only
                             # decorate them for this page; never reclassify them with
@@ -247,9 +274,17 @@ class JobManager:
                             value['device_display']=device+(f' · 第 {usage} 次' if usage else '')
                         else:
                             value['category']='not_started' if not value.get('attempts') else result_bucket(value)
-                        cached['rows']['all'].append(value)
-                        cached['rows'][value['category']].append(value)
-            rows=cached['rows'][category]
+                        cached['by_row'][row]=value
+                        cached['dirty']=True
+
+            if cached['dirty']:
+                rows=defaultdict(list)
+                for value in sorted(cached['by_row'].values(),key=lambda item:item['row']):
+                    rows['all'].append(value)
+                    rows[value['category']].append(value)
+                cached['rows']=rows
+                cached['dirty']=False
+            rows=cached['rows'].get(category,[])
             return {'total':len(rows),'rows':rows[offset:offset+limit]}
 
     def start(self,accounts,settings,proxy_auth='',simulation=False):

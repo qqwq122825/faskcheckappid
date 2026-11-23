@@ -136,24 +136,28 @@ class ExecutorScaleTests(unittest.TestCase):
         class EmptyPool(FakePool):
             ready = set()
             registered = []
+            registration_barrier = None
 
             def inspect(self, slot):
                 return {'state': 'ready' if int(slot) in type(self).ready else 'missing',
                         'device_id': f'device-{slot}' if int(slot) in type(self).ready else ''}
 
             def fetch_headers(self, slot, *_args, **_kwargs):
+                type(self).registration_barrier.wait(1)
                 type(self).ready.add(int(slot))
                 type(self).registered.append(int(slot))
                 return {'slot': int(slot)}
 
         EmptyPool.ready = set()
         EmptyPool.registered = []
+        EmptyPool.registration_barrier = threading.Barrier(2)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'input.part').write_text(
-                'one@example.com----a\ntwo@example.com----b\n', encoding='utf-8')
-            descriptor = {'rows': 2, 'first_row': 1, 'threads': 2,
-                          'device_capacity': 2, 'device_slots': [1, 2],
+                'one@example.com----a\ntwo@example.com----b\nthree@example.com----c\n',
+                encoding='utf-8')
+            descriptor = {'rows': 3, 'first_row': 1, 'threads': 2,
+                          'device_capacity': 3, 'device_slots': [1, 2, 3],
                           'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5}
             barrier = threading.Barrier(2)
@@ -173,7 +177,8 @@ class ExecutorScaleTests(unittest.TestCase):
                 _execute_auth_unit(root, descriptor, threading.Event())
 
             self.assertEqual(sorted(EmptyPool.registered), [1, 2])
-            self.assertEqual(sorted(used), [1, 2])
+            self.assertEqual(len(used),3)
+            self.assertEqual(set(used),{1,2})
             for slot in (1, 2):
                 state = json.loads(
                     (EmptyPool(root / 'devices').slot_directory(slot) /
