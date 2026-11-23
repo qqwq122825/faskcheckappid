@@ -199,8 +199,8 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(value['progress']['cpu_reserve'], 1)
         self.assertEqual(value['node']['telemetry']['cpu_percent'], 81.2)
         self.assertEqual(value['configuration']['logging'], {
-            'mode': 'timeout_full_trace', 'sample_every': None,
-            'sampling_strategy': 'event_filtered'})
+            'mode': 'sampled_performance_plus_timeouts', 'sample_every': 20,
+            'sampling_strategy': 'first_and_every_n_plus_slow_and_timeout'})
         self.assertEqual(value['debug']['srp']['compute_cpu_ms']['total'], 8.5)
         self.assertEqual(value['debug']['srp']['math_backends'], {'gmpy2': 1})
         encoded = json.dumps(value)

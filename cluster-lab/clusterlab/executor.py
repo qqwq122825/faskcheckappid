@@ -36,6 +36,8 @@ LOCAL_QUEUE_LOW_WATER = 100
 LOCAL_QUEUE_TARGET = 300
 MIN_STALL_TIMEOUT_SECONDS = 180.0
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
+PERFORMANCE_TRACE_SAMPLE_EVERY = 20
+PERFORMANCE_TRACE_SLOW_MS = 30000.0
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
 PROXY_EXIT_IP_TIMEOUT = 4.0
 PROXY_EXIT_IP_MAX = 2048
@@ -501,6 +503,47 @@ def _refine_repair_auth_with_rotation(result, email, password, proxy, timeout,
         if exhausted:
             refined['web_rotation_exhausted'] = True
     return refined
+
+
+def _srp_timing_summary(phase_ms, phase_cpu_ms, phase_counts, sampled):
+    """Summarize measured SRP leaf phases; missing samples are never zero."""
+    stages = {}
+    for name in ('init', 'challenge'):
+        compute = f'srp_{name}_compute'
+        wait = f'srp_{name}_lane_wait'
+        compute_calls = int(phase_counts.get(compute, 0))
+        wait_calls = int(phase_counts.get(wait, 0))
+        stages[name] = {
+            'compute_calls': compute_calls if sampled else None,
+            'compute_wall_ms': (round(phase_ms.get(compute, 0), 3)
+                                if compute_calls else None),
+            'compute_cpu_ms': (round(phase_cpu_ms.get(compute, 0), 3)
+                               if compute_calls else None),
+            'lane_wait_calls': wait_calls if sampled else None,
+            'lane_wait_ms': (round(phase_ms.get(wait, 0), 3)
+                             if wait_calls else None),
+            'lane_wait_cpu_ms': (round(phase_cpu_ms.get(wait, 0), 3)
+                                 if wait_calls else None),
+        }
+    observed = any(value['compute_calls'] for value in stages.values())
+    return {
+        'scope': 'sampled_attempt_leaf_phases',
+        'state': ('observed' if observed else
+                  'no_compute_events' if sampled else 'not_sampled'),
+        'challenge_observed': (bool(stages['challenge']['compute_calls'])
+                               if sampled else None),
+        'compute_cpu_ms': (round(sum(value['compute_cpu_ms'] or 0
+                                    for value in stages.values()), 3)
+                           if observed else None),
+        'compute_wall_ms': (round(sum(value['compute_wall_ms'] or 0
+                                     for value in stages.values()), 3)
+                            if observed else None),
+        'lane_wait_ms': (round(sum(value['lane_wait_ms'] or 0
+                                  for value in stages.values()), 3)
+                         if any(value['lane_wait_calls'] for value in stages.values())
+                         else None),
+        **stages,
+    }
 
 
 def _write_proxy_debug(path, event, **fields):
@@ -1202,7 +1245,9 @@ def execute_unit_group(directory, descriptor, stop):
             threads=int(descriptor.get('threads') or 1),
             retries=int(descriptor.get('retries') or 0),
             timeout=float(descriptor.get('timeout') or 20),
-            mode='timeout_full_trace', credentials_recorded=False)
+            mode='sampled_performance_plus_timeouts',
+            sample_every=PERFORMANCE_TRACE_SAMPLE_EVERY,
+            credentials_recorded=False)
     started = time.time()
     rows = max(0, int(descriptor.get('rows') or 0))
     process_limit = max(1, int(descriptor.get('processes') or 1))
@@ -1735,7 +1780,13 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            threads=workers, configured_threads=configured_workers,
                            worker_nice=int(descriptor.get('_worker_nice') or 0),
                            retries=retries, timeout=timeout,
-                           slots=slot_ids, credentials_recorded=False)
+                           slots=slot_ids,
+                           srp_math_backend=getattr(
+                               sys.modules.get('fastcheck.protocols.srp_auth'),
+                               'SRP_MATH_BACKEND', 'unknown'),
+                           performance_sample_every=PERFORMANCE_TRACE_SAMPLE_EVERY,
+                           performance_first_row_sampled=True,
+                           credentials_recorded=False)
 
     # 只发现已有设备，不在工作线程启动前预注册。身份头也只能
     # 在拿到独占租约后读取，避免两个线程同时使用同一设备。
@@ -1878,6 +1929,30 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         # 不会在“0 次重试”时暗中多发请求。
         attempt_limit = retries + 1
         for attempt in range(start_attempt, attempt_limit):
+            # 1000条压测默认只记录首条和每20条中的1条（约5%）。
+            # 超过30秒的慢请求即使不在样本中也记录外层耗时；不记录账号、
+            # 密码或完整代理地址，避免日志本身改变CPU/吞吐表现。
+            trace_sampled = (debug_enabled and (
+                row == int(descriptor.get('first_row') or 1)
+                or row % PERFORMANCE_TRACE_SAMPLE_EVERY == 0))
+            phase_ms = Counter()
+            phase_cpu_ms = Counter()
+            phase_counts = Counter()
+
+            def collect_phase(event):
+                if event.get('event') != 'phase_end':
+                    return
+                phase = str(event.get('phase') or '')
+                if not phase:
+                    return
+                try:
+                    phase_ms[phase] += max(0.0, float(event.get('ms') or 0))
+                    phase_cpu_ms[phase] += max(
+                        0.0, float(event.get('cpu_ms') or 0))
+                    phase_counts[phase] += 1
+                except (TypeError, ValueError):
+                    return
+
             acquire_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
             acquire_started = time.monotonic() if debug_enabled else None
             account_proxy, lease = proxy_for(index + attempt)
@@ -1914,9 +1989,19 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                               _retry_previous=current_proxy)
                 return row, line, result
             request_started = time.monotonic() if debug_enabled else None
+            request_thread_cpu_started = time.thread_time() if debug_enabled else None
+            request_process_cpu_started = time.process_time() if debug_enabled else None
             device_lease = None
+            device_lease_ms = None
+            device_identity_ms = None
+            device_was_ready = None
+            device_registered = False
             try:
+                device_started = time.monotonic() if debug_enabled else None
                 device_lease = device_allocator.acquire(stop)
+                if debug_enabled:
+                    device_lease_ms = round(
+                        (time.monotonic() - device_started) * 1000, 3)
                 slot_id = device_lease.slot
                 if device_lease.initial_state == 'ready':
                     identity = _cached_device_identity(
@@ -1931,12 +2016,14 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     # 每进程只开一条设备/SRP 准备通道。已有设备刷新头；
                     # 如果租到的是缺失槽位，就由当前工作线程完成注册。
                     with device_prepare_gate:
+                        identity_started = time.monotonic() if debug_enabled else None
                         identity = _cached_device_identity(
                             identities, identity_fetched_at, slot_id)
                         if identity is None:
                             info = pool.info(timeout, proxy=account_proxy,
                                              provider_direct=True)
                             ready = pool.inspect(slot_id)['state'] == 'ready'
+                            device_was_ready = ready
                             profile = device_profile(pool, slot_id)
                             info = dict(info, client_info=profile['client_info'],
                                         user_agent=profile['user_agent'])
@@ -1949,17 +2036,22 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             device_labels[slot_id] = _device_id_label(
                                 refreshed.get('device_id'))
                             if not ready and refreshed['state'] == 'ready':
+                                device_registered = True
                                 device_allocator.reset_registered(device_lease)
                                 record_device_registration(
                                     device_root, slot_id, account_proxy,
                                     profile.get('model', ''))
+                        if debug_enabled:
+                            device_identity_ms = round(
+                                (time.monotonic() - identity_started) * 1000, 3)
                 # Only the actual external request consumes one use.  The
                 # twentieth request retires this identity in release().
                 device_use = device_allocator.consume(device_lease)
                 # 换 IP 重试由节点池处理，协议层每次只使用当前出口一次。
                 result = gsa_check(account, password, account_proxy, timeout=timeout,
                                    retries=0 if proxy_pool is not None else retries,
-                                   cancel=stop.is_set, identity=identity)
+                                   cancel=stop.is_set, identity=identity,
+                                   diagnostics=(collect_phase if trace_sampled else None))
                 result['_device_use'] = device_use
                 if descriptor.get('_web_secondary_auth'):
                     def rotate_web(web_attempt):
@@ -1995,6 +2087,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     device_lease.release()
             request_ms = (round((time.monotonic() - request_started) * 1000, 2)
                           if debug_enabled else None)
+            request_thread_cpu_ms = (
+                round((time.thread_time() - request_thread_cpu_started) * 1000, 3)
+                if debug_enabled else None)
+            process_cpu_ms_during_request = (
+                round((time.process_time() - request_process_cpu_started) * 1000, 3)
+                if debug_enabled else None)
             transport_failed = retryable_transport(result)
             try:
                 result_http = int(result.get('http'))
@@ -2010,6 +2108,30 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 web_http = None
             web_failed = (str(result.get('web_status') or '').casefold() == 'error'
                           and web_http in (0, 500, 502, 503, 504))
+            if debug_enabled and (trace_sampled
+                                  or (request_ms or 0) >= PERFORMANCE_TRACE_SLOW_MS):
+                _write_proxy_debug(
+                    debug_path, 'auth_timing', row=row, slot=slot_id,
+                    attempt=attempt, sampled=trace_sampled,
+                    proxy_acquire_ms=acquire_ms,
+                    device_lease_ms=device_lease_ms,
+                    device_identity_ms=device_identity_ms,
+                    request_ms=request_ms,
+                    request_thread_cpu_ms=request_thread_cpu_ms,
+                    request_non_cpu_ms=round(max(
+                        0.0, request_ms - request_thread_cpu_ms), 3),
+                    process_cpu_ms_during_request=process_cpu_ms_during_request,
+                    process_core_equivalents_during_request=(
+                        round(process_cpu_ms_during_request / request_ms, 3)
+                        if request_ms > 0 else None),
+                    trace_sample_every=PERFORMANCE_TRACE_SAMPLE_EVERY,
+                    srp=_srp_timing_summary(
+                        phase_ms, phase_cpu_ms, phase_counts, trace_sampled),
+                    device_was_ready=device_was_ready,
+                    device_registered=device_registered,
+                    http=result_http, apple_ec=apple_ec,
+                    status=str(result.get('status') or ''),
+                    stage=str(result.get('stage') or ''))
             # HTTP 0 and transient 5xx are retry outcomes: remove that exact lease now,
             # wait five seconds, then acquire an available (never in-use) exit.
             # Proxy-auth 407 and other transport failures retain the general

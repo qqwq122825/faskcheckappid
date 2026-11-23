@@ -826,6 +826,7 @@ class Node:
             'device_identity_ms', 'request_ms', 'request_thread_cpu_ms',
             'request_non_cpu_ms', 'process_cpu_ms_during_request',
             'process_core_equivalents_during_request', 'http', 'apple_ec',
+            'trace_sample_every', 'device_was_ready', 'device_registered',
             'status', 'stage', 'kind', 'retryable', 'release',
             'port_changed', 'pair_changed', 'recorded_retries',
             'configured_retries', 'ok', 'processed', 'counts')
@@ -949,13 +950,12 @@ class Node:
                 'device_mode': descriptor.get('_device_mode',
                                               descriptor.get('device_mode')),
                 'logging': {
-                    # v0.3.87 only emits bounded lifecycle, proxy and timeout
-                    # events.  Keep the executor unchanged so adding this
-                    # read-only endpoint cannot alter benchmark throughput.
-                    'mode': ('timeout_full_trace'
+                    # 1000条压测默认记录首条、每20条中的1条以及所有超时；
+                    # 不是全量账号日志，避免诊断本身改变CPU和吞吐。
+                    'mode': ('sampled_performance_plus_timeouts'
                              if descriptor.get('_proxy_debug') else 'off'),
-                    'sample_every': None,
-                    'sampling_strategy': 'event_filtered',
+                    'sample_every': 20 if descriptor.get('_proxy_debug') else None,
+                    'sampling_strategy': 'first_and_every_n_plus_slow_and_timeout',
                 },
             },
             'progress': progress, 'done': done, 'workers': worker_states,
