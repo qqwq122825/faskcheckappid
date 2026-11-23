@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from fastcheck.scheduler import Settings, Supervisor
-from fastcheck.workers import demo_attempt, demo_registration, protocol_attempt
+from fastcheck.workers import cached_identity, demo_attempt, demo_registration, protocol_attempt
 from batch_fixtures import (supervisor_retry, supervisor_limited, supervisor_hang,
                             supervisor_crash, supervisor_debug,supervisor_retry_priority)
 from archive.legacy.gsa_batch import Account
@@ -92,11 +92,11 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(len([e for e in events if e['event']=='task_dispatch']),100)
         self.assertEqual(runner.proxies.target,0)
 
-    def test_gsa_devices_are_exclusive_and_can_be_reused_after_two_ready(self):
+    def test_gsa_initial_pool_grows_without_duplicate_device_lease(self):
         runner = self.runner(protocol='gsa', device_capacity=3)
         summary = self.run_quiet(runner)
         self.assertIsNone(summary['stop_reason'])
-        self.assertLessEqual(summary['max_active'], 3)
+        self.assertLessEqual(summary['max_active'], 20)
         busy, uses = set(), {}
         for event in self.events():
             if event['event']=='task_dispatch':
@@ -106,7 +106,8 @@ class SupervisorTests(unittest.TestCase):
             if event['event']=='task_done':
                 busy.remove(event['device'])
         self.assertFalse(busy)
-        self.assertTrue(any(value>1 for value in uses.values()))
+        self.assertEqual(len(uses),20)
+        self.assertTrue(all(value==1 for value in uses.values()))
         self.assertEqual(sum(summary['results'].values()),20)
         self.assertFalse(runner.registration_thread.is_alive())
         self.assertFalse(runner.proxies.thread.is_alive())
@@ -124,7 +125,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(len([e for e in dispatch if e['row']==3]),1)
         self.assertEqual(runner.results[3]['status'],'init_refused')
 
-    def test_device_rests_preserve_identities_and_do_not_retry_20970(self):
+    def test_dynamic_slots_avoid_reuse_and_rest_until_capacity_is_full(self):
         runner=self.runner(count=20,protocol='gsa',device_capacity=3,
                            device_rest_after=2,device_rest_seconds=.1,device_rest_slots=1)
         original={}
@@ -138,15 +139,16 @@ class SupervisorTests(unittest.TestCase):
         self.assertIsNone(summary['stop_reason'])
         self.assertEqual(sum(summary['results'].values()),20)
         events=self.events()
-        self.assertTrue(any(e['event']=='device_rest_started' for e in events))
-        self.assertTrue(any(e['event']=='device_rest_ended' for e in events))
+        self.assertFalse(any(e['event']=='device_rest_started' for e in events))
+        self.assertFalse(any(e['event']=='device_rest_ended' for e in events))
         self.assertFalse(any(e['event']=='registration_start' for e in events))
         self.assertEqual(len([e for e in events if e['event']=='task_dispatch' and e['row']==1]),1)
         self.assertEqual(runner.results[1]['status'],'init_refused')
         self.assertEqual(sum(v['total_uses'] for v in summary['device_usage'].values()),20)
+        self.assertEqual(summary['ready_devices'],20)
         self.assertEqual({s:runner.pool.inspect(s)['device_id'] for s in original},original)
 
-    def test_due_retry_does_not_hold_device_behind_unstarted_accounts(self):
+    def test_due_retry_runs_after_the_fully_dispatched_first_wave(self):
         runner=self.runner(count=20,protocol='gsa',device_capacity=2,
                            handler=supervisor_retry_priority,max_attempts=2)
         summary=self.run_quiet(runner)
@@ -154,29 +156,49 @@ class SupervisorTests(unittest.TestCase):
         dispatch=[v for v in self.events() if v['event']=='task_dispatch']
         retry=next(i for i,v in enumerate(dispatch) if v['row']==1 and v['attempt']==2)
         last=next(i for i,v in enumerate(dispatch) if v['row']==20 and v['attempt']==1)
-        self.assertLess(retry,last)
+        self.assertGreater(retry,last)
 
-    def test_two_devices_can_fill_eighty_thread_slots_when_sharing_is_enabled(self):
+    def test_two_initial_devices_grow_to_eighty_exclusive_slots(self):
         runner=self.runner(count=82,protocol='gsa',processes=8,threads=10,
                            device_capacity=2,device_parallelism=0,max_attempts=1)
         summary=self.run_quiet(runner)
         self.assertIsNone(summary['stop_reason'])
         self.assertEqual(sum(summary['results'].values()),82)
-        self.assertGreater(summary['max_active'],10)
         self.assertLessEqual(summary['max_active'],80)
-        self.assertEqual(summary['ready_devices'],2)
+        self.assertEqual(summary['ready_devices'],80)
+        busy=set()
+        for event in self.events():
+            if event['event']=='task_dispatch':
+                self.assertNotIn(event['device'],busy)
+                busy.add(event['device'])
+            elif event['event']=='task_done':
+                busy.remove(event['device'])
+        self.assertFalse(busy)
 
-    def test_empty_pool_reports_zero_of_target_before_startup_and_two_ready_gate(self):
+    def test_empty_pool_starts_immediately_and_workers_register_missing_slots(self):
         runner=self.runner(count=4,protocol='gsa',device_capacity=3,processes=1,threads=2)
         progress=[];runner.progress=progress.append
         summary=self.run_quiet(runner)
         self.assertEqual((progress[0]['devices']['total'],progress[0]['devices']['target']),(0,3))
         self.assertEqual(progress[0]['devices']['restored'],0)
         self.assertEqual(summary['device_pool']['registered_this_run'],summary['ready_devices'])
-        ready=0
-        for event in self.events():
-            if event['event']=='registration_ready':ready=event['ready_devices']
-            if event['event']=='task_dispatch':self.assertGreaterEqual(ready,2)
+        dispatch=[event for event in self.events() if event['event']=='task_dispatch']
+        self.assertTrue(dispatch)
+        self.assertTrue(any(event.get('device_registration') for event in dispatch))
+        self.assertEqual(sum(summary['results'].values()),4)
+
+    def test_zero_initial_devices_grow_to_thread_capacity_without_duplicate_lease(self):
+        runner=self.runner(count=8,protocol='gsa',device_capacity=0,
+                           processes=2,threads=4,warmup_devices=0)
+        summary=self.run_quiet(runner)
+        self.assertIsNone(summary['stop_reason'])
+        self.assertEqual(sum(summary['results'].values()),8)
+        self.assertEqual(summary['ready_devices'],8)
+        registration_dispatch=[event for event in self.events()
+                               if event['event']=='task_dispatch'
+                               and event.get('device_registration')]
+        self.assertEqual(len(registration_dispatch),8)
+        self.assertEqual(len({event['device'] for event in registration_dispatch}),8)
 
     def test_saved_pool_reports_reuse_instead_of_new_registration(self):
         runner=self.runner(count=4,protocol='gsa',device_capacity=2,processes=1,threads=2)
@@ -272,6 +294,35 @@ class WebAdapterTests(unittest.TestCase):
 
 
 class GSAAdapterTests(unittest.TestCase):
+    def test_device_headers_are_reused_until_the_thirty_second_cache_expires(self):
+        from fastcheck import workers
+
+        class HeaderPool:
+            def __init__(self, root):
+                self.root=Path(root)
+                self.calls=0
+            def slot_directory(self, slot):
+                path=self.root/str(slot);path.mkdir(parents=True,exist_ok=True);return path
+            def info(self, *_args, **_kwargs):
+                return {}
+            def fetch_headers(self, *_args, **_kwargs):
+                self.calls+=1
+                return {'generation':self.calls}
+
+        with tempfile.TemporaryDirectory() as directory:
+            pool=HeaderPool(directory)
+            workers._IDENTITY_CACHE.clear()
+            with patch.object(workers,'_IDENTITY_TTL',.05):
+                first=cached_identity(pool,1,1,None,None)
+                second=cached_identity(pool,1,1,None,None)
+                self.assertIs(first,second)
+                self.assertEqual(pool.calls,1)
+                __import__('time').sleep(.06)
+                third=cached_identity(pool,1,1,None,None)
+                self.assertEqual(pool.calls,2)
+                self.assertEqual(third['generation'],2)
+            workers._IDENTITY_CACHE.clear()
+
     def test_legacy_dual_flag_does_not_start_web_recheck(self):
         identity={'X-Apple-I-MD':'otp','X-Apple-I-MD-M':'machine','X-Apple-I-MD-LU':'user',
                   'X-Apple-I-MD-RINFO':'17106176','X-Mme-Device-Id':'device',

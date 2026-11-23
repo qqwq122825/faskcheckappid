@@ -23,11 +23,11 @@ class Settings:
     processes: int = 2
     threads: int = 10
     device_capacity: int = 10
-    device_parallelism: int = 0
+    device_parallelism: int = 1
     device_selection: str = 'prefer_new'
     warmup_devices: int = 2
-    device_rest_after: int = 20
-    device_rest_seconds: float = 30
+    device_rest_after: int = 0
+    device_rest_seconds: float = 0
     device_rest_slots: int = 1
     proxy_target: int = 0
     # 供应商的隧道默认只有 60 秒存活，留 10 秒余量避免请求打到将死的端口上
@@ -55,10 +55,10 @@ class Settings:
         if type(self.anisette_proxy) is not bool:
             raise ValueError('anisette_proxy 必须是布尔值。')
         for name, low, high in (('processes', 1, None), ('threads', 1, None),
-                                ('device_capacity', 1, None), ('proxy_target', 0, None),
+                                ('device_capacity', 0, None), ('proxy_target', 0, None),
                                 ('device_parallelism',0,None),
                                 ('device_rest_after', 0, None), ('device_rest_slots', 1, None),
-                                ('warmup_devices', 1, self.device_capacity), ('max_attempts', 1, 6)):
+                                ('warmup_devices', 0, None), ('max_attempts', 1, 6)):
             value = getattr(self, name)
             if type(value) is not int or value < low or (high is not None and value > high):
                 raise ValueError(f'{name} 必须不少于 {low}'+(f' 且不超过 {high}' if high is not None else '')+'。')
@@ -83,15 +83,17 @@ class Task:
     slot: int | None = None
     ready_at: float = 0
     history: list = None
+    device_leased: bool = False
+    registering: bool = False
 
     def __post_init__(self):
         self.history = []
 
 
 # 身份池调度策略（供维护参考，不在界面上展示）：
-#   · device_parallelism 固定 0：单身份并发跟随总体线程容量，设备之间按在途数
-#     均匀分配，不做额外限流；这个参数不再暴露到界面上；
-#   · warmup_devices 默认 2，够 2 台就绪就派发任务，注册线程在后台继续补齐；
+#   · GSA 设备固定单线程独占；旧配置中的 device_parallelism=0 也按 1 处理；
+#   · 预注册数可以是 0；没有空闲就绪设备时，工作线程原子占用
+#     一个空槽并在首个账号上完成注册，成功后归还到池中；
 #   · device_rest_after / device_rest_seconds 为 0 时关闭休息策略。
 class Supervisor:
     def __init__(self, accounts, api_url, root, directory, settings, *, proxy_auth='',
@@ -112,8 +114,13 @@ class Supervisor:
         self.accounts = accounts
         self.active, self.results, self.workers = {}, {}, {}
         self.devices = set()
+        self.registering_slots = set()
         self.restored_devices = 0
-        self.device_parallelism = settings.device_parallelism or settings.processes*settings.threads
+        # 本地版先固定验证“一台设备同时只给一个线程”。
+        self.device_parallelism = 1 if settings.protocol == 'gsa' else (
+            settings.device_parallelism or settings.processes*settings.threads)
+        self.device_slot_capacity = max(
+            1, settings.device_capacity, settings.processes * settings.threads)
         self.device_scheduler = DeviceScheduler(rest_after=settings.device_rest_after,
             rest_seconds=settings.device_rest_seconds, rest_slots=settings.device_rest_slots,
             minimum_ready=min(settings.warmup_devices,len(accounts)), concurrency=self.device_parallelism,
@@ -125,7 +132,9 @@ class Supervisor:
         self.worker_serial = 0
         self.next_retry_at = float('inf')
         self.device_root = self.root/'config/batch-device-pool'
-        self.pool = DevicePool(self.device_root, settings.origin, max_devices=settings.device_capacity) if settings.protocol == 'gsa' else None
+        self.pool = DevicePool(
+            self.device_root, settings.origin,
+            max_devices=self.device_slot_capacity) if settings.protocol == 'gsa' else None
         fetch = fetcher or ApiFetcher(self.context, self.stop, proxy_auth,
                                      debug_log=self.log.debug if settings.debug else None,
                                      scheme=None if settings.proxy_scheme=='http' else settings.proxy_scheme)
@@ -171,10 +180,14 @@ class Supervisor:
             for slot in range(1, s.device_capacity+1):
                 if self.stop.is_set():
                     break
-                if slot in self.devices:
-                    continue
+                with self.resource_lock:
+                    if slot in self.devices or slot in self.registering_slots:
+                        continue
+                    self.registering_slots.add(slot)
                 if self.pool.inspect(slot)['state'] == 'invalid':
                     self.log('registration_failed', device=slot, error_type='InvalidSavedState')
+                    with self.resource_lock:
+                        self.registering_slots.discard(slot)
                     failures += 1
                     if failures >= max_consecutive_failures:
                         break
@@ -186,6 +199,8 @@ class Supervisor:
                     lease = self.proxies.take(timeout=.2, min_remaining=s.registration_budget+3,
                                               share=True)
                 if lease is None:
+                    with self.resource_lock:
+                        self.registering_slots.discard(slot)
                     failures += 1
                     if failures >= max_consecutive_failures:
                         break
@@ -218,6 +233,8 @@ class Supervisor:
                     self.reap(process, output)
                     self.proxies.release(lease, valid=bool(result and result.get('ok')))
                 if not result or not result.get('ok'):
+                    with self.resource_lock:
+                        self.registering_slots.discard(slot)
                     self.log('registration_failed', device=slot, **(result or {'kind':'timeout'}))
                     if result and result.get('http') == 429:
                         self.request_stop('registration_ratelimit')
@@ -227,18 +244,24 @@ class Supervisor:
                         break
                     continue
                 if self.pool.inspect(slot)['state'] != 'ready':
+                    with self.resource_lock:
+                        self.registering_slots.discard(slot)
                     failures += 1
                     if failures >= max_consecutive_failures:
                         break
                     continue
                 failures = 0
                 with self.resource_lock:
+                    self.registering_slots.discard(slot)
                     self.devices.add(slot)
                     self.device_scheduler.add(slot)
                 self.log('registration_ready', device=slot, ready_devices=len(self.devices))
                 if self.stop.wait(.2):
                     break
         except Exception as exc:
+            with self.resource_lock:
+                if 'slot' in locals():
+                    self.registering_slots.discard(slot)
             self.log('registration_failed', error_type=type(exc).__name__)
         finally:
             self.registration_done.set()
@@ -269,6 +292,33 @@ class Supervisor:
                 allowed = {slot for slot in self.devices if
                            health['devices'].get(str(slot),{}).get('until',0) <= now}
         return self.device_scheduler.reserve(allowed)
+
+    def claim_device(self, job):
+        """Lease one ready device, or atomically reserve one empty slot."""
+        slot = self.choose_device()
+        if slot is not None:
+            job.device_leased = True
+            job.registering = False
+            return slot
+        with self.resource_lock:
+            for candidate in range(1, self.device_slot_capacity + 1):
+                if candidate in self.devices or candidate in self.registering_slots:
+                    continue
+                state = self.pool.inspect(candidate).get('state')
+                if state == 'ready':
+                    self.devices.add(candidate)
+                    self.device_scheduler.add(candidate)
+                    continue
+                if state == 'missing':
+                    self.registering_slots.add(candidate)
+                    job.device_leased = False
+                    job.registering = True
+                    return candidate
+        slot = self.choose_device()
+        if slot is not None:
+            job.device_leased = True
+            job.registering = False
+        return slot
 
     def proxy_demand(self):
         # 在途任务仍持有 IP，必须计入需求：只看 pending 会在派发高峰后立刻收缩
@@ -301,7 +351,7 @@ class Supervisor:
                 self.pending.append(job)
                 continue
             if self.pool and job.slot is None:
-                job.slot = self.choose_device()
+                job.slot = self.claim_device(job)
                 if job.slot is None:
                     self.pending.appendleft(job)
                     break
@@ -317,7 +367,9 @@ class Supervisor:
             payload = {'row': job.account.row, 'email': job.account.email, 'password': job.account.password,
                        'attempt': job.attempt, 'slot': job.slot, 'proxy': lease.url, 'protocol': s.protocol,
                        'timeout': s.timeout, 'prepare_timeout': s.prepare_timeout, 'debug': s.debug,
-                       'device_root': str(self.device_root), 'device_capacity': s.device_capacity, 'origin': s.origin}
+                       'device_root': str(self.device_root),
+                       'device_capacity': self.device_slot_capacity, 'origin': s.origin,
+                       'register_device': bool(job.registering)}
             payload['device_parallelism']=self.device_parallelism
             payload['anisette_proxy']=s.anisette_proxy
             deadline = min(time.monotonic()+s.attempt_budget, lease.expires_at-2)
@@ -328,7 +380,8 @@ class Supervisor:
             self.worker_serial += 1
             w['dispatch_serial'] = self.worker_serial
             w['in'].put_nowait(payload)
-            device_fields = self.device_scheduler.dispatched(job.slot) if job.slot is not None else {}
+            device_fields = (self.device_scheduler.dispatched(job.slot)
+                             if job.device_leased else {'device_registration': True})
             self.max_active = max(self.max_active, len(self.active))
             self.log('task_dispatch', row=row, attempt=job.attempt, worker=worker,
                      device=job.slot, proxy=lease.label, active=len(self.active),
@@ -346,8 +399,13 @@ class Supervisor:
         except OSError as exc:
             self.export_failures.append(row)
             self.log('export_failed',row=row,error_type=type(exc).__name__)
-        if job.slot is not None:
+        if job.registering and job.slot is not None:
+            with self.resource_lock:
+                self.registering_slots.discard(job.slot)
+            job.registering = False
+        if job.device_leased and job.slot is not None:
             self.device_scheduler.release(job.slot,allow_rest=not self.stop.is_set() and bool(self.pending or self.active))
+            job.device_leased = False
         job.account.password = ''
 
     def accept(self, message):
@@ -362,6 +420,25 @@ class Supervisor:
         del self.active[row]
         self.workers[item['worker']]['rows'].discard(row)
         job, result = item['job'], message['result']
+        if job.registering:
+            registered = self.pool.inspect(job.slot).get('state') == 'ready'
+            with self.resource_lock:
+                self.registering_slots.discard(job.slot)
+                if registered:
+                    self.devices.add(job.slot)
+                    self.device_scheduler.add(job.slot)
+            if registered:
+                leased = self.device_scheduler.reserve({job.slot})
+                if leased != job.slot:
+                    raise RuntimeError('newly registered device was not leasable')
+                self.device_scheduler.dispatched(job.slot)
+                job.device_leased = True
+                job.registering = False
+                self.log('registration_ready', device=job.slot,
+                         ready_devices=len(self.devices), source='worker')
+            else:
+                job.registering = False
+                job.slot = None
         job.history.append(dict(result, attempt=job.attempt, worker=item['worker']))
         # 只有传输层失败才说明出口本身不可用。HTTP 5xx/超时是目标站或链路抖动，
         # 跟着丢弃整条隧道会让供应商重复提取同一批出口，白烧额度、白等补货。
@@ -434,7 +511,7 @@ class Supervisor:
                  proxy_ttl=s.proxy_ttl, debug=s.debug)
         try:
             if self.pool:
-                for slot in range(1, s.device_capacity+1):
+                for slot in range(1, self.device_slot_capacity+1):
                     if self.pool.inspect(slot)['state'] == 'ready':
                         self.devices.add(slot)
                         self.device_scheduler.add(slot)
@@ -459,12 +536,10 @@ class Supervisor:
                 self.collect()
                 if self.stop.is_set():
                     break
-                with self.resource_lock:
-                    gate = not self.pool or len(self.devices) >= min(s.warmup_devices, len(self.accounts))
-                if gate:
-                    self.dispatch()
-                elif self.registration_done.is_set():
-                    self.request_stop('device_warmup_failed')
+                # 没有预注册设备也可以开工；dispatch 会让线程原子预留
+                # 空槽并完成注册。
+                gate = True
+                self.dispatch()
                 self.proxies.set_target(self.proxy_demand())
                 if before != (len(self.results), len(self.active)):
                     last_progress = time.monotonic()

@@ -45,7 +45,7 @@ def create_app(data_dir=None):
         path=root/'config/web-settings.json'
         if path.exists():return json.loads(path.read_text())
         path=ROOT/'examples/auth_settings.json'
-        return json.loads(path.read_text()) if path.exists() else asdict(Settings(max_attempts=1,device_parallelism=0,device_selection='prefer_new'))
+        return json.loads(path.read_text()) if path.exists() else asdict(Settings(max_attempts=1,device_parallelism=1,device_selection='prefer_new'))
 
     def options(data):
         if not isinstance(data,dict):raise ValueError('任务配置字段无效。')

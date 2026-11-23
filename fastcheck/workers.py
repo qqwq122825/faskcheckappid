@@ -84,7 +84,8 @@ _IDENTITY_LOCK = threading.Lock()
 _IDENTITY_TTL = 30.0
 
 
-def cached_identity(pool, slot, prepare_timeout, proxy, diagnostic, direct=True):
+def cached_identity(pool, slot, prepare_timeout, proxy, diagnostic, direct=True,
+                    registered=True):
     """30 秒内同一设备复用设备参数，省掉一次 anisette 往返。"""
     now = time.monotonic()
     with _IDENTITY_LOCK:
@@ -108,7 +109,8 @@ def cached_identity(pool, slot, prepare_timeout, proxy, diagnostic, direct=True)
             info = dict(info, client_info=profile['client_info'], user_agent=profile['user_agent'])
             identity = pool.fetch_headers(slot, info, prepare_timeout,
                                           proxy=proxy, diagnostics=diagnostic,
-                                          provider_direct=direct)
+                                          provider_direct=direct,
+                                          registered=registered)
         with _IDENTITY_LOCK:
             _IDENTITY_CACHE[slot] = (time.monotonic(), identity)
         return identity
@@ -208,7 +210,8 @@ def protocol_attempt(payload, output, stop):
         try:
             identity = cached_identity(pool, payload['slot'], payload['prepare_timeout'],
                                        payload['proxy'], diagnostic,
-                                       direct=not payload.get('anisette_proxy', False))
+                                       direct=not payload.get('anisette_proxy', False),
+                                       registered=not payload.get('register_device', False))
             if diagnostic:
                 diagnostic.context['otp_fingerprint']=hashlib.sha256(identity['X-Apple-I-MD'].encode()).hexdigest()[:16]
                 diagnostic({'event':'device_identity_refreshed','phase':'device_headers_refresh'})
@@ -296,6 +299,14 @@ def demo_attempt(payload, output, stop):
     def forbidden(*args, **kwargs):
         raise AssertionError('Offline demo forbids network')
     socket.socket.connect = forbidden
+    if payload.get('protocol') == 'gsa' and payload.get('register_device'):
+        import base64
+        pool = DevicePool(payload['device_root'], payload['origin'],
+                          max_devices=payload['device_capacity'])
+        store = pool.store(payload['slot'])
+        state = store.load()
+        state['adi_pb'] = base64.b64encode(b'offline-demo-state').decode()
+        store.save(state)
     time.sleep(.2)
     if payload['row'] == 1:
         return {'status': 'error', 'kind': 'protocol', 'stage': 'init',
