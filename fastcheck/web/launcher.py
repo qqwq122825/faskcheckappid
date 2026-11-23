@@ -27,6 +27,7 @@ def main(argv=None):
     if not 1<=port<=65535:parser.error('端口必须在 1–65535。')
     if args.web_threads<1:parser.error('Web 请求线程数必须为正整数。')
     if args.data_dir:os.environ['GSA_DATA_DIR']=str(Path(args.data_dir).resolve())
+    if args.local:os.environ['FASTCHECK_LOCAL_NODE_EXECUTOR']='1'
     from .bootstrap import data_root,initialize
     if args.local and args.host not in ('127.0.0.1','localhost','::1'):
         parser.error('--local 使用本机回环地址。服务器部署请去掉 --local。')

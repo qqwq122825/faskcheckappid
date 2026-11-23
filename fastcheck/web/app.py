@@ -76,12 +76,16 @@ def create_app(data_dir=None):
     def index():return app.send_static_file('index.html')
 
     @app.get('/healthz')
-    def health():return jsonify(ok=True,version=VERSION)
+    def health():return jsonify(ok=True,version=VERSION,executor_backend=
+                                'clusterlab.executor' if os.environ.get(
+                                    'FASTCHECK_LOCAL_NODE_EXECUTOR')=='1' else 'fastcheck.scheduler')
 
     @app.get('/api/session')
     def current_session():
         session.setdefault('csrf',secrets.token_urlsafe(32))
-        return jsonify(authenticated=bool(session.get('authenticated')),csrf=session['csrf'],version=VERSION)
+        return jsonify(authenticated=bool(session.get('authenticated')),csrf=session['csrf'],version=VERSION,
+                       executor_backend='clusterlab.executor' if os.environ.get(
+                           'FASTCHECK_LOCAL_NODE_EXECUTOR')=='1' else 'fastcheck.scheduler')
 
     @app.post('/api/login')
     def login():

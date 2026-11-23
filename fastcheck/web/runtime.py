@@ -29,6 +29,83 @@ TERMINAL={'completed','stopped','failed','unknown'}
 def timestamp():return datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(timespec='seconds')
 
 
+def _node_executor():
+    """Import the exact executor used by deployed cluster nodes."""
+    import sys
+    root=Path(__file__).resolve().parents[2]
+    cluster=root/'cluster-lab'
+    if str(cluster) not in sys.path:sys.path.insert(0,str(cluster))
+    from clusterlab.executor import execute_unit_group
+    return execute_unit_group
+
+
+def _node_progress(value,total,started):
+    """Adapt node progress to the local console without changing execution."""
+    processed=max(0,min(total,int(value.get('processed') or 0)))
+    counts=dict(value.get('counts') or {})
+    counts.update(total=total,processed=processed,remaining=max(0,total-processed),
+                  active=max(0,int(value.get('active_threads_total') or 0))
+                  if processed<total else 0)
+    return {'counts':counts,'phase':'节点执行器本地模式',
+            'elapsed_seconds':round(max(0,time.time()-started),3),
+            'executor_backend':'clusterlab.executor',
+            'workers':int(value.get('workers') or 0),
+            'active_threads_by_process':value.get('active_threads_by_process') or [],
+            'active_threads_total':int(value.get('active_threads_total') or 0),
+            **({'proxy_pool':value['proxy_pool']} if value.get('proxy_pool') else {})}
+
+
+def run_node_auth_job(root,directory,accounts,settings,api,progress):
+    """Run a local GSA task through the deployed node's executor code path."""
+    directory=Path(directory);started=time.time()
+    input_path=directory/'input.part'
+    with input_path.open('w',encoding='utf-8',newline='') as output:
+        input_path.chmod(0o600)
+        for account in accounts:
+            output.write(f'{account.email}----{account.password}\n')
+    rows=len(accounts)
+    capacity=max(1,min(rows,settings.processes*settings.threads))
+    descriptor={
+        'id':directory.name,'job_id':directory.name,'mode':'auth',
+        'first_row':1,'rows':rows,'processes':settings.processes,
+        'threads':settings.threads,'timeout':settings.timeout,
+        'retries':max(0,settings.max_attempts-1),'proxy_api':api,
+        'proxy_scheme':settings.proxy_scheme,'proxy_ttl':settings.proxy_ttl,
+        'proxy_pool_size':1000,
+        'origin':settings.origin,'device_root':str(private_directory(Path(root)/'device-pool')),
+        'device_pool_capacity':capacity,'device_slots':list(range(1,capacity+1)),
+        'device_use_limit':20,'_proxy_debug':bool(settings.debug),
+        '_web_secondary_auth':True,
+    }
+    save_json(directory/'manifest.json',descriptor)
+    context=mp.get_context('spawn');stop=context.Event();finished=threading.Event()
+    def monitor():
+        while not finished.wait(.15):
+            if (directory/'stop').exists():stop.set()
+            try:value=json.loads((directory/'progress.json').read_text())
+            except (OSError,ValueError):value={}
+            progress(_node_progress(value,rows,started))
+    thread=threading.Thread(target=monitor,name='local-node-monitor',daemon=True)
+    thread.start()
+    try:_node_executor()(directory,descriptor,stop)
+    finally:
+        finished.set();thread.join()
+    done=json.loads((directory/'done.json').read_text())
+    if not done.get('ok'):raise RuntimeError(str(done.get('error') or 'node executor failed'))
+    try:value=json.loads((directory/'progress.json').read_text())
+    except (OSError,ValueError):value={}
+    current=_node_progress(value,rows,started);progress(current)
+    results=dict(done.get('counts') or {})
+    return {'accounts':rows,'results':results,'display_counts':current['counts'],
+            'elapsed_seconds':round(float(done.get('elapsed') or time.time()-started),3),
+            'max_active':int(done.get('active_threads_total') or
+                             current.get('active_threads_total') or 0),
+            'active_threads_by_process':done.get('active_threads_by_process') or
+                                        current.get('active_threads_by_process') or [],
+            'executor_backend':'clusterlab.executor','stop_reason':
+            'user_cancelled' if stop.is_set() else None}
+
+
 def run_job(root,job_id,accounts,settings_values,proxy_auth,simulation):
     isolate_process()
     root=Path(root);directory=root/'jobs'/job_id;state_path=directory/'state.json'
@@ -58,6 +135,14 @@ def run_job(root,job_id,accounts,settings_values,proxy_auth,simulation):
             def progress(value):
                 state['progress']=value
                 save_json(state_path,state)
+            use_node=(not simulation and settings.protocol=='gsa' and
+                      os.environ.get('FASTCHECK_LOCAL_NODE_EXECUTOR')=='1')
+            if use_node:
+                summary=run_node_auth_job(root,directory,accounts,settings,api,progress)
+                state.update(state='stopped' if summary['stop_reason'] else 'completed',
+                             summary=summary,executor_backend='clusterlab.executor',
+                             completed_at=timestamp())
+                return
             runner=Supervisor(accounts,api,runtime_root,directory,settings,proxy_auth=proxy_auth,
                               progress=progress,console=False,**options)
             def monitor():
@@ -147,7 +232,21 @@ class JobManager:
                         try:value=json.loads(line)
                         except ValueError:continue
                         value['email']=cached['index'].get(value['row'],'')
-                        value['category']='not_started' if not value.get('attempts') else result_bucket(value)
+                        if value.get('protocol')=='GSA' and 'code' in value:
+                            # Node records already contain their final bucket.  Only
+                            # decorate them for this page; never reclassify them with
+                            # the legacy local-result rules.
+                            value['category']=value.get('status') or 'undetermined'
+                            value['result_code']=value.get('code')
+                            value['total_ms']=round(float(value.get('elapsed') or 0)*1000)
+                            value['retry_count']=max(0,int(value.get('attempts') or 0))
+                            label=str(value.get('device_label') or '').strip()
+                            slot=value.get('device')
+                            device=label or (f'#{slot}' if slot else '—')
+                            usage=max(0,int(value.get('device_usage') or 0))
+                            value['device_display']=device+(f' · 第 {usage} 次' if usage else '')
+                        else:
+                            value['category']='not_started' if not value.get('attempts') else result_bucket(value)
                         cached['rows']['all'].append(value)
                         cached['rows'][value['category']].append(value)
             rows=cached['rows'][category]
@@ -165,6 +264,9 @@ class JobManager:
             directory=private_directory(self.root/'jobs'/job_id)
             state={'id':job_id,'state':'queued','created_at':timestamp(),'protocol':settings.protocol,
                    'simulation':simulation,'accounts':len(accounts),'settings':asdict(settings)}
+            if (not simulation and settings.protocol=='gsa' and
+                    os.environ.get('FASTCHECK_LOCAL_NODE_EXECUTOR')=='1'):
+                state['executor_backend']='clusterlab.executor'
             save_json(directory/'state.json',state)
             save_json(directory/'accounts-index.json',[{'row':a.row,'email':a.email} for a in accounts])
             process=self.context.Process(target=run_job,args=(str(self.root),job_id,accounts,asdict(settings),proxy_auth,simulation),name='web-task-supervisor')

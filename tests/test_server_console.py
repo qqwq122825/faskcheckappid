@@ -84,6 +84,74 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(response.status_code,400)
         self.assertIn('FASTCHECK_MOCK',response.json['error'])
 
+    def test_real_task_upload_keeps_duplicate_account_rows(self):
+        self.login();captured=[]
+        def start(accounts,*_args):
+            captured.extend((row.row,row.email,row.password) for row in accounts)
+            return {'id':'captured-duplicate-rows'}
+        with patch('fastcheck.protocols.gsa_status.mock_enabled',return_value=False), \
+             patch('fastcheck.web.app.load_api',return_value='https://proxy.example/list'), \
+             patch.object(self.app.extensions['jobs'],'start',side_effect=start):
+            response=self.client.post('/api/jobs',data={
+                'accounts_text':'same@example.com----one\nSAME@example.com----two\nsame@example.com----three\n',
+                'settings':json.dumps({'protocol':'gsa'}),
+            },headers={'X-CSRF-Token':self.csrf})
+        self.assertEqual(response.status_code,202,response.json)
+        self.assertEqual(captured,[(1,'same@example.com','one'),
+                                   (2,'SAME@example.com','two'),
+                                   (3,'same@example.com','three')])
+
+    def test_local_node_backend_reuses_executor_and_preserves_device_label(self):
+        from fastcheck.scheduler import Settings
+        from fastcheck.task_io import Account
+        from fastcheck.devices import save_json
+        from fastcheck.web import runtime
+        executor=runtime._node_executor()
+        self.assertEqual((executor.__module__,executor.__name__),
+                         ('clusterlab.executor','execute_unit_group'))
+        job='a'*32;directory=self.root/'jobs'/job;directory.mkdir(parents=True)
+        accounts=[Account(1,'same@example.com','one'),
+                  Account(2,'SAME@example.com','two')]
+        save_json(directory/'state.json',{'id':job,'state':'running','accounts':2})
+        save_json(directory/'accounts-index.json',[{'row':a.row,'email':a.email}
+                                                    for a in accounts])
+        captured={}
+        def fake_node_executor(target,descriptor,_stop):
+            captured.update(descriptor)
+            records=[]
+            for row,status in ((1,'init_refused'),(2,'need_2fa')):
+                records.append(json.dumps({
+                    'row':row,'status':status,'protocol':'GSA','code':'-20970',
+                    'stage':'init','http':200,'device':row,
+                    'device_label':f'B64:device-{row}','device_usage':2,
+                    'elapsed':1.25,'attempts':1,
+                },separators=(',',':')))
+            (Path(target)/'results.jsonl').write_text('\n'.join(records)+'\n')
+            save_json(Path(target)/'progress.json',{
+                'processed':2,'counts':{'init_refused':1,'need_2fa':1},
+                'active_threads_total':2,'active_threads_by_process':[2]})
+            save_json(Path(target)/'done.json',{
+                'ok':True,'processed':2,'counts':{'init_refused':1,'need_2fa':1},
+                'elapsed':2.5,'active_threads_total':2,
+                'active_threads_by_process':[2]})
+        progress=[]
+        settings=Settings(protocol='gsa',processes=4,threads=250,
+                          device_capacity=0,warmup_devices=0)
+        with patch('fastcheck.web.runtime._node_executor',return_value=fake_node_executor):
+            summary=runtime.run_node_auth_job(
+                self.root,directory,accounts,settings,'https://proxy.example/list',
+                progress.append)
+        self.assertEqual((captured['processes'],captured['threads']),(4,250))
+        self.assertEqual(captured['device_slots'],[1,2])
+        self.assertEqual((directory/'input.part').read_text().splitlines(),[
+            'same@example.com----one','SAME@example.com----two'])
+        self.assertEqual(summary['executor_backend'],'clusterlab.executor')
+        rows=self.app.extensions['jobs'].read_results(job)['rows']
+        self.assertEqual(rows[0]['category'],'init_refused')
+        self.assertEqual(rows[0]['device_display'],'B64:device-1 · 第 2 次')
+        self.assertEqual(rows[0]['result_code'],'-20970')
+        self.assertEqual(rows[0]['retry_count'],1)
+
     def test_stop_and_second_task_conflict(self):
         self.login();headers={'X-CSRF-Token':self.csrf}
         data={'simulation':'true','demo_count':'100','settings':json.dumps({'processes':1,'threads':1})}

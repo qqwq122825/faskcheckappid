@@ -38,7 +38,7 @@ class Account:
 
 
 def read_accounts(path, *, max_accounts=10):
-    records, seen = [], set()
+    records = []
     for line_number, line in enumerate(Path(path).expanduser().read_text(encoding='utf-8-sig').splitlines(), 1):
         if not line.strip():
             continue
@@ -48,12 +48,9 @@ def read_accounts(path, *, max_accounts=10):
             raise ValueError(f'第 {line_number} 行格式错误或仍为示例：应为 邮箱----密码。')
         if len(email) > 4096 or len(password) > 4096 or any(ord(c) < 32 for c in email + password):
             raise ValueError(f'第 {line_number} 行包含无效字段。')
-        if email.casefold() in seen:
-            raise ValueError(f'第 {line_number} 行账号重复，请每个账号仅保留一行。')
-        seen.add(email.casefold())
         records.append(Account(len(records) + 1, email, password))
     if not records or (max_accounts is not None and len(records)>max_accounts):
-        raise ValueError(f'此测试入口接收 1–{max_accounts} 个不同的自有账号。' if max_accounts else '账号文件不能为空。')
+        raise ValueError(f'此测试入口接收 1–{max_accounts} 个自有账号。' if max_accounts else '账号文件不能为空。')
     return records
 
 

@@ -16,6 +16,7 @@ from unittest.mock import patch
 from fastcheck.proxy_pool import ApiFetcher, ProxyFetchError, ProxyLease, ProxyPool
 from archive.legacy.gsa_batch import Account, BatchRunner, read_accounts
 from fastcheck.devices import DevicePool
+from fastcheck.task_io import read_accounts as read_current_accounts
 from fastcheck.protocols.anisette_v3 import Client, StateStore
 from fastcheck.protocols.proxy_api import demand_url, parse
 from batch_fixtures import auth, register, limited, hang, finish, api_ready, api_hang, debug_auth, retry_then_limit
@@ -144,14 +145,18 @@ class BatchTests(unittest.TestCase):
         stats = json.loads((self.root/'logs/debug-summary.json').read_text())
         self.assertEqual(next(row for row in stats['phases'] if row['phase']=='synthetic_phase')['count'],100)
 
-    def test_account_parser_preserves_password_and_rejects_duplicates(self):
+    def test_account_parser_preserves_password_and_duplicate_rows(self):
         path = self.root/'accounts.txt'
-        path.write_text('own@example.com---- password----suffix \n')
-        accounts = read_accounts(path)
-        self.assertEqual(accounts[0].password, ' password----suffix ')
-        path.write_text('own@example.com----a\nOWN@example.com----b\n')
-        with self.assertRaises(ValueError):
-            read_accounts(path)
+        for parser in (read_accounts,read_current_accounts):
+            path.write_text('own@example.com---- password----suffix \n')
+            accounts = parser(path)
+            self.assertEqual(accounts[0].password, ' password----suffix ')
+            path.write_text('own@example.com----a\nOWN@example.com----b\n')
+            accounts = parser(path)
+            self.assertEqual([(row.row,row.email,row.password) for row in accounts], [
+                (1,'own@example.com','a'),
+                (2,'OWN@example.com','b'),
+            ])
 
     def test_proxy_requests_exact_ten_and_parser_preserves_proxy_credentials(self):
         url = 'https://api.example.invalid/?password=a%26b&num=200&region=any'
