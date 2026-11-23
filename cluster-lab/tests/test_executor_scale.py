@@ -360,6 +360,7 @@ class ExecutorScaleTests(unittest.TestCase):
                 _execute_auth_unit(root, descriptor, threading.Event())
             records = [json.loads(line) for line in
                        (root / 'results.jsonl').read_text().splitlines()]
+            records.sort(key=lambda item: item['row'])
             self.assertEqual([item['device_usage'] for item in records],
                              list(range(1, 21)) + [1])
             self.assertEqual(LifecyclePool.registrations, 1)
@@ -564,28 +565,29 @@ class ExecutorScaleTests(unittest.TestCase):
         finally:
             pool.close()
 
-    def test_proxy_pool_marks_exits_aging_at_45_seconds(self):
+    def test_proxy_pool_marks_only_exits_with_45_seconds_remaining(self):
         context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=2, ttl=50, target=2)
+        pool = NodeProxyPool(context, concurrency=2, ttl=1800, target=2)
         try:
             now = time.monotonic()
-            pool.add_fresh(['socks5h://young'], fetched_at=now - 44)
-            pool.add_fresh(['socks5h://aging'], fetched_at=now - 46)
+            pool.add_fresh(['socks5h://not-expiring'], fetched_at=now - 1700)
+            pool.add_fresh(['socks5h://expiring'], fetched_at=now - 1760)
             time.sleep(.05)
             self.assertEqual(pool.count_aging(now=now), 1)
+            self.assertEqual(pool.snapshot()['expiring_45s'], 1)
             self.assertEqual(pool.snapshot()['aging_45s'], 1)
             self.assertEqual(pool.snapshot()['known'], 2)
         finally:
             pool.close()
 
-    def test_supplier_prefetches_replacements_for_45_second_old_exits(self):
+    def test_supplier_prefetches_replacements_45_seconds_before_expiry(self):
         context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=2, ttl=50, target=2)
+        pool = NodeProxyPool(context, concurrency=2, ttl=1800, target=2)
         stop = threading.Event()
         calls = []
         try:
             pool.add_fresh(['socks5h://old-one', 'socks5h://old-two'],
-                           fetched_at=time.monotonic() - 46)
+                           fetched_at=time.monotonic() - 1760)
             time.sleep(.05)
 
             def fetcher(_url, count, scheme=None):
@@ -605,6 +607,55 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(calls, [2])
             self.assertEqual(pool.snapshot()['known'], 2)
             self.assertEqual(pool.snapshot()['refreshed'], 2)
+        finally:
+            stop.set()
+            pool.close()
+
+    def test_supplier_waits_above_low_water_instead_of_chasing_target(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=10, ttl=1800, target=10)
+        stop = threading.Event()
+        calls = []
+        try:
+            pool.add_fresh([f'socks5h://stock-{index}' for index in range(6)])
+
+            def fetcher(_url, count, scheme=None):
+                calls.append(count)
+                return []
+
+            thread = threading.Thread(
+                target=proxy_supplier_loop,
+                args=(pool, 'http://proxy.test/list', 'socks5h', stop, fetcher))
+            thread.start()
+            time.sleep(.1)
+            stop.set()
+            thread.join(2)
+            self.assertEqual(pool.low_water, 5)
+            self.assertEqual(pool.snapshot()['known'], 6)
+            self.assertEqual(calls, [])
+        finally:
+            stop.set()
+            pool.close()
+
+    def test_supplier_refills_from_below_low_water_to_target(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=10, ttl=1800, target=10)
+        stop = threading.Event()
+        calls = []
+        try:
+            pool.add_fresh([f'socks5h://stock-{index}' for index in range(4)])
+
+            def fetcher(_url, count, scheme=None):
+                calls.append(count)
+                stop.set()
+                return [f'{scheme}://replacement-{index}' for index in range(count)]
+
+            thread = threading.Thread(
+                target=proxy_supplier_loop,
+                args=(pool, 'http://proxy.test/list', 'socks5h', stop, fetcher))
+            thread.start()
+            thread.join(2)
+            self.assertEqual(calls, [6])
         finally:
             stop.set()
             pool.close()

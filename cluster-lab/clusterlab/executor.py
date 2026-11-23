@@ -1023,10 +1023,10 @@ class NodeProxyPool:
         return removed
 
     def count_aging(self, now=None):
-        """Count queued exits aged 45 seconds without leasing them."""
+        """Count queued exits with at most 45 seconds of lifetime remaining."""
         current = time.monotonic() if now is None else float(now)
         aging = 0
-        remaining = max(0.0, self.ttl - PROXY_AGING_SECONDS)
+        remaining = PROXY_AGING_SECONDS
         for channel, counter in ((self.fresh, self.fresh_count),
                                  (self.reusable, self.reusable_count)):
             visible = []
@@ -1034,7 +1034,7 @@ class NodeProxyPool:
                 try:
                     # multiprocessing.Queue publishes its shared count before
                     # the feeder has necessarily made the item readable.  A
-                    # short bounded wait keeps the 45-second rotation scan
+                    # short bounded wait keeps the pre-expiry rotation scan
                     # deterministic without entering the worker hot path.
                     lease = channel.get(timeout=0.02)
                 except queue.Empty:
@@ -1089,6 +1089,8 @@ class NodeProxyPool:
             'last_fetch_ms': round(last_fetch_ms, 1),
             'ttl_seconds': self.ttl,
             'ready': self.ready.is_set(),
+            'expiring_45s': aging,
+            # Compatibility alias for older controller/node panels.
             'aging_45s': aging,
         }
 
@@ -1124,12 +1126,16 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
             if stop.wait(max(0.0, next_tick - time.monotonic())):
                 return
             pool.refill.clear()
-            # Busy leases are still valid inventory and will return to the
-            # reusable queue. Counting only queued exits made 1,000 workers
-            # look like 1,000 missing proxies and triggered needless refills.
-            needed = max(0, pool.target - pool.snapshot()['known'])
-            # Fill shortages immediately. Once full, fetch replacements only
-            # when exits reach age 45s, before the default 50s expiry.
+            # Busy leases count as inventory and will return to the reusable
+            # queue. Refill to the target only after total known inventory
+            # drops below the low-water mark; do not continuously chase every
+            # small gap between low-water and target.
+            state = pool.snapshot()
+            known = int(state.get('known') or 0)
+            needed = max(0, pool.target - known) if known < pool.low_water else 0
+            # Independently replace only exits whose real expiry is at most
+            # 45 seconds away. A 1,800-second lease is therefore not rotated
+            # merely because it has been in the pool for 45 seconds.
             aging = pool.count_aging()
             count = min(PROXY_FETCH_LIMIT, max(needed, aging))
             if count <= 0:
