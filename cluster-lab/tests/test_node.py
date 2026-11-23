@@ -545,7 +545,7 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(descriptor['device_overflow_slots'], list(range(1001, 1051)))
         self.assertEqual(descriptor['device_base_capacity'], 1000)
         self.assertEqual(descriptor['device_pool_capacity'], 1050)
-        self.assertEqual(descriptor['device_usage_limit'], 10)
+        self.assertEqual(descriptor['device_usage_limit'], 100)
         self.assertEqual(descriptor['device_cooldown_seconds'], 3.0)
         self.assertNotIn('device_plan', descriptor)
         self.assertEqual(descriptor['_retry_delay'], 10.0)
@@ -578,7 +578,7 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(descriptor['device_base_capacity'], 0)
         self.assertEqual(descriptor['device_ready_slots'], [])
         self.assertEqual(descriptor['device_overflow_slots'], list(range(1, 1001)))
-        self.assertEqual(descriptor['device_usage_limit'], 10)
+        self.assertEqual(descriptor['device_usage_limit'], 100000)
 
     def test_two_nodes_with_one_hundred_ready_devices_send_nine_hundred_threads_to_registration(self):
         snapshot = {'capacity': 100, 'slots': [

@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 '''
 
 DEVICE_AUTH_LIMIT = 100
-ONE_TIME_DEVICE_AUTH_LIMIT = 10
+ONE_TIME_DEVICE_AUTH_LIMIT = 100000
 DEVICE_POOL_LIMIT = 10000
 DEVICE_AUTH_COOLDOWN_SECONDS = 3.0
 
@@ -696,7 +696,8 @@ class Node:
             active_devices = min(rows, processes * max(
                 1, int(descriptor.get('threads') or 1)))
             pool_size = base_capacity + active_devices
-            limit = ONE_TIME_DEVICE_AUTH_LIMIT
+            limit = max(1, int(descriptor.get(
+                'device_usage_limit') or ONE_TIME_DEVICE_AUTH_LIMIT))
             ready_slots = sorted({int(item.get('slot') or 0) for item in entries
                                   if isinstance(item, dict)
                                   and item.get('state') == 'ready'

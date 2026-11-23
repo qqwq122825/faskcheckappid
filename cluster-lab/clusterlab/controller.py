@@ -1679,12 +1679,12 @@ class Controller:
                 config = self.proxy_for_node(node)
                 settings = self.settings()
                 device_mode = (unit['device_mode'] or 'one_time').lower()
+                device_usage_limit = max(
+                    1, int(settings.get('device_rotate_after') or 100000))
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
                                proxy_pool_size=int(settings.get('proxy_pool_size') or 10000),
                                device_registration_workers=32,
-                               device_usage_limit=(10 if device_mode == 'one_time' else
-                                                   max(1, int(settings.get(
-                                                       'device_rotate_after') or 100))),
+                               device_usage_limit=device_usage_limit,
                                origin=settings.get('origin', 'https://new.ani.sidestore.io'),
                                _proxy_debug=bool(settings.get('proxy_debug')),
                                _proxy_debug_mode=settings.get('proxy_debug_mode', 'off'),

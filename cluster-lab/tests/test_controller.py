@@ -127,6 +127,10 @@ class ControllerTests(unittest.TestCase):
     def test_rotation_threshold_persists_while_background_refill_stays_off(self):
         result = self.service.configure_rotation({'device_rotate_after': 37})
         self.assertFalse(result['device_auto_rotate'])
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual(unit['device_usage_limit'], 37)
         self.service.close()
         self.service = Controller(self.temp.name)
         self.assertFalse(self.service.settings()['device_auto_rotate'])
