@@ -24,13 +24,14 @@ test('Task creation exposes retries and node settings allow up to 4 x 500', () =
   assert.doesNotMatch(nodes, /active-text="允许领取新工作包"/)
 })
 
-test('New nodes stay paused until all default devices are initialized', () => {
+test('Paused nodes can start while missing devices register on demand', () => {
   const nodes = source('src/views/Nodes.vue')
   const dialogs = source('src/components/NodeDialogs.vue')
-  assert.match(nodes, /!node\.enabled && !node\.device_initialization_complete/)
-  assert.match(nodes, /设备初始化 \{\{ node\.device_ready \|\| 0 \}\}\/\{\{ node\.device_request \|\| 30 \}\}/)
+  assert.doesNotMatch(nodes, /:disabled="[^"]*device_initialization_complete/)
+  assert.match(nodes, /缺失设备由工作线程按需注册/)
   assert.match(nodes, /开始接单/)
-  assert.match(dialogs, /新节点先暂停接单并自动初始化 30 台设备/)
+  assert.match(dialogs, /也可立即开始接单/)
+  assert.match(dialogs, /缺失设备由工作线程按需注册/)
   assert.doesNotMatch(dialogs, /允许领取新工作包/)
 })
 

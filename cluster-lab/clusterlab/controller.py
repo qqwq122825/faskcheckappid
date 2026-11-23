@@ -470,11 +470,7 @@ class Controller:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:
                 raise ValueError('节点不存在')
-            initialization = self._device_initialization(node)
             enabled = bool(node['enabled']) if 'enabled' not in data else data['enabled']
-            if enabled and not node['enabled'] and not initialization['complete']:
-                raise Conflict(f'设备初始化完成后才能开始接单（'
-                               f'{initialization["ready"]}/{initialization["requested"]}）')
             active = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? AND status IN ('leased','running')", (node_id,)).fetchone()[0]
             if enabled and (node['stop_version'] > node['ack_stop_version'] or
                                     not node['enabled'] and node['stop_version'] > 0 and active):
@@ -1409,7 +1405,7 @@ class Controller:
                                 now if final else None, node_id))
                     if update_state == 'success':
                         current = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
-                        if current['update_resume_enabled'] and self._device_initialization(current)['complete']:
+                        if current['update_resume_enabled']:
                             db.execute('UPDATE nodes SET enabled=1 WHERE id=?', (node_id,))
                         event(db, 'node_update_success',
                               f'节点更新成功：{current["update_ref"]}', node_id=node_id)

@@ -18,7 +18,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from .common import atomic_json
+from .common import atomic_json, read_json
 
 
 PROXY_TTL_SECONDS = 50.0
@@ -28,6 +28,7 @@ PROXY_FAILURE_LIMIT = 3
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
 PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
+DEVICE_LEASE_POLL_SECONDS = 0.05
 MIN_STALL_TIMEOUT_SECONDS = 180.0
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
@@ -66,6 +67,128 @@ def _device_id_label(device_id):
     raw = str(device_id or '').encode('utf-8')
     return ('B64:' + base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')[:8]
             if raw else '')
+
+
+class DeviceAuthLease:
+    """A process-safe, exclusive lease for one persisted device slot."""
+
+    def __init__(self, handle, state_path, slot, initial_state):
+        self.handle = handle
+        self.state_path = state_path
+        self.slot = int(slot)
+        self.initial_state = str(initial_state or 'missing')
+        self.released = False
+
+    @classmethod
+    def try_acquire(cls, pool, slot):
+        """Try one slot without waiting; file locking covers all processes."""
+        import portalocker
+
+        directory = pool.slot_directory(int(slot))
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_path = directory / '.lease.lock'
+        state_path = directory / '.lease-state.json'
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        handle = os.fdopen(descriptor, 'a+')
+        try:
+            portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
+        except portalocker.exceptions.LockException:
+            handle.close()
+            return None
+        initial_state = pool.inspect(int(slot)).get('state') or 'missing'
+        if initial_state not in ('ready', 'missing'):
+            portalocker.unlock(handle)
+            handle.close()
+            return None
+        now = time.time()
+        previous = read_json(state_path, {})
+        atomic_json(state_path, {
+            'state': 'in_use', 'slot': int(slot), 'pid': os.getpid(),
+            'acquired_at': now,
+            'last_used_at': previous.get('last_used_at'),
+        })
+        return cls(handle, state_path, slot, initial_state)
+
+    @classmethod
+    def acquire_any(cls, pool, slots, stop):
+        """Prefer an idle ready device, then claim one missing slot to register."""
+        candidates = [int(slot) for slot in slots]
+        if not candidates:
+            raise ValueError('device slot list is empty')
+        while not stop.is_set():
+            ready, missing = [], []
+            for slot in candidates:
+                state = pool.inspect(slot).get('state')
+                if state == 'ready':
+                    ready.append(slot)
+                elif state == 'missing':
+                    missing.append(slot)
+            for slot in ready + missing:
+                lease = cls.try_acquire(pool, slot)
+                if lease is not None:
+                    return lease
+            stop.wait(DEVICE_LEASE_POLL_SECONDS)
+        raise InterruptedError('节点关闭，停止等待设备')
+
+    def release(self):
+        """Write the return timestamp before making the slot available again."""
+        if self.released:
+            return
+        import portalocker
+
+        now = time.time()
+        try:
+            atomic_json(self.state_path, {
+                'state': 'idle', 'slot': self.slot,
+                'last_used_at': now,
+                'last_used': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now)),
+            })
+        finally:
+            portalocker.unlock(self.handle)
+            self.handle.close()
+            self.released = True
+
+
+class DeviceLeaseAllocator:
+    """Rotate scan starts so hundreds of threads do not hammer slot one."""
+
+    def __init__(self, pool, slots):
+        self.pool = pool
+        self.lock = threading.Lock()
+        self.ready = []
+        self.missing = []
+        for slot in (int(value) for value in slots):
+            state = pool.inspect(slot).get('state')
+            if state == 'ready':
+                self.ready.append(slot)
+            elif state == 'missing':
+                self.missing.append(slot)
+        self.ready_cursor = 0
+        self.missing_cursor = 0
+
+    def _rotated(self):
+        with self.lock:
+            ready = list(self.ready)
+            missing = list(self.missing)
+            if ready:
+                offset = self.ready_cursor % len(ready)
+                self.ready_cursor += 1
+                ready = ready[offset:] + ready[:offset]
+            if missing:
+                offset = self.missing_cursor % len(missing)
+                self.missing_cursor += 1
+                missing = missing[offset:] + missing[:offset]
+        return ready, missing
+
+    def acquire(self, stop):
+        while not stop.is_set():
+            ready, missing = self._rotated()
+            for slot in ready + missing:
+                lease = DeviceAuthLease.try_acquire(self.pool, slot)
+                if lease is not None:
+                    return lease
+            stop.wait(DEVICE_LEASE_POLL_SECONDS)
+        raise InterruptedError('节点关闭，停止等待设备')
 
 
 def _proxy_debug_enabled(descriptor=None):
@@ -1373,58 +1496,48 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            retries=retries, timeout=timeout,
                            slots=slot_ids, credentials_recorded=False)
 
-    # 一个包内把账号摊到所有设备上：一台设备只承担 rows/capacity 条，
-    # 比固定用 1 号设备更分散，明显降低单设备被风控的概率。
-    identities, infos, device_labels = {}, {}, {}
+    # 只发现已有设备，不在工作线程启动前预注册。身份头也只能
+    # 在拿到独占租约后读取，避免两个线程同时使用同一设备。
+    identities, device_labels = {}, {}
     for index in slot_ids:
-        bootstrap_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
-        bootstrap_started = time.monotonic() if debug_enabled else None
-        bootstrap_lease = proxy_pool.acquire(wait=2.0) if proxy_pool is not None else None
-        bootstrap_proxy = bootstrap_lease[0] if bootstrap_lease is not None else proxy
-        bootstrap_identity = (_proxy_identity(bootstrap_proxy) if debug_enabled else
-                              {'endpoint': '', 'host': '', 'port': None})
-        if debug_enabled and proxy_pool is not None and bootstrap_lease is None:
-            _write_proxy_debug(
-                debug_path, 'bootstrap_pool_empty', slot=index,
-                wait_ms=round((time.monotonic() - bootstrap_started) * 1000, 2),
-                pool_before=bootstrap_before, pool_after=_proxy_pool_snapshot(proxy_pool))
-        if descriptor.get('proxy_api') and not bootstrap_proxy:
-            infos[index] = None
-            identities[index] = None
-            continue
+        bootstrap_device_lease = None
+        bootstrap_lease = None
         try:
-            base_info = pool.info(timeout, proxy=bootstrap_proxy, provider_direct=True)
-            profile = device_profile(pool, index)
-            infos[index] = dict(base_info, client_info=profile['client_info'],
-                                user_agent=profile['user_agent'])
             inspected = pool.inspect(index)
-            ready = inspected['state'] == 'ready'
             device_labels[index] = _device_id_label(inspected.get('device_id'))
-            identities[index] = pool.fetch_headers(index, infos[index], max(timeout, 40),
-                                                   registered=ready, proxy=bootstrap_proxy,
-                                                   provider_direct=True)
-            refreshed = pool.inspect(index)
-            device_labels[index] = (_device_id_label(refreshed.get('device_id')) or
-                                    device_labels[index])
-            if not ready and refreshed['state'] == 'ready':
-                record_device_registration(device_root, index, bootstrap_proxy,
-                                           profile.get('model', ''))
-            if proxy_pool is not None:
-                proxy_pool.release(bootstrap_lease, healthy=True)
-        except Exception as exc:                                   # noqa: BLE001
-            infos[index] = None
+            if inspected.get('state') != 'ready':
+                continue
+            # 已有设备保持旧版的包启动缓存行为，但刷新过程也必须先取得
+            # 设备租约。缺失槽位不在这里注册，留给真正拿不到设备的工作线程。
+            bootstrap_device_lease = DeviceAuthLease.try_acquire(pool, index)
+            if bootstrap_device_lease is None:
+                continue
+            bootstrap_lease = (proxy_pool.acquire(wait=2.0)
+                               if proxy_pool is not None else None)
+            bootstrap_proxy = (bootstrap_lease[0]
+                               if bootstrap_lease is not None else proxy)
+            if descriptor.get('proxy_api') and not bootstrap_proxy:
+                continue
+            info = pool.info(timeout, proxy=bootstrap_proxy, provider_direct=True)
+            profile = device_profile(pool, index)
+            info = dict(info, client_info=profile['client_info'],
+                        user_agent=profile['user_agent'])
+            identities[index] = pool.fetch_headers(
+                index, info, max(timeout, 40), registered=True,
+                proxy=bootstrap_proxy, provider_direct=True)
+        except Exception:                                          # noqa: BLE001
             identities[index] = None
-            if proxy_pool is not None:
-                proxy_pool.release(bootstrap_lease, healthy=False)
-            if debug_enabled:
-                _write_proxy_debug(
-                    debug_path, 'bootstrap_error', slot=index,
-                    wait_ms=round((time.monotonic() - bootstrap_started) * 1000, 2),
-                    endpoint=bootstrap_identity['endpoint'],
-                    host=bootstrap_identity['host'], port=bootstrap_identity['port'],
-                    error_type=type(exc).__name__, detail=_proxy_debug_detail(exc),
-                    pool_before=bootstrap_before,
-                    pool_after=_proxy_pool_snapshot(proxy_pool))
+        finally:
+            if proxy_pool is not None and bootstrap_lease is not None:
+                proxy_pool.release(bootstrap_lease,
+                                   healthy=identities.get(index) is not None)
+            if bootstrap_device_lease is not None:
+                bootstrap_device_lease.release()
+
+    # 每个执行进程只让一个线程进入设备/SRP 准备段；
+    # 网络认证仍由所有工作线程并发执行。
+    device_prepare_gate = threading.Semaphore(1)
+    device_allocator = DeviceLeaseAllocator(pool, slot_ids)
 
     def proxy_for(index):
         if proxy_pool is not None:
@@ -1514,8 +1627,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             return row, line, {'status': 'undetermined', 'kind': 'format_error',
                                'stage': 'input', 'http': None, 'detail': problem,
                                'slot': slot_id, 'device_key': account_prefix, 'elapsed': 0}
-        identity = (identities.get(slot_id) if identity_override is identity_default
-                    else identity_override)
+        identity = None
         result = None
         previous_proxy = previous_proxy or {'endpoint': '', 'host': '', 'port': None}
         # 用户设置的重试次数仍是唯一上限；节点池只负责每次重试换出口，
@@ -1554,24 +1666,38 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 result.update(_retry_at=time.monotonic() + retry_delay,
                               _retry_attempt=attempt + 1,
                               _retry_started=account_started,
-                              _retry_identity=identity,
+                              _retry_identity=None,
                               _retry_previous=current_proxy)
                 return row, line, result
             request_started = time.monotonic() if debug_enabled else None
+            device_lease = None
             try:
+                device_lease = device_allocator.acquire(stop)
+                slot_id = device_lease.slot
+                identity = identities.get(slot_id)
                 if identity is None:
-                    # 预取失败的槽位在这里补一次
-                    info = pool.info(timeout, proxy=account_proxy, provider_direct=True)
-                    ready = pool.inspect(slot_id)['state'] == 'ready'
-                    profile = device_profile(pool, slot_id)
-                    info = dict(info, client_info=profile['client_info'],
-                                user_agent=profile['user_agent'])
-                    identity = pool.fetch_headers(slot_id, info, max(timeout, 40),
-                                                  registered=ready, proxy=account_proxy,
-                                                  provider_direct=True)
-                    if not ready and pool.inspect(slot_id)['state'] == 'ready':
-                        record_device_registration(device_root, slot_id, account_proxy,
-                                                   profile.get('model', ''))
+                    # 每进程只开一条设备/SRP 准备通道。已有设备刷新头；
+                    # 如果租到的是缺失槽位，就由当前工作线程完成注册。
+                    with device_prepare_gate:
+                        identity = identities.get(slot_id)
+                        if identity is None:
+                            info = pool.info(timeout, proxy=account_proxy,
+                                             provider_direct=True)
+                            ready = pool.inspect(slot_id)['state'] == 'ready'
+                            profile = device_profile(pool, slot_id)
+                            info = dict(info, client_info=profile['client_info'],
+                                        user_agent=profile['user_agent'])
+                            identity = pool.fetch_headers(
+                                slot_id, info, max(timeout, 40), registered=ready,
+                                proxy=account_proxy, provider_direct=True)
+                            identities[slot_id] = identity
+                            refreshed = pool.inspect(slot_id)
+                            device_labels[slot_id] = _device_id_label(
+                                refreshed.get('device_id'))
+                            if not ready and refreshed['state'] == 'ready':
+                                record_device_registration(
+                                    device_root, slot_id, account_proxy,
+                                    profile.get('model', ''))
                 # 换 IP 重试由节点池处理，协议层每次只使用当前出口一次。
                 result = gsa_check(account, password, account_proxy, timeout=timeout,
                                    retries=0 if proxy_pool is not None else retries,
@@ -1605,6 +1731,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             except Exception as exc:                               # noqa: BLE001
                 result = {'status': 'error', 'kind': type(exc).__name__, 'http': 0,
                           'stage': 'init', 'detail': str(exc)[:180]}
+            finally:
+                if device_lease is not None:
+                    device_lease.release()
             request_ms = (round((time.monotonic() - request_started) * 1000, 2)
                           if debug_enabled else None)
             transport_failed = retryable_transport(result)
@@ -1674,6 +1803,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 # 这不是账号结论；下一次重新获取 Anisette 身份，避免用
                 # 同一份无效设备认证数据重复请求。
                 identity = None
+                identities.pop(slot_id, None)
             previous_proxy = current_proxy
             if not transport_failed or attempt + 1 >= attempt_limit:
                 result['_proxy_retries'] = attempt
@@ -1683,7 +1813,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             result.update(_retry_at=time.monotonic() + retry_delay,
                           _retry_attempt=attempt + 1,
                           _retry_started=account_started,
-                          _retry_identity=identity,
+                          _retry_identity=None,
                           _retry_previous=current_proxy)
             return row, line, result
         if result is None:

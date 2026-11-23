@@ -364,7 +364,7 @@ class NodeRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '结果待上传'):
             self.node.connect('http://127.0.0.1:18772','x'*32)
 
-    def test_auth_task_uses_only_this_nodes_ready_devices(self):
+    def test_auth_task_adds_on_demand_slots_up_to_worker_concurrency(self):
         descriptor = {'mode': 'auth', 'rows': 10000, 'seq': 2,
                       'processes': 10, 'device_capacity': 30}
         ready = {'slots': [
@@ -373,18 +373,31 @@ class NodeRecoveryTests(unittest.TestCase):
         with patch.object(self.node.builder, 'snapshot', return_value=ready), \
              patch.object(self.node.builder, 'start') as start:
             self.node._prepare_auth_devices(descriptor)
-        self.assertEqual(descriptor['device_pool_capacity'], 9)
-        self.assertEqual(descriptor['device_slots'], [2, 7, 9])
-        self.assertEqual(descriptor['processes'], 3)
+        self.assertEqual(descriptor['device_pool_capacity'], 10)
+        self.assertEqual(descriptor['device_slots'], list(range(1, 11)))
+        self.assertEqual(descriptor['processes'], 10)
         self.assertNotIn('device_capacity', descriptor)
         start.assert_not_called()
-        self.assertEqual(self.node.builder.reserved, {2, 7, 9})
+        self.assertEqual(self.node.builder.reserved, set(range(1, 11)))
         self.node.builder.release(descriptor['device_slots'])
 
-    def test_auth_task_refuses_to_run_without_ready_devices(self):
+    def test_auth_task_with_empty_pool_registers_from_worker_threads(self):
         with patch.object(self.node.builder, 'snapshot', return_value={'slots': []}):
-            with self.assertRaisesRegex(RuntimeError, '没有已就绪设备'):
-                self.node._prepare_auth_devices({'mode': 'auth', 'rows': 50, 'processes': 10})
+            descriptor = {'mode': 'auth', 'rows': 50, 'processes': 2, 'threads': 25}
+            self.node._prepare_auth_devices(descriptor)
+        self.assertEqual(descriptor['device_pool_capacity'], 50)
+        self.assertEqual(descriptor['device_slots'], list(range(1, 51)))
+        self.assertEqual(descriptor['processes'], 2)
+
+    def test_four_processes_by_250_threads_expose_1000_exclusive_slots(self):
+        with patch.object(self.node.builder, 'snapshot', return_value={'slots': []}):
+            descriptor = {'mode': 'auth', 'rows': 1000,
+                          'processes': 4, 'threads': 250}
+            self.node._prepare_auth_devices(descriptor)
+        self.assertEqual(descriptor['device_pool_capacity'], 1000)
+        self.assertEqual(len(descriptor['device_slots']), 1000)
+        self.assertEqual(descriptor['device_slots'][0], 1)
+        self.assertEqual(descriptor['device_slots'][-1], 1000)
 
     def test_background_builder_never_registers_without_a_proxy(self):
         class Pool:
@@ -405,6 +418,32 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(self.node.builder.state['proxy_ip'], '')
         self.assertEqual(self.node.builder.state['slot_errors']['1'], '代理获取失败')
         self.assertFalse((self.node.root / 'device-pool' / 'registrations').exists())
+
+    def test_device_builder_cancel_terminates_current_registration_process(self):
+        class Process:
+            alive = True
+            terminated = False
+
+            def is_alive(inner):
+                return inner.alive
+
+            def terminate(inner):
+                inner.terminated = True
+                inner.alive = False
+
+            def join(inner, _timeout=None):
+                return None
+
+            def kill(inner):
+                inner.alive = False
+
+        process = Process()
+        self.node.builder.state['running'] = True
+        self.node.builder.provision_process = process
+        self.node.builder.cancel()
+        self.assertTrue(self.node.builder.stop.is_set())
+        self.assertTrue(process.terminated)
+        self.assertEqual(self.node.builder.state['message'], '正在停止')
 
     def test_snapshot_distinguishes_registering_failed_and_pending_slots(self):
         class Pool:

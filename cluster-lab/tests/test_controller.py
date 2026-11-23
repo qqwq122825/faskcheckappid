@@ -37,7 +37,7 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(saved['enabled'])
         self.assertEqual((saved['desired_processes'], saved['desired_threads']), (4, 250))
 
-    def test_new_node_defaults_to_thirty_device_registrations(self):
+    def test_new_node_can_start_while_default_devices_register_on_demand(self):
         node = self.service.add_node('auto-devices', 4, 250)
         with self.service.db.connect() as db:
             saved = db.execute('SELECT device_request,enabled FROM nodes WHERE id=?',
@@ -49,9 +49,9 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(saved['enabled'])
         self.assertEqual(response['device_request'], 30)
         self.assertFalse(response['enabled'])
-        with self.assertRaisesRegex(Conflict, '设备初始化完成后'):
-            self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
-                                                       'enabled': True})
+        self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
+                                                  'enabled': True})
+        self.assertTrue(self.service.snapshot()['nodes'][-1]['enabled'])
         self.service.heartbeat(node['id'], {
             'session': 'auto-device-session', 'hostname': 'new-node', 'version': 'test',
             'max_processes': 4, 'max_threads': 500, 'active': [], 'interrupted': [],

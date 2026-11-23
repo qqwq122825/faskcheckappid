@@ -605,15 +605,18 @@ class Node:
         return True
 
     def _prepare_auth_devices(self, descriptor):
-        """Use exactly the ready devices owned by this node; tasks do not resize the pool."""
+        """Expose one candidate slot per worker; missing slots register on demand."""
         snapshot = self.builder.snapshot()
-        slots = [int(item['slot']) for item in snapshot.get('slots') or []
-                 if item.get('state') == 'ready']
-        if not slots:
-            raise RuntimeError('节点没有已就绪设备，请先初始化设备池')
-        processes = max(1, min(int(descriptor.get('processes') or 1),
-                               int(descriptor.get('rows') or 1), len(slots)))
-        capacity = max(slots)
+        ready_slots = [int(item['slot']) for item in snapshot.get('slots') or []
+                       if item.get('state') == 'ready']
+        rows = max(1, int(descriptor.get('rows') or 1))
+        processes = max(1, min(int(descriptor.get('processes') or 1), rows))
+        threads = max(1, int(descriptor.get('threads') or 1))
+        # 4 进程 × 250 线程得到 1000 个可独占槽位。已有设备先用；
+        # 所有已有设备都在用时，工作线程占用一个缺失槽位并自行注册。
+        requested = min(2000, rows, processes * threads)
+        capacity = max(max(ready_slots, default=0), requested, 1)
+        slots = list(range(1, capacity + 1))
         descriptor.pop('device_capacity', None)
         descriptor['processes'] = processes
         descriptor['device_pool_capacity'] = capacity

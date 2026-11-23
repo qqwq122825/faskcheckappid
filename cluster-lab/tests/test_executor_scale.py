@@ -12,15 +12,18 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (NodeProxyPool, _auth_process_limit, _auth_worker_limit, _device_id_label, _execute_auth_unit, _partition_device_slots,
+from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _device_id_label, _execute_auth_unit, _partition_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
 
 
 class FakePool:
-    def __init__(self, *_args, **_kwargs):
-        pass
+    def __init__(self, root, *_args, **_kwargs):
+        self.root = Path(root)
+
+    def slot_directory(self, slot):
+        return self.root / 'fake-devices' / f'{int(slot):03d}'
 
     def info(self, *_args, **_kwargs):
         return {}
@@ -91,6 +94,79 @@ def use_shared_proxy_pool(pool, output):
 
 
 class ExecutorScaleTests(unittest.TestCase):
+    def test_device_lease_is_exclusive_and_writes_return_timestamp(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pool = FakePool(temporary)
+            stop = threading.Event()
+            first = DeviceAuthLease.acquire_any(pool, [1], stop)
+            acquired = []
+
+            def second_user():
+                lease = DeviceAuthLease.acquire_any(pool, [1], stop)
+                acquired.append(lease.slot)
+                lease.release()
+
+            thread = threading.Thread(target=second_user)
+            thread.start()
+            time.sleep(.05)
+            self.assertEqual(acquired, [])
+            first.release()
+            thread.join(1)
+            self.assertEqual(acquired, [1])
+            state = json.loads((pool.slot_directory(1) / '.lease-state.json').read_text())
+            self.assertEqual(state['state'], 'idle')
+            self.assertIsInstance(state['last_used_at'], float)
+            self.assertTrue(state['last_used'])
+
+    def test_empty_pool_registers_distinct_devices_inside_worker_threads(self):
+        class EmptyPool(FakePool):
+            ready = set()
+            registered = []
+
+            def inspect(self, slot):
+                return {'state': 'ready' if int(slot) in type(self).ready else 'missing',
+                        'device_id': f'device-{slot}' if int(slot) in type(self).ready else ''}
+
+            def fetch_headers(self, slot, *_args, **_kwargs):
+                type(self).ready.add(int(slot))
+                type(self).registered.append(int(slot))
+                return {'slot': int(slot)}
+
+        EmptyPool.ready = set()
+        EmptyPool.registered = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text(
+                'one@example.com----a\ntwo@example.com----b\n', encoding='utf-8')
+            descriptor = {'rows': 2, 'first_row': 1, 'threads': 2,
+                          'device_capacity': 2, 'device_slots': [1, 2],
+                          'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
+            barrier = threading.Barrier(2)
+            used = []
+
+            def check(_account, _password, _proxy, **kwargs):
+                used.append(kwargs['identity']['slot'])
+                barrier.wait(1)
+                return {'status': 'valid', 'http': 200, 'stage': 'complete'}
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    EmptyPool, check, lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor.record_device_registration'), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event())
+
+            self.assertEqual(sorted(EmptyPool.registered), [1, 2])
+            self.assertEqual(sorted(used), [1, 2])
+            for slot in (1, 2):
+                state = json.loads(
+                    (EmptyPool(root / 'devices').slot_directory(slot) /
+                     '.lease-state.json').read_text())
+                self.assertEqual(state['state'], 'idle')
+                self.assertTrue(state['last_used_at'])
+
     def test_raw_apple_reason_is_packaged_only_when_debug_is_enabled(self):
         result = {'apple_message': 'Your account information was entered incorrectly.'}
         self.assertEqual(_apple_reason_for_record(result, 'wrong_password'), '')
@@ -448,7 +524,7 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
-                          '_retry_delay': 0}
+                          '_retry_delay': 0, '_proxy_debug': True}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://dead-exit', 'socks5h://good-exit'])
             stop = RecordingStop()
@@ -530,7 +606,7 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
-                          '_retry_delay': 0}
+                          '_retry_delay': 0, '_proxy_debug': True}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://first-exit', 'socks5h://second-exit'])
             stop = RecordingStop()
@@ -575,7 +651,7 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 2,
-                          '_retry_delay': 0}
+                          '_retry_delay': 0, '_proxy_debug': True}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://first-exit',
                 'socks5h://second-exit', 'socks5h://third-exit'])
@@ -819,7 +895,7 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5,
-                          'dual_recheck': True}
+                          'dual_recheck': True, '_proxy_debug': True}
 
             with patch('clusterlab.executor._load_fastcheck', return_value=(
                     FakePool,

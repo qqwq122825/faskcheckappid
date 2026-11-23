@@ -41,6 +41,7 @@ class DeviceBuilder:
         self.node = node
         self.lock = threading.Lock()
         self.thread = None
+        self.provision_process = None
         self.stop = threading.Event()
         self.reserved = set()
         self.state = {'running': False, 'capacity': 0, 'ready': 0, 'built': 0,
@@ -137,6 +138,14 @@ class DeviceBuilder:
 
     def cancel(self):
         self.stop.set()
+        with self.lock:
+            process = self.provision_process
+            if self.state.get('running'):
+                self.state['message'] = '正在停止'
+        # 不只设置标志：当前注册在独立子进程中，必须立即终止，
+        # 否则 UI 会显示“已请求停止”但仍等待完整注册超时。
+        if process is not None:
+            self._stop_process(process)
 
     def clear(self):
         """清空节点本地设备身份、注册记录和使用计数。"""
@@ -198,8 +207,21 @@ class DeviceBuilder:
             self.thread.start()
 
     @staticmethod
-    def _provision(payload):
+    def _stop_process(process):
+        try:
+            if process.is_alive():
+                process.terminate()
+                process.join(2)
+            if process.is_alive():
+                process.kill()
+                process.join(1)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    def _provision(self, payload):
         """Run one registration in a spawned process and return its safe result."""
+        if self.stop.is_set():
+            return {'ok': False, 'cancelled': True, 'error': '已取消'}
         context = mp.get_context('spawn')
         output = context.Queue(maxsize=8)
         process = context.Process(target=_register, args=(payload, output),
@@ -209,10 +231,15 @@ class DeviceBuilder:
         try:
             process.start()
             started = True
+            with self.lock:
+                self.provision_process = process
             # Residential exits can need 40–60 seconds for the first complete
             # Apple provisioning exchange. Keep the existing safety margin.
             deadline = time.monotonic() + payload['timeout'] + 30
             while time.monotonic() < deadline:
+                if self.stop.is_set():
+                    result = {'ok': False, 'cancelled': True, 'error': '已取消'}
+                    break
                 try:
                     result = output.get(timeout=.2)
                     break
@@ -220,13 +247,17 @@ class DeviceBuilder:
                     if not process.is_alive():
                         break
         finally:
-            if started and process.is_alive():
-                process.terminate(); process.join(2)
-                if process.is_alive():
-                    process.kill(); process.join(1)
+            if started:
+                self._stop_process(process)
+            with self.lock:
+                if self.provision_process is process:
+                    self.provision_process = None
             output.cancel_join_thread(); output.close()
             if started:
-                process.close()
+                try:
+                    process.close()
+                except (OSError, ValueError):
+                    pass
         return result
 
     def _run(self, capacity):
@@ -258,6 +289,9 @@ class DeviceBuilder:
                            'device_root': str(root), 'origin': self.node.origin,
                            'timeout': REGISTRATION_TIMEOUT}
                 result = self._provision(payload)
+                if self.stop.is_set() or (result or {}).get('cancelled'):
+                    self._update(message='已取消')
+                    break
                 ok = bool(result and result.get('ok')) and pool.inspect(slot)['state'] == 'ready'
                 if ok:
                     self._record(slot, proxy, (result or {}).get('model'))
@@ -294,6 +328,9 @@ class DeviceBuilder:
                        'device_root': str(staging_root), 'origin': self.node.origin,
                        'timeout': REGISTRATION_TIMEOUT}
             result = self._provision(payload)
+            if self.stop.is_set() or (result or {}).get('cancelled'):
+                self._update(message='已取消')
+                return
             staged = DevicePool(str(staging_root), self.node.origin, max_devices=1)
             ok = bool(result and result.get('ok')) and staged.inspect(1)['state'] == 'ready'
             if not ok:
