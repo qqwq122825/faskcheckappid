@@ -218,6 +218,14 @@ class NodeRecoveryTests(unittest.TestCase):
                                 'compute_wall_ms': 9.0, 'lane_wait_ms': 2.0,
                                 'local_lane_wait_ms': 0.5,
                                 'global_lane_wait_ms': 1.5}}),
+            json.dumps({'event': 'device_identity_result', 'row': 7,
+                        'registered_before': True, 'identity_ms': 123.4,
+                        'identity_type': 'dict', 'identity_valid': True,
+                        'identity_field_count': 9,
+                        'identity_keys': 'X-Apple-I-MD,X-Apple-I-Client-Time',
+                        'identity_value_bytes': 512,
+                        'identity_max_value_bytes': 128,
+                        'credentials_recorded': False}),
         )) + '\n', 'utf-8')
         self.node.telemetry.latest = {'cpu_percent': 81.2, 'memory_percent': 33.0}
 
@@ -239,6 +247,10 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(value['debug']['srp']['compute_cpu_ms']['total'], 8.5)
         self.assertEqual(value['debug']['srp']['global_lane_wait_ms']['total'], 1.5)
         self.assertEqual(value['debug']['srp']['math_backends'], {'gmpy2': 1})
+        identity_event = next(row for row in value['debug']['recent']
+                              if row.get('event') == 'device_identity_result')
+        self.assertEqual(identity_event['identity_field_count'], 9)
+        self.assertFalse(identity_event['credentials_recorded'])
         encoded = json.dumps(value)
         for secret in ('top-secret-lease', 'user:password', 'hunter2',
                        '10.0.0.1', '/private/device-pool', 'proxy.invalid'):

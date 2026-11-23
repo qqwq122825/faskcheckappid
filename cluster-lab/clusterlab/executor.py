@@ -560,6 +560,28 @@ def _write_proxy_debug(path, event, **fields):
         os.close(fd)
 
 
+def _identity_debug_shape(identity):
+    """Describe returned Anisette headers without recording any value."""
+    if not isinstance(identity, dict):
+        return {'identity_type': type(identity).__name__, 'identity_valid': False,
+                'identity_field_count': 0, 'identity_keys': '',
+                'identity_value_bytes': 0, 'identity_max_value_bytes': 0}
+    keys = sorted(str(key)[:80] for key in identity)[:40]
+    sizes = []
+    for value in identity.values():
+        if isinstance(value, bytes):
+            sizes.append(len(value))
+        elif isinstance(value, str):
+            sizes.append(len(value.encode('utf-8', errors='replace')))
+        else:
+            sizes.append(len(str(value).encode('utf-8', errors='replace')))
+    return {'identity_type': 'dict', 'identity_valid': bool(identity),
+            'identity_field_count': len(identity),
+            'identity_keys': ','.join(keys),
+            'identity_value_bytes': sum(sizes),
+            'identity_max_value_bytes': max(sizes, default=0)}
+
+
 def _probe_proxy_exit_ip(proxy, timeout=PROXY_EXIT_IP_TIMEOUT, url=None):
     """Return the public exit IP observed through one proxy endpoint."""
     import requests
@@ -2473,6 +2495,14 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     if debug_enabled:
                         device_identity_ms = round(
                             (time.monotonic() - identity_started) * 1000, 2)
+                        if (trace_sampled or
+                                device_identity_ms >= PERFORMANCE_TRACE_SLOW_MS):
+                            _write_proxy_debug(
+                                debug_path, 'device_identity_result', row=row,
+                                slot=slot_id, registered_before=ready,
+                                identity_ms=device_identity_ms,
+                                credentials_recorded=False,
+                                **_identity_debug_shape(identity))
                     if device_mode == 'one_time':
                         device_labels[slot_id] = _device_id_label(inspected.get('device_id'))
                 # 主协议由系统设置固化到任务；Web 模式不先发 GSA 请求。

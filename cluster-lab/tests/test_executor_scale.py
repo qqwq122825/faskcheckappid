@@ -18,6 +18,7 @@ from clusterlab.executor import (PROXY_FETCH_LIMIT, PROXY_INITIAL_FETCH,
                                  _auth_worker_limit, _srp_global_limit,
                                  _consume_thread_pool_device,
                                  _device_id_label, _execute_auth_unit,
+                                 _identity_debug_shape,
                                  _partition_device_slots,
                                  _partition_one_time_device_slots, _usage_snapshot,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
@@ -266,6 +267,16 @@ class ExecutorScaleTests(unittest.TestCase):
     def test_device_id_uses_short_base64_label(self):
         self.assertEqual(_device_id_label('device-1'), 'B64:ZGV2aWNl')
         self.assertEqual(_device_id_label(''), '')
+
+    def test_identity_debug_shape_never_records_header_values(self):
+        value = _identity_debug_shape({
+            'X-Apple-I-MD': 'secret-md-value',
+            'X-Apple-I-Client-Time': '2026-11-23T20:00:00Z'})
+        self.assertEqual(value['identity_type'], 'dict')
+        self.assertEqual(value['identity_field_count'], 2)
+        self.assertIn('X-Apple-I-MD', value['identity_keys'])
+        self.assertNotIn('secret-md-value', str(value))
+        self.assertGreater(value['identity_value_bytes'], 0)
 
     def test_full_device_pool_is_partitioned_without_overlap(self):
         groups = [_partition_device_slots(range(1, 31), 10, index)

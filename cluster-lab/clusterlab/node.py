@@ -964,7 +964,11 @@ class Node:
         allowed = allowed + ('local_limit', 'global_limit',
                              'process_start_stagger_ms',
                              'process_start_delay_ms', 'srp_local_limit',
-                             'srp_global_limit', 'scope')
+                             'srp_global_limit', 'scope', 'registered_before',
+                             'identity_ms', 'identity_type', 'identity_valid',
+                             'identity_field_count', 'identity_keys',
+                             'identity_value_bytes', 'identity_max_value_bytes',
+                             'credentials_recorded')
         for raw in raw_lines:
             try:
                 item = json.loads(raw)
