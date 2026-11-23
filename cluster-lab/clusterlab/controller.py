@@ -89,6 +89,8 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_auto_rotate'
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_pool_size','10000');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug_mode','off');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug_sample_every','20');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('web_secondary_auth','1');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('auth_protocol','gsa');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_mode','one_time');
@@ -706,6 +708,19 @@ class Controller:
             values = {row['key']: row['value'] for row in db.execute('SELECT key,value FROM controller_settings')}
         maximum = int(values.get('max_unit_rows', 100000))
         proxy_parts = [part for part in str(values.get('proxy_api', '')).split() if part]
+        debug_enabled = str(values.get('proxy_debug', '0')) in ('1', 'True', 'true')
+        debug_mode = str(values.get('proxy_debug_mode', '')).lower()
+        if debug_mode not in ('off', 'sampled', 'detailed'):
+            debug_mode = 'sampled' if debug_enabled else 'off'
+        # An older database can have proxy_debug=1 and gain the new keys from
+        # SCHEMA with their default.  Preserve the already enabled behavior.
+        if debug_enabled and debug_mode == 'off':
+            debug_mode = 'sampled'
+        try:
+            debug_sample_every = max(1, min(10000, int(
+                values.get('proxy_debug_sample_every', 20) or 20)))
+        except (TypeError, ValueError):
+            debug_sample_every = 20
         return {'max_unit_rows': maximum, 'default_unit_rows': min(10000, maximum),
                 'unit_byte_limit': 32 * 1024 * 1024,
                 'proxy_api': mask_api(values.get('proxy_api', '')),
@@ -718,7 +733,9 @@ class Controller:
                 'device_auto_rotate': False,
                 'proxy_ttl': int(values.get('proxy_ttl', 50) or 50),
                 'proxy_pool_size': int(values.get('proxy_pool_size', 10000) or 10000),
-                'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true'),
+                'proxy_debug': debug_mode != 'off',
+                'proxy_debug_mode': debug_mode,
+                'proxy_debug_sample_every': debug_sample_every,
                 'web_secondary_auth': str(values.get('web_secondary_auth', '1')) in
                                       ('1', 'True', 'true'),
                 'auth_protocol': (str(values.get('auth_protocol', 'gsa')).lower()
@@ -753,17 +770,40 @@ class Controller:
         return self.settings()
 
     def configure_debug(self, data):
+        requested_mode = data.get('mode', data.get('proxy_debug_mode'))
         enabled = data.get('proxy_debug')
-        if type(enabled) is not bool:
-            raise ValueError('代理调试开关应为布尔值')
-        value = '1' if enabled else '0'
+        if requested_mode is None:
+            if type(enabled) is not bool:
+                raise ValueError('代理调试开关应为布尔值')
+            mode = 'sampled' if enabled else 'off'
+        else:
+            mode = str(requested_mode).strip().lower()
+            if mode not in ('off', 'sampled', 'detailed'):
+                raise ValueError('日志模式只能是 off、sampled 或 detailed')
+            if enabled is not None and type(enabled) is not bool:
+                raise ValueError('代理调试开关应为布尔值')
+            if enabled is False:
+                mode = 'off'
+        with self.db.connect() as db:
+            current = db.execute(
+                "SELECT value FROM controller_settings WHERE key='proxy_debug_sample_every'"
+            ).fetchone()
+        sample_every = integer(
+            data.get('sample_every', data.get('proxy_debug_sample_every',
+                                              current[0] if current else 20)),
+            '日志抽样间隔', 1, 10000)
+        value = '0' if mode == 'off' else '1'
         with self.db.transaction() as db:
-            db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
-                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                       ('proxy_debug', value))
+            for key, saved in (('proxy_debug', value),
+                               ('proxy_debug_mode', mode),
+                               ('proxy_debug_sample_every', str(sample_every))):
+                db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           (key, saved))
+            labels = {'off': '关闭', 'sampled': f'稳定随机抽样（约每 {sample_every} 条一条）',
+                      'detailed': '逐条详细记录'}
             event(db, 'controller_config',
-                  '代理调试日志已开启；新工作包将记录超时出口明细' if enabled else
-                  '代理调试日志已关闭；新工作包不再写入调试日志')
+                  f'节点调试日志生成模式已设为{labels[mode]}；仅影响新工作包')
         return self.settings()
 
     def configure_web_secondary_auth(self, data):
@@ -1647,6 +1687,9 @@ class Controller:
                                                        'device_rotate_after') or 100))),
                                origin=settings.get('origin', 'https://new.ani.sidestore.io'),
                                _proxy_debug=bool(settings.get('proxy_debug')),
+                               _proxy_debug_mode=settings.get('proxy_debug_mode', 'off'),
+                               _proxy_debug_sample_every=int(
+                                   settings.get('proxy_debug_sample_every') or 20),
                                _auth_protocol=(unit['auth_protocol'] or 'gsa').lower(),
                                _device_mode=device_mode,
                                _web_secondary_auth=(

@@ -20,6 +20,7 @@ from clusterlab.executor import (PROXY_FETCH_LIMIT, PROXY_INITIAL_FETCH,
                                  _partition_device_slots,
                                  _partition_one_time_device_slots, _usage_snapshot,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
+                                 _debug_trace_sampled,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
 
@@ -336,6 +337,23 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertFalse(_proxy_debug_enabled({'_proxy_debug': False}))
             self.assertTrue(_proxy_debug_enabled({'_proxy_debug': True}))
             self.assertTrue(_proxy_debug_enabled({}))
+
+    def test_debug_generator_supports_stable_sampling_and_detailed_mode(self):
+        sampled = {'_proxy_debug': True, '_proxy_debug_mode': 'sampled',
+                   '_proxy_debug_sample_every': 7, 'job_id': 'job',
+                   'id': 'unit', 'first_row': 1}
+        first = [row for row in range(1, 201)
+                 if _debug_trace_sampled(sampled, row)]
+        second = [row for row in range(1, 201)
+                  if _debug_trace_sampled(sampled, row)]
+        self.assertEqual(first, second)
+        self.assertIn(1, first)
+        self.assertGreater(len(first), 10)
+        self.assertLess(len(first), 60)
+        detailed = dict(sampled, _proxy_debug_mode='detailed')
+        self.assertTrue(all(_debug_trace_sampled(detailed, row)
+                            for row in range(1, 201)))
+        self.assertFalse(_debug_trace_sampled({'_proxy_debug_mode': 'off'}, 1))
 
     def test_node_proxy_pool_is_shared_across_spawned_processes(self):
         context = mp.get_context('spawn')

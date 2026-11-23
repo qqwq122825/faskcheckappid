@@ -231,10 +231,32 @@ def _proxy_debug_enabled(descriptor=None):
     # A controller-supplied value is authoritative, including explicit False.
     # This lets the system setting turn logging off even when an older node
     # service still has CLUSTER_PROXY_DEBUG=1 in its environment.
+    if descriptor is not None and '_proxy_debug_mode' in descriptor:
+        return str(descriptor.get('_proxy_debug_mode') or 'off').lower() != 'off'
     if descriptor is not None and '_proxy_debug' in descriptor:
         return bool(descriptor.get('_proxy_debug'))
     value = os.environ.get(PROXY_DEBUG_ENV, '')
     return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _debug_trace_sampled(descriptor, row):
+    """Choose detailed rows with a reproducible hash instead of periodic bursts."""
+    if not _proxy_debug_enabled(descriptor):
+        return False
+    mode = str(descriptor.get('_proxy_debug_mode') or 'sampled').lower()
+    if mode == 'detailed':
+        return True
+    try:
+        every = max(1, min(10000, int(
+            descriptor.get('_proxy_debug_sample_every') or
+            PERFORMANCE_TRACE_SAMPLE_EVERY)))
+    except (TypeError, ValueError):
+        every = PERFORMANCE_TRACE_SAMPLE_EVERY
+    first_row = int(descriptor.get('first_row') or 1)
+    if int(row) == first_row:
+        return True
+    identity = f"{descriptor.get('job_id','')}:{descriptor.get('id','')}:{int(row)}"
+    return int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], 'big') % every == 0
 
 
 def _proxy_identity(value):
@@ -1330,7 +1352,10 @@ def execute_unit_group(directory, descriptor, stop):
             threads=int(descriptor.get('threads') or 1),
             retries=int(descriptor.get('retries') or 0),
             timeout=float(descriptor.get('timeout') or 20),
-            mode='timeout_full_trace', credentials_recorded=False)
+            log_mode=str(descriptor.get('_proxy_debug_mode') or 'sampled'),
+            sample_every=int(descriptor.get('_proxy_debug_sample_every') or
+                             PERFORMANCE_TRACE_SAMPLE_EVERY),
+            sampling_strategy='stable_hash', credentials_recorded=False)
     started = time.time()
     rows = max(0, int(descriptor.get('rows') or 0))
     process_limit = max(1, int(descriptor.get('processes') or 1))
@@ -1984,6 +2009,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                              descriptor.get('_node_configured_process_count') or 1,
                              descriptor.get('_node_process_count') or 1)))
     debug_enabled = _proxy_debug_enabled(descriptor)
+    debug_mode = str(descriptor.get('_proxy_debug_mode') or
+                     ('sampled' if debug_enabled else 'off')).lower()
+    debug_sample_every = max(1, min(10000, int(
+        descriptor.get('_proxy_debug_sample_every') or
+        PERFORMANCE_TRACE_SAMPLE_EVERY)))
     debug_path = (descriptor.get('_proxy_debug_path') or
                   str(directory / 'proxy-debug.jsonl')) if debug_enabled else None
     exit_ip_debug = _ProxyExitIpDebug(debug_path) if debug_enabled else None
@@ -2008,7 +2038,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            srp_math_backend=getattr(
                                sys.modules.get('fastcheck.protocols.srp_auth'),
                                'SRP_MATH_BACKEND', 'unknown'),
-                           performance_sample_every=PERFORMANCE_TRACE_SAMPLE_EVERY,
+                           log_mode=debug_mode,
+                           performance_sample_every=debug_sample_every,
+                           sampling_strategy='stable_hash',
                            performance_first_row_sampled=True,
                            credentials_recorded=False)
 
@@ -2248,9 +2280,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             # every one of hundreds of account threads changes the workload we
             # are trying to measure and creates very large JSONL files.  Slow
             # unsampled rows still emit their outer proxy/device/request times.
-            trace_sampled = (debug_enabled and (
-                row == int(descriptor.get('first_row') or 1)
-                or row % PERFORMANCE_TRACE_SAMPLE_EVERY == 0))
+            trace_sampled = _debug_trace_sampled(descriptor, row)
             phase_ms = Counter()
             phase_cpu_ms = Counter()
             phase_counts = Counter()
@@ -2485,7 +2515,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                         round(process_cpu_ms_during_request / request_ms, 3)
                         if request_ms > 0 else None),
                     process_cpu_scope='whole_process_overlapping_interval_not_additive',
-                    trace_sample_every=PERFORMANCE_TRACE_SAMPLE_EVERY,
+                    trace_sample_every=debug_sample_every,
+                    trace_mode=debug_mode,
+                    trace_sampling_strategy='stable_hash',
                     phase_counts=dict(sorted(phase_counts.items())),
                     phase_totals_scope='nested_phases_do_not_sum',
                     srp=_srp_timing_summary(

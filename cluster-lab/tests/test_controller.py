@@ -150,6 +150,17 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(self.service.settings()['proxy_debug'])
         self.assertFalse(self.service.configure_debug({'proxy_debug': False})['proxy_debug'])
 
+    def test_debug_generator_supports_sampled_and_detailed_modes(self):
+        sampled = self.service.configure_debug(
+            {'mode': 'sampled', 'sample_every': 37})
+        self.assertEqual(sampled['proxy_debug_mode'], 'sampled')
+        self.assertEqual(sampled['proxy_debug_sample_every'], 37)
+        detailed = self.service.configure_debug(
+            {'mode': 'detailed', 'sample_every': 37})
+        self.assertEqual(detailed['proxy_debug_mode'], 'detailed')
+        with self.assertRaisesRegex(ValueError, 'off、sampled 或 detailed'):
+            self.service.configure_debug({'mode': 'random-everything'})
+
     def test_web_secondary_auth_defaults_on_persists_and_rejects_non_boolean(self):
         self.assertTrue(self.service.settings()['web_secondary_auth'])
         self.assertFalse(self.service.configure_web_secondary_auth(
@@ -374,6 +385,8 @@ class ControllerTests(unittest.TestCase):
             time.sleep(.01)
         unit = self.service.lease(self.node['id'], 'test-session')
         self.assertIs(unit['_proxy_debug'], True)
+        self.assertEqual(unit['_proxy_debug_mode'], 'sampled')
+        self.assertEqual(unit['_proxy_debug_sample_every'], 20)
 
     def test_four_process_five_hundred_thread_capacity_is_accepted(self):
         """4 核节点的用户可调上限为 4 进程 / 500 线程。"""

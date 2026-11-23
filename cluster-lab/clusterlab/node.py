@@ -1,4 +1,5 @@
 import atexit
+from collections import Counter
 import hashlib
 import json
 import multiprocessing as mp
@@ -853,3 +854,228 @@ class Node:
                 'max_threads': self.max_threads, 'active_processes': active_processes,
                 'confirmed': confirmed, 'outbox': outbox, 'processed': processed, 'telemetry': dict(self.telemetry.latest),
                 'hostname': socket.gethostname(), 'server_time': time.time()}
+
+    @staticmethod
+    def _diagnostic_counts(value):
+        if not isinstance(value, dict):
+            return {}
+        output = {}
+        for key, count in value.items():
+            if len(output) >= 40:
+                break
+            try:
+                output[str(key)[:60]] = int(count)
+            except (TypeError, ValueError):
+                continue
+        return output
+
+    @classmethod
+    def _diagnostic_state(cls, value):
+        """Return execution counters without credentials, paths or row content."""
+        if not isinstance(value, dict):
+            return None
+        output = {}
+        integer_fields = (
+            'processed', 'workers', 'worker_limit', 'configured_process_limit',
+            'cpu_reserve', 'threads_per_process', 'active_threads_per_process')
+        for key in integer_fields:
+            if value.get(key) is not None:
+                try:
+                    output[key] = int(value[key])
+                except (TypeError, ValueError):
+                    pass
+        for key in ('started', 'elapsed'):
+            if value.get(key) is not None:
+                try:
+                    output[key] = round(float(value[key]), 6)
+                except (TypeError, ValueError):
+                    pass
+        if 'ok' in value:
+            output['ok'] = bool(value.get('ok'))
+        if value.get('counts') is not None:
+            output['counts'] = cls._diagnostic_counts(value.get('counts'))
+        pool = value.get('proxy_pool')
+        if isinstance(pool, dict):
+            safe_pool = {}
+            for key in ('target', 'known', 'available', 'in_use', 'fresh',
+                        'created', 'reused', 'refreshed', 'discarded',
+                        'failures', 'quarantined', 'waiters'):
+                if pool.get(key) is not None:
+                    try:
+                        safe_pool[key] = int(pool[key])
+                    except (TypeError, ValueError):
+                        pass
+            if safe_pool:
+                output['proxy_pool'] = safe_pool
+        if value.get('error'):
+            # Executor errors are already bounded.  Return only the exception
+            # class so a provider URL or credential can never cross this API.
+            output['error_type'] = str(value['error']).split(':', 1)[0][:80]
+        return output
+
+    @staticmethod
+    def _diagnostic_average(values):
+        if not values:
+            return None
+        return {'samples': len(values), 'average': round(sum(values) / len(values), 3),
+                'maximum': round(max(values), 3), 'total': round(sum(values), 3)}
+
+    @classmethod
+    def _diagnostic_debug(cls, path, recent_limit):
+        """Read a bounded JSONL tail and expose only an explicit safe schema."""
+        if not path.is_file():
+            return {'available': False, 'events': {}, 'recent': [],
+                    'srp': {'samples': 0, 'states': {}, 'math_backends': {}}}
+        size = path.stat().st_size
+        byte_limit = 2 * 1024 * 1024
+        with path.open('rb') as stream:
+            offset = max(0, size - byte_limit)
+            stream.seek(offset)
+            if offset:
+                stream.readline()
+            raw_lines = stream.readlines()
+        raw_lines = raw_lines[-2000:]
+        events, recent, malformed = Counter(), [], 0
+        srp_states, math_backends = Counter(), Counter()
+        metrics = {key: [] for key in (
+            'compute_cpu_ms', 'compute_wall_ms', 'lane_wait_ms',
+            'request_ms', 'request_thread_cpu_ms')}
+        allowed = (
+            'at', 'event', 'pid', 'thread', 'row', 'slot', 'attempt',
+            'attempt_limit', 'sampled', 'proxy_acquire_ms', 'device_lease_ms',
+            'device_identity_ms', 'request_ms', 'request_thread_cpu_ms',
+            'request_non_cpu_ms', 'process_cpu_ms_during_request',
+            'process_core_equivalents_during_request', 'http', 'apple_ec',
+            'status', 'stage', 'kind', 'retryable', 'release',
+            'port_changed', 'pair_changed', 'recorded_retries',
+            'configured_retries', 'ok', 'processed', 'counts')
+        for raw in raw_lines:
+            try:
+                item = json.loads(raw)
+                if not isinstance(item, dict):
+                    raise ValueError('not an object')
+            except (UnicodeDecodeError, ValueError, TypeError):
+                malformed += 1
+                continue
+            event = str(item.get('event') or 'unknown')[:80]
+            events[event] += 1
+            backend = item.get('srp_math_backend')
+            if event == 'worker_start' and backend:
+                math_backends[str(backend)[:40]] += 1
+            srp = item.get('srp') if isinstance(item.get('srp'), dict) else None
+            if srp is not None:
+                srp_states[str(srp.get('state') or 'unknown')[:40]] += 1
+                for key in ('compute_cpu_ms', 'compute_wall_ms', 'lane_wait_ms'):
+                    try:
+                        if srp.get(key) is not None:
+                            metrics[key].append(float(srp[key]))
+                    except (TypeError, ValueError):
+                        pass
+            for key in ('request_ms', 'request_thread_cpu_ms'):
+                try:
+                    if item.get(key) is not None:
+                        metrics[key].append(float(item[key]))
+                except (TypeError, ValueError):
+                    pass
+            if recent_limit:
+                safe = {key: item[key] for key in allowed if key in item and
+                        isinstance(item[key], (str, int, float, bool, type(None)))}
+                if isinstance(item.get('counts'), dict):
+                    safe['counts'] = cls._diagnostic_counts(item['counts'])
+                if srp is not None:
+                    safe['srp'] = {key: srp.get(key) for key in
+                                   ('scope', 'state', 'challenge_observed',
+                                    'compute_cpu_ms', 'compute_wall_ms',
+                                    'lane_wait_ms')}
+                recent.append(safe)
+                recent = recent[-recent_limit:]
+        return {
+            'available': True, 'file_bytes': size, 'tail_bytes': min(size, byte_limit),
+            'lines_scanned': len(raw_lines), 'malformed_lines': malformed,
+            'truncated': size > byte_limit or len(raw_lines) >= 2000,
+            'events': dict(sorted(events.items())), 'recent': recent,
+            'srp': {
+                'samples': sum(srp_states.values()),
+                'states': dict(sorted(srp_states.items())),
+                'math_backends': dict(sorted(math_backends.items())),
+                **{key: cls._diagnostic_average(values)
+                   for key, values in metrics.items()},
+            },
+        }
+
+    def task_log(self, payload):
+        """Return a bounded, credential-free diagnostic view of one local task."""
+        if not isinstance(payload, dict):
+            raise ValueError('请求体必须是任务对象')
+        task_object = payload.get('task', payload)
+        if not isinstance(task_object, dict):
+            raise ValueError('task 必须是对象')
+        unit_id = task_object.get('id') or task_object.get('task_id') or task_object.get('unit_id')
+        if (not isinstance(unit_id, str) or not re.fullmatch(r'[0-9a-f]{32}', unit_id)):
+            raise ValueError('任务标识必须是 32 位小写十六进制字符串')
+        try:
+            recent_limit = integer(payload.get('recent', 20), '最近日志条数', 0, 100)
+        except ValueError:
+            raise
+        with self.db.connect() as db:
+            task = db.execute('SELECT * FROM tasks WHERE id=?', (unit_id,)).fetchone()
+        if task is None:
+            raise ValueError('本节点没有这个任务')
+        descriptor = json.loads(task['descriptor'])
+        for key, actual in (('job_id', task['job_id']), ('seq', task['seq'])):
+            if task_object.get(key) is not None and str(task_object[key]) != str(actual):
+                raise ValueError(f'任务对象的 {key} 与节点记录不一致')
+        supplied_token = task_object.get('lease_token', task_object.get('token'))
+        if supplied_token is not None and str(supplied_token) != str(descriptor.get('token') or ''):
+            raise ValueError('任务对象的 lease_token 与节点记录不一致')
+        directory = (self.spool / unit_id).resolve()
+        if directory.parent != self.spool.resolve():
+            raise ValueError('任务目录无效')
+        progress = self._diagnostic_state(read_json(directory / 'progress.json', {}))
+        done = self._diagnostic_state(read_json(directory / 'done.json', {}))
+        worker_states = []
+        workers = directory / 'workers'
+        if workers.is_dir():
+            for worker in sorted(path for path in workers.iterdir() if path.is_dir())[:200]:
+                worker_states.append({
+                    'worker': worker.name[:80],
+                    'progress': self._diagnostic_state(read_json(worker / 'progress.json', {})),
+                    'done': self._diagnostic_state(read_json(worker / 'done.json', {})),
+                })
+        telemetry = {key: self.telemetry.latest.get(key) for key in
+                     ('cpu_percent', 'memory_percent', 'upload_bps', 'download_bps',
+                      'network_bytes', 'sampled_at', 'scope')
+                     if key in self.telemetry.latest}
+        return {
+            'ok': True, 'public_endpoint': True, 'credentials_recorded': False,
+            'node': {'hostname': socket.gethostname(), 'max_processes': self.max_processes,
+                     'max_threads': self.max_threads, 'telemetry': telemetry},
+            'task': {
+                'id': task['id'], 'job_id': task['job_id'], 'seq': task['seq'],
+                'status': task['status'], 'rows': int(descriptor.get('rows') or 0),
+                'processed': int((progress or {}).get('processed', task['processed']) or 0),
+                'created': task['created'], 'updated': task['updated'],
+                'error_type': (str(task['error']).split(':', 1)[0][:80]
+                               if task['error'] else None),
+            },
+            'configuration': {
+                'mode': descriptor.get('mode'),
+                'processes': int(descriptor.get('processes') or 1),
+                'threads': int(descriptor.get('threads') or 1),
+                'timeout': float(descriptor.get('timeout') or 0),
+                'retries': int(descriptor.get('retries') or 0),
+                'auth_protocol': descriptor.get('_auth_protocol',
+                                                descriptor.get('auth_protocol')),
+                'device_mode': descriptor.get('_device_mode',
+                                              descriptor.get('device_mode')),
+                'logging': {
+                    'mode': str(descriptor.get('_proxy_debug_mode') or
+                                ('sampled' if descriptor.get('_proxy_debug') else 'off')),
+                    'sample_every': int(descriptor.get('_proxy_debug_sample_every') or 20),
+                    'sampling_strategy': 'stable_hash',
+                },
+            },
+            'progress': progress, 'done': done, 'workers': worker_states,
+            'debug': self._diagnostic_debug(directory / 'proxy-debug.jsonl', recent_limit),
+            'server_time': time.time(),
+        }
