@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots,
+from clusterlab.executor import (DeviceAuthLease, NodeProxyPool, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots, _reset_incomplete_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
@@ -94,6 +94,27 @@ def use_shared_proxy_pool(pool, output):
 
 
 class ExecutorScaleTests(unittest.TestCase):
+    def test_new_task_resets_only_incomplete_assigned_slots(self):
+        class MixedPool(FakePool):
+            states = {1: 'ready', 2: 'pending', 3: 'invalid', 4: 'missing'}
+
+            def inspect(self, slot):
+                return {'state': self.states[int(slot)]}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pool = MixedPool(temporary)
+            for slot in range(1, 5):
+                directory = pool.slot_directory(slot)
+                directory.mkdir(parents=True)
+                (directory / 'identity.json').write_text(f'slot-{slot}')
+                (directory / '.lease-state.json').write_text('{}')
+            reset = _reset_incomplete_device_slots(pool, [1, 2, 3, 4])
+            self.assertEqual(reset, [2, 3])
+            self.assertTrue((pool.slot_directory(1) / 'identity.json').exists())
+            self.assertFalse((pool.slot_directory(2) / 'identity.json').exists())
+            self.assertFalse((pool.slot_directory(3) / '.lease-state.json').exists())
+            self.assertTrue((pool.slot_directory(4) / 'identity.json').exists())
+
     def test_local_queue_refills_at_low_water_to_three_hundred(self):
         self.assertEqual(_local_queue_refill_count(1000, 1100, 100), 200)
         self.assertEqual(_local_queue_refill_count(1000, 1080, 80), 220)

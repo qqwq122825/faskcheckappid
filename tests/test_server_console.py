@@ -215,6 +215,16 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(builder.snapshot()['slots'],[])
             self.assertEqual(builder.snapshot(include_pending=True)['slots'],pending['slots'])
 
+        mixed={'ready':1,'slots':[
+            {'slot':1,'state':'ready','device_id':'current','error':''},
+            {'slot':2,'state':'pending','device_id':'','error':''},
+            {'slot':999,'state':'pending','device_id':'','error':''},
+        ]}
+        with patch.object(builder.builder,'snapshot',return_value=mixed):
+            current=builder.snapshot(include_pending=True,slot_ids=[1,2])
+            self.assertEqual([item['slot'] for item in current['slots']],[1,2])
+            self.assertEqual(current['ready'],1)
+
     def test_stop_and_second_task_conflict(self):
         self.login();headers={'X-CSRF-Token':self.csrf}
         data={'simulation':'true','demo_count':'100','settings':json.dumps({'processes':1,'threads':1})}

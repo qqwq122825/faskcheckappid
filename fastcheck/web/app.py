@@ -42,14 +42,18 @@ class LocalNodeDeviceBuilder:
         self.node.max_processes=max(1,int(processes));self.node.max_threads=max(1,int(threads))
         self.builder.start(capacity)
 
-    def snapshot(self,include_pending=False):
+    def snapshot(self,include_pending=False,slot_ids=None):
         value=self.builder.snapshot()
         # The node builder scans up to the highest historical slot so it can
         # discover persisted identities.  The console needs the current pool,
         # not hundreds of empty placeholders on every two-second poll.
+        allowed=(None if slot_ids is None else
+                 {int(slot) for slot in slot_ids if str(slot).isdigit()})
         ignored={'missing','retired'}|({'pending'} if not include_pending else set())
         value['slots']=[item for item in value.get('slots',[])
-                        if item.get('state') not in ignored or item.get('error')]
+                        if (allowed is None or item.get('slot') in allowed) and
+                        (item.get('state') not in ignored or item.get('error'))]
+        value['ready']=sum(item.get('state')=='ready' for item in value['slots'])
         return value
     def cancel(self):return self.builder.cancel()
 
@@ -246,8 +250,21 @@ def create_app(data_dir=None):
     @app.get('/api/devices/build')
     def devices_build_status():
         selected = options({})
-        active=any(item.get('state') not in TERMINAL for item in manager.history())
-        return jsonify(builder.snapshot(include_pending=active) if local_node else
+        running=next((item for item in manager.history()
+                      if item.get('state') not in TERMINAL),None)
+        slots=None
+        if local_node and running:
+            manifest=manager.directory(running['id'])/'manifest.json'
+            if manifest.exists():
+                try:slots=json.loads(manifest.read_text()).get('device_slots')
+                except (OSError,ValueError,TypeError):slots=None
+            if not slots:
+                settings=running.get('settings') or {}
+                capacity=max(1,min(int(running.get('accounts') or 1),
+                                   max(1,int(settings.get('processes') or 1))*
+                                   max(1,int(settings.get('threads') or 1))))
+                slots=list(range(1,capacity+1))
+        return jsonify(builder.snapshot(include_pending=bool(running),slot_ids=slots) if local_node else
                        builder.snapshot(selected.device_capacity))
 
     @app.post('/api/devices/build/cancel')

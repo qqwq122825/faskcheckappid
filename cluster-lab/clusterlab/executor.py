@@ -107,6 +107,45 @@ def _local_queue_refill_count(workers, pending, queued):
     return max(0, worker_count + LOCAL_QUEUE_TARGET - pending_count)
 
 
+def _reset_incomplete_device_slots(pool, slots):
+    """Make every assigned task slot usable before worker threads start.
+
+    A killed registration can leave an identifier file without ``adi_pb``.
+    ``DevicePool.inspect`` calls that state ``pending``; it is neither a
+    reusable device nor a missing slot, so an allocator would otherwise skip
+    it forever.  A new task keeps complete registered identities, but removes
+    incomplete/invalid bytes from only its own freshly assigned slot set.
+    """
+    import portalocker
+    import shutil
+
+    reset = []
+    for value in slots:
+        slot = int(value)
+        if pool.inspect(slot).get('state') not in ('pending', 'invalid'):
+            continue
+        directory = pool.slot_directory(slot)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_path = directory / '.lease.lock'
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(descriptor, 'a+') as handle:
+            portalocker.lock(handle, portalocker.LOCK_EX)
+            try:
+                if pool.inspect(slot).get('state') not in ('pending', 'invalid'):
+                    continue
+                for path in directory.iterdir():
+                    if path.name == '.lease.lock':
+                        continue
+                    if path.is_dir():
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        path.unlink(missing_ok=True)
+                reset.append(slot)
+            finally:
+                portalocker.unlock(handle)
+    return reset
+
+
 class DeviceAuthLease:
     """A process-safe, exclusive lease for one persisted device slot."""
 
@@ -1778,6 +1817,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     pool = DevicePool(device_root, origin, max_devices=capacity)
     from fastcheck.workers import device_profile
+    _reset_incomplete_device_slots(pool, slot_ids)
     if debug_enabled:
         _write_proxy_debug(debug_path, 'worker_start',
                            rows=int(descriptor.get('rows') or 0),
