@@ -653,6 +653,12 @@ class Node:
         self.upload_thread.start()
         atexit.register(self.close)
 
+    def _heartbeat_delay(self):
+        with self.lock:
+            busy = bool(self.active)
+        building = bool(self.builder.state.get('running'))
+        return self.interval if busy or building else max(self.interval, 3.0)
+
     def _heartbeat_loop(self):
         while not self.stop.is_set():
             with self.lock:
@@ -665,7 +671,11 @@ class Node:
                     with self.lock:
                         self.connected = False
                         self.error = message[:240]
-            self.stop.wait(self.interval)
+            # Active work keeps one-second live progress.  An idle node has no
+            # rows or leases to report, so three seconds is enough to remain
+            # comfortably inside the controller's 12-second offline window
+            # while cutting fleet-wide idle heartbeat traffic by two thirds.
+            self.stop.wait(self._heartbeat_delay())
 
     def _upload_loop(self):
         while not self.stop.is_set():

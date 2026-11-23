@@ -157,6 +157,14 @@ class NodeRecoveryTests(unittest.TestCase):
             finally:
                 legacy.close()
 
+    def test_idle_heartbeat_uses_three_second_backoff_but_busy_stays_live(self):
+        self.assertEqual(self.node._heartbeat_delay(), 3.0)
+        self.node.active[self.unit] = (object(), threading.Event())
+        self.assertEqual(self.node._heartbeat_delay(), self.node.interval)
+        self.node.active.clear()
+        self.node.builder.state['running'] = True
+        self.assertEqual(self.node._heartbeat_delay(), self.node.interval)
+
     def test_public_task_log_returns_bounded_sanitized_json(self):
         directory = self.node.spool / self.unit
         descriptor = {
