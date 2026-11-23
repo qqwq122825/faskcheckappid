@@ -318,6 +318,27 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(captured['devices']['proxy_ip'], '1.2.3.4:80')
         self.assertEqual(captured['devices']['message'], '正在注册第 4 台')
 
+    def test_unchanged_device_rows_are_not_retransmitted_each_heartbeat(self):
+        captured = []
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': []}
+        snapshot = {'running': False, 'capacity': 1, 'ready': 1, 'built': 0,
+                    'failed': 0, 'current': 0, 'attempted': 1,
+                    'slots': [{'slot': 1, 'state': 'ready', 'label': 'B64:test',
+                               'used': 3, 'recorded': True}]}
+
+        def request(*_args, **kwargs):
+            captured.append(kwargs['json']['devices'])
+            return Response(value)
+
+        with patch.object(self.node.builder, 'snapshot', return_value=snapshot), \
+             patch.object(self.node, '_request', side_effect=request):
+            self.node._heartbeat()
+            self.node._heartbeat()
+        self.assertEqual(captured[0]['slots'], snapshot['slots'])
+        self.assertNotIn('slots', captured[1])
+        self.assertEqual(captured[1]['ready'], 1)
+
     def test_heartbeat_reports_update_status_and_schedules_new_generation(self):
         with self.node.db.transaction() as db:
             db.execute("UPDATE tasks SET status='confirmed'")

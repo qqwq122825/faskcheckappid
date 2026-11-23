@@ -30,6 +30,17 @@ class ControllerTests(unittest.TestCase):
     def test_default_lease_allows_cpu_bound_heartbeat_jitter(self):
         self.assertEqual(self.service.lease_seconds, 120)
 
+    def test_heartbeat_preserves_unchanged_device_rows_when_node_omits_them(self):
+        slot = {'slot': 1, 'state': 'ready', 'label': 'B64:test', 'used': 3,
+                'recorded': True}
+        self.heartbeat(devices={'running': False, 'capacity': 1, 'ready': 1,
+                                'built': 0, 'failed': 0, 'attempted': 1,
+                                'slots': [slot]})
+        self.heartbeat(devices={'running': False, 'capacity': 1, 'ready': 1,
+                                'built': 0, 'failed': 0, 'attempted': 1})
+        saved = self.service.snapshot()['nodes'][0]['telemetry']['device_pool']
+        self.assertEqual(saved['slots'][0]['label'], 'B64:test')
+
     def test_saving_concurrency_without_enabled_preserves_accepting_state(self):
         self.service.configure_node(self.node['id'], {'processes': 4, 'threads': 250})
         saved = next(value for value in self.service.snapshot()['nodes']

@@ -1384,6 +1384,17 @@ class Controller:
                 previous_telemetry = json.loads(node['telemetry_json'] or '{}')
             except (TypeError, ValueError):
                 previous_telemetry = {}
+            # Nodes send the large device table only when it changes.  Preserve
+            # the last accepted rows while still replacing the live summary on
+            # every heartbeat.  An explicit empty list remains authoritative
+            # and therefore clears the table after a pool reset.
+            current_pool = cleaned_telemetry.get('device_pool')
+            previous_pool = (previous_telemetry.get('device_pool')
+                             if isinstance(previous_telemetry, dict) else None)
+            if (isinstance(current_pool, dict) and 'slots' not in current_pool
+                    and isinstance(previous_pool, dict)
+                    and isinstance(previous_pool.get('slots'), list)):
+                current_pool['slots'] = previous_pool['slots']
             current_bytes = cleaned_telemetry.get('network_bytes')
             previous_bytes = previous_telemetry.get('network_bytes')
             current_job_id = next(iter(traffic_jobs)) if len(traffic_jobs) == 1 else None

@@ -87,6 +87,9 @@ class Node:
         self.update_generation = control.get('update_generation', 0)
         self.update_status_path = self.root / 'update-status.json'
         self.telemetry = HostTelemetry()
+        # Device rows can be hundreds of entries.  Keep the summary in every
+        # heartbeat, but transmit the table only when it actually changes.
+        self._last_device_slots_signature = None
         self.proxy_api, self.proxy_scheme = '', 'socks5h'
         self.proxy_ttl = 50
         self.proxy_pool_size = 1000
@@ -333,11 +336,21 @@ class Node:
         except Exception:                                          # noqa: BLE001
             snapshot = dict(self.builder.state)
             snapshot['slots'] = []
-        return {key: snapshot.get(key) for key in
-                ('running', 'capacity', 'ready', 'built', 'failed',
-                 'current', 'attempted', 'registering', 'in_use',
-                 'pending', 'failed_slots', 'proxy_status', 'proxy_ip',
-                 'message', 'slots')}
+        result = {key: snapshot.get(key) for key in
+                  ('running', 'capacity', 'ready', 'built', 'failed',
+                   'current', 'attempted', 'registering', 'in_use',
+                   'pending', 'failed_slots', 'proxy_status', 'proxy_ip',
+                   'message')}
+        slots = snapshot.get('slots') if isinstance(snapshot.get('slots'), list) else []
+        signature = tuple(
+            (item.get('slot'), item.get('state'), item.get('label'),
+             item.get('error'), item.get('model'), item.get('proxy'),
+             item.get('at'), item.get('used'), bool(item.get('recorded')))
+            for item in slots if isinstance(item, dict))
+        if signature != self._last_device_slots_signature:
+            result['slots'] = slots
+            self._last_device_slots_signature = signature
+        return result
 
     def _live_result_paths(self, unit_id):
         """Return worker outputs, never the later merged duplicate file."""
