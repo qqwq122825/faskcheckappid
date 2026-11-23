@@ -110,13 +110,14 @@ class DebugTransportTests(unittest.TestCase):
             proxy_thread.start()
             output = queue.Queue()
             diagnostic = SafeDiagnostics(output, role='authentication', row=1, device=1)
+            client_context = ssl.create_default_context(cafile=str(certificate))
             identity = {'X-Apple-I-MD':'private-otp','X-Apple-I-MD-M':'private-machine',
                         'X-Apple-I-MD-LU':'private-user','X-Apple-I-MD-RINFO':'17106176',
                         'X-Mme-Device-Id':'private-device','X-Mme-Client-Info':'synthetic-client',
                         'User-Agent':'synthetic-agent'}
             try:
                 with patch.object(gsa,'GSA_URL',f'https://localhost:{server.server_port}/gsa'), \
-                     patch.object(gsa,'gsa_ca_file',return_value=str(certificate)), \
+                     patch.object(gsa,'gsa_context',return_value=client_context), \
                      patch.dict('os.environ',{'FASTCHECK_MOCK':''}):
                     gsa.close_session()
                     result = gsa.check('owned@example.invalid','synthetic-password',f'http://127.0.0.1:{proxy.server_port}',

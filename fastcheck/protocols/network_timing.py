@@ -345,13 +345,28 @@ def _instrument_manager(manager, trace, socks_proxy=False):
 
 
 class TimingAdapter(VerifiedTLSAdapter):
-    def __init__(self, trace, **kwargs):
+    def __init__(self, trace, ssl_context=None, **kwargs):
         self.trace = trace
+        self._timing_ssl_context = ssl_context
         super().__init__(diagnostics=trace.record, **kwargs)
 
     def init_poolmanager(self, *args, **kwargs):
+        if self._timing_ssl_context is not None:
+            kwargs["ssl_context"] = self._timing_ssl_context
         super().init_poolmanager(*args, **kwargs)
         _instrument_manager(self.poolmanager, self.trace)
+
+    def build_connection_pool_key_attributes(self, request, verify, cert=None):
+        host, options = super().build_connection_pool_key_attributes(request, verify, cert)
+        if host["scheme"] == "https" and self._timing_ssl_context is not None:
+            # Detailed timing must not replace a caller's trust policy.  GSA
+            # uses Apple's private root, which is intentionally absent from
+            # Certifi; losing this context turns every traced request into a
+            # CERTIFICATE_VERIFY_FAILED result.
+            options["ssl_context"] = self._timing_ssl_context
+            options.pop("ca_certs", None)
+            options.pop("ca_cert_dir", None)
+        return host, options
 
     def send(self, *args, **kwargs):
         response = super().send(*args, **kwargs)
@@ -360,6 +375,10 @@ class TimingAdapter(VerifiedTLSAdapter):
         return response
 
     def proxy_manager_for(self, proxy, **kwargs):
+        if self._timing_ssl_context is not None:
+            # SOCKSProxyManager is created lazily and does not inherit the
+            # direct pool manager's context.
+            kwargs["ssl_context"] = self._timing_ssl_context
         existing = proxy in self.proxy_manager
         manager = super().proxy_manager_for(proxy, **kwargs)
         if not existing:

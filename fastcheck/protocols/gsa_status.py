@@ -425,8 +425,9 @@ class _Session:
                     self._trace = NetworkTrace(diagnostics, resolver=self._resolver)
                     for scheme in ("http://", "https://"):
                         old = self._impl.get_adapter(scheme)
-                        self._impl.mount(scheme, TimingAdapter(self._trace, pool_connections=4,
-                                                              pool_maxsize=4, max_retries=0))
+                        self._impl.mount(scheme, TimingAdapter(
+                            self._trace, ssl_context=gsa_context(), pool_connections=4,
+                            pool_maxsize=4, max_retries=0))
                         old.close()
                 trace = self._trace
                 if trace is not None:

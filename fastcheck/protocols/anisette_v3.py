@@ -27,7 +27,7 @@ import uuid
 
 import requests
 
-from .apple_trust import AppleTrustAdapter
+from .apple_trust import AppleTrustAdapter, gsa_context
 from .timing import phase
 
 LIMIT = 1024 * 1024
@@ -185,7 +185,8 @@ class Client:
         self.info=client_info
         if resolver is not None:
             from .network_timing import NetworkTrace,TimingAdapter
-            self.session.mount('https://',TimingAdapter(NetworkTrace(None,resolver=resolver)))
+            self.session.mount('https://',TimingAdapter(NetworkTrace(None,resolver=resolver),
+                                                       ssl_context=gsa_context()))
             self.session.mount('http://',TimingAdapter(NetworkTrace(None,resolver=resolver)))
 
     def close(self):
