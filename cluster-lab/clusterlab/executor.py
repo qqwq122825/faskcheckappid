@@ -3,7 +3,7 @@
 No plugin loading, account authentication, shell commands or target URLs.
 """
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 import base64
 import hashlib
@@ -1309,11 +1309,17 @@ def execute_unit(directory, descriptor, stop):
         with (directory / 'input.part').open('rb') as source, output_path.open('wb') as output:
             output_path.chmod(0o600)
             with ThreadPoolExecutor(max_workers=descriptor['threads']) as pool:
-                pending = deque()
+                # Reclaim whichever request finishes first so a slow account
+                # cannot stop the executor from dispatching more work.  Keep
+                # a small ordered result buffer so the package JSONL contract
+                # (row order) remains unchanged.
+                pending = {}
+                completed = {}
                 next_row = descriptor['first_row']
+                next_write_row = descriptor['first_row']
                 exhausted = False
                 last_progress = 0
-                while not exhausted or pending:
+                while not exhausted or pending or completed:
                     if stop.is_set():
                         raise InterruptedError('租约失效或节点关闭')
                     while not exhausted and len(pending) < descriptor['threads'] * 2:
@@ -1323,13 +1329,22 @@ def execute_unit(directory, descriptor, stop):
                             break
                         if len(line) > 65536:
                             raise ValueError('输入记录过长')
-                        pending.append(pool.submit(transform, (next_row, line)))
+                        future = pool.submit(transform, (next_row, line))
+                        pending[future] = next_row
                         next_row += 1
                     if pending:
-                        result = pending.popleft().result()
+                        finished, _unfinished = wait(
+                            set(pending), timeout=0.25,
+                            return_when=FIRST_COMPLETED)
+                        for future in finished:
+                            row = pending.pop(future)
+                            completed[row] = future.result()
+                    while next_write_row in completed:
+                        result = completed.pop(next_write_row)
                         output.write(result)
                         output_digest.update(result)
                         processed += 1
+                        next_write_row += 1
                     if time.monotonic() - last_progress > 0.25:
                         # Make complete JSONL lines visible to the node agent.
                         # Only the node heartbeat reports them; worker processes

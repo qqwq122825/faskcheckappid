@@ -93,6 +93,7 @@ class Node:
         self.proxy_api, self.proxy_scheme = '', 'socks5h'
         self.proxy_ttl = 50
         self.proxy_pool_size = 1000
+        self.device_use_limit = 20
         self.origin = 'https://new.ani.sidestore.io'
         from .device_build import DeviceBuilder
         self.builder = DeviceBuilder(self)
@@ -498,6 +499,11 @@ class Node:
                     value.get('proxy_pool_size') or 1000)))
             except (TypeError, ValueError):
                 self.proxy_pool_size = 1000
+            try:
+                self.device_use_limit = max(
+                    1, min(100000, int(value.get('device_use_limit') or 20)))
+            except (TypeError, ValueError):
+                self.device_use_limit = 20
             clear_version = int(value.get('device_clear_version') or 0)
             if clear_version > self.device_clear_version:
                 self.builder.cancel()
@@ -610,6 +616,7 @@ class Node:
         descriptor['device_slots'] = slots
         descriptor['device_use_limit'] = max(
             1, int(descriptor.get('device_use_limit') or 20))
+        self.device_use_limit = descriptor['device_use_limit']
         self.builder.reserve(slots)
 
     def start(self):

@@ -1429,6 +1429,8 @@ class Controller:
                     'device_clear_version': node['device_clear_version'],
                     'proxy_ttl': int(self.settings().get('proxy_ttl') or 50),
                     'proxy_pool_size': int(self.settings().get('proxy_pool_size') or 1000),
+                    'device_use_limit': max(
+                        1, int(self.settings().get('device_use_limit') or 20)),
                     'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds,
                     'update': update,
                     'server_time': now,

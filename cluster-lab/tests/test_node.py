@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from clusterlab.node import Node
-from clusterlab.device_build import REGISTRATION_TIMEOUT, _register
+from clusterlab.device_build import DeviceBuilder, REGISTRATION_TIMEOUT, _register
 from clusterlab.web import create_app
 
 
@@ -34,6 +34,50 @@ def _construct_node_in_spawned_child(root):
 
 
 class NodeRecoveryTests(unittest.TestCase):
+    def test_device_snapshot_counts_only_available_unexhausted_devices_as_ready(self):
+        class Pool:
+            key = 'fake'
+
+            def __init__(inner, root, _origin, max_devices):
+                inner.root = Path(root)
+                inner.max_devices = max_devices
+
+            def inspect(inner, slot):
+                return {'state': 'ready', 'device_id': f'device-{slot}'}
+
+            def slot_directory(inner, slot):
+                return inner.root / 'slot' / str(slot)
+
+        class FakeNode:
+            def __init__(inner, root):
+                inner.root = Path(root)
+                inner.origin = 'https://example.invalid'
+                inner.max_processes = 1
+                inner.max_threads = 3
+                inner.device_use_limit = 20
+
+        with tempfile.TemporaryDirectory() as root:
+            node = FakeNode(root)
+            target = node.root / 'device-pool'
+            target.mkdir()
+            (target / 'target.json').write_text('{"capacity":3}')
+            builder = DeviceBuilder(node)
+            with patch('clusterlab.device_build._load_fastcheck',
+                       return_value=(Pool, None, None)), \
+                 patch.object(builder, 'usage',
+                              return_value={'1': 20, '2': 3, '3': 3}), \
+                 patch.object(builder, 'registry', return_value={}), \
+                 patch.object(builder, '_recover_slot', return_value={}), \
+                 patch.object(builder, '_active_task_lease',
+                              side_effect=lambda _pool, slot: slot == 2):
+                snapshot = builder.snapshot()
+            self.assertEqual(snapshot['ready'], 1)
+            self.assertEqual(snapshot['in_use'], 1)
+            self.assertEqual(snapshot['pending'], 1)
+            self.assertEqual([item['state'] for item in snapshot['slots']],
+                             ['pending', 'in_use', 'ready'])
+            self.assertEqual(snapshot['slots'][0]['used'], 20)
+
     def test_device_registration_allows_realistic_provisioning_time(self):
         self.assertEqual(REGISTRATION_TIMEOUT, 20)
 
@@ -579,7 +623,9 @@ class NodeRecoveryTests(unittest.TestCase):
             snapshot = self.node.builder.snapshot()
         self.assertEqual([row['state'] for row in snapshot['slots']],
                          ['in_use', 'registering', 'registering'])
-        self.assertEqual(snapshot['ready'], 1)
+        # A leased device is not currently available and therefore must not
+        # inflate the ready count.
+        self.assertEqual(snapshot['ready'], 0)
         self.assertEqual(snapshot['in_use'], 1)
         self.assertEqual(snapshot['registering'], 2)
         self.assertEqual(snapshot['pending'], 0)
@@ -606,6 +652,7 @@ class NodeRecoveryTests(unittest.TestCase):
         state = directory / 'origin-key.json'
         state.write_text('{}')
         (self.node.root / 'device-pool' / 'usage.json').write_text('{"1":123}')
+        self.node.device_use_limit = 1000
         with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)):
             snapshot = self.node.builder.snapshot()
         self.assertEqual(snapshot['attempted'], 1)

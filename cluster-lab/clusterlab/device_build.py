@@ -59,6 +59,7 @@ class DeviceBuilder:
         ready = 0
         slots = []
         usage = self.usage()
+        use_limit = max(1, int(getattr(self.node, 'device_use_limit', 20) or 20))
         with self.lock:
             data = dict(self.state)
             data['slot_errors'] = dict(data.get('slot_errors') or {})
@@ -88,10 +89,22 @@ class DeviceBuilder:
                 inspected = pool.inspect(slot)
                 state = inspected['state']
                 lease = self._active_task_lease(pool, slot)
+                used = usage.get(str(slot), 0)
+                used = used if type(used) is int and used >= 0 else 0
+                exhausted = False
                 if state == 'ready':
-                    ready += 1
                     if lease:
                         state = 'in_use'
+                    elif used >= use_limit:
+                        # A device at its configured request limit is not
+                        # available work capacity.  The executor normally
+                        # removes its identity in release(); exposing it as
+                        # pending here also keeps a crash-window/stale row out
+                        # of the ready count until the next worker replaces it.
+                        state = 'pending'
+                        exhausted = True
+                    else:
+                        ready += 1
                 elif state in ('missing', 'pending', 'invalid') and lease:
                     # Work threads register missing identities under the same
                     # exclusive slot lease used for requests.  The standalone
@@ -103,12 +116,11 @@ class DeviceBuilder:
                 elif str(slot) in data['slot_errors']:
                     state = 'failed'
                 current_identity = state in ('ready', 'idle', 'in_use')
-                used = usage.get(str(slot), 0) if current_identity else 0
                 slots.append({'slot': slot, 'state': state,
                               'device_id': inspected.get('device_id', ''),
                               'label': device_label(inspected.get('device_id')),
                               'error': data['slot_errors'].get(str(slot), ''),
-                              'used': used if type(used) is int and used >= 0 else 0})
+                              'used': used if current_identity or exhausted else 0})
         except Exception:                                          # noqa: BLE001
             pass
         registry = self.registry()

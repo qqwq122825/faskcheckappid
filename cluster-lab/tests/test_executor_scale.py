@@ -8,13 +8,14 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import Future
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from clusterlab.executor import (DEVICE_REGISTRATION_TIMEOUT_SECONDS, DeviceAuthLease, DeviceLeaseAllocator, NodeProxyPool, StageTelemetry, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots, _reset_incomplete_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
-                                 execute_unit_group, proxy_supplier_loop,
+                                 execute_unit, execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
 
 
@@ -119,6 +120,50 @@ def use_shared_proxy_pool(pool, output):
 
 
 class ExecutorScaleTests(unittest.TestCase):
+    def test_offline_executor_refills_after_any_completed_future(self):
+        class CompletingExecutor:
+            last = None
+
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+                self.submitted = 0
+                self.first = None
+                type(self).last = self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def submit(self, function, item):
+                self.submitted += 1
+                future = Future()
+                if self.submitted == 1:
+                    self.first = (future, function, item)
+                else:
+                    future.set_result(function(item))
+                # With two workers the initial bounded queue contains four
+                # items.  Reaching item five proves the collector reclaimed a
+                # later completed future instead of waiting for item one.
+                if self.submitted == 5:
+                    first, first_function, first_item = self.first
+                    first.set_result(first_function(first_item))
+                return future
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_bytes(
+                b''.join(f'row-{number}\n'.encode() for number in range(8)))
+            descriptor = {'rows': 8, 'first_row': 1, 'threads': 2,
+                          'mode': 'simulate'}
+            with patch('clusterlab.executor.ThreadPoolExecutor', CompletingExecutor):
+                execute_unit(root, descriptor, threading.Event())
+            self.assertEqual(CompletingExecutor.last.submitted, 8)
+            done = json.loads((root / 'done.json').read_text())
+            self.assertTrue(done['ok'])
+            self.assertEqual(done['processed'], 8)
+
     def test_new_task_resets_only_incomplete_assigned_slots(self):
         class MixedPool(FakePool):
             states = {1: 'ready', 2: 'pending', 3: 'invalid', 4: 'missing'}
