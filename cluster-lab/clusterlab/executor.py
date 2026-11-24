@@ -374,13 +374,20 @@ class DeviceAuthLease:
 
 
 class DeviceLeaseAllocator:
-    """Rotate scan starts so hundreds of threads do not hammer slot one."""
+    """Hand idle slots to workers without polling every device lock.
+
+    Slots assigned to one worker process are disjoint.  A condition-backed
+    queue therefore provides the normal hand-off path; the file lock remains
+    the cross-process crash-safety boundary rather than a lock every waiting
+    thread repeatedly probes.
+    """
 
     def __init__(self, pool, slots, device_root=None, use_limit=DEVICE_USE_LIMIT):
         self.pool = pool
         self.device_root = device_root
         self.use_limit = max(1, int(use_limit or DEVICE_USE_LIMIT))
         self.lock = threading.Lock()
+        self.available_changed = threading.Condition(self.lock)
         self.usage = _usage_snapshot(device_root)
         self.dirty_usage = set()
         self.ready = []
@@ -391,46 +398,80 @@ class DeviceLeaseAllocator:
                 self.ready.append(slot)
             elif state == 'missing':
                 self.missing.append(slot)
-        self.ready_cursor = 0
-        self.missing_cursor = 0
+        self.available = deque(self.ready + self.missing)
+        self.available_slots = set(self.available)
 
-    def _rotated(self):
-        with self.lock:
-            ready = list(self.ready)
-            missing = list(self.missing)
-            if ready:
-                offset = self.ready_cursor % len(ready)
-                self.ready_cursor += 1
-                ready = ready[offset:] + ready[:offset]
-            if missing:
-                offset = self.missing_cursor % len(missing)
-                self.missing_cursor += 1
-                missing = missing[offset:] + missing[:offset]
-        return ready, missing
+    def _publish_locked(self, slot):
+        slot = int(slot)
+        if slot not in self.available_slots:
+            self.available.append(slot)
+            self.available_slots.add(slot)
+
+    def _record_state_locked(self, slot, state):
+        slot = int(slot)
+        if state == 'ready':
+            if slot not in self.ready:
+                self.ready.append(slot)
+            if slot in self.missing:
+                self.missing.remove(slot)
+        else:
+            if slot not in self.missing:
+                self.missing.append(slot)
+            if slot in self.ready:
+                self.ready.remove(slot)
 
     def acquire(self, stop):
         while not stop.is_set():
-            ready, missing = self._rotated()
-            for slot in ready + missing:
-                lease = DeviceAuthLease.try_acquire(self.pool, slot)
-                if lease is not None:
-                    with self.lock:
-                        prior = int(self.usage.get(slot, 0))
-                    if lease.initial_state == 'ready' and prior >= self.use_limit:
-                        lease.uses = prior
-                        lease.use_limit = self.use_limit
-                        lease.retire_on_release = True
-                        lease.release()
-                        # The retired identity bytes are gone.  Reset the slot
-                        # counter so the next owner can register a fresh
-                        # identity in this same pool slot.
-                        with self.lock:
-                            self.usage[slot] = 0
-                            self.dirty_usage.add(slot)
-                        continue
-                    return lease
-            stop.wait(DEVICE_LEASE_POLL_SECONDS)
+            with self.available_changed:
+                while not self.available and not stop.is_set():
+                    self.available_changed.wait(timeout=0.25)
+                if stop.is_set():
+                    break
+                slot = self.available.popleft()
+                self.available_slots.remove(slot)
+
+            lease = DeviceAuthLease.try_acquire(self.pool, slot)
+            if lease is None:
+                # An old process may still hold the file lease after a rolling
+                # restart.  This is a rare safety path; normal in-process
+                # contention never probes the same locked slot.
+                with self.available_changed:
+                    self._publish_locked(slot)
+                    self.available_changed.wait(timeout=DEVICE_LEASE_POLL_SECONDS)
+                continue
+
+            with self.lock:
+                prior = int(self.usage.get(slot, 0))
+            if lease.initial_state == 'ready' and prior >= self.use_limit:
+                lease.uses = prior
+                lease.use_limit = self.use_limit
+                lease.retire_on_release = True
+                # Reset the generation before making its slot visible again.
+                lease.release()
+                with self.available_changed:
+                    self.usage[slot] = 0
+                    self.dirty_usage.add(slot)
+                    self._record_state_locked(slot, 'missing')
+                    self._publish_locked(slot)
+                    self.available_changed.notify()
+                continue
+            return lease
         raise InterruptedError('节点关闭，停止等待设备')
+
+    def release(self, lease):
+        """Release one slot and wake exactly one device waiter."""
+        slot = int(lease.slot)
+        try:
+            lease.release()
+        finally:
+            try:
+                state = self.pool.inspect(slot).get('state')
+            except Exception:                                   # noqa: BLE001
+                state = 'missing' if lease.retire_on_release else lease.initial_state
+            with self.available_changed:
+                self._record_state_locked(slot, state)
+                self._publish_locked(slot)
+                self.available_changed.notify()
 
     def reset_registered(self, lease):
         """Publish a freshly registered slot for ready-first reuse."""
@@ -440,10 +481,7 @@ class DeviceLeaseAllocator:
         with self.lock:
             self.usage[lease.slot] = 0
             self.dirty_usage.add(lease.slot)
-            if lease.slot not in self.ready:
-                self.ready.append(lease.slot)
-            if lease.slot in self.missing:
-                self.missing.remove(lease.slot)
+            self._record_state_locked(lease.slot, 'ready')
         lease.uses = 0
 
     def consume(self, lease):
@@ -963,6 +1001,9 @@ class NodeProxyPool:
             self._add(self.discarded, sum(bool(value) for value in values))
             return 0
         added = 0
+        known = (self._value(self.fresh_count)
+                 + self._value(self.reusable_count)
+                 + self._value(self.in_use_count))
         for value in values:
             if not value:
                 continue
@@ -977,12 +1018,13 @@ class NodeProxyPool:
             # The two physical queues share one logical capacity. Without this
             # guard, a full reusable queue plus scheduled fresh rotation could
             # silently grow a target=10,000 pool toward 20,000 entries.
-            if self.snapshot()['known'] >= self.target:
+            if known >= self.target:
                 oldest = self._take(self.fresh, self.fresh_count, 0.02)
                 if oldest is None:
                     oldest = self._take(self.reusable, self.reusable_count, 0.02)
                 if oldest is None:  # every known exit is currently leased
                     continue
+                known -= 1
                 self._add(self.discarded, 1)
                 self._add(self.refreshed, 1)
             self._add(self.fresh_count, 1)
@@ -994,6 +1036,7 @@ class NodeProxyPool:
                 # exit when full, never an exit already leased to a worker.
                 oldest = self._take(self.fresh, self.fresh_count, 0.02)
                 if oldest is not None:
+                    known -= 1
                     self._add(self.discarded, 1)
                     self._add(self.refreshed, 1)
                 self._add(self.fresh_count, 1)
@@ -1004,6 +1047,7 @@ class NodeProxyPool:
                     continue
             self._recent_exits[key] = expires_at
             added += 1
+            known += 1
         self._add(self.fetched, added)
         # A rate-limited provider may return fewer exits than the requested
         # target (for example 200 per minute for 1,000 workers).  Start work as
@@ -2302,7 +2346,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'stage': 'init', 'detail': str(exc)[:180]}
             finally:
                 if device_lease is not None:
-                    device_lease.release()
+                    device_allocator.release(device_lease)
             request_ms = (round((time.monotonic() - request_started) * 1000, 2)
                           if debug_enabled else None)
             request_thread_cpu_ms = (

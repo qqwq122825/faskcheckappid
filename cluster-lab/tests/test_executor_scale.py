@@ -120,6 +120,70 @@ def use_shared_proxy_pool(pool, output):
 
 
 class ExecutorScaleTests(unittest.TestCase):
+    def test_device_allocator_release_wakes_one_waiter_without_polling(self):
+        class ReadyPool:
+            def inspect(self, _slot):
+                return {'state': 'ready'}
+
+        held = set()
+        held_lock = threading.Lock()
+
+        class Lease:
+            initial_state = 'ready'
+            uses = 0
+            use_limit = 20
+            retire_on_release = False
+
+            def __init__(self, slot):
+                self.slot = slot
+
+            def release(self):
+                with held_lock:
+                    held.remove(self.slot)
+
+        def acquire(_pool, slot):
+            with held_lock:
+                if slot in held:
+                    return None
+                held.add(slot)
+            return Lease(slot)
+
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(DeviceAuthLease, 'try_acquire', side_effect=acquire):
+            allocator = DeviceLeaseAllocator(ReadyPool(), [1], temporary)
+            stop = RecordingStop()
+            first = allocator.acquire(stop)
+            acquired = []
+            completed = threading.Event()
+
+            def wait_for_slot():
+                acquired.append(allocator.acquire(stop))
+                completed.set()
+
+            waiter = threading.Thread(target=wait_for_slot)
+            waiter.start()
+            time.sleep(.03)
+            self.assertFalse(completed.is_set())
+            allocator.release(first)
+            self.assertTrue(completed.wait(.5))
+            allocator.release(acquired[0])
+            waiter.join(.5)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(stop.waits, [])
+            self.assertEqual(held, set())
+
+    def test_proxy_refill_does_not_take_full_snapshot_for_every_exit(self):
+        context = mp.get_context('spawn')
+        pool = NodeProxyPool(context, concurrency=2, ttl=30, target=3)
+        try:
+            with patch.object(pool, 'snapshot', side_effect=AssertionError(
+                    'add_fresh must use one local capacity counter')):
+                self.assertEqual(pool.add_fresh([
+                    'socks5h://one', 'socks5h://two', 'socks5h://three']), 3)
+            self.assertEqual(pool.snapshot()['known'], 3)
+        finally:
+            pool.close()
+
     def test_offline_executor_refills_after_any_completed_future(self):
         class CompletingExecutor:
             last = None
@@ -1282,7 +1346,11 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(json.loads((root / 'progress.json').read_text('utf-8'))['counts'],
                              {'valid': 500})
             self.assertEqual(done['checksum'], hashlib.sha256(payload).hexdigest())
-            self.assertGreaterEqual(len(usage_calls), 2)
+            # A fast local run may finish before the 250ms live-update tick;
+            # the final batched flush is still mandatory and per-row writes
+            # are forbidden.
+            self.assertGreaterEqual(len(usage_calls), 1)
+            self.assertLess(len(usage_calls), len(lines))
             self.assertTrue(any(call for call in usage_calls))
             self.assertTrue(all(0 <= value <= 20 for call in usage_calls
                                 for value in call.values()))
