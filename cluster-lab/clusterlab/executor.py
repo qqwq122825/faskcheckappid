@@ -59,6 +59,21 @@ def _percentile(values, percentile):
     return round(ordered[rank], 3)
 
 
+def _performance_trace_interval(rows):
+    """Trace all tiny diagnostics; sample about five percent of large jobs."""
+    return 1 if 0 < int(rows or 0) <= 10 else PERFORMANCE_TRACE_SAMPLE_EVERY
+
+
+def _performance_trace_sampled(job_id, row, first_row, sample_every):
+    """Choose stable pseudo-random rows without hashing account contents."""
+    interval = max(1, int(sample_every or 1))
+    if interval == 1 or int(row) == int(first_row):
+        return True
+    seed = f'{job_id or "local"}:{int(row)}'.encode('utf-8')
+    value = int.from_bytes(hashlib.blake2s(seed, digest_size=8).digest(), 'big')
+    return value % interval == 0
+
+
 class StageTelemetry:
     """Low-volume aggregate timings for the public node task-log API.
 
@@ -748,6 +763,52 @@ def _srp_timing_summary(phase_ms, phase_cpu_ms, phase_counts, sampled):
                          if any(value['lane_wait_calls'] for value in stages.values())
                          else None),
         **stages,
+    }
+
+
+_NETWORK_PHASES = (
+    'proxy_dns', 'proxy_tcp_connect', 'socks_auth', 'proxy_target_connect',
+    'target_dns', 'tcp_connect', 'tls_setup', 'tls_handshake', 'http_send',
+    'response_first_byte', 'response_headers', 'response_body',
+)
+
+
+def _network_timing_summary(phase_ms, phase_cpu_ms, phase_counts,
+                            connection_counts, sampled):
+    """Return bounded connection metrics for one sampled authentication."""
+    phases = {}
+    for name in _NETWORK_PHASES:
+        calls = int(phase_counts.get(name, 0))
+        if calls:
+            phases[name] = {
+                'calls': calls,
+                'wall_ms': round(float(phase_ms.get(name, 0.0)), 3),
+                'thread_cpu_ms': round(float(phase_cpu_ms.get(name, 0.0)), 3),
+            }
+    new = int(connection_counts.get('new', 0))
+    reused = int(connection_counts.get('reused', 0))
+    total = new + reused
+    return {
+        'scope': 'sampled_attempt_connection_lifecycle',
+        'state': ('observed' if sampled and (total or phases) else
+                  'no_network_events' if sampled else 'not_sampled'),
+        'connections': {
+            'total': total if sampled else None,
+            'new': new if sampled else None,
+            'reused': reused if sampled else None,
+            'reuse_ratio': (round(reused / total, 4) if total else
+                            0.0 if sampled else None),
+            'remote_dns': (int(connection_counts.get('remote_dns', 0))
+                           if sampled else None),
+        },
+        'tcp_connects': (sum(int(phase_counts.get(name, 0))
+                             for name in ('proxy_tcp_connect', 'tcp_connect'))
+                         if sampled else None),
+        'socks_negotiations': (int(phase_counts.get('socks_auth', 0))
+                               if sampled else None),
+        'tls_handshakes': (int(phase_counts.get('tls_handshake', 0))
+                           if sampled else None),
+        'phases': phases,
     }
 
 
@@ -1465,6 +1526,8 @@ def execute_unit_group(directory, descriptor, stop):
     """
     directory = Path(directory)
     descriptor = dict(descriptor)
+    descriptor['_performance_sample_every'] = _performance_trace_interval(
+        descriptor.get('rows'))
     debug_path = None
     if _proxy_debug_enabled(descriptor):
         debug_path = directory / 'proxy-debug.jsonl'
@@ -1478,7 +1541,7 @@ def execute_unit_group(directory, descriptor, stop):
             retries=int(descriptor.get('retries') or 0),
             timeout=float(descriptor.get('timeout') or 20),
             mode='sampled_performance_plus_timeouts',
-            sample_every=PERFORMANCE_TRACE_SAMPLE_EVERY,
+            sample_every=descriptor['_performance_sample_every'],
             credentials_recorded=False)
     started = time.time()
     rows = max(0, int(descriptor.get('rows') or 0))
@@ -1992,6 +2055,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         slot_ids, descriptor.get('process_request_budget'))
     use_limit = max(1, int(descriptor.get('device_use_limit') or DEVICE_USE_LIMIT))
     debug_enabled = _proxy_debug_enabled(descriptor)
+    performance_sample_every = max(
+        1, int(descriptor.get('_performance_sample_every')
+               or _performance_trace_interval(descriptor.get('rows'))))
     stage_telemetry = StageTelemetry(debug_enabled)
     debug_path = (descriptor.get('_proxy_debug_path') or
                   str(directory / 'proxy-debug.jsonl')) if debug_enabled else None
@@ -2014,7 +2080,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            srp_math_backend=getattr(
                                sys.modules.get('fastcheck.protocols.srp_auth'),
                                'SRP_MATH_BACKEND', 'unknown'),
-                           performance_sample_every=PERFORMANCE_TRACE_SAMPLE_EVERY,
+                           performance_sample_every=performance_sample_every,
                            performance_first_row_sampled=True,
                            credentials_recorded=False)
 
@@ -2133,18 +2199,27 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         # 不会在“0 次重试”时暗中多发请求。
         attempt_limit = retries + 1
         for attempt in range(start_attempt, attempt_limit):
-            # 1000条压测默认只记录首条和每20条中的1条（约5%）。
+            # 10条以内全量记录；大任务记录每进程首条，并按任务ID+行号
+            # 稳定伪随机抽取约5%，不读取或哈希账号和密码。
             # 超过30秒的慢请求即使不在样本中也记录外层耗时；不记录账号、
             # 密码或完整代理地址，避免日志本身改变CPU/吞吐表现。
-            trace_sampled = (debug_enabled and (
-                row == int(descriptor.get('first_row') or 1)
-                or row % PERFORMANCE_TRACE_SAMPLE_EVERY == 0))
+            trace_sampled = (debug_enabled and _performance_trace_sampled(
+                descriptor.get('job_id'), row,
+                int(descriptor.get('first_row') or 1),
+                performance_sample_every))
             phase_ms = Counter()
             phase_cpu_ms = Counter()
             phase_counts = Counter()
+            connection_counts = Counter()
 
             def collect_phase(event):
-                if event.get('event') != 'phase_end':
+                event_type = event.get('event')
+                if event_type == 'connection':
+                    connection_counts['reused' if event.get('reused') else 'new'] += 1
+                    if event.get('target_dns_mode') == 'remote':
+                        connection_counts['remote_dns'] += 1
+                    return
+                if event_type != 'phase_end':
                     return
                 phase = str(event.get('phase') or '')
                 if not phase:
@@ -2300,7 +2375,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                         account, password, account_proxy, timeout=timeout,
                         retries=0 if proxy_pool is not None else retries,
                         cancel=stop.is_set, identity=identity,
-                        diagnostics=(collect_phase if debug_enabled else None))
+                        diagnostics=(collect_phase if trace_sampled else None))
                 finally:
                     stage_telemetry.end(auth_token)
                 result['_device_use'] = device_use
@@ -2404,9 +2479,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     process_core_equivalents_during_request=(
                         round(process_cpu_ms_during_request / request_ms, 3)
                         if request_ms > 0 else None),
-                    trace_sample_every=PERFORMANCE_TRACE_SAMPLE_EVERY,
+                    trace_sample_every=performance_sample_every,
                     srp=_srp_timing_summary(
                         phase_ms, phase_cpu_ms, phase_counts, trace_sampled),
+                    network=_network_timing_summary(
+                        phase_ms, phase_cpu_ms, phase_counts,
+                        connection_counts, trace_sampled),
                     device_was_ready=device_was_ready,
                     device_registered=device_registered,
                     http=result_http, apple_ec=apple_ec,

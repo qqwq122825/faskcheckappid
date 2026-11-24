@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (DEVICE_REGISTRATION_TIMEOUT_SECONDS, DeviceAuthLease, DeviceLeaseAllocator, NodeProxyPool, StageTelemetry, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots, _reset_incomplete_device_slots,
+from clusterlab.executor import (DEVICE_REGISTRATION_TIMEOUT_SECONDS, DeviceAuthLease, DeviceLeaseAllocator, NodeProxyPool, StageTelemetry, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots, _performance_trace_interval, _performance_trace_sampled, _reset_incomplete_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit, execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
@@ -1249,7 +1249,7 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(allocator.usage[3], 0)
             self.assertEqual(lease.uses, 0)
 
-    def test_debug_uses_five_percent_timing_samples_not_full_account_logging(self):
+    def test_debug_small_task_records_bounded_connection_timing(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'input.part').write_text(
@@ -1267,6 +1267,16 @@ class ExecutorScaleTests(unittest.TestCase):
             def check(_account, _password, _proxy, **kwargs):
                 diagnostics = kwargs.get('diagnostics')
                 self.assertIsNotNone(diagnostics)
+                diagnostics({'event': 'connection', 'reused': False,
+                             'target_dns_mode': 'remote'})
+                diagnostics({'event': 'connection', 'reused': True,
+                             'target_dns_mode': 'remote'})
+                diagnostics({'event': 'phase_end', 'phase': 'proxy_tcp_connect',
+                             'ms': 8.0, 'cpu_ms': .5})
+                diagnostics({'event': 'phase_end', 'phase': 'socks_auth',
+                             'ms': 4.0, 'cpu_ms': .25})
+                diagnostics({'event': 'phase_end', 'phase': 'tls_handshake',
+                             'ms': 20.0, 'cpu_ms': 6.5})
                 diagnostics({'event': 'phase_end',
                              'phase': 'srp_challenge_compute',
                              'ms': 12.5, 'cpu_ms': 7.25})
@@ -1289,12 +1299,66 @@ class ExecutorScaleTests(unittest.TestCase):
             timing = next(item for item in events
                           if item.get('event') == 'auth_timing')
             self.assertTrue(timing['sampled'])
-            self.assertEqual(timing['trace_sample_every'], 20)
+            self.assertEqual(timing['trace_sample_every'], 1)
             self.assertEqual(timing['srp']['state'], 'observed')
             self.assertEqual(timing['srp']['compute_cpu_ms'], 7.25)
+            self.assertEqual(timing['network']['state'], 'observed')
+            self.assertEqual(timing['network']['connections'], {
+                'total': 2, 'new': 1, 'reused': 1,
+                'reuse_ratio': .5, 'remote_dns': 2})
+            self.assertEqual(timing['network']['tcp_connects'], 1)
+            self.assertEqual(timing['network']['socks_negotiations'], 1)
+            self.assertEqual(timing['network']['tls_handshakes'], 1)
+            self.assertEqual(
+                timing['network']['phases']['tls_handshake']['thread_cpu_ms'], 6.5)
             serialized = json.dumps(timing)
             self.assertNotIn('account----password', serialized)
             self.assertNotIn('socks5h://account-exit', serialized)
+
+    def test_debug_network_trace_instruments_all_ten_local_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rows = [f'user-{index}@example.com----password'
+                    for index in range(1, 11)]
+            (root / 'input.part').write_text(
+                '\n'.join(rows) + '\n', encoding='utf-8')
+            descriptor = {'rows': 10, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1,
+                          'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1',
+                          'timeout': 5, 'retries': 0,
+                          '_proxy_debug': True,
+                          '_performance_sample_every': 1}
+            shared = ScriptedProxyPool(
+                ['socks5h://headers']
+                + [f'socks5h://account-{index}' for index in range(1, 11)])
+            traced = []
+
+            def check(_account, _password, _proxy, **kwargs):
+                traced.append(kwargs.get('diagnostics') is not None)
+                return {'status': 'wrong_password', 'stage': 'complete',
+                        'http': 200, 'apple_ec': -22406,
+                        'detail': 'synthetic wrong password'}
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool, check, lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+
+            self.assertEqual(traced, [True] * 10)
+
+    def test_large_job_sampling_is_stable_random_and_credential_free(self):
+        selected = [row for row in range(1, 2001)
+                    if _performance_trace_sampled('job-123', row, 1, 20)]
+        self.assertEqual(_performance_trace_interval(10), 1)
+        self.assertEqual(_performance_trace_interval(11), 20)
+        self.assertEqual(selected,
+                         [row for row in range(1, 2001)
+                          if _performance_trace_sampled('job-123', row, 1, 20)])
+        self.assertTrue(70 <= len(selected) <= 130)
+        self.assertNotEqual(selected[1:10], list(range(20, 201, 20))[:9])
 
     def test_one_package_fans_out_to_processes_and_merges_in_row_order(self):
         with tempfile.TemporaryDirectory() as temporary:
