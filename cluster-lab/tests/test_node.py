@@ -134,11 +134,11 @@ class NodeRecoveryTests(unittest.TestCase):
         self.node.close()
         self.temp.cleanup()
 
-    def test_legacy_ten_by_one_hundred_service_becomes_single_process(self):
+    def test_legacy_ten_by_one_hundred_service_becomes_two_by_two_fifty(self):
         with tempfile.TemporaryDirectory() as root:
             legacy = Node(root, max_processes=10, max_threads=100)
             try:
-                self.assertEqual((legacy.max_processes, legacy.max_threads), (1, 500))
+                self.assertEqual((legacy.max_processes, legacy.max_threads), (2, 250))
             finally:
                 legacy.close()
 
@@ -302,18 +302,18 @@ class NodeRecoveryTests(unittest.TestCase):
         with patch.object(self.node.builder, 'snapshot',
                           side_effect=AssertionError('must not inspect device pool')):
             self.node._prepare_auth_devices(descriptor)
-        self.assertEqual(descriptor['device_pool_capacity'], 200)
-        self.assertEqual(descriptor['device_slots'], list(range(1, 201)))
-        self.assertEqual(descriptor['processes'], 1)
+        self.assertEqual(descriptor['device_pool_capacity'], 400)
+        self.assertEqual(descriptor['device_slots'], list(range(1, 401)))
+        self.assertEqual(descriptor['processes'], 2)
         self.assertNotIn('device_capacity', descriptor)
-        self.assertEqual(self.node.builder.reserved, set(range(1, 201)))
+        self.assertEqual(self.node.builder.reserved, set(range(1, 401)))
 
     def test_auth_task_does_not_require_ready_devices(self):
         descriptor = {'mode': 'auth', 'rows': 2, 'processes': 4, 'threads': 10}
         with patch.object(self.node.builder, 'snapshot',
                           side_effect=AssertionError('must not inspect device pool')):
             self.node._prepare_auth_devices(descriptor)
-        self.assertEqual(descriptor['processes'], 1)
+        self.assertEqual(descriptor['processes'], 2)
         self.assertEqual(descriptor['device_slots'], [1, 2])
         self.assertEqual(self.node.builder.reserved, {1, 2})
 

@@ -37,6 +37,19 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(saved['enabled'])
         self.assertEqual((saved['desired_processes'], saved['desired_threads']), (1, 250))
 
+    def test_online_node_runs_requested_concurrency_without_reported_cap(self):
+        self.service.configure_node(self.node['id'], {
+            'processes': 7, 'threads': 777, 'enabled': True})
+        response = self.service.heartbeat(self.node['id'], {
+            'session': 'test-session', 'hostname': 'test', 'version': 'test',
+            'max_processes': 2, 'max_threads': 250,
+            'active': [], 'interrupted': []})
+        self.assertEqual((response['processes'], response['threads']), (7, 777))
+        saved = next(value for value in self.service.snapshot()['nodes']
+                     if value['id'] == self.node['id'])
+        self.assertEqual((saved['effective_processes'], saved['effective_threads']),
+                         (7, 777))
+
     def test_new_node_can_start_without_device_prefill(self):
         node = self.service.add_node('auto-devices', 1, 300)
         with self.service.db.connect() as db:
@@ -132,11 +145,11 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual((unit['public_header_use_limit'], unit['device_use_limit']),
                          (7, 321))
 
-    def test_refresh_devices_clears_then_rebuilds_to_effective_thread_count(self):
+    def test_refresh_devices_rebuilds_to_requested_total_concurrency(self):
         result = self.service.refresh_devices(self.node['id'])
-        self.assertEqual(result['requested'], 2)
+        self.assertEqual(result['requested'], 4)
         response = self.heartbeat(ack_device_clear_version=0)
-        self.assertEqual(response['device_request'], 2)
+        self.assertEqual(response['device_request'], 4)
         self.assertEqual(response['device_clear_version'], result['version'])
 
     def test_web_secondary_auth_defaults_on_persists_and_rejects_non_boolean(self):
@@ -262,12 +275,12 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(sum(j['status'] == 'running' for j in snapshot['jobs']), 1)
         self.assertEqual(snapshot['totals']['queued'], 2)
 
-    def test_lease_requires_started_job_and_respects_node_capacity(self):
+    def test_lease_requires_started_job_and_uses_requested_concurrency(self):
         job = self.job()
         self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
         self.service.job_action(job, 'start')
         unit = self.service.lease(self.node['id'], 'test-session')
-        self.assertEqual(unit['threads'], 2)  # Local maximum wins over desired 4.
+        self.assertEqual(unit['threads'], 4)
         self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
         self.service.job_action(job, 'pause')
         payload, checksum = self.output(unit)
@@ -359,23 +372,23 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual((saved['status'], saved['attempt'], saved['processed']),
                          ('leased', 2, 0))
 
-    def test_legacy_multi_process_node_migrates_to_one_by_three_hundred(self):
+    def test_legacy_node_migrates_to_two_by_two_fifty(self):
         node = self.service.add_node('legacy-10x100', 1, 300)
         with self.service.db.transaction() as db:
             db.execute('UPDATE nodes SET desired_processes=10,desired_threads=100 WHERE id=?',
                        (node['id'],))
-            db.execute("DELETE FROM controller_settings WHERE key='single_process_300_migrated'")
+            db.execute("DELETE FROM controller_settings WHERE key='dual_process_250_migrated'")
         self.service.close()
         self.service = Controller(self.temp.name)
         response = self.service.heartbeat(node['id'], {
-            'session': 'legacy-session', 'version': '0.3.66',
-            'max_processes': 1, 'max_threads': 500, 'active': [], 'interrupted': []})
-        self.assertEqual((response['processes'], response['threads']), (1, 300))
-        self.assertEqual((response['desired_processes'], response['desired_threads']), (1, 300))
+            'session': 'legacy-session', 'version': '1.0.2',
+            'max_processes': 2, 'max_threads': 250, 'active': [], 'interrupted': []})
+        self.assertEqual((response['processes'], response['threads']), (2, 250))
+        self.assertEqual((response['desired_processes'], response['desired_threads']), (2, 250))
         with self.service.db.connect() as db:
             saved = db.execute('SELECT desired_processes,desired_threads FROM nodes WHERE id=?',
                                (node['id'],)).fetchone()
-        self.assertEqual(tuple(saved), (1, 300))
+        self.assertEqual(tuple(saved), (2, 250))
 
     def test_lease_carries_job_timeout_and_indexed_package_bytes(self):
         job = self.service.create_job('indexed', io.BytesIO(b'hello\n' * 100), 50,
@@ -1021,6 +1034,20 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(Conflict, '仍有 1 个工作包'):
             self.service.clear_devices(self.node['id'])
 
+    def test_device_fill_accepts_two_process_five_hundred_thread_target(self):
+        with self.service.db.connect() as db:
+            before_version = db.execute(
+                'SELECT device_clear_version FROM nodes WHERE id=?',
+                (self.node['id'],)).fetchone()[0]
+        requested = self.service.request_devices(self.node['id'], 1000)
+        with self.service.db.connect() as db:
+            pending, after_version = db.execute(
+                'SELECT device_request,device_clear_version FROM nodes WHERE id=?',
+                (self.node['id'],)).fetchone()
+        self.assertEqual(requested, {'requested': 1000})
+        self.assertEqual(pending, 1000)
+        self.assertEqual(after_version, before_version)
+
     def test_10002_records_balance_packages_and_keep_final_blank_records(self):
         source = b''.join(f'account-{index:05d}\n'.encode() for index in range(10000)) + b'\n\n'
         job = self.service.create_job('10002 records', io.BytesIO(source), 10000)
@@ -1142,6 +1169,18 @@ class ControllerTests(unittest.TestCase):
         with patch('clusterlab.controller.SequenceMatcher',
                    side_effect=AssertionError('impossible length must not use fuzzy matching')):
             self.assertIsNone(apple_reason_bucket({'reason': 'probe'}))
+
+    def test_repeated_unknown_reason_reuses_fuzzy_classification(self):
+        from clusterlab import controller
+        controller._apple_reason_bucket_texts.cache_clear()
+        reason = {'reason': 'A new Apple server response that cannot be classified cleanly.'}
+        original = controller.SequenceMatcher
+        with patch('clusterlab.controller.SequenceMatcher', wraps=original) as matcher:
+            self.assertIsNone(apple_reason_bucket(reason))
+            first_count = matcher.call_count
+            self.assertGreater(first_count, 0)
+            self.assertIsNone(apple_reason_bucket(reason))
+            self.assertEqual(matcher.call_count, first_count)
 
     def test_live_category_page_stops_scanning_after_limit(self):
         job = self.job(200)

@@ -86,7 +86,9 @@ def event(db, code, message, job_id=None, node_id=None):
                (time.time(), code, message, job_id, node_id))
 
 
-def integer(value, name, low, high):
-    if type(value) is not int or not low <= value <= high:
-        raise ValueError(f'{name}应为 {low}–{high} 的整数')
+def integer(value, name, low, high=None):
+    if (type(value) is not int or value < low
+            or (high is not None and value > high)):
+        bound = f'{low} 以上' if high is None else f'{low}–{high}'
+        raise ValueError(f'{name}应为 {bound}的整数')
     return value

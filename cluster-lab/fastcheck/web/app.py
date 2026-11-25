@@ -1,0 +1,316 @@
+from dataclasses import asdict,fields
+from datetime import timedelta
+import json
+import os
+from pathlib import Path
+import secrets
+import tempfile
+import threading
+import time
+from types import SimpleNamespace
+
+from flask import Flask,jsonify,request,session,send_file
+from werkzeug.security import check_password_hash
+
+from fastcheck.scheduler import Settings
+from fastcheck.exports import FILES,LABELS
+from fastcheck.task_io import Account,read_accounts
+from fastcheck.devices import save_json,private_directory
+from fastcheck.settings_store import load_api,save_api
+from fastcheck.status import result_bucket
+from fastcheck.version import VERSION
+from .bootstrap import ROOT,data_root
+from .runtime import JobManager,TERMINAL
+from .log_archive import build_log_archive,LogArchiveTooLarge
+from fastcheck.device_build import DeviceBuilder
+
+
+class LocalNodeDeviceBuilder:
+    """Expose the deployed node device builder through the local page."""
+    def __init__(self, root, origin):
+        import sys
+        cluster=ROOT/'cluster-lab'
+        if str(cluster) not in sys.path:sys.path.insert(0,str(cluster))
+        from clusterlab.device_build import DeviceBuilder as NodeDeviceBuilder
+        self.node=SimpleNamespace(root=Path(root),origin=origin,proxy_api='',
+                                  proxy_scheme='socks5h',max_processes=200,max_threads=512)
+        self.builder=NodeDeviceBuilder(self.node)
+
+    def start(self, capacity, api_url, scheme, processes, threads):
+        self.node.proxy_api=api_url;self.node.proxy_scheme=scheme
+        self.node.max_processes=max(1,int(processes));self.node.max_threads=max(1,int(threads))
+        self.builder.start(capacity)
+
+    def snapshot(self,include_pending=False,slot_ids=None):
+        value=self.builder.snapshot()
+        # The node builder scans up to the highest historical slot so it can
+        # discover persisted identities.  The console needs the current pool,
+        # not hundreds of empty placeholders on every two-second poll.
+        allowed=(None if slot_ids is None else
+                 {int(slot) for slot in slot_ids if str(slot).isdigit()})
+        ignored=({'retired'} if include_pending else
+                 {'missing','pending','retired'})
+        value['slots']=[item for item in value.get('slots',[])
+                        if (allowed is None or item.get('slot') in allowed) and
+                        (item.get('state') not in ignored or item.get('error'))]
+        value['ready']=sum(item.get('state')=='ready' for item in value['slots'])
+        return value
+    def cancel(self):return self.builder.cancel()
+
+
+def create_app(data_dir=None):
+    root=private_directory(Path(data_dir) if data_dir else data_root())
+    auth_path=root/'config/web-admin.json'
+    if not auth_path.exists():raise RuntimeError('请先运行 .venv/bin/python -m server.bootstrap 设置管理密码。')
+    auth=json.loads(auth_path.read_text());auth_path.chmod(0o600)
+    app=Flask(__name__,static_folder='static',static_url_path='/static')
+    app.secret_key=auth['session_secret'];app.json.ensure_ascii=False
+    app.config.update(MAX_CONTENT_LENGTH=int(os.environ.get('GSA_MAX_UPLOAD_MB','8'))*1024*1024,
+                      SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',
+                      SESSION_COOKIE_SECURE=os.environ.get('GSA_COOKIE_SECURE')=='1',
+                      PERMANENT_SESSION_LIFETIME=timedelta(hours=8))
+    manager=JobManager(root);app.extensions['jobs']=manager
+    local_node=os.environ.get('FASTCHECK_LOCAL_NODE_EXECUTOR')=='1'
+    builder=(LocalNodeDeviceBuilder(root,Settings().origin) if local_node else
+             DeviceBuilder(root,Settings().origin,root/'config/batch-device-pool'))
+    app.extensions['builder']=builder
+    login_attempts={};login_lock=threading.Lock()
+
+    def defaults():
+        path=root/'config/web-settings.json'
+        if path.exists():
+            value=json.loads(path.read_text())
+            if 'device_use_limit' not in value:
+                value.update(device_capacity=0,device_use_limit=20,
+                             device_rest_after=0,device_rest_seconds=0)
+            return value
+        path=ROOT/'examples/auth_settings.json'
+        value=(json.loads(path.read_text()) if path.exists() else
+               asdict(Settings(max_attempts=1,device_parallelism=1,
+                               device_selection='prefer_new')))
+        value.update(device_capacity=0,device_use_limit=20,
+                     device_rest_after=0,device_rest_seconds=0)
+        return value
+
+    def options(data):
+        if not isinstance(data,dict):raise ValueError('任务配置字段无效。')
+        extra=set(data)-{f.name for f in fields(Settings)}
+        if extra:raise ValueError('配置里有当前版本不认识的字段：'+'、'.join(sorted(extra))+'。请刷新页面或更新服务端。')
+        values=defaults();values.update(data)
+        if type(values.get('debug')) is not bool:raise ValueError('调试模式必须为布尔值。')
+        return Settings(**values)
+
+    @app.before_request
+    def protect():
+        if request.method in ('POST','PUT','DELETE'):
+            token=request.headers.get('X-CSRF-Token','')
+            if not token or not secrets.compare_digest(token,session.get('csrf','')):
+                return jsonify(error='页面会话已失效，请刷新。'),403
+        if request.path.startswith('/api/') and request.path not in ('/api/session','/api/login') and not session.get('authenticated'):
+            return jsonify(error='请先登录。'),401
+
+    @app.after_request
+    def headers(response):
+        response.headers['Cache-Control']='no-store'
+        response.headers['X-Content-Type-Options']='nosniff'
+        response.headers['X-Frame-Options']='DENY'
+        response.headers['Content-Security-Policy']="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'"
+        return response
+
+    @app.get('/')
+    def index():return app.send_static_file('index.html')
+
+    @app.get('/healthz')
+    def health():return jsonify(ok=True,version=VERSION,executor_backend=
+                                'clusterlab.executor' if os.environ.get(
+                                    'FASTCHECK_LOCAL_NODE_EXECUTOR')=='1' else 'fastcheck.scheduler')
+
+    @app.get('/api/session')
+    def current_session():
+        session.setdefault('csrf',secrets.token_urlsafe(32))
+        return jsonify(authenticated=bool(session.get('authenticated')),csrf=session['csrf'],version=VERSION,
+                       executor_backend='clusterlab.executor' if os.environ.get(
+                           'FASTCHECK_LOCAL_NODE_EXECUTOR')=='1' else 'fastcheck.scheduler')
+
+    @app.post('/api/login')
+    def login():
+        data=request.get_json(silent=True) or {};password=data.get('password','')
+        ip=request.remote_addr or 'local';now=time.monotonic()
+        with login_lock:
+            values=[v for v in login_attempts.get(ip,[]) if now-v<60]
+            if len(values)>=10:return jsonify(error='登录尝试过多，请稍后再试。'),429
+            values.append(now);login_attempts[ip]=values
+        if not isinstance(password,str) or data.get('username','admin')!='admin' or not check_password_hash(auth['password_hash'],password):
+            return jsonify(error='用户名或密码错误。'),401
+        session.clear();session.update(authenticated=True,csrf=secrets.token_urlsafe(32));session.permanent=True
+        return jsonify(authenticated=True,csrf=session['csrf'])
+
+    @app.post('/api/logout')
+    def logout():session.clear();return jsonify(ok=True)
+
+    @app.get('/api/settings')
+    def settings_get():return jsonify(settings=defaults(),proxy_saved=bool(load_api(root)))
+
+    @app.post('/api/settings')
+    def settings_save():
+        data=request.get_json(silent=True) or {};selected=options(data.get('settings',{}))
+        api=data.get('api_url','').strip()
+        if api:save_api(root,api)
+        save_json(root/'config/web-settings.json',asdict(selected))
+        return jsonify(ok=True,proxy_saved=bool(load_api(root)))
+
+    @app.get('/api/jobs')
+    def jobs():return jsonify(jobs=manager.history())
+
+    @app.post('/api/jobs')
+    def start():
+        accounts=[]
+        try:
+            selected=options(json.loads(request.form.get('settings','{}')))
+            simulation=request.form.get('simulation')=='true'
+            api=request.form.get('api_url','').strip()
+            if api:save_api(root,api)
+            if simulation:
+                count=int(request.form.get('demo_count','20'))
+                if count<1:raise ValueError('演示任务数必须为正整数。')
+                accounts=[Account(n,f'demo-{n}@example.invalid','demo-password') for n in range(1,count+1)]
+            else:
+                from fastcheck.protocols import gsa_status
+                if gsa_status.mock_enabled():raise ValueError('请清除 FASTCHECK_MOCK；真实任务不接受模拟认证。')
+                if not load_api(root):raise ValueError('请先填写代理 API。')
+                upload=request.files.get('accounts')
+                raw=upload.read() if upload else request.form.get('accounts_text','').encode('utf-8')
+                if not raw:raise ValueError('请选择账号文件或粘贴账号。')
+                directory=private_directory(root/'uploads')
+                with tempfile.NamedTemporaryFile(dir=directory,delete=False) as handle:
+                    path=Path(handle.name);os.chmod(path,0o600);handle.write(raw)
+                try:
+                    limit=int(os.environ.get('GSA_MAX_ACCOUNTS','0'))
+                    accounts=read_accounts(path,max_accounts=limit or None)
+                finally:path.unlink(missing_ok=True)
+            state=manager.start(accounts,selected,request.form.get('proxy_auth',''),simulation)
+            return jsonify(state),202
+        finally:
+            for account in accounts:account.password=''
+
+    @app.post('/api/proxy/check')
+    def proxy_check():
+        """取一条出口，实际打一次目标站，回报出口 IP 与延迟。"""
+        import time as _time
+        import requests as _requests
+        from fastcheck.proxy_pool import fetch_proxies
+        from fastcheck.protocols.proxy_api import inject_auth, mask
+        data = request.get_json(silent=True) or {}
+        selected = options(data.get('settings', {}))
+        api = (data.get('api_url') or '').strip() or load_api(root)
+        if not api:
+            raise ValueError('请先填写或保存代理 API 地址。')
+        scheme = None if selected.proxy_scheme == 'http' else selected.proxy_scheme
+        started = _time.monotonic()
+        try:
+            proxies = fetch_proxies(api, 1, scheme=scheme)
+        except Exception as exc:
+            raise ValueError(f'提取失败：{type(exc).__name__}') from None
+        if not proxies:
+            raise ValueError('提取返回空，供应商没给出口。')
+        auth = (data.get('proxy_auth') or '').strip()
+        proxy = inject_auth(proxies, auth)[0] if auth else proxies[0]
+        fetch_ms = round((_time.monotonic()-started)*1000)
+        started = _time.monotonic()
+        try:
+            response = _requests.get('https://api.ipify.org',
+                                     proxies={'http': proxy, 'https': proxy},
+                                     timeout=min(20, selected.timeout*2))
+        except Exception as exc:
+            raise ValueError(f'出口不可用：{type(exc).__name__}') from None
+        return jsonify(ok=True, proxy=mask(proxy), exit_ip=response.text.strip()[:64],
+                       fetch_ms=fetch_ms, request_ms=round((_time.monotonic()-started)*1000))
+
+    @app.post('/api/devices/build')
+    def devices_build_start():
+        data = request.get_json(silent=True) or {}
+        selected = options(data.get('settings', {}))
+        api = (data.get('api_url') or '').strip() or load_api(root)
+        if not api:
+            raise ValueError('请先填写或保存代理 API 地址。')
+        if selected.device_capacity == 0:
+            snapshot=builder.snapshot() if local_node else builder.snapshot(0)
+            snapshot['message']='提前注册数量为 0；任务开始后按需注册'
+            return jsonify(snapshot)
+        if any(item.get('state') not in TERMINAL for item in manager.history()):
+            raise RuntimeError('任务正在执行，不能同时提前注册设备。')
+        if local_node:
+            builder.start(selected.device_capacity,api,selected.proxy_scheme,
+                          selected.processes,selected.threads)
+            return jsonify(builder.snapshot()),202
+        builder.start(selected.device_capacity, api, selected.proxy_scheme,
+                      (data.get('proxy_auth') or '').strip())
+        return jsonify(builder.snapshot(selected.device_capacity)), 202
+
+    @app.get('/api/devices/build')
+    def devices_build_status():
+        selected = options({})
+        running=next((item for item in manager.history()
+                      if item.get('state') not in TERMINAL),None)
+        slots=None
+        if local_node and running:
+            manifest=manager.directory(running['id'])/'manifest.json'
+            if manifest.exists():
+                try:slots=json.loads(manifest.read_text()).get('device_slots')
+                except (OSError,ValueError,TypeError):slots=None
+            if not slots:
+                settings=running.get('settings') or {}
+                capacity=max(1,min(int(running.get('accounts') or 1),
+                                   max(1,int(settings.get('processes') or 1))*
+                                   max(1,int(settings.get('threads') or 1))))
+                slots=list(range(1,capacity+1))
+        return jsonify(builder.snapshot(include_pending=bool(running),slot_ids=slots) if local_node else
+                       builder.snapshot(selected.device_capacity))
+
+    @app.post('/api/devices/build/cancel')
+    def devices_build_cancel():
+        builder.cancel()
+        return jsonify(ok=True)
+
+    @app.post('/api/jobs/clear')
+    def clear_jobs():return jsonify(removed=manager.clear_history(),jobs=manager.history())
+
+    @app.get('/api/jobs/<job_id>')
+    def status(job_id):return jsonify(manager.get(job_id))
+
+    @app.post('/api/jobs/<job_id>/stop')
+    def stop(job_id):manager.stop(job_id);return jsonify(ok=True),202
+
+    @app.get('/api/jobs/<job_id>/results')
+    def results(job_id):
+        category=request.args.get('category','all')
+        offset=max(0,int(request.args.get('offset',0)));limit=min(200,max(1,int(request.args.get('limit',100))))
+        return jsonify(manager.read_results(job_id,category,offset,limit))
+
+    @app.get('/api/jobs/<job_id>/exports/<category>')
+    def export(job_id,category):
+        if category not in FILES:raise FileNotFoundError
+        path=manager.directory(job_id)/'exports'/FILES[category]
+        if not path.exists():raise FileNotFoundError
+        return send_file(path,as_attachment=True,download_name=LABELS[category]+'.txt')
+
+    @app.get('/api/jobs/<job_id>/logs')
+    def logs(job_id):
+        directory=manager.directory(job_id)
+        try:
+            buffer=build_log_archive(directory)
+        except LogArchiveTooLarge:
+            return jsonify(error='日志较大，请从服务器任务目录获取。'),413
+        return send_file(buffer,as_attachment=True,download_name='logs-'+job_id+'.zip')
+
+    @app.errorhandler(ValueError)
+    def invalid(error):return jsonify(error=str(error)),400
+    @app.errorhandler(TypeError)
+    def wrong_type(error):return jsonify(error='配置字段类型无效。'),400
+    @app.errorhandler(RuntimeError)
+    def conflict(error):return jsonify(error=str(error)),409
+    @app.errorhandler(FileNotFoundError)
+    def missing(error):return jsonify(error='记录尚未生成或不存在。'),404
+    @app.errorhandler(413)
+    def large(error):return jsonify(error='上传文件超过服务器设置的大小。'),413
+    return app

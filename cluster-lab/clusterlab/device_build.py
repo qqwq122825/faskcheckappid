@@ -64,12 +64,14 @@ class DeviceBuilder:
             # The in-memory builder state resets on a service restart. Discover
             # the persisted slots so a task can still use the node's complete
             # device pool before any new initialization request is made.
+            configured = max(1, int(self.node.settings.get('processes') or 1)
+                             * int(self.node.settings.get('threads') or 1))
             pool = DevicePool(str(root), self.node.origin,
-                              max_devices=max(200, int(self.node.max_threads)))
+                              max_devices=max(200, configured))
             device_root = Path(getattr(pool, 'base', root)) / 'devices'
             existing = ([int(path.name) for path in device_root.iterdir()
                          if path.is_dir() and path.name.isdigit()
-                         and 1 <= int(path.name) <= max(200, int(self.node.max_threads))]
+                         and 1 <= int(path.name) <= max(200, configured)]
                         if device_root.is_dir() else [])
             persisted_capacity = max(existing, default=0)
             limit = max(1, int(data.get('capacity') or 0), persisted_capacity)
@@ -125,9 +127,8 @@ class DeviceBuilder:
         with self.lock:
             if self.state['running']:
                 raise RuntimeError('正在初始化设备，请等待本轮结束')
-            maximum = max(1, min(500, int(self.node.max_threads)))
-            if not 1 <= int(capacity) <= maximum:
-                raise ValueError(f'设备数量应为 1–{maximum}')
+            if int(capacity) < 1:
+                raise ValueError('设备数量应为 1 以上的整数')
             # 设备注册会连 Apple；没有代理就变成用机房 IP 注册，出生地不可改，
             # 宁可拒绝也不留这种设备。
             if not (self.node.proxy_api or '').strip():

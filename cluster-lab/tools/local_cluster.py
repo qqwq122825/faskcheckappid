@@ -57,13 +57,13 @@ def ensure_connected(controller_url: str, node_url: str) -> dict:
     controller_session, controller_csrf = api_session(controller_url)
     created = controller_session.post(
         controller_url + '/api/nodes',
-        json={'name': '本地测试节点', 'processes': 1, 'threads': 300},
+        json={'name': '本地测试节点', 'processes': 2, 'threads': 500},
         headers={'X-CSRF-Token': controller_csrf}, timeout=(2, 5))
     created.raise_for_status()
     node = created.json()
     configured = controller_session.post(
         controller_url + f"/api/nodes/{node['id']}/config",
-        json={'processes': 1, 'threads': 300, 'enabled': True},
+        json={'processes': 2, 'threads': 500, 'enabled': True},
         headers={'X-CSRF-Token': controller_csrf}, timeout=(2, 5))
     configured.raise_for_status()
     connected = node_session.post(
@@ -97,7 +97,7 @@ def main() -> int:
     description = {
         'controller': controller_url, 'node': node_url,
         'executor': 'clusterlab.executor.execute_unit_group',
-        'processes': 1, 'threads': 300,
+        'processes': 2, 'threads': 500,
         'core': str((ROOT / 'clusterlab').resolve()),
     }
     if args.check:
@@ -112,7 +112,7 @@ def main() -> int:
                   '--data-dir', str(runtime / 'controller')], cwd=ROOT)
     node = subprocess.Popen(
         common + ['node', '--host', '127.0.0.1', '--port', str(args.node_port),
-                  '--data-dir', str(runtime / 'node'), '--max-processes', '1',
+                  '--data-dir', str(runtime / 'node'), '--max-processes', '2',
                   '--max-threads', '500'], cwd=ROOT)
     processes = (node, controller)
 

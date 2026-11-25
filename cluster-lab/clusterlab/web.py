@@ -17,6 +17,15 @@ from .common import atomic_json, integer, read_json
 from .controller import Conflict
 
 
+def task_device_policy(data, *, text=False):
+    """Read optional task policy without silently coercing JSON floats or booleans."""
+    values = {}
+    for key in ('public_header_use_limit', 'device_use_limit'):
+        value = data.get(key)
+        values[key] = int(value) if text and value is not None else value
+    return values
+
+
 def create_app(role, service, password=None):
     static = Path(__file__).resolve().parent / 'static'
     app = Flask(__name__, static_folder=str(static), static_url_path='/static')
@@ -130,7 +139,7 @@ def create_app(role, service, password=None):
         @app.post('/api/nodes')
         def add_node():
             data = request.get_json() or {}
-            return jsonify(service.add_node(data.get('name'), data.get('processes', 1), data.get('threads', 300))), 201
+            return jsonify(service.add_node(data.get('name'), data.get('processes', 2), data.get('threads', 250))), 201
 
         @app.post('/api/nodes/<node_id>/devices')
         def request_devices(node_id):
@@ -179,7 +188,8 @@ def create_app(role, service, password=None):
                                                   str(enqueue) == 'true',
                                                   float(data.get('timeout') or 25),
                                                   int(data.get('retries') if data.get('retries') is not None else 2),
-                                                  item_timeout=float(data.get('item_timeout') or 40))
+                                                  item_timeout=float(data.get('item_timeout') or 40),
+                                                  **task_device_policy(data))
             return jsonify(id=job_id), 202
 
         @app.post('/api/jobs/stream')
@@ -202,7 +212,8 @@ def create_app(role, service, password=None):
             item_timeout = float(request.args.get('item_timeout') or 40)
             job_id = service.create_job(name or '未命名任务', request.stream, unit_rows,
                                         mode, enqueue == 'true', timeout, retries,
-                                        item_timeout=item_timeout)
+                                        item_timeout=item_timeout,
+                                        **task_device_policy(request.args, text=True))
             return jsonify(id=job_id, bytes=request.content_length), 202
 
         @app.post('/api/jobs')
@@ -220,7 +231,8 @@ def create_app(role, service, password=None):
             item_timeout = float(request.form.get('item_timeout') or 40)
             job_id = service.create_job(request.form.get('name') or uploaded.filename, uploaded.stream,
                                         unit_rows, mode, enqueue == 'true', timeout, retries,
-                                        item_timeout=item_timeout)
+                                        item_timeout=item_timeout,
+                                        **task_device_policy(request.form, text=True))
             return jsonify(id=job_id), 202
 
         @app.post('/api/demo')

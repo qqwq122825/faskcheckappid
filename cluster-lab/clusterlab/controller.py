@@ -1,6 +1,7 @@
 from collections import Counter, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -31,14 +32,16 @@ CREATE TABLE IF NOT EXISTS jobs (
  traffic_bytes INTEGER NOT NULL DEFAULT 0,
  req_timeout REAL NOT NULL DEFAULT 25, req_retries INTEGER NOT NULL DEFAULT 2,
  req_item_timeout REAL NOT NULL DEFAULT 40,
+ public_header_use_limit INTEGER,
+ device_use_limit INTEGER,
  device_capacity INTEGER NOT NULL DEFAULT 30,
  dual_recheck INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS nodes (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
  created REAL NOT NULL, last_seen REAL, session TEXT, hostname TEXT,
- enabled INTEGER NOT NULL DEFAULT 1, desired_processes INTEGER NOT NULL DEFAULT 1,
- desired_threads INTEGER NOT NULL DEFAULT 300, max_processes INTEGER,
+ enabled INTEGER NOT NULL DEFAULT 1, desired_processes INTEGER NOT NULL DEFAULT 2,
+ desired_threads INTEGER NOT NULL DEFAULT 250, max_processes INTEGER,
  max_threads INTEGER, version TEXT, last_total INTEGER NOT NULL DEFAULT 0,
  rate REAL NOT NULL DEFAULT 0, last_error TEXT,
  update_generation INTEGER NOT NULL DEFAULT 0,
@@ -153,10 +156,15 @@ def apple_reason_matches(text, phrase, threshold=0.90):
     return SequenceMatcher(None, phrase, candidate, autojunk=False).ratio() >= threshold
 
 
-def apple_reason_bucket(value):
-    """Return a business bucket only for explicit English Apple reasons."""
-    fields = (value.get('reason'), value.get('apple_message'), value.get('detail'))
-    texts = [normalized_apple_reason(field) for field in fields if field]
+@lru_cache(maxsize=8192)
+def _apple_reason_bucket_texts(texts):
+    """Classify a normalized reason tuple once, including its fuzzy fallback.
+
+    Apple repeats a very small set of reason strings across large batches.  A
+    bounded cache keeps rare/unknown prose from rebuilding up to twelve
+    SequenceMatcher edit graphs every time the same response is ingested,
+    paged, or exported.
+    """
     # Almost every production response contains the canonical English phrase.
     # Check all cheap substring matches before invoking SequenceMatcher; doing a
     # fuzzy comparison for every earlier, unrelated phrase made large result
@@ -168,6 +176,13 @@ def apple_reason_bucket(value):
         if any(apple_reason_matches(text, phrase) for text in texts):
             return bucket
     return None
+
+
+def apple_reason_bucket(value):
+    """Return a business bucket only for explicit English Apple reasons."""
+    fields = (value.get('reason'), value.get('apple_message'), value.get('detail'))
+    texts = tuple(normalized_apple_reason(field) for field in fields if field)
+    return _apple_reason_bucket_texts(texts)
 
 
 def result_record_bucket(value):
@@ -278,7 +293,7 @@ def result_reason_cn(value, bucket=None):
 
 
 class Controller:
-    MAX_PROCESSES = 1
+    MAX_PROCESSES = 2
     MAX_THREADS = 500
     MAX_ACTIVE_UNITS = 512
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
@@ -315,6 +330,10 @@ class Controller:
                     column_type = ('REAL' if name in ('req_timeout', 'req_item_timeout')
                                    else 'INTEGER')
                     db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {column_type} NOT NULL DEFAULT {default}')
+            # NULL identifies pre-upgrade jobs, which retain the global-policy fallback.
+            for name in ('public_header_use_limit', 'device_use_limit'):
+                if name not in job_columns:
+                    db.execute(f'ALTER TABLE jobs ADD COLUMN {name} INTEGER')
             for name, definition in {'telemetry_json': "TEXT NOT NULL DEFAULT '{}'",
                                      'device_request': 'INTEGER NOT NULL DEFAULT 0',
                                      'stop_version': 'INTEGER NOT NULL DEFAULT 0',
@@ -339,6 +358,13 @@ class Controller:
                 db.execute('UPDATE nodes SET desired_processes=1,desired_threads=300')
                 db.execute("INSERT INTO controller_settings(key,value) "
                            "VALUES('single_process_300_migrated','1')")
+            dual_migrated = db.execute(
+                "SELECT value FROM controller_settings WHERE key='dual_process_250_migrated'"
+            ).fetchone()
+            if not dual_migrated:
+                db.execute('UPDATE nodes SET desired_processes=2,desired_threads=250')
+                db.execute("INSERT INTO controller_settings(key,value) "
+                           "VALUES('dual_process_250_migrated','1')")
             unit_columns = {row['name'] for row in db.execute('PRAGMA table_info(units)')}
             if 'result_counts' not in unit_columns:
                 db.execute('ALTER TABLE units ADD COLUMN result_counts TEXT')
@@ -451,12 +477,12 @@ class Controller:
                            (json.dumps(dict(counts), separators=(',', ':')),
                             self.RESULT_CLASSIFICATION_VERSION, unit['id']))
 
-    def add_node(self, name, processes=1, threads=300):
+    def add_node(self, name, processes=2, threads=250):
         name = str(name).strip()[:80]
         if not name:
             raise ValueError('请填写节点名称')
-        integer(processes, '进程数', 1, self.MAX_PROCESSES)
-        integer(threads, '线程数', 1, self.MAX_THREADS)
+        integer(processes, '进程数', 1)
+        integer(threads, '线程数', 1)
         node_id, token = uuid.uuid4().hex, secrets.token_urlsafe(32)
         with self.db.transaction() as db:
             db.execute('INSERT INTO nodes(id,name,token_hash,created,enabled,desired_processes,desired_threads,device_request) '
@@ -475,8 +501,8 @@ class Controller:
             return row['id'] if row else None
 
     def configure_node(self, node_id, data):
-        processes = integer(data.get('processes'), '进程数', 1, self.MAX_PROCESSES)
-        threads = integer(data.get('threads'), '线程数', 1, self.MAX_THREADS)
+        processes = integer(data.get('processes'), '进程数', 1)
+        threads = integer(data.get('threads'), '线程数', 1)
         if 'enabled' in data and type(data.get('enabled')) is not bool:
             raise ValueError('节点接单状态无效')
         with self.db.transaction() as db:
@@ -599,15 +625,27 @@ class Controller:
             raise ValueError('单账号总预算应不小于单请求超时，且不超过 600 秒')
         return value, count, budget
 
+    def _check_task_device_policy(self, public_header_use_limit, device_use_limit):
+        settings = self.settings()
+        header = (settings.get('public_header_use_limit', 15) if public_header_use_limit is None
+                  else public_header_use_limit)
+        device = (settings.get('device_use_limit', 1000) if device_use_limit is None
+                  else device_use_limit)
+        return (integer(header, '公共头使用次数', 1, 10000),
+                integer(device, '设备使用次数', 1, 1000000))
+
     def create_job(self, name, stream, unit_rows=500, mode='auth', enqueue=False,
                    timeout=25.0, retries=2, device_capacity=30,
-                   dual_recheck=False, item_timeout=40.0):
+                   dual_recheck=False, item_timeout=40.0,
+                   public_header_use_limit=None, device_use_limit=None):
         integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
         if type(enqueue) is not bool:
             raise ValueError('加入队列选项无效')
         if mode not in ('digest', 'simulate', 'auth'):
             raise ValueError('执行模式应为 digest / simulate / auth')
         timeout, retries, item_timeout = self._check_exec(timeout, retries, item_timeout)
+        header_limit, device_limit = self._check_task_device_policy(
+            public_header_use_limit, device_use_limit)
         # 兼容旧调用参数，但任务不再决定节点设备数量。
         _ = device_capacity
         device_capacity = 0
@@ -623,10 +661,10 @@ class Controller:
             raise ValueError('文件为空')
         now = time.time()
         with self.db.transaction() as db:
-            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,req_item_timeout,device_capacity,dual_recheck) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,req_item_timeout,device_capacity,dual_recheck,public_header_use_limit,device_use_limit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                        (job_id, str(name).strip()[:120] or '未命名任务', 'preparing', now, now,
                         str(target), target.stat().st_size, unit_rows, mode, now if enqueue else None,
-                        timeout, retries, item_timeout, device_capacity, 0))
+                        timeout, retries, item_timeout, device_capacity, 0, header_limit, device_limit))
             event(db, 'job_uploaded', '输入文件已保存，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
@@ -791,8 +829,8 @@ class Controller:
         return self.settings()
 
     def request_devices(self, node_id, capacity):
-        """把设备初始化意图挂到节点上，节点下次心跳取走执行。"""
-        capacity = integer(int(capacity), '设备数量', 1, 500)
+        """把非破坏性补齐意图挂到节点上，节点只注册缺失槽位。"""
+        capacity = integer(int(capacity), '设备数量', 1)
         with self.db.transaction() as db:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:
@@ -832,9 +870,9 @@ class Controller:
                                 "AND status IN ('leased','running','unknown')", (node_id,)).fetchone()[0]
             if active:
                 raise Conflict(f'节点仍有 {active} 个工作包在执行，请先停止任务')
-            maximum = max(1, min(500, int(node['max_threads'] or 1)))
-            effective = max(1, min(int(node['desired_threads'] or 1), maximum))
-            target = integer(int(capacity or effective), '设备数量', 1, maximum)
+            effective = max(1, int(node['desired_processes'] or 1)
+                            * int(node['desired_threads'] or 1))
+            target = integer(int(capacity or effective), '设备数量', 1)
             version = int(node['device_clear_version'] or 0) + 1
             db.execute('UPDATE nodes SET device_request=?,device_clear_version=? WHERE id=?',
                        (target, version, node_id))
@@ -1081,12 +1119,15 @@ class Controller:
 
     def create_job_from_file(self, source, name, unit_rows=10000, mode='auth', enqueue=False,
                              timeout=25.0, retries=2, device_capacity=30,
-                             dual_recheck=False, item_timeout=40.0):
+                             dual_recheck=False, item_timeout=40.0,
+                             public_header_use_limit=None, device_use_limit=None):
         """复用已上传的源文件创建任务，不再接收文件内容。"""
         integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
         if mode not in ('digest', 'simulate', 'auth'):
             raise ValueError('执行模式应为 digest / simulate / auth')
         timeout, retries, item_timeout = self._check_exec(timeout, retries, item_timeout)
+        header_limit, device_limit = self._check_task_device_policy(
+            public_header_use_limit, device_use_limit)
         # 兼容旧调用参数，但任务不再决定节点设备数量。
         _ = device_capacity
         device_capacity = 0
@@ -1101,11 +1142,11 @@ class Controller:
         job_id = uuid.uuid4().hex
         now = time.time()
         with self.db.transaction() as db:
-            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,req_item_timeout,device_capacity,dual_recheck) '
-                       'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,req_item_timeout,device_capacity,dual_recheck,public_header_use_limit,device_use_limit) '
+                       'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                        (job_id, str(name).strip()[:120] or path.name, 'preparing', now, now,
                         str(path), path.stat().st_size, unit_rows, mode, now if enqueue else None,
-                        timeout, retries, item_timeout, device_capacity, 0))
+                        timeout, retries, item_timeout, device_capacity, 0, header_limit, device_limit))
             event(db, 'job_uploaded', '复用已有输入文件，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
@@ -1286,7 +1327,7 @@ class Controller:
         session = str(data.get('session', ''))[:64]
         if not session:
             raise ValueError('缺少节点会话')
-        # 滚动更新期间允许旧节点继续上报 10×100；新的可配置上限仍是 4×500。
+        # 节点仍上报启动参数用于兼容旧协议，但不再作为总控配置上限。
         max_p = integer(data.get('max_processes'), '节点进程上限', 1, 200)
         max_t = integer(data.get('max_threads'), '节点线程上限', 1, 512)
         active = data.get('active', [])
@@ -1456,7 +1497,7 @@ class Controller:
                 update = {'generation': int(node['update_generation']),
                           'ref': node['update_ref'], 'service': 'cluster-node'}
             response = {'node_id': node_id, 'name': node['name'], 'enabled': bool(node['enabled']),
-                    'processes': min(desired_processes, max_p), 'threads': min(desired_threads, max_t),
+                    'processes': desired_processes, 'threads': desired_threads,
                     'desired_processes': desired_processes, 'desired_threads': desired_threads,
                     'rejected': reject, 'confirmed': confirmed, 'interrupted_ack': interrupted_ack,
                     'reported': reported_ack,
@@ -1499,7 +1540,7 @@ class Controller:
             # process/thread ceiling and recreate the old overload bug.
             if not node['enabled'] or active >= 1:
                 return None
-            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries,j.req_item_timeout FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
+            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries,j.req_item_timeout,j.public_header_use_limit,j.device_use_limit FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
             if not unit:
                 return None
             # A manually retried package must not inherit rows accepted under
@@ -1518,21 +1559,25 @@ class Controller:
                        'first_row': unit['first_row'], 'rows': unit['rows'],
                        'checksum': unit['checksum'], 'token': token, 'mode': unit['mode'],
                        'bytes': max(0, int(unit['byte_end']) - int(unit['byte_start'])),
-                       'processes': min(node['desired_processes'], node['max_processes'] or 1,
-                                        unit['rows']),
-                       'threads': min(node['desired_threads'], node['max_threads'] or 1),
+                       'processes': min(node['desired_processes'], unit['rows']),
+                       'threads': node['desired_threads'],
                        'lease_seconds': self.lease_seconds}
             if unit['mode'] == 'auth':
                 # 认证任务额外带设备与出口配置；代理地址取服务端保存的原文。
                 # 必须和心跳下发使用同一个节点专属配置，不能把全部 API
                 # 串成一个地址交给执行器。
                 config = self.proxy_for_node(node)
+                settings = self.settings()
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
-                               origin=self.settings().get('origin', 'https://new.ani.sidestore.io'),
-                               _proxy_debug=bool(self.settings().get('proxy_debug')),
-                               _web_secondary_auth=bool(self.settings().get('web_secondary_auth')),
-                               public_header_use_limit=int(self.settings().get('public_header_use_limit', 15)),
-                               device_use_limit=int(self.settings().get('device_use_limit', 1000)))
+                               origin=settings.get('origin', 'https://new.ani.sidestore.io'),
+                               _proxy_debug=bool(settings.get('proxy_debug')),
+                               _web_secondary_auth=bool(settings.get('web_secondary_auth')),
+                               public_header_use_limit=(unit['public_header_use_limit']
+                                   if unit['public_header_use_limit'] is not None else
+                                   settings.get('public_header_use_limit', 15)),
+                               device_use_limit=(unit['device_use_limit']
+                                   if unit['device_use_limit'] is not None else
+                                   settings.get('device_use_limit', 1000)))
             return payload
 
     def unit_for_node(self, node_id, unit_id, token):
@@ -1732,8 +1777,8 @@ class Controller:
                     value['status'] = 'stopping'
                 value['telemetry'] = json.loads(row['telemetry_json']) if online else {}
                 value['device_initialization_complete'] = True
-                value['effective_processes'] = min(row['desired_processes'], row['max_processes']) if row['max_processes'] else None
-                value['effective_threads'] = min(row['desired_threads'], row['max_threads']) if row['max_threads'] else None
+                value['effective_processes'] = row['desired_processes'] if online else None
+                value['effective_threads'] = row['desired_threads'] if online else None
                 nodes.append(value)
             events = [dict(r) for r in db.execute('SELECT * FROM events ORDER BY id DESC LIMIT 40')]
             aggregate = db.execute('SELECT COALESCE(SUM(rows),0),COUNT(*) FROM jobs').fetchone()

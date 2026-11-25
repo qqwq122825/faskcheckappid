@@ -42,7 +42,7 @@ class Node:
     # request/retry windows below.
     TASK_STALL_SECONDS = 210.0
 
-    def __init__(self, root, max_processes=1, max_threads=500, allow_http=False, interval=1.0):
+    def __init__(self, root, max_processes=2, max_threads=250, allow_http=False, interval=1.0):
         self.root = private_dir(root)
         self.spool = private_dir(self.root / 'spool')
         self.db = Database(self.root / 'node.sqlite3', SCHEMA)
@@ -60,12 +60,13 @@ class Node:
             self.primary_instance = True
         requested_processes = integer(max_processes, '本机进程上限', 1, 200)
         requested_threads = integer(max_threads, '本机线程上限', 1, 512)
-        self.max_processes = 1
-        # Existing node services still launch with the historical 10×100
-        # arguments.  Treat that exact pair as a legacy profile so the new
-        # 1×300 default is not silently capped at 100 threads.
-        self.max_threads = (500 if (requested_processes, requested_threads) == (10, 100)
-                            else requested_threads)
+        # Existing deployments may still launch with the historical 10×100 or
+        # the temporary 1×500 profile.  Both advertise the requested 2×250
+        # execution shape after upgrade.
+        if (requested_processes, requested_threads) in ((10, 100), (1, 500)):
+            requested_processes, requested_threads = 2, 250
+        self.max_processes = requested_processes
+        self.max_threads = requested_threads
         self.allow_http, self.interval = allow_http, interval
         self.instance = uuid.uuid4().hex
         self.context = mp.get_context('spawn')
@@ -465,6 +466,9 @@ class Node:
                 atomic_json(self.spool / unit_id / 'report-state.json', next_state)
         with self.lock:
             self.settings = value
+            # 总控配置就是执行配置，不再被节点启动参数二次截断。
+            self.max_processes = max(1, int(value.get('processes') or self.max_processes))
+            self.max_threads = max(1, int(value.get('threads') or self.max_threads))
             self.connected, self.error, self.last_success = True, '; '.join(report_errors)[:240], time.time()
             if value.get('stop_version', 0) > self.stop_version:
                 for process, stop in self.active.values():
@@ -567,16 +571,17 @@ class Node:
         return True
 
     def _prepare_auth_devices(self, descriptor):
-        """Assign one stable local device slot per thread in the single process."""
+        """Assign disjoint stable device slots across all local worker processes."""
         rows = max(1, int(descriptor.get('rows') or 1))
+        processes = max(1, min(int(descriptor.get('processes') or 1), rows))
         threads = max(1, int(descriptor.get('threads') or 1))
-        capacity = min(rows, threads)
+        capacity = min(rows, processes * threads)
         slots = list(range(1, capacity + 1))
         # A running task owns these stable slots.  Manual device operations must
         # not rotate or clear identities that worker threads are actively using.
         self.builder.reserve(slots)
         descriptor.pop('device_capacity', None)
-        descriptor['processes'] = 1
+        descriptor['processes'] = processes
         descriptor['device_pool_capacity'] = capacity
         descriptor['device_slots'] = slots
 
