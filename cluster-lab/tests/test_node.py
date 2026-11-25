@@ -338,6 +338,50 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(self.node.builder.state['slot_errors']['1'], '代理获取失败')
         self.assertFalse((self.node.root / 'device-pool' / 'registrations').exists())
 
+    def test_background_builder_registers_missing_slots_concurrently(self):
+        class Pool:
+            ready = set()
+            lock = threading.Lock()
+
+            def __init__(inner, *_args, **_kwargs):
+                pass
+
+            def inspect(inner, slot):
+                with inner.lock:
+                    state = 'ready' if slot in inner.ready else 'missing'
+                return {'state': state}
+
+        entered = 0
+        maximum = 0
+        guard = threading.Lock()
+        two_workers = threading.Event()
+
+        def provision(payload):
+            nonlocal entered, maximum
+            with guard:
+                entered += 1
+                maximum = max(maximum, entered)
+                if entered >= 2:
+                    two_workers.set()
+            self.assertTrue(two_workers.wait(2), 'registration remained serial')
+            with Pool.lock:
+                Pool.ready.add(payload['slot'])
+            with guard:
+                entered -= 1
+            return {'ok': True, 'model': 'MacBookPro14,3'}
+
+        with patch('clusterlab.device_build._load_fastcheck',
+                   return_value=(Pool, None, None)), \
+             patch.object(self.node.builder, '_proxy', return_value='socks5h://proxy'), \
+             patch.object(self.node.builder, '_provision', side_effect=provision), \
+             patch.object(self.node.builder, '_record', return_value=True):
+            self.node.builder._run(4)
+        self.assertGreaterEqual(maximum, 2)
+        self.assertEqual(self.node.builder.state['built'], 4)
+        self.assertEqual(self.node.builder.state['ready'], 4)
+        self.assertEqual(self.node.builder.state['failed'], 0)
+        self.assertEqual(self.node.builder.state['active_slots'], [])
+
     def test_snapshot_distinguishes_registering_failed_and_pending_slots(self):
         class Pool:
             def __init__(inner, *_args, **_kwargs):
