@@ -8,23 +8,19 @@ import tempfile
 import threading
 import time
 import unittest
-from concurrent.futures import Future
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (DEVICE_REGISTRATION_TIMEOUT_SECONDS, DeviceAuthLease, DeviceLeaseAllocator, NodeProxyPool, StageTelemetry, _auth_process_limit, _auth_worker_limit, _cached_device_identity, _consume_device_use, _device_id_label, _effective_auth_workers, _execute_auth_unit, _local_queue_refill_count, _partition_device_slots, _performance_trace_interval, _performance_trace_sampled, _reset_incomplete_device_slots,
+from clusterlab.executor import (NodeProxyPool, _auth_process_limit, _auth_worker_limit, _device_id_label, _execute_auth_unit, _partition_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
-                                 execute_unit, execute_unit_group, proxy_supplier_loop,
+                                 execute_unit_group, proxy_supplier_loop,
                                  record_device_registration, stall_timeout_seconds)
 
 
 class FakePool:
-    def __init__(self, root, *_args, **_kwargs):
-        self.root = Path(root)
-
-    def slot_directory(self, slot):
-        return self.root / 'fake-devices' / f'{int(slot):03d}'
+    def __init__(self, *_args, **_kwargs):
+        pass
 
     def info(self, *_args, **_kwargs):
         return {}
@@ -34,31 +30,6 @@ class FakePool:
 
     def fetch_headers(self, *_args, **_kwargs):
         return {}
-
-
-class StageTelemetryTests(unittest.TestCase):
-    def test_snapshot_reports_active_percentiles_cpu_and_errors(self):
-        telemetry = StageTelemetry(True)
-        token = telemetry.begin('wait_proxy')
-        active = telemetry.snapshot(retry_waiting=3)
-        self.assertEqual(active['stages']['wait_proxy']['active'], 1)
-        telemetry.end(token)
-        telemetry.observe('wait_proxy', 10, 2)
-        telemetry.observe('wait_proxy', 30, 4)
-        telemetry.record_error('tls')
-        snapshot = telemetry.snapshot(retry_waiting=2)
-        stage = snapshot['stages']['wait_proxy']
-        self.assertEqual(stage['active'], 0)
-        self.assertEqual(stage['completed'], 3)
-        self.assertGreaterEqual(stage['p95_ms'], 30)
-        self.assertGreaterEqual(stage['thread_cpu_total_ms'], 6)
-        self.assertEqual(snapshot['errors'], {'tls': 1})
-        self.assertEqual(snapshot['retry_waiting'], 2)
-
-    def test_disabled_snapshot_has_no_stage_payload(self):
-        telemetry = StageTelemetry(False)
-        telemetry.end(telemetry.begin('wait_proxy'))
-        self.assertEqual(telemetry.snapshot(), {'enabled': False})
 
 
 class ScriptedProxyPool:
@@ -120,331 +91,6 @@ def use_shared_proxy_pool(pool, output):
 
 
 class ExecutorScaleTests(unittest.TestCase):
-    def test_device_allocator_release_wakes_one_waiter_without_polling(self):
-        class ReadyPool:
-            def inspect(self, _slot):
-                return {'state': 'ready'}
-
-        held = set()
-        held_lock = threading.Lock()
-
-        class Lease:
-            initial_state = 'ready'
-            uses = 0
-            use_limit = 20
-            retire_on_release = False
-
-            def __init__(self, slot):
-                self.slot = slot
-
-            def release(self):
-                with held_lock:
-                    held.remove(self.slot)
-
-        def acquire(_pool, slot):
-            with held_lock:
-                if slot in held:
-                    return None
-                held.add(slot)
-            return Lease(slot)
-
-        with tempfile.TemporaryDirectory() as temporary, \
-             patch.object(DeviceAuthLease, 'try_acquire', side_effect=acquire):
-            allocator = DeviceLeaseAllocator(ReadyPool(), [1], temporary)
-            stop = RecordingStop()
-            first = allocator.acquire(stop)
-            acquired = []
-            completed = threading.Event()
-
-            def wait_for_slot():
-                acquired.append(allocator.acquire(stop))
-                completed.set()
-
-            waiter = threading.Thread(target=wait_for_slot)
-            waiter.start()
-            time.sleep(.03)
-            self.assertFalse(completed.is_set())
-            allocator.release(first)
-            self.assertTrue(completed.wait(.5))
-            allocator.release(acquired[0])
-            waiter.join(.5)
-            self.assertFalse(waiter.is_alive())
-            self.assertEqual(stop.waits, [])
-            self.assertEqual(held, set())
-
-    def test_proxy_refill_does_not_take_full_snapshot_for_every_exit(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=2, ttl=30, target=3)
-        try:
-            with patch.object(pool, 'snapshot', side_effect=AssertionError(
-                    'add_fresh must use one local capacity counter')):
-                self.assertEqual(pool.add_fresh([
-                    'socks5h://one', 'socks5h://two', 'socks5h://three']), 3)
-            self.assertEqual(pool.snapshot()['known'], 3)
-        finally:
-            pool.close()
-
-    def test_offline_executor_refills_after_any_completed_future(self):
-        class CompletingExecutor:
-            last = None
-
-            def __init__(self, max_workers):
-                self.max_workers = max_workers
-                self.submitted = 0
-                self.first = None
-                type(self).last = self
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def submit(self, function, item):
-                self.submitted += 1
-                future = Future()
-                if self.submitted == 1:
-                    self.first = (future, function, item)
-                else:
-                    future.set_result(function(item))
-                # With two workers the initial bounded queue contains four
-                # items.  Reaching item five proves the collector reclaimed a
-                # later completed future instead of waiting for item one.
-                if self.submitted == 5:
-                    first, first_function, first_item = self.first
-                    first.set_result(first_function(first_item))
-                return future
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / 'input.part').write_bytes(
-                b''.join(f'row-{number}\n'.encode() for number in range(8)))
-            descriptor = {'rows': 8, 'first_row': 1, 'threads': 2,
-                          'mode': 'simulate'}
-            with patch('clusterlab.executor.ThreadPoolExecutor', CompletingExecutor):
-                execute_unit(root, descriptor, threading.Event())
-            self.assertEqual(CompletingExecutor.last.submitted, 8)
-            done = json.loads((root / 'done.json').read_text())
-            self.assertTrue(done['ok'])
-            self.assertEqual(done['processed'], 8)
-
-    def test_new_task_resets_only_incomplete_assigned_slots(self):
-        class MixedPool(FakePool):
-            states = {1: 'ready', 2: 'pending', 3: 'invalid', 4: 'missing'}
-
-            def inspect(self, slot):
-                return {'state': self.states[int(slot)]}
-
-        with tempfile.TemporaryDirectory() as temporary:
-            pool = MixedPool(temporary)
-            for slot in range(1, 5):
-                directory = pool.slot_directory(slot)
-                directory.mkdir(parents=True)
-                (directory / 'identity.json').write_text(f'slot-{slot}')
-                (directory / '.lease-state.json').write_text('{}')
-            reset = _reset_incomplete_device_slots(pool, [1, 2, 3, 4])
-            self.assertEqual(reset, [2, 3])
-            self.assertTrue((pool.slot_directory(1) / 'identity.json').exists())
-            self.assertFalse((pool.slot_directory(2) / 'identity.json').exists())
-            self.assertFalse((pool.slot_directory(3) / '.lease-state.json').exists())
-            self.assertTrue((pool.slot_directory(4) / 'identity.json').exists())
-
-    def test_local_queue_refills_at_low_water_to_three_hundred(self):
-        self.assertEqual(_local_queue_refill_count(1000, 1100, 100), 200)
-        self.assertEqual(_local_queue_refill_count(1000, 1080, 80), 220)
-        self.assertEqual(_local_queue_refill_count(1000, 1260, 260), 0)
-        self.assertEqual(_local_queue_refill_count(1000, 0, 0), 1300)
-
-    def test_device_identity_cache_lasts_for_the_device_lifetime(self):
-        identities = {7: {'X-Apple-I-MD': 'cached'}}
-        fetched_at = {7: 100.0}
-        self.assertIs(_cached_device_identity(identities, fetched_at, 7, 129.999),
-                      identities[7])
-        self.assertIs(_cached_device_identity(identities, fetched_at, 7, 100000.0),
-                      identities[7])
-        self.assertIs(_cached_device_identity(identities, {}, 7, 101.0), identities[7])
-        identities.pop(7)
-        fetched_at.pop(7)
-        self.assertIsNone(_cached_device_identity(identities, fetched_at, 7, 101.0))
-
-    def test_device_lease_is_exclusive_and_writes_return_timestamp(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            pool = FakePool(temporary)
-            stop = threading.Event()
-            first = DeviceAuthLease.acquire_any(pool, [1], stop)
-            acquired = []
-
-            def second_user():
-                lease = DeviceAuthLease.acquire_any(pool, [1], stop)
-                acquired.append(lease.slot)
-                lease.release()
-
-            thread = threading.Thread(target=second_user)
-            thread.start()
-            time.sleep(.05)
-            self.assertEqual(acquired, [])
-            first.release()
-            thread.join(1)
-            self.assertEqual(acquired, [1])
-            state = json.loads((pool.slot_directory(1) / '.lease-state.json').read_text())
-            self.assertEqual(state['state'], 'idle')
-            self.assertIsInstance(state['last_used_at'], float)
-            self.assertTrue(state['last_used'])
-
-    def test_empty_pool_registers_distinct_devices_inside_worker_threads(self):
-        class EmptyPool(FakePool):
-            ready = set()
-            registered = []
-            registration_barrier = None
-
-            def inspect(self, slot):
-                return {'state': 'ready' if int(slot) in type(self).ready else 'missing',
-                        'device_id': f'device-{slot}' if int(slot) in type(self).ready else ''}
-
-            def fetch_headers(self, slot, *_args, **_kwargs):
-                type(self).registration_barrier.wait(1)
-                type(self).ready.add(int(slot))
-                type(self).registered.append(int(slot))
-                return {'slot': int(slot)}
-
-        EmptyPool.ready = set()
-        EmptyPool.registered = []
-        EmptyPool.registration_barrier = threading.Barrier(2)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / 'input.part').write_text(
-                'one@example.com----a\ntwo@example.com----b\nthree@example.com----c\n',
-                encoding='utf-8')
-            descriptor = {'rows': 3, 'first_row': 1, 'threads': 2,
-                          'device_capacity': 3, 'device_slots': [1, 2, 3],
-                          'device_root': str(root / 'devices'),
-                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
-            barrier = threading.Barrier(2)
-            used = []
-
-            def check(_account, _password, _proxy, **kwargs):
-                used.append(kwargs['identity']['slot'])
-                barrier.wait(1)
-                return {'status': 'valid', 'http': 200, 'stage': 'complete'}
-
-            with patch('clusterlab.executor._load_fastcheck', return_value=(
-                    EmptyPool, check, lambda result: result['status'])), \
-                 patch('fastcheck.workers.device_profile',
-                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
-                 patch('clusterlab.executor.record_device_registration'), \
-                 patch('clusterlab.executor._bump_usage'):
-                _execute_auth_unit(root, descriptor, threading.Event())
-
-            self.assertEqual(sorted(EmptyPool.registered), [1, 2])
-            self.assertEqual(len(used),3)
-            self.assertEqual(set(used),{1,2})
-            for slot in (1, 2):
-                state = json.loads(
-                    (EmptyPool(root / 'devices').slot_directory(slot) /
-                     '.lease-state.json').read_text())
-                self.assertEqual(state['state'], 'idle')
-                self.assertTrue(state['last_used_at'])
-
-    def test_ready_device_headers_are_loaded_lazily_and_in_parallel(self):
-        class ReadyPool(FakePool):
-            calls = []
-            barrier = None
-
-            def inspect(self, slot):
-                return {'state': 'ready', 'device_id': f'device-{slot}'}
-
-            def fetch_headers(self, slot, *_args, **_kwargs):
-                type(self).calls.append((int(slot), threading.current_thread().name))
-                type(self).barrier.wait(1)
-                return {'slot': int(slot)}
-
-        ReadyPool.calls = []
-        ReadyPool.barrier = threading.Barrier(2)
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / 'input.part').write_text(
-                'one@example.com----a\ntwo@example.com----b\n', encoding='utf-8')
-            descriptor = {'rows': 2, 'first_row': 1, 'threads': 2,
-                          'device_capacity': 2, 'device_slots': [1, 2],
-                          'device_root': str(root / 'devices'),
-                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
-
-            with patch('clusterlab.executor._load_fastcheck', return_value=(
-                    ReadyPool,
-                    lambda *_args, **_kwargs: {
-                        'status': 'valid', 'http': 200, 'stage': 'complete'},
-                    lambda result: result['status'])), \
-                 patch('fastcheck.workers.device_profile',
-                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
-                 patch('clusterlab.executor._bump_usage'):
-                _execute_auth_unit(root, descriptor, threading.Event())
-
-            self.assertEqual(sorted(slot for slot, _thread in ReadyPool.calls), [1, 2])
-            self.assertTrue(all('ThreadPoolExecutor' in thread
-                                for _slot, thread in ReadyPool.calls))
-            records = [json.loads(line) for line in
-                       (root / 'results.jsonl').read_text().splitlines()]
-            self.assertEqual(len(records), 2)
-
-    def test_failed_registration_clears_partial_slot_and_next_account_retries(self):
-        class FlakyRegistrationPool(FakePool):
-            calls = 0
-
-            def inspect(self, slot):
-                directory = self.slot_directory(slot)
-                if (directory / 'ready').exists():
-                    return {'state': 'ready', 'device_id': f'device-{slot}'}
-                if (directory / 'identity.json').exists():
-                    return {'state': 'pending', 'device_id': f'partial-{slot}'}
-                return {'state': 'missing', 'device_id': ''}
-
-            def fetch_headers(self, slot, *_args, **_kwargs):
-                type(self).calls += 1
-                directory = self.slot_directory(slot)
-                directory.mkdir(parents=True, exist_ok=True)
-                (directory / 'identity.json').write_text('{}')
-                if type(self).calls == 1:
-                    raise RuntimeError('synthetic registration failure')
-                (directory / 'ready').write_text('ok')
-                return {'slot': int(slot)}
-
-        FlakyRegistrationPool.calls = 0
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / 'input.part').write_text(
-                'one@example.com----a\ntwo@example.com----b\n', encoding='utf-8')
-            descriptor = {'rows': 2, 'first_row': 1, 'threads': 1,
-                          'device_capacity': 1, 'device_slots': [1],
-                          'device_root': str(root / 'devices'),
-                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
-            proxies = ScriptedProxyPool([
-                'socks5h://bad-registration-exit',
-                'socks5h://replacement-registration-exit',
-                'socks5h://second-account-exit',
-            ])
-            with patch('clusterlab.executor._load_fastcheck', return_value=(
-                    FlakyRegistrationPool,
-                    lambda *_args, **_kwargs: {
-                        'status': 'valid', 'http': 200, 'stage': 'complete'},
-                    lambda result: result['status'])), \
-                 patch('fastcheck.workers.device_profile',
-                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
-                 patch('clusterlab.executor.record_device_registration'), \
-                 patch('clusterlab.executor._bump_usage'):
-                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=proxies)
-
-            records = [json.loads(line) for line in
-                       (root / 'results.jsonl').read_text().splitlines()]
-            self.assertEqual(FlakyRegistrationPool.calls, 2)
-            self.assertEqual([record['status'] for record in records], ['valid', 'valid'])
-            self.assertEqual([record['device_usage'] for record in records], [1, 2])
-            self.assertEqual(proxies.discards, ['socks5h://bad-registration-exit'])
-            self.assertEqual(
-                FlakyRegistrationPool(root / 'devices').inspect(1)['state'], 'ready')
-
-    def test_device_registration_has_a_twenty_second_total_budget(self):
-        self.assertEqual(DEVICE_REGISTRATION_TIMEOUT_SECONDS, 20.0)
-
     def test_raw_apple_reason_is_packaged_only_when_debug_is_enabled(self):
         result = {'apple_message': 'Your account information was entered incorrectly.'}
         self.assertEqual(_apple_reason_for_record(result, 'wrong_password'), '')
@@ -475,74 +121,6 @@ class ExecutorScaleTests(unittest.TestCase):
         self.assertEqual(groups[9], [10, 20, 30])
         self.assertEqual(sorted(slot for group in groups for slot in group),
                          list(range(1, 31)))
-
-    def test_four_processes_with_thirty_slots_start_only_thirty_threads(self):
-        groups = [_partition_device_slots(range(1, 31), 4, index)
-                  for index in range(4)]
-        self.assertEqual([len(group) for group in groups], [8, 8, 7, 7])
-        workers = [_effective_auth_workers(250, group) for group in groups]
-        self.assertEqual(workers, [8, 8, 7, 7])
-        self.assertEqual(sum(workers), 30)
-
-    def test_four_processes_with_two_hundred_pool_slots_start_two_hundred_threads(self):
-        groups = [_partition_device_slots(range(1, 201), 4, index)
-                  for index in range(4)]
-        workers = [_effective_auth_workers(250, group) for group in groups]
-        self.assertEqual(workers, [50, 50, 50, 50])
-        self.assertEqual(sum(workers), 200)
-
-    def test_device_use_is_atomic_and_never_exceeds_limit(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            values = [_consume_device_use(temporary, 3, 20) for _ in range(20)]
-            self.assertEqual(values, list(range(1, 21)))
-            with self.assertRaisesRegex(RuntimeError, 'reached use limit 20'):
-                _consume_device_use(temporary, 3, 20)
-            usage = json.loads((Path(temporary) / 'usage.json').read_text())
-            self.assertEqual(usage['3'], 20)
-
-    def test_twentieth_request_retires_identity_and_next_request_registers_fresh(self):
-        class LifecyclePool(FakePool):
-            registrations = 0
-
-            def inspect(self, slot):
-                marker = self.slot_directory(slot) / 'identity.json'
-                return {'state': 'ready' if marker.exists() else 'missing',
-                        'device_id': f'device-{slot}' if marker.exists() else ''}
-
-            def fetch_headers(self, slot, *_args, registered=True, **_kwargs):
-                directory = self.slot_directory(slot)
-                directory.mkdir(parents=True, exist_ok=True)
-                (directory / 'identity.json').write_text('{}')
-                if not registered:
-                    type(self).registrations += 1
-                return {'slot': slot}
-
-        LifecyclePool.registrations = 0
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            device_root = root / 'devices'
-            pool = LifecyclePool(device_root)
-            pool.slot_directory(1).mkdir(parents=True)
-            (pool.slot_directory(1) / 'identity.json').write_text('{}')
-            lines = [f'user-{index}@example.com----password' for index in range(21)]
-            (root / 'input.part').write_text('\n'.join(lines) + '\n')
-            descriptor = {'rows': 21, 'first_row': 1, 'threads': 1,
-                          'device_capacity': 1, 'device_slots': [1],
-                          'device_use_limit': 20, 'device_root': str(device_root),
-                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
-            with patch('clusterlab.executor._load_fastcheck', return_value=(
-                    LifecyclePool, lambda *_args, **_kwargs: {'status': 'valid'},
-                    lambda result: result['status'])), \
-                 patch('fastcheck.workers.device_profile',
-                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
-                 patch('clusterlab.executor.record_device_registration'):
-                _execute_auth_unit(root, descriptor, threading.Event())
-            records = [json.loads(line) for line in
-                       (root / 'results.jsonl').read_text().splitlines()]
-            records.sort(key=lambda item: item['row'])
-            self.assertEqual([item['device_usage'] for item in records],
-                             list(range(1, 21)) + [1])
-            self.assertEqual(LifecyclePool.registrations, 1)
 
     def test_account_hash_balances_and_exposes_base64_prefix(self):
         slots = list(range(1, 31))
@@ -744,101 +322,6 @@ class ExecutorScaleTests(unittest.TestCase):
         finally:
             pool.close()
 
-    def test_proxy_pool_marks_only_exits_with_45_seconds_remaining(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=2, ttl=1800, target=2)
-        try:
-            now = time.monotonic()
-            pool.add_fresh(['socks5h://not-expiring'], fetched_at=now - 1700)
-            pool.add_fresh(['socks5h://expiring'], fetched_at=now - 1760)
-            time.sleep(.05)
-            self.assertEqual(pool.count_aging(now=now), 1)
-            self.assertEqual(pool.snapshot()['expiring_45s'], 1)
-            self.assertEqual(pool.snapshot()['aging_45s'], 1)
-            self.assertEqual(pool.snapshot()['known'], 2)
-        finally:
-            pool.close()
-
-    def test_supplier_prefetches_replacements_45_seconds_before_expiry(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=2, ttl=1800, target=2)
-        stop = threading.Event()
-        calls = []
-        try:
-            pool.add_fresh(['socks5h://old-one', 'socks5h://old-two'],
-                           fetched_at=time.monotonic() - 1760)
-            time.sleep(.05)
-
-            def fetcher(_url, count, scheme=None):
-                calls.append(count)
-                return [f'{scheme}://replacement-{index}' for index in range(count)]
-
-            thread = threading.Thread(
-                target=proxy_supplier_loop,
-                args=(pool, 'http://proxy.test/list', 'socks5h', stop, fetcher))
-            thread.start()
-            deadline = time.monotonic() + 1
-            while pool.snapshot()['refreshed'] < 2 and time.monotonic() < deadline:
-                time.sleep(.01)
-            stop.set()
-            thread.join(2)
-            self.assertFalse(thread.is_alive())
-            self.assertEqual(calls, [2])
-            self.assertEqual(pool.snapshot()['known'], 2)
-            self.assertEqual(pool.snapshot()['refreshed'], 2)
-        finally:
-            stop.set()
-            pool.close()
-
-    def test_supplier_waits_above_low_water_instead_of_chasing_target(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=10, ttl=1800, target=10)
-        stop = threading.Event()
-        calls = []
-        try:
-            pool.add_fresh([f'socks5h://stock-{index}' for index in range(6)])
-
-            def fetcher(_url, count, scheme=None):
-                calls.append(count)
-                return []
-
-            thread = threading.Thread(
-                target=proxy_supplier_loop,
-                args=(pool, 'http://proxy.test/list', 'socks5h', stop, fetcher))
-            thread.start()
-            time.sleep(.1)
-            stop.set()
-            thread.join(2)
-            self.assertEqual(pool.low_water, 5)
-            self.assertEqual(pool.snapshot()['known'], 6)
-            self.assertEqual(calls, [])
-        finally:
-            stop.set()
-            pool.close()
-
-    def test_supplier_refills_from_below_low_water_to_target(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=10, ttl=1800, target=10)
-        stop = threading.Event()
-        calls = []
-        try:
-            pool.add_fresh([f'socks5h://stock-{index}' for index in range(4)])
-
-            def fetcher(_url, count, scheme=None):
-                calls.append(count)
-                stop.set()
-                return [f'{scheme}://replacement-{index}' for index in range(count)]
-
-            thread = threading.Thread(
-                target=proxy_supplier_loop,
-                args=(pool, 'http://proxy.test/list', 'socks5h', stop, fetcher))
-            thread.start()
-            thread.join(2)
-            self.assertEqual(calls, [6])
-        finally:
-            stop.set()
-            pool.close()
-
     def test_proxy_supplier_prefills_pool_and_reports_fetch_metrics(self):
         context = mp.get_context('spawn')
         pool = NodeProxyPool(context, concurrency=4, ttl=30)
@@ -965,7 +448,7 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
-                          '_retry_delay': 0, '_proxy_debug': True}
+                          '_retry_delay': 0}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://dead-exit', 'socks5h://good-exit'])
             stop = RecordingStop()
@@ -1047,7 +530,7 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
-                          '_retry_delay': 0, '_proxy_debug': True}
+                          '_retry_delay': 0}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://first-exit', 'socks5h://second-exit'])
             stop = RecordingStop()
@@ -1092,7 +575,7 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 2,
-                          '_retry_delay': 0, '_proxy_debug': True}
+                          '_retry_delay': 0}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://first-exit',
                 'socks5h://second-exit', 'socks5h://third-exit'])
@@ -1218,147 +701,16 @@ class ExecutorScaleTests(unittest.TestCase):
                 self.assertEqual(shared.discards,
                                  ['socks5h://first-exit', 'socks5h://second-exit'])
 
-    def test_registration_history_tracks_the_current_identity_generation(self):
+    def test_registration_history_keeps_the_first_time_and_proxy_per_slot(self):
         with tempfile.TemporaryDirectory() as temporary:
             self.assertTrue(record_device_registration(temporary, 3, 'socks5h://first:9000',
                                                        'MacBookPro14,3'))
-            self.assertTrue(record_device_registration(temporary, 3, 'socks5h://later:9001',
-                                                       'iMac17,1'))
+            self.assertFalse(record_device_registration(temporary, 3, 'socks5h://later:9001',
+                                                        'iMac17,1'))
             value = json.loads((Path(temporary) / 'registrations' / '003.json').read_text())
-            self.assertEqual(value['proxy'], 'socks5h://later:9001')
-            self.assertEqual(value['model'], 'iMac17,1')
+            self.assertEqual(value['proxy'], 'socks5h://first:9000')
+            self.assertEqual(value['model'], 'MacBookPro14,3')
             self.assertRegex(value['at'], r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
-
-    def test_newly_registered_generation_persists_zero_before_publish(self):
-        class MissingPool:
-            def inspect(self, _slot):
-                return {'state': 'missing'}
-
-        class Lease:
-            slot = 3
-            uses = 17
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            atomic_json(root / 'usage.json', {'3': 17})
-            allocator = DeviceLeaseAllocator(MissingPool(), [3], root, use_limit=20)
-            lease = Lease()
-            allocator.reset_registered(lease)
-            persisted = json.loads((root / 'usage.json').read_text('utf-8'))
-            self.assertEqual(persisted['3'], 0)
-            self.assertEqual(allocator.usage[3], 0)
-            self.assertEqual(lease.uses, 0)
-
-    def test_debug_small_task_records_bounded_connection_timing(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / 'input.part').write_text(
-                'account----password\n', encoding='utf-8')
-            descriptor = {'rows': 1, 'first_row': 20, 'threads': 1,
-                          'device_capacity': 1,
-                          'device_root': str(root / 'devices'),
-                          'origin': 'http://127.0.0.1:1',
-                          'timeout': 5, 'retries': 0,
-                          '_proxy_debug': True}
-            shared = ScriptedProxyPool(
-                ['socks5h://bootstrap', 'socks5h://account-exit'])
-            stop = RecordingStop()
-
-            def check(_account, _password, _proxy, **kwargs):
-                diagnostics = kwargs.get('diagnostics')
-                self.assertIsNotNone(diagnostics)
-                diagnostics({'event': 'connection', 'reused': False,
-                             'target_dns_mode': 'remote'})
-                diagnostics({'event': 'connection', 'reused': True,
-                             'target_dns_mode': 'remote'})
-                diagnostics({'event': 'phase_end', 'phase': 'proxy_tcp_connect',
-                             'ms': 8.0, 'cpu_ms': .5})
-                diagnostics({'event': 'phase_end', 'phase': 'socks_auth',
-                             'ms': 4.0, 'cpu_ms': .25})
-                diagnostics({'event': 'phase_end', 'phase': 'tls_handshake',
-                             'ms': 20.0, 'cpu_ms': 6.5})
-                diagnostics({'event': 'phase_end',
-                             'phase': 'srp_challenge_compute',
-                             'ms': 12.5, 'cpu_ms': 7.25})
-                diagnostics({'event': 'phase_end',
-                             'phase': 'http_complete',
-                             'ms': 45.0, 'cpu_ms': 1.0})
-                return {'status': 'wrong_password', 'stage': 'complete',
-                        'http': 200, 'apple_ec': -22406,
-                        'detail': 'synthetic wrong password'}
-
-            with patch('clusterlab.executor._load_fastcheck', return_value=(
-                    FakePool, check, lambda result: result['status'])), \
-                 patch('fastcheck.workers.device_profile',
-                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
-                 patch('clusterlab.executor._bump_usage'):
-                _execute_auth_unit(root, descriptor, stop, proxy_pool=shared)
-
-            events = [json.loads(line) for line in
-                      (root / 'proxy-debug.jsonl').read_text().splitlines()]
-            timing = next(item for item in events
-                          if item.get('event') == 'auth_timing')
-            self.assertTrue(timing['sampled'])
-            self.assertEqual(timing['trace_sample_every'], 1)
-            self.assertEqual(timing['srp']['state'], 'observed')
-            self.assertEqual(timing['srp']['compute_cpu_ms'], 7.25)
-            self.assertEqual(timing['network']['state'], 'observed')
-            self.assertEqual(timing['network']['connections'], {
-                'total': 2, 'new': 1, 'reused': 1,
-                'reuse_ratio': .5, 'remote_dns': 2})
-            self.assertEqual(timing['network']['tcp_connects'], 1)
-            self.assertEqual(timing['network']['socks_negotiations'], 1)
-            self.assertEqual(timing['network']['tls_handshakes'], 1)
-            self.assertEqual(
-                timing['network']['phases']['tls_handshake']['thread_cpu_ms'], 6.5)
-            serialized = json.dumps(timing)
-            self.assertNotIn('account----password', serialized)
-            self.assertNotIn('socks5h://account-exit', serialized)
-
-    def test_debug_network_trace_instruments_all_ten_local_rows(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            rows = [f'user-{index}@example.com----password'
-                    for index in range(1, 11)]
-            (root / 'input.part').write_text(
-                '\n'.join(rows) + '\n', encoding='utf-8')
-            descriptor = {'rows': 10, 'first_row': 1, 'threads': 1,
-                          'device_capacity': 1,
-                          'device_root': str(root / 'devices'),
-                          'origin': 'http://127.0.0.1:1',
-                          'timeout': 5, 'retries': 0,
-                          '_proxy_debug': True,
-                          '_performance_sample_every': 1}
-            shared = ScriptedProxyPool(
-                ['socks5h://headers']
-                + [f'socks5h://account-{index}' for index in range(1, 11)])
-            traced = []
-
-            def check(_account, _password, _proxy, **kwargs):
-                traced.append(kwargs.get('diagnostics') is not None)
-                return {'status': 'wrong_password', 'stage': 'complete',
-                        'http': 200, 'apple_ec': -22406,
-                        'detail': 'synthetic wrong password'}
-
-            with patch('clusterlab.executor._load_fastcheck', return_value=(
-                    FakePool, check, lambda result: result['status'])), \
-                 patch('fastcheck.workers.device_profile',
-                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
-                 patch('clusterlab.executor._bump_usage'):
-                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
-
-            self.assertEqual(traced, [True] * 10)
-
-    def test_large_job_sampling_is_stable_random_and_credential_free(self):
-        selected = [row for row in range(1, 2001)
-                    if _performance_trace_sampled('job-123', row, 1, 20)]
-        self.assertEqual(_performance_trace_interval(10), 1)
-        self.assertEqual(_performance_trace_interval(11), 20)
-        self.assertEqual(selected,
-                         [row for row in range(1, 2001)
-                          if _performance_trace_sampled('job-123', row, 1, 20)])
-        self.assertTrue(70 <= len(selected) <= 130)
-        self.assertNotEqual(selected[1:10], list(range(20, 201, 20))[:9])
 
     def test_one_package_fans_out_to_processes_and_merges_in_row_order(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1399,7 +751,7 @@ class ExecutorScaleTests(unittest.TestCase):
                        return_value=(FakePool, check, lambda result: result['status'])), \
                  patch('fastcheck.workers.device_profile',
                        return_value={'client_info': 'test', 'user_agent': 'test'}), \
-                 patch('clusterlab.executor._merge_device_usage',
+                 patch('clusterlab.executor._bump_usage',
                        side_effect=lambda _root, counts: usage_calls.append(dict(counts))), \
                  patch.object(Path, 'read_bytes', side_effect=AssertionError('must hash while writing')):
                 _execute_auth_unit(root, descriptor, threading.Event())
@@ -1410,14 +762,8 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(json.loads((root / 'progress.json').read_text('utf-8'))['counts'],
                              {'valid': 500})
             self.assertEqual(done['checksum'], hashlib.sha256(payload).hexdigest())
-            # A fast local run may finish before the 250ms live-update tick;
-            # the final batched flush is still mandatory and per-row writes
-            # are forbidden.
-            self.assertGreaterEqual(len(usage_calls), 1)
-            self.assertLess(len(usage_calls), len(lines))
-            self.assertTrue(any(call for call in usage_calls))
-            self.assertTrue(all(0 <= value <= 20 for call in usage_calls
-                                for value in call.values()))
+            self.assertEqual(sum(usage_calls[0].values()), 500)
+            self.assertLess(abs(usage_calls[0][1] - usage_calls[0][2]), 50)
             self.assertEqual(len(payload.splitlines()), 500)
 
     def test_auth_progress_is_time_based_instead_of_waiting_for_ten_results(self):
@@ -1427,20 +773,13 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5}
-            flushes = []
-            original_flush = DeviceLeaseAllocator.flush_usage
-            def record_flush(allocator):
-                flushes.append(dict(allocator.usage))
-                return original_flush(allocator)
             with patch('clusterlab.executor._load_fastcheck', return_value=(
                     FakePool, lambda *_args, **_kwargs: {'status': 'wrong_password'},
                     lambda result: result['status'])), \
                  patch('fastcheck.workers.device_profile',
                        return_value={'client_info': 'test', 'user_agent': 'test'}), \
                  patch('clusterlab.executor._bump_usage'), \
-                 patch('clusterlab.executor.time.monotonic',
-                       side_effect=[10.0] * 3 + [10.3] * 8), \
-                 patch.object(DeviceLeaseAllocator, 'flush_usage', record_flush), \
+                 patch('clusterlab.executor.time.monotonic', side_effect=[10.0, 10.0, 10.3]), \
                  patch('clusterlab.executor.atomic_json', wraps=atomic_json) as writes:
                 _execute_auth_unit(root, descriptor, threading.Event())
 
@@ -1448,32 +787,6 @@ class ExecutorScaleTests(unittest.TestCase):
                         if call.args[0].name == 'progress.json']
             self.assertEqual([item['processed'] for item in progress], [1, 1])
             self.assertEqual(progress[0]['counts'], {'wrong_password': 1})
-            self.assertGreaterEqual(len(flushes), 2)
-            self.assertEqual(flushes[0][1], 1)
-
-    def test_auth_result_records_device_usage_at_that_account(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / 'input.part').write_text(
-                'one@example.com----a\ntwo@example.com----b\nthree@example.com----c\n',
-                encoding='utf-8')
-            devices = root / 'devices'
-            devices.mkdir()
-            (devices / 'usage.json').write_text('{"1":7}', encoding='utf-8')
-            descriptor = {'rows': 3, 'first_row': 1, 'threads': 1,
-                          'device_capacity': 1, 'device_root': str(devices),
-                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
-            with patch('clusterlab.executor._load_fastcheck', return_value=(
-                    FakePool, lambda *_args, **_kwargs: {'status': 'valid'},
-                    lambda result: result['status'])), \
-                 patch('fastcheck.workers.device_profile',
-                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
-                 patch('clusterlab.executor._bump_usage'):
-                _execute_auth_unit(root, descriptor, threading.Event())
-
-            records = [json.loads(line) for line in
-                       (root / 'results.jsonl').read_text('utf-8').splitlines()]
-            self.assertEqual([record['device_usage'] for record in records], [8, 9, 10])
 
     def test_auth_unit_classifies_gsa_20970_as_invalid_without_web_recheck(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1482,7 +795,7 @@ class ExecutorScaleTests(unittest.TestCase):
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': 5,
-                          'dual_recheck': True, '_proxy_debug': True}
+                          'dual_recheck': True}
 
             with patch('clusterlab.executor._load_fastcheck', return_value=(
                     FakePool,

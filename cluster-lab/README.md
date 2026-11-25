@@ -153,12 +153,6 @@ npm run build
 
 开发机需要 Node.js 20.19+ 或 22.12+。服务器使用已经生成的 ZIP 时仅需 Python，不需要 Node.js。
 
-### 版本规则
-
-当前线上版本为 `1.0.0`，后续按语义化版本规则递增，不再使用 `0.3.x` 或开发阶段后缀。
-总控、节点、健康接口和前端展示统一读取 `clusterlab/__init__.py` 中的 `VERSION`，
-每次发布必须同步更新。
-
 ```bash
 # 开发：先启动 Python 总控，再启动 Vue 开发服务
 cd frontend

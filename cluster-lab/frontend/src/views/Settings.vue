@@ -5,12 +5,11 @@ import { session, isNode, state, busy, mutate } from '../composables/useCluster'
 const maxUnitRows = ref(10000), error = ref('')
 const proxyApi = ref(''), proxyScheme = ref('socks5h'), proxyError = ref(''), proxyBusy = ref(false)
 const proxyPoolSize = ref(1000), proxyPoolBusy = ref(false)
-const deviceHeaderReuse = ref(15)
-const deviceUseLimit = ref(0), deviceUseLimitBusy = ref(false)
+const rotateAfter = ref(0), rotateBusy = ref(false)
 const proxyDebug = ref(false), proxyDebugBusy = ref(false)
 const webSecondaryAuth = ref(true), webSecondaryAuthBusy = ref(false)
-watch(() => state.value?.settings?.device_use_limit, value => {
-  if (value != null) deviceUseLimit.value = value
+watch(() => state.value?.settings?.device_rotate_after, value => {
+  if (value != null) rotateAfter.value = value
 }, { immediate: true })
 watch(() => state.value?.settings?.max_unit_rows, value => {
   if (value != null) maxUnitRows.value = value
@@ -27,9 +26,6 @@ watch(() => state.value?.settings?.web_secondary_auth, value => {
 watch(() => state.value?.settings?.proxy_pool_size, value => {
   if (value != null) proxyPoolSize.value = Number(value)
 }, { immediate: true })
-watch(() => state.value?.settings?.device_header_reuse, value => {
-  if (value != null) deviceHeaderReuse.value = Number(value)
-}, { immediate: true })
 async function save() {
   error.value = ''
   if (!Number.isInteger(maxUnitRows.value) || maxUnitRows.value < 50 || maxUnitRows.value > 100000) {
@@ -38,14 +34,13 @@ async function save() {
   try { await mutate('/api/settings', { max_unit_rows: maxUnitRows.value }, '分片上限已保存，仅对新创建的任务生效') }
   catch (e) { error.value = (e as Error).message; ElMessage.error(error.value) }
 }
-async function saveDeviceUseLimit() {
-  deviceUseLimitBusy.value = true
+async function saveRotation() {
+  rotateBusy.value = true
   try {
-    await mutate('/api/settings/device-use-limit', { device_use_limit: deviceUseLimit.value },
-                 deviceUseLimit.value === 0 ? '设备身份已设置为长期复用' :
-                 `每台设备最多使用 ${deviceUseLimit.value} 次`)
+    await mutate('/api/settings/rotation', { device_rotate_after: rotateAfter.value },
+                 rotateAfter.value ? `每台设备用满 ${rotateAfter.value} 条后自动换新` : '设备轮换已关闭')
   } catch (e) { ElMessage.error((e as Error).message) }
-  finally { deviceUseLimitBusy.value = false }
+  finally { rotateBusy.value = false }
 }
 async function addProxy() {
   proxyError.value = ''
@@ -69,15 +64,10 @@ async function saveProxyPoolSize() {
   if (!Number.isInteger(proxyPoolSize.value) || proxyPoolSize.value < 1 || proxyPoolSize.value > 10000) {
     proxyError.value = '单节点代理池容量应为 1–10,000 的整数'; return
   }
-  if (!Number.isInteger(deviceHeaderReuse.value) || deviceHeaderReuse.value < 1 || deviceHeaderReuse.value > 1000) {
-    proxyError.value = '设备公共头使用次数应为 1–1,000 的整数'; return
-  }
   proxyPoolBusy.value = true
   try {
-    await mutate('/api/settings/proxy', {
-      action: 'resize', proxy_pool_size: proxyPoolSize.value,
-      device_header_reuse: deviceHeaderReuse.value,
-    }, `代理池容量已保存；公共头每使用 ${deviceHeaderReuse.value} 次后更新`)
+    await mutate('/api/settings/proxy', { action: 'resize', proxy_pool_size: proxyPoolSize.value },
+                 `单节点代理池容量已设置为 ${proxyPoolSize.value.toLocaleString()}`)
   } catch (e) { proxyError.value = (e as Error).message; ElMessage.error(proxyError.value) }
   finally { proxyPoolBusy.value = false }
 }
@@ -134,18 +124,18 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
     </el-form>
   </el-card>
   <el-card v-if="!isNode" shadow="never" class="section-card">
-    <template #header><h2>设备使用上限</h2></template>
-    <el-form label-position="top" @submit.prevent="saveDeviceUseLimit">
-      <el-form-item label="每台设备最多使用次数">
-        <el-input-number v-model="deviceUseLimit" :min="0" :max="100000" :step="1" :precision="0" :disabled="deviceUseLimitBusy" />
-        <span class="field-note">0 表示长期复用；大于 0 时达到上限后由工作线程退役并重新注册。</span>
+    <template #header><h2>设备轮换</h2></template>
+    <el-form label-position="top" @submit.prevent="saveRotation">
+      <el-form-item label="每台设备用满多少条后自动换新">
+        <el-input-number v-model="rotateAfter" :min="0" :max="100000" :step="10" :precision="0" :disabled="rotateBusy" />
+        <span class="field-note">0 表示不轮换。设备在节点本地重新注册（约 6–8 秒），旧身份被删除。</span>
       </el-form-item>
       <el-descriptions :column="1" border>
-        <el-descriptions-item label="当前上限">
-          {{ state?.settings?.device_use_limit === 0 ? '长期复用' : state?.settings?.device_use_limit + ' 次/台' }}
+        <el-descriptions-item label="当前阈值">
+          {{ state?.settings?.device_rotate_after ? state.settings.device_rotate_after + ' 条/台' : '未启用' }}
         </el-descriptions-item>
       </el-descriptions>
-      <el-button type="primary" native-type="submit" :loading="deviceUseLimitBusy">保存使用上限</el-button>
+      <el-button type="primary" native-type="submit" :loading="rotateBusy">保存轮换设置</el-button>
     </el-form>
   </el-card>
   <el-card v-if="!isNode" shadow="never" class="section-card">
@@ -176,21 +166,10 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
           代理明细不会每秒传回总控。
         </span>
       </el-form-item>
-      <el-form-item label="设备公共头使用次数">
-        <el-input-number v-model="deviceHeaderReuse" :min="1" :max="1000" :step="1"
-                         :precision="0" :disabled="proxyPoolBusy" />
-        <span class="field-note">
-          默认 15。线程累计使用满该次数后自行获取新公共头；只更新公共头，不退役设备身份。
-          保存后对新领取的工作包生效。
-        </span>
-      </el-form-item>
-      <el-button :loading="proxyPoolBusy" :disabled="proxyBusy" @click="saveProxyPoolSize">保存代理与公共头设置</el-button>
+      <el-button :loading="proxyPoolBusy" :disabled="proxyBusy" @click="saveProxyPoolSize">保存代理池容量</el-button>
       <el-descriptions :column="1" border>
         <el-descriptions-item label="当前状态">
           {{ state?.settings?.proxy_configured ? `已配置 ${state.settings.proxy_count} 个` : '未配置' }}
-        </el-descriptions-item>
-        <el-descriptions-item label="公共头更新频率">
-          每 {{ state?.settings?.device_header_reuse ?? 15 }} 次/设备
         </el-descriptions-item>
       </el-descriptions>
       <el-table v-if="state?.settings?.proxy_apis?.length" :data="state.settings.proxy_apis" border>

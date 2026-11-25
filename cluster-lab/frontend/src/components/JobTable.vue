@@ -1,22 +1,11 @@
 <script setup lang="ts">
-import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete } from '@element-plus/icons-vue'
 import { api, fmt, percent, date, refresh } from '../composables/useCluster'
 import StatusBadge from './StatusBadge.vue'
-const props = defineProps<{ jobs: any[] }>()
-const emit = defineEmits<{ (e: 'selection-change', rows: any[]): void }>()
+defineProps<{ jobs: any[] }>()
 const router = useRouter()
-const table = ref<any>()
-function selectable(row: any) { return row.status !== 'preparing' }
-function onSelectionChange(rows: any[]) { emit('selection-change', rows) }
-function selectAllVisible() {
-  table.value?.clearSelection()
-  for (const row of props.jobs.filter(selectable)) table.value?.toggleRowSelection(row, true)
-}
-function clearSelection() { table.value?.clearSelection() }
-defineExpose({ selectAllVisible, clearSelection })
 
 async function remove(job: any) {
   try {
@@ -34,8 +23,7 @@ async function remove(job: any) {
 }
 </script>
 <template>
-  <el-table ref="table" :data="jobs" stripe class="job-table desktop-job-table" empty-text="暂无任务，点击右上角创建任务" @selection-change="onSelectionChange">
-    <el-table-column type="selection" width="42" :selectable="selectable" />
+  <el-table :data="jobs" stripe class="job-table desktop-job-table" empty-text="暂无任务，点击右上角创建任务">
     <el-table-column label="任务名称" min-width="250"><template #default="{ row }"><el-button link type="primary" class="job-link" @click="router.push('/jobs/' + row.id)">{{ row.name }}</el-button><div class="muted table-meta">{{ date(row.created) }} · {{ row.mode === 'auth' ? '账号校验' : '数据任务' }}</div></template></el-table-column>
     <el-table-column label="状态" width="185"><template #default="{ row }"><StatusBadge :status="row.status" :unit-counts="row.unit_counts" /><div v-if="row.queue_position" class="muted table-meta">等待第 {{ row.queue_position }} 位</div></template></el-table-column>
     <el-table-column label="任务进度" min-width="220"><template #default="{ row }"><div class="progress-label">{{ fmt(Math.max(row.processed || 0, row.confirmed || 0)) }} / {{ fmt(row.rows) }} 条已处理</div><el-progress :percentage="Number(percent(row).toFixed(1))" :stroke-width="7" /></template></el-table-column>

@@ -80,15 +80,10 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('max_unit_rows',1000
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_api','');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_scheme','socks5h');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('origin','https://new.ani.sidestore.io');
-INSERT OR IGNORE INTO controller_settings(key,value)
-SELECT 'device_use_limit', CASE
- WHEN CAST(COALESCE((SELECT value FROM controller_settings
-                     WHERE key='device_rotate_after'),'0') AS INTEGER) > 0
- THEN (SELECT value FROM controller_settings WHERE key='device_rotate_after')
- ELSE '0' END;
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_rotate_after','0');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_auto_rotate','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_pool_size','1000');
-INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_header_reuse','15');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('web_secondary_auth','1');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('update_parallel','2');
@@ -475,7 +470,11 @@ class Controller:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:
                 raise ValueError('节点不存在')
+            initialization = self._device_initialization(node)
             enabled = bool(node['enabled']) if 'enabled' not in data else data['enabled']
+            if enabled and not node['enabled'] and not initialization['complete']:
+                raise Conflict(f'设备初始化完成后才能开始接单（'
+                               f'{initialization["ready"]}/{initialization["requested"]}）')
             active = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? AND status IN ('leased','running')", (node_id,)).fetchone()[0]
             if enabled and (node['stop_version'] > node['ack_stop_version'] or
                                     not node['enabled'] and node['stop_version'] > 0 and active):
@@ -537,7 +536,7 @@ class Controller:
             if not row['last_seen'] or now - row['last_seen'] >= self.offline_seconds:
                 continue
             working = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? "
-                                 "AND status IN ('leased','running')", (row['id'],)).fetchone()[0]
+                                 "AND status IN ('leased','running','unknown')", (row['id'],)).fetchone()[0]
             if working:
                 db.execute("UPDATE nodes SET update_message=? WHERE id=?",
                            (f'等待 {working} 个在途工作包完成', row['id']))
@@ -602,36 +601,20 @@ class Controller:
         # 兼容旧调用签名；双协议复检已撤回，所有新任务固定使用 GSA。
         _ = dual_recheck
         job_id = uuid.uuid4().hex
-        while True:
-            target = self._source_path(name).resolve()
-            try:
-                output = target.open('xb')
-                break
-            except FileExistsError:
-                # Another upload claimed the name after _source_path checked it.
-                continue
-        try:
-            with output:
-                target.chmod(0o600)
-                shutil.copyfileobj(stream, output, 1024 * 1024)
-            size = target.stat().st_size
-            if not size:
-                raise ValueError('文件为空')
-            now = time.time()
-            with self.db.transaction() as db:
-                db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,device_capacity,dual_recheck) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                           (job_id, str(name).strip()[:120] or '未命名任务', 'preparing', now, now,
-                            str(target), size, unit_rows, mode, now if enqueue else None,
-                            timeout, retries, device_capacity, 0))
-                event(db, 'job_uploaded', '输入文件已保存，正在后台准备工作包', job_id=job_id)
-        except BaseException:
-            # Only a successful exclusive create gives us ownership to clean up.
-            # Cleanup errors must not replace the original upload/DB exception.
-            try:
-                target.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        target = self._source_path(name).resolve()
+        with target.open('xb') as output:
+            target.chmod(0o600)
+            shutil.copyfileobj(stream, output, 1024 * 1024)
+        if not target.stat().st_size:
+            target.unlink()
+            raise ValueError('文件为空')
+        now = time.time()
+        with self.db.transaction() as db:
+            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,device_capacity,dual_recheck) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                       (job_id, str(name).strip()[:120] or '未命名任务', 'preparing', now, now,
+                        str(target), target.stat().st_size, unit_rows, mode, now if enqueue else None,
+                        timeout, retries, device_capacity, 0))
+            event(db, 'job_uploaded', '输入文件已保存，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
 
@@ -647,11 +630,11 @@ class Controller:
                 'proxy_count': len(proxy_parts),
                 'proxy_configured': bool(proxy_parts),
                 'proxy_scheme': values.get('proxy_scheme', 'socks5h'),
-                'device_use_limit': max(0, int(values.get('device_use_limit', 0) or 0)),
+                'device_rotate_after': int(values.get('device_rotate_after', 0) or 0),
+                # column 声明是 INTEGER，存 '1' 会读回整数 1，比较时统一转字符串
+                'device_auto_rotate': str(values.get('device_auto_rotate', '0')) in ('1', 'True', 'true'),
                 'proxy_ttl': int(values.get('proxy_ttl', 50) or 50),
                 'proxy_pool_size': int(values.get('proxy_pool_size', 1000) or 1000),
-                'device_header_reuse': max(
-                    1, min(1000, int(values.get('device_header_reuse', 15) or 15))),
                 'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true'),
                 'web_secondary_auth': str(values.get('web_secondary_auth', '1')) in
                                       ('1', 'True', 'true')}
@@ -711,15 +694,32 @@ class Controller:
                   'Web 二次验证已关闭；新工作包只使用 GSA 结果')
         return self.settings()
 
-    def configure_device_use_limit(self, data):
-        limit = integer(data.get('device_use_limit'), '每台设备最多使用次数', 0, 100000)
+    def configure_rotation(self, data):
         with self.db.transaction() as db:
-            db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
-                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                       ('device_use_limit', str(limit)))
-            event(db, 'controller_config',
-                  ('设备身份已设置为长期复用' if limit == 0 else
-                   f'每台设备最多使用次数已设置为 {limit}'))
+            current = {row['key']: row['value'] for row in db.execute(
+                "SELECT key,value FROM controller_settings "
+                "WHERE key IN ('device_rotate_after','device_auto_rotate')")}
+            # This endpoint accepts partial updates. Saving a threshold must
+            # not implicitly disable the separately saved refill switch.
+            limit_value = data.get('device_rotate_after', current.get('device_rotate_after', 0))
+            limit = integer(int(limit_value or 0), '设备轮换阈值', 0, 100000)
+            if 'device_auto_rotate' in data:
+                if type(data['device_auto_rotate']) is not bool:
+                    raise ValueError('设备自动补充开关应为布尔值')
+                auto = '1' if data['device_auto_rotate'] else '0'
+            else:
+                auto = '1' if str(current.get('device_auto_rotate', '0')) in ('1', 'True', 'true') else '0'
+            for key_name, key_value in (('device_rotate_after', str(limit)),
+                                        ('device_auto_rotate', auto)):
+                db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           (key_name, key_value))
+            if auto == '1':
+                event(db, 'controller_config',
+                      f'设备自动补充已开启：每台用满 {limit or 20} 条后换新并补齐' if limit
+                      else '设备自动补充已开启（轮换阈值 0 时只补缺不换新）')
+            else:
+                event(db, 'controller_config', '设备自动补充已关闭')
         return self.settings()
 
     def configure_proxy(self, data):
@@ -729,8 +729,7 @@ class Controller:
         with self.db.connect() as db:
             current = {row['key']: row['value'] for row in db.execute(
                 "SELECT key,value FROM controller_settings "
-                "WHERE key IN ('proxy_api','proxy_scheme','proxy_pool_size',"
-                "'device_header_reuse')")}
+                "WHERE key IN ('proxy_api','proxy_scheme','proxy_pool_size')")}
         scheme = str(data.get('proxy_scheme') or current.get('proxy_scheme') or 'socks5h').strip()
         if scheme not in ('socks5h', 'socks5', 'http', 'https'):
             raise ValueError('代理协议应为 socks5h / socks5 / http / https')
@@ -740,12 +739,6 @@ class Controller:
         except (TypeError, ValueError):
             raise ValueError('单节点代理池容量应为 1–10000 的整数') from None
         pool_size = integer(pool_value, '单节点代理池容量', 1, 10000)
-        try:
-            reuse_value = int(data['device_header_reuse'] if 'device_header_reuse' in data
-                              else current.get('device_header_reuse') or 15)
-        except (TypeError, ValueError):
-            raise ValueError('设备公共头使用次数应为 1–1000 的整数') from None
-        header_reuse = integer(reuse_value, '设备公共头使用次数', 1, 1000)
         existing = [part for part in str(current.get('proxy_api') or '').split() if part]
         submitted = [part for part in str(data.get('proxy_api') or '').split() if part]
         if action == 'add':
@@ -779,13 +772,9 @@ class Controller:
             db.execute("UPDATE controller_settings SET value=? WHERE key='proxy_scheme'", (scheme,))
             db.execute("INSERT INTO controller_settings(key,value) VALUES('proxy_pool_size',?) "
                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(pool_size),))
-            db.execute("INSERT INTO controller_settings(key,value) VALUES('device_header_reuse',?) "
-                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                       (str(header_reuse),))
             if action == 'resize':
                 event(db, 'controller_config',
-                      f'单节点代理池容量已设置为 {pool_size:,}；设备公共头每使用 '
-                      f'{header_reuse} 次后由线程自行更新')
+                      f'单节点代理池容量已设置为 {pool_size:,}；每次最多提取 1,000 条并在节点本地补齐')
             else:
                 event(db, 'controller_config',
                       f'代理 API 配置已更新，当前 {len(parts)} 个，按节点轮询分配'
@@ -794,15 +783,11 @@ class Controller:
 
     def request_devices(self, node_id, capacity):
         """把设备初始化意图挂到节点上，节点下次心跳取走执行。"""
+        capacity = integer(int(capacity), '设备数量', 0, 200)
         with self.db.transaction() as db:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:
                 raise ValueError('节点不存在')
-            slot_limit = max(1, min(int(node['desired_processes']),
-                                    int(node['max_processes'] or 1)) *
-                                min(int(node['desired_threads']),
-                                    int(node['max_threads'] or 1)))
-            capacity = integer(int(capacity), '设备数量', 0, slot_limit)
             if not node['last_seen'] or time.time() - node['last_seen'] > self.offline_seconds:
                 raise Conflict('节点离线，无法初始化设备')
             db.execute('UPDATE nodes SET device_request=? WHERE id=?', (capacity, node_id))
@@ -852,8 +837,7 @@ class Controller:
         if isinstance(pool, dict):
             result['device_pool'] = {key: pool.get(key) for key in
                                      ('running', 'capacity', 'ready', 'built', 'failed',
-                                      'current', 'attempted', 'registering', 'in_use',
-                                      'pending', 'failed_slots')}
+                                      'current', 'attempted')}
             proxy_status = str(pool.get('proxy_status') or 'idle')
             result['device_pool']['proxy_status'] = (proxy_status if proxy_status in
                                                       ('idle', 'checking', 'ok', 'failed') else 'idle')
@@ -1354,17 +1338,7 @@ class Controller:
                     continue
                 traffic_jobs.add(unit['job_id'])
                 count = integer(value.get('processed', 0), '已处理数量', 0, unit['rows'])
-                try:
-                    live_counts = self.clean_live_counts(
-                        value.get('counts'), count, unit['rows'])
-                except ValueError as exc:
-                    if str(exc) != '实时分类数超过已处理数':
-                        raise
-                    # Older thread workers counted out-of-order completions before
-                    # the same rows were committed to the ordered result stream.
-                    # Ignore only that inconsistent summary so one bad snapshot
-                    # cannot suppress liveness, stop ACKs, or rolling updates.
-                    live_counts = {}
+                live_counts = self.clean_live_counts(value.get('counts'), count, unit['rows'])
                 reported_ack[unit['id']] = self._accept_live_records(
                     db, unit, value.get('records', []))
                 if (reported_ack[unit['id']] == int(unit['rows'])
@@ -1409,17 +1383,6 @@ class Controller:
                 previous_telemetry = json.loads(node['telemetry_json'] or '{}')
             except (TypeError, ValueError):
                 previous_telemetry = {}
-            # Nodes send the large device table only when it changes.  Preserve
-            # the last accepted rows while still replacing the live summary on
-            # every heartbeat.  An explicit empty list remains authoritative
-            # and therefore clears the table after a pool reset.
-            current_pool = cleaned_telemetry.get('device_pool')
-            previous_pool = (previous_telemetry.get('device_pool')
-                             if isinstance(previous_telemetry, dict) else None)
-            if (isinstance(current_pool, dict) and 'slots' not in current_pool
-                    and isinstance(previous_pool, dict)
-                    and isinstance(previous_pool.get('slots'), list)):
-                current_pool['slots'] = previous_pool['slots']
             current_bytes = cleaned_telemetry.get('network_bytes')
             previous_bytes = previous_telemetry.get('network_bytes')
             current_job_id = next(iter(traffic_jobs)) if len(traffic_jobs) == 1 else None
@@ -1446,7 +1409,7 @@ class Controller:
                                 now if final else None, node_id))
                     if update_state == 'success':
                         current = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
-                        if current['update_resume_enabled']:
+                        if current['update_resume_enabled'] and self._device_initialization(current)['complete']:
                             db.execute('UPDATE nodes SET enabled=1 WHERE id=?', (node_id,))
                         event(db, 'node_update_success',
                               f'节点更新成功：{current["update_ref"]}', node_id=node_id)
@@ -1469,12 +1432,10 @@ class Controller:
                     'reported': reported_ack,
                     'device_request': node['device_request'],
                     'device_clear_version': node['device_clear_version'],
+                    'device_rotate_after': self.settings().get('device_rotate_after', 0),
+                    'device_auto_rotate': bool(self.settings().get('device_auto_rotate')),
                     'proxy_ttl': int(self.settings().get('proxy_ttl') or 50),
                     'proxy_pool_size': int(self.settings().get('proxy_pool_size') or 1000),
-                    'device_header_reuse': int(
-                        self.settings().get('device_header_reuse') or 15),
-                    'device_use_limit': max(
-                        0, int(self.settings().get('device_use_limit') or 0)),
                     'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds,
                     'update': update,
                     'server_time': now,
@@ -1510,7 +1471,7 @@ class Controller:
             # process/thread ceiling and recreate the old overload bug.
             if not node['enabled'] or active >= 1:
                 return None
-            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries,j.device_capacity FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
+            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
             if not unit:
                 return None
             # A manually retried package must not inherit rows accepted under
@@ -1538,8 +1499,6 @@ class Controller:
                 config = self.proxy_for_node(node)
                 settings = self.settings()
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
-                               device_use_limit=max(0, int(settings.get('device_use_limit') or 0)),
-                               otp_reuse=int(settings.get('device_header_reuse') or 15),
                                proxy_pool_size=int(settings.get('proxy_pool_size') or 1000),
                                origin=settings.get('origin', 'https://new.ani.sidestore.io'),
                                _proxy_debug=bool(settings.get('proxy_debug')),
@@ -1801,12 +1760,7 @@ class Controller:
             label = labels.get((node_id, slot), '')
         node_text = f'节点{number:02d}' if number else '节点—'
         device_text = label[:32] if label else (f'#{slot}' if slot else '—')
-        try:
-            usage = max(0, int(record.get('device_usage') or 0))
-        except (TypeError, ValueError):
-            usage = 0
-        usage_text = f' · 第 {usage} 次' if usage else ''
-        record['device_display'] = f'{node_text} · {device_text}{usage_text}'
+        record['device_display'] = f'{node_text} · {device_text}'
         method_labels = {
             'verification_code': '手机或 App 验证码',
             'security_repair': '密保或安全修复',
@@ -1944,64 +1898,10 @@ class Controller:
                         result.append(record)
         return {'rows': result, 'total': total, 'offset': offset}
 
-    def _search_rows_uncached(self, db, job_id, offset, limit, category, wanted,
-                              device_context, search):
-        """Search confirmed accounts across completed shards and current live rows."""
-        needle = str(search or '').strip().casefold()
-        rows, total = [], 0
-        units = db.execute(
-            "SELECT id,status,result_path,node_id FROM units WHERE job_id=? "
-            "AND status IN ('leased','running','completed') ORDER BY seq", (job_id,))
-        for unit in units:
-            if unit['status'] == 'completed':
-                path = unit['result_path']
-                if not path or not Path(path).exists():
-                    continue
-                try:
-                    stream = Path(path).open('r', encoding='utf-8')
-                except OSError:
-                    continue
-                with stream:
-                    payloads = stream
-                    for payload in payloads:
-                        try:
-                            record = json.loads(payload)
-                        except (TypeError, ValueError):
-                            continue
-                        record['status'] = result_record_bucket(record)
-                        if category != 'all' and record['status'] not in wanted:
-                            continue
-                        if needle not in str(record.get('account') or '').casefold():
-                            continue
-                        total += 1
-                        if total <= offset or len(rows) >= limit:
-                            continue
-                        self._decorate_result_device(record, unit, device_context)
-                        rows.append(record)
-            else:
-                for live in db.execute(
-                        'SELECT payload FROM live_result_rows WHERE unit_id=? ORDER BY row',
-                        (unit['id'],)):
-                    try:
-                        record = json.loads(live['payload'])
-                    except (TypeError, ValueError):
-                        continue
-                    record['status'] = result_record_bucket(record)
-                    if category != 'all' and record['status'] not in wanted:
-                        continue
-                    if needle not in str(record.get('account') or '').casefold():
-                        continue
-                    total += 1
-                    if total <= offset or len(rows) >= limit:
-                        continue
-                    self._decorate_result_device(record, unit, device_context)
-                    rows.append(record)
-        return {'rows': rows, 'total': total, 'offset': offset, 'search': search}
-
-    def _read_rows_uncached(self, job_id, offset=0, limit=100, category='all', search=''):
+    def _read_rows_uncached(self, job_id, offset=0, limit=100, category='all'):
         """按行号窗口读取结果，供页面表格分页。
 
-        全部结果按已确认分片的累计条数定位页面；分类结果利用每片
+        全部结果按 first_row 直接定位覆盖页面的分片；分类结果利用每片
         result_counts 跳过不需要的整片。100,000,000 条任务的高位页不再从第 1 条扫描。
         """
         limit = max(1, min(int(limit), 500))
@@ -2020,24 +1920,17 @@ class Controller:
                 (job_id, job_id)).fetchone()
             if not job:
                 raise ValueError('任务不存在')
-            if search:
-                return self._search_rows_uncached(
-                    db, job_id, offset, limit, category, wanted, device_context, search)
             if db.execute('SELECT 1 FROM live_result_rows WHERE job_id=? LIMIT 1',
                           (job_id,)).fetchone():
                 return self._read_rows_with_live(db, job_id, offset, limit, category,
                                                  device_context)
             if category == 'all':
-                # Offset indexes the confirmed set, not the original input rows:
-                # packages may finish out of order.  Window only shard metadata,
-                # so even high pages open no preceding result files.  Missing
-                # files retain their confirmed slots rather than changing total.
+                # offset 是全局零基行号，利用分片的连续行号范围直接定位。
+                first, last = offset + 1, offset + limit
                 units = list(db.execute(
-                    "SELECT * FROM (SELECT seq,first_row,rows,result_path,result_counts,node_id,"
-                    "SUM(rows) OVER (ORDER BY seq)-rows AS result_offset FROM units "
-                    "WHERE job_id=? AND status='completed') "
-                    "WHERE result_offset<? AND result_offset+rows>? ORDER BY seq",
-                    (job_id, offset + limit, offset)))
+                    "SELECT seq,first_row,rows,result_path,result_counts,node_id FROM units "
+                    "WHERE job_id=? AND status='completed' AND first_row<=? "
+                    "AND first_row+rows>? ORDER BY seq", (job_id, last, first)))
             else:
                 # 分类偏移不能由全局行号推导，但可用分片计数跳过整个结果文件。
                 units = list(db.execute(
@@ -2063,8 +1956,6 @@ class Controller:
 
                 path = unit['result_path']
                 if not path or not Path(path).exists():
-                    if category == 'all':
-                        raise FileNotFoundError(f'已确认结果文件缺失：{path or unit["seq"]}')
                     continue
                 try:
                     with Path(path).open('r', encoding='utf-8') as stream:
@@ -2082,9 +1973,9 @@ class Controller:
                             if category != 'all' and record['status'] not in wanted:
                                 continue
                             if category == 'all':
-                                absolute = unit['result_offset'] + local_index
+                                absolute = unit['first_row'] + local_index
                                 local_index += 1
-                                if absolute < offset:
+                                if absolute <= offset:
                                     continue
                             elif counts is None:
                                 total += 1
@@ -2097,8 +1988,6 @@ class Controller:
                                     and (category == 'all' or counts is not None)):
                                 break
                 except OSError:
-                    if category == 'all':
-                        raise
                     continue
             if category != 'all':
                 # Older shards may carry counts produced by an earlier rule set.
@@ -2113,11 +2002,10 @@ class Controller:
         return {'rows': [dict(row) for row in page['rows']],
                 'total': page['total'], 'offset': page['offset']}
 
-    def read_rows(self, job_id, offset=0, limit=100, category='all', search=''):
+    def read_rows(self, job_id, offset=0, limit=100, category='all'):
         """Read a page once and reuse it while a paused/completed job is stable."""
         limit = max(1, min(int(limit), 500))
         offset = max(0, int(offset))
-        search = str(search or '').strip()[:256]
         with self.result_query_lock:
             with self.db.connect() as db:
                 job = db.execute('SELECT status,updated FROM jobs WHERE id=?',
@@ -2127,14 +2015,14 @@ class Controller:
             if not job:
                 raise ValueError('任务不存在')
             stable = job['status'] in ('paused', 'completed')
-            key = (job_id, offset, limit, category, search, float(job['updated']),
+            key = (job_id, offset, limit, category, float(job['updated']),
                    str(debug_row['value']) if debug_row else '0')
             if stable and key in self.result_page_cache:
                 page = self.result_page_cache.pop(key)
                 self.result_page_cache[key] = page
                 return self._copy_result_page(page)
 
-            page = self._read_rows_uncached(job_id, offset, limit, category, search)
+            page = self._read_rows_uncached(job_id, offset, limit, category)
             if stable:
                 self.result_page_cache[key] = self._copy_result_page(page)
                 while len(self.result_page_cache) > 32:
@@ -2152,13 +2040,6 @@ class Controller:
             active = db.execute("SELECT COUNT(*) FROM units WHERE job_id=? "
                                 "AND status IN ('leased','running','unknown')",
                                 (job_id,)).fetchone()[0]
-            # Accepted results live directly under results/, not results/job_id.
-            # Capture their references before deleting units; retain any file
-            # which is still referenced by a different job.
-            result_paths = [row['result_path'] for row in db.execute(
-                "SELECT result_path FROM units WHERE job_id=? AND result_path IS NOT NULL "
-                "EXCEPT SELECT result_path FROM units WHERE job_id!=? "
-                "AND result_path IS NOT NULL", (job_id, job_id))]
             db.execute('DELETE FROM live_result_rows WHERE job_id=?', (job_id,))
             db.execute('DELETE FROM units WHERE job_id=?', (job_id,))
             db.execute('DELETE FROM jobs WHERE id=?', (job_id,))
@@ -2169,43 +2050,11 @@ class Controller:
                                    (job['source'],)).fetchone()[0]
         shutil.rmtree(self.units_dir / job_id, ignore_errors=True)
         shutil.rmtree(self.results / job_id, ignore_errors=True)
-        for value in result_paths:
-            path = Path(value)
-            try:
-                resolved = path.resolve()
-            except (OSError, RuntimeError, ValueError):
-                continue
-            # Resolve traversal and symlinks before touching stored paths, and
-            # never unlink the results directory itself or unrelated sources.
-            if self.results in resolved.parents and not resolved.is_dir():
-                path.unlink(missing_ok=True)
         source = Path(job['source']) if job['source'] else None
         if source and remaining == 0 and source.exists() and source.parent == self.inputs:
             source.unlink(missing_ok=True)
         return {'deleted': job_id, 'source_kept': bool(remaining),
                 'cancelled_units': int(active)}
-
-    def delete_jobs(self, job_ids):
-        """批量删除任务；文件准备中的任务跳过，其余逐个删除并汇总结果。"""
-        if not isinstance(job_ids, list) or not job_ids:
-            raise ValueError('请选择要删除的任务')
-        if len(job_ids) > 200:
-            raise ValueError('一次最多删除 200 个任务')
-        unique = list(dict.fromkeys(str(value) for value in job_ids if value))
-        deleted, skipped, errors = [], [], {}
-        cancelled = 0
-        for job_id in unique:
-            try:
-                result = self.delete_job(job_id)
-                deleted.append(job_id)
-                cancelled += int(result.get('cancelled_units') or 0)
-            except Conflict as exc:
-                skipped.append(job_id)
-                errors[job_id] = str(exc)
-            except ValueError as exc:
-                errors[job_id] = str(exc)
-        return {'deleted': len(deleted), 'skipped': skipped,
-                'cancelled_units': cancelled, 'errors': errors}
 
     def export_results(self, job_id, category='all'):
         """按分类流式导出，内容保持上传时的原始记录（`账号----密码`）。

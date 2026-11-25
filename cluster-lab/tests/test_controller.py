@@ -30,17 +30,6 @@ class ControllerTests(unittest.TestCase):
     def test_default_lease_allows_cpu_bound_heartbeat_jitter(self):
         self.assertEqual(self.service.lease_seconds, 120)
 
-    def test_heartbeat_preserves_unchanged_device_rows_when_node_omits_them(self):
-        slot = {'slot': 1, 'state': 'ready', 'label': 'B64:test', 'used': 3,
-                'recorded': True}
-        self.heartbeat(devices={'running': False, 'capacity': 1, 'ready': 1,
-                                'built': 0, 'failed': 0, 'attempted': 1,
-                                'slots': [slot]})
-        self.heartbeat(devices={'running': False, 'capacity': 1, 'ready': 1,
-                                'built': 0, 'failed': 0, 'attempted': 1})
-        saved = self.service.snapshot()['nodes'][0]['telemetry']['device_pool']
-        self.assertEqual(saved['slots'][0]['label'], 'B64:test')
-
     def test_saving_concurrency_without_enabled_preserves_accepting_state(self):
         self.service.configure_node(self.node['id'], {'processes': 4, 'threads': 250})
         saved = next(value for value in self.service.snapshot()['nodes']
@@ -48,7 +37,7 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(saved['enabled'])
         self.assertEqual((saved['desired_processes'], saved['desired_threads']), (4, 250))
 
-    def test_new_node_can_start_while_default_devices_register_on_demand(self):
+    def test_new_node_defaults_to_thirty_device_registrations(self):
         node = self.service.add_node('auto-devices', 4, 250)
         with self.service.db.connect() as db:
             saved = db.execute('SELECT device_request,enabled FROM nodes WHERE id=?',
@@ -60,9 +49,9 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(saved['enabled'])
         self.assertEqual(response['device_request'], 30)
         self.assertFalse(response['enabled'])
-        self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
-                                                  'enabled': True})
-        self.assertTrue(self.service.snapshot()['nodes'][-1]['enabled'])
+        with self.assertRaisesRegex(Conflict, '设备初始化完成后'):
+            self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
+                                                       'enabled': True})
         self.service.heartbeat(node['id'], {
             'session': 'auto-device-session', 'hostname': 'new-node', 'version': 'test',
             'max_processes': 4, 'max_threads': 500, 'active': [], 'interrupted': [],
@@ -71,18 +60,6 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(self.service.snapshot()['nodes'][-1]['device_initialization_complete'])
         self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
                                                   'enabled': True})
-
-    def test_initial_device_target_follows_controller_node_concurrency(self):
-        node = self.service.add_node('large-device-pool', 4, 250)
-        self.service.heartbeat(node['id'], {
-            'session': 'large-device-session', 'hostname': 'large', 'version': 'test',
-            'max_processes': 4, 'max_threads': 500, 'active': [], 'interrupted': []})
-        self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
-                                                  'enabled': False})
-        self.assertEqual(self.service.request_devices(node['id'], 1000),
-                         {'requested': 1000})
-        with self.assertRaisesRegex(ValueError, '0–1000'):
-            self.service.request_devices(node['id'], 1001)
 
     def test_rolling_update_drains_limits_parallelism_and_resumes_after_health(self):
         other = self.service.add_node('second-update-node', 2, 4)
@@ -123,41 +100,25 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '合法'):
             self.service.request_updates([self.node['id']], '../main', 1)
 
-    def test_rolling_update_does_not_wait_for_nonexecuting_unknown_unit(self):
-        job = self.job(50)
-        self.service.job_action(job, 'start')
-        unit = self.service.lease(self.node['id'], 'test-session')
-        with self.service.db.transaction() as db:
-            db.execute("UPDATE units SET status='unknown' WHERE id=?", (unit['id'],))
-
-        self.service.request_updates([self.node['id']], 'main', 1)
-
-        node = next(value for value in self.service.snapshot()['nodes']
-                    if value['id'] == self.node['id'])
-        self.assertEqual('dispatched', node['update_state'])
-
-    def test_device_use_limit_migrates_legacy_rotation_threshold(self):
-        self.service.close()
-        database = Path(self.temp.name) / 'controller.sqlite3'
-        with sqlite3.connect(database) as db:
-            db.execute("DELETE FROM controller_settings WHERE key='device_use_limit'")
-            db.execute("INSERT OR REPLACE INTO controller_settings(key,value) "
-                       "VALUES('device_rotate_after','100000')")
-        self.service = Controller(self.temp.name)
-        self.assertEqual(self.service.settings()['device_use_limit'], 100000)
-
-    def test_device_use_limit_persists(self):
-        result = self.service.configure_device_use_limit({'device_use_limit': 37})
-        self.assertEqual(result['device_use_limit'], 37)
+    def test_rotation_partial_updates_preserve_switch_and_restart(self):
+        self.service.configure_rotation({'device_rotate_after': 20, 'device_auto_rotate': True})
+        result = self.service.configure_rotation({'device_rotate_after': 37})
+        self.assertTrue(result['device_auto_rotate'])
         self.service.close()
         self.service = Controller(self.temp.name)
-        self.assertEqual(self.service.settings()['device_use_limit'], 37)
+        self.assertTrue(self.service.settings()['device_auto_rotate'])
+        self.assertEqual(self.service.settings()['device_rotate_after'], 37)
+        for enabled in (False, True):
+            result = self.service.configure_rotation({'device_auto_rotate': enabled})
+            self.assertIs(result['device_auto_rotate'], enabled)
+            self.assertEqual(result['device_rotate_after'], 37)
 
-    def test_device_use_limit_zero_means_long_term_reuse(self):
-        self.service.configure_device_use_limit({'device_use_limit': 20})
-        result = self.service.configure_device_use_limit({'device_use_limit': 0})
-        self.assertEqual(result['device_use_limit'], 0)
-        self.assertEqual(self.service.settings()['device_use_limit'], 0)
+    def test_rotation_rejects_string_switch_without_changing_saved_state(self):
+        self.service.configure_rotation({'device_rotate_after': 20, 'device_auto_rotate': True})
+        with self.assertRaisesRegex(ValueError, '布尔'):
+            self.service.configure_rotation({'device_auto_rotate': 'false'})
+        self.assertTrue(self.service.settings()['device_auto_rotate'])
+        self.assertEqual(self.service.settings()['device_rotate_after'], 20)
 
     def test_proxy_debug_switch_defaults_off_persists_and_rejects_non_boolean(self):
         self.assertFalse(self.service.settings()['proxy_debug'])
@@ -317,10 +278,8 @@ class ControllerTests(unittest.TestCase):
             'https://proxy.example/one?password=***&num=200',
             'https://proxy.example/two?token=***&num=200'])
         settings = self.service.configure_proxy({
-            'action': 'resize', 'proxy_pool_size': 10000,
-            'device_header_reuse': 23})
+            'action': 'resize', 'proxy_pool_size': 10000})
         self.assertEqual(settings['proxy_pool_size'], 10000)
-        self.assertEqual(settings['device_header_reuse'], 23)
 
         other = self.service.add_node('second-node', 2, 4)
         self.service.heartbeat(other['id'], dict(session='second-session', max_processes=1,
@@ -338,7 +297,6 @@ class ControllerTests(unittest.TestCase):
         unit = self.service.lease(self.node['id'], 'test-session')
         self.assertEqual(unit['proxy_api'], first)
         self.assertEqual(unit['proxy_pool_size'], 10000)
-        self.assertEqual(unit['otp_reuse'], 23)
         self.assertIs(unit['_proxy_debug'], False)
         self.assertIs(unit['_web_secondary_auth'], True)
         self.assertNotIn(second, unit['proxy_api'])
@@ -536,25 +494,6 @@ class ControllerTests(unittest.TestCase):
             self.assertIsNone(db.execute('SELECT live_counts FROM units WHERE id=?',
                                          (unit['id'],)).fetchone()[0])
 
-    def test_inconsistent_live_counts_do_not_suppress_node_heartbeat(self):
-        job = self.job(50)
-        self.service.job_action(job, 'start')
-        unit = self.service.lease(self.node['id'], 'test-session')
-        before = self.service.snapshot()['nodes'][0]['last_seen']
-
-        response = self.service.heartbeat(self.node['id'], {
-            'session': 'test-session', 'version': 'old-thread-worker',
-            'max_processes': 1, 'max_threads': 2, 'interrupted': [],
-            'active': [{'id': unit['id'], 'token': unit['token'],
-                        'processed': 1, 'counts': {'wrong_password': 3}}]})
-
-        self.assertEqual([], response['rejected'])
-        state = next(value for value in self.service.snapshot()['jobs']
-                     if value['id'] == job)
-        self.assertEqual(1, state['processed'])
-        self.assertEqual(0, state['categorized']['wrong_password'])
-        self.assertGreaterEqual(self.service.snapshot()['nodes'][0]['last_seen'], before)
-
     def test_node_heartbeat_streams_rows_idempotently_and_completes_package(self):
         job = self.job(50)
         self.service.job_action(job, 'start')
@@ -611,7 +550,7 @@ class ControllerTests(unittest.TestCase):
         unit = self.service.lease(self.node['id'], 'test-session')
         payload = b''.join((json.dumps({
             'row': unit['first_row'] + offset, 'account': f'user{offset}@example.com',
-            'status': 'valid', 'device': 1, 'device_usage': offset + 17,
+            'status': 'valid', 'device': 1,
             'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
             separators=(',', ':')) + '\n').encode() for offset in range(50))
         with self.service.db.transaction() as db:
@@ -622,11 +561,7 @@ class ControllerTests(unittest.TestCase):
         self.service.accept_result(self.node['id'], unit['id'], unit['token'],
                                    io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
         row = self.service.read_rows(job, 0, 1, 'all')['rows'][0]
-        self.assertEqual(row['device_display'], '节点01 · B64:ZGV2aWNl · 第 17 次')
-
-        found = self.service.read_rows(job, 0, 100, 'all', 'USER49@EXAMPLE')
-        self.assertEqual((found['total'], found['rows'][0]['account']),
-                         (1, 'user49@example.com'))
+        self.assertEqual(row['device_display'], '节点01 · B64:ZGV2aWNl')
 
     def test_paused_export_includes_heartbeat_confirmed_partial_rows(self):
         job = self.job(50)
@@ -1035,16 +970,6 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.service.accept_result(self.node['id'], unit['id'], unit['token'], io.BytesIO(payload), checksum)
 
-    def test_batch_delete_removes_selected_jobs_and_deduplicates_ids(self):
-        first, second = self.queued_job(50, 50), self.queued_job(50, 50)
-        result = self.service.delete_jobs([first, second, first])
-        self.assertEqual(result['deleted'], 2)
-        self.assertEqual(result['skipped'], [])
-        self.assertEqual(result['errors'], {})
-        remaining = {job['id'] for job in self.service.snapshot()['jobs']}
-        self.assertNotIn(first, remaining)
-        self.assertNotIn(second, remaining)
-
     def test_delete_running_job_revokes_node_work_and_advances_queue(self):
         first, second = self.queued_job(100, 50), self.queued_job(50, 50)
         unit = self.service.lease(self.node['id'], 'test-session')
@@ -1066,7 +991,7 @@ class ControllerTests(unittest.TestCase):
                                        io.BytesIO(payload), checksum)
 
     def test_clear_device_pool_is_persistent_and_requires_an_idle_node(self):
-        self.service.request_devices(self.node['id'], 2)
+        self.service.request_devices(self.node['id'], 30)
         requested = self.service.clear_devices(self.node['id'])
         self.assertEqual(requested, {'requested': True, 'version': 1})
         response = self.service.heartbeat(self.node['id'], {

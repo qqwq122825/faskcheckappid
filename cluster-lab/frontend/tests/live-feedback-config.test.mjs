@@ -24,14 +24,13 @@ test('Task creation exposes retries and node settings allow up to 4 x 500', () =
   assert.doesNotMatch(nodes, /active-text="允许领取新工作包"/)
 })
 
-test('Paused nodes can start while missing devices register on demand', () => {
+test('New nodes stay paused until all default devices are initialized', () => {
   const nodes = source('src/views/Nodes.vue')
   const dialogs = source('src/components/NodeDialogs.vue')
-  assert.doesNotMatch(nodes, /:disabled="[^"]*device_initialization_complete/)
-  assert.match(nodes, /缺失设备由工作线程按需注册/)
+  assert.match(nodes, /!node\.enabled && !node\.device_initialization_complete/)
+  assert.match(nodes, /设备初始化 \{\{ node\.device_ready \|\| 0 \}\}\/\{\{ node\.device_request \|\| 30 \}\}/)
   assert.match(nodes, /开始接单/)
-  assert.match(dialogs, /也可立即开始接单/)
-  assert.match(dialogs, /缺失设备由工作线程按需注册/)
+  assert.match(dialogs, /新节点先暂停接单并自动初始化 30 台设备/)
   assert.doesNotMatch(dialogs, /允许领取新工作包/)
 })
 
@@ -52,9 +51,6 @@ test('Device rows use short Base64 labels instead of reusable slot numbers', () 
   assert.match(drawer, /label: item\.label \|\| `#\$\{item\.slot\}`/)
   assert.match(drawer, /prop="label" label="设备标识"/)
   assert.match(results, /prop="device_display" label="设备"/)
-  assert.match(results, /v-model="accountSearch"/)
-  assert.match(results, /placeholder="搜索账号"/)
-  assert.match(results, /search=\$\{search\}/)
   assert.doesNotMatch(results, /label="二次验证方式"/)
   assert.doesNotMatch(results, /prop="device" label="设备"/)
 })
@@ -81,11 +77,6 @@ test('Proxy settings add, list, delete, and explain node distribution', () => {
   assert.match(settings, /action: 'delete'/)
   assert.match(settings, /action: 'resize'/)
   assert.match(settings, /proxy_pool_size/)
-  assert.match(settings, /device_header_reuse/)
-  assert.match(settings, /设备公共头使用次数/)
-  assert.match(settings, /默认 15/)
-  assert.match(settings, /线程累计使用满该次数后自行获取新公共头/)
-  assert.match(settings, /只更新公共头，不退役设备身份/)
   assert.match(settings, /每个节点只维护自己的代理池/)
   assert.match(settings, /单次最多从该节点的 API 提取 1,000 条/)
   assert.match(settings, /代理明细不会每秒传回总控/)
@@ -217,11 +208,6 @@ test('Device pool has a guarded one-click clear action', () => {
   assert.match(drawer, /所有设备身份、注册记录和使用计数都会删除/)
   assert.match(drawer, /Boolean\(node\?\.active\)/)
   assert.match(drawer, /pool\.capacity \?\? capacity/)
-  assert.match(drawer, /pool\.value\.registering/)
-  assert.match(drawer, /pool\.value\.in_use/)
-  assert.match(drawer, />\u6ce8\u518c\u4e2d</)
-  assert.match(drawer, />\u4f7f\u7528\u4e2d</)
-  assert.match(drawer, />\u5f85\u6ce8\u518c</)
 })
 
 test('GSA result categories expose invalid and locked business states', () => {
@@ -256,20 +242,16 @@ test('Result list keeps one result-code column without web recheck fields', () =
 })
 
 
-test('Device use limit accepts zero for long-term reuse through 100000', () => {
-  const settings = source('src/views/Settings.vue')
-  assert.match(settings, /v-model="deviceUseLimit"[^>]*:min="0"[^>]*:max="100000"[^>]*:step="1"/)
-  assert.doesNotMatch(settings, /v-model="deviceUseLimit"[^>]*:step="10"/)
-})
-
-test('Device pool exposes only explicit initialization without background refill controls', () => {
+test('Device refill switch reopens from persisted settings and publishes save immediately', () => {
   const drawer = source('src/components/DevicePoolDrawer.vue')
-  const settings = source('src/views/Settings.vue')
-  assert.doesNotMatch(drawer, /device_auto_rotate|settings\/rotation|自动补充|先增后换/)
-  assert.match(drawer, /点击“开始初始化设备池”才会注册设备/)
-  assert.match(drawer, /缺失设备由工作线程按需注册/)
-  assert.match(settings, /settings\/device-use-limit/)
-  assert.match(settings, /0 表示长期复用/)
+  assert.match(drawer, /const settings = state\.value\?\.settings/)
+  assert.match(drawer, /Boolean\(settings\.device_auto_rotate/)
+  assert.doesNotMatch(drawer, /telemetry\?\.device_auto_rotate/)
+  assert.match(drawer, /const saved = await api\('\/api\/settings\/rotation'/)
+  assert.match(drawer, /state\.value\.settings =/)
+  assert.match(drawer, /:disabled="building \|\| savingAuto"/)
+  assert.match(drawer, /先注册一台替换设备/)
+  assert.match(drawer, /新设备成功后才移除出生日期最早且空闲的旧设备/)
 })
 
 test('Task detail shows one node-reported traffic card with the 1 GB estimate', () => {

@@ -1,5 +1,4 @@
 import atexit
-from collections import Counter
 import hashlib
 import json
 import multiprocessing as mp
@@ -87,14 +86,9 @@ class Node:
         self.update_generation = control.get('update_generation', 0)
         self.update_status_path = self.root / 'update-status.json'
         self.telemetry = HostTelemetry()
-        # Device rows can be hundreds of entries.  Keep the summary in every
-        # heartbeat, but transmit the table only when it actually changes.
-        self._last_device_slots_signature = None
         self.proxy_api, self.proxy_scheme = '', 'socks5h'
         self.proxy_ttl = 50
         self.proxy_pool_size = 1000
-        self.device_use_limit = 0
-        self.device_header_reuse = 15
         self.origin = 'https://new.ani.sidestore.io'
         from .device_build import DeviceBuilder
         self.builder = DeviceBuilder(self)
@@ -338,21 +332,10 @@ class Node:
         except Exception:                                          # noqa: BLE001
             snapshot = dict(self.builder.state)
             snapshot['slots'] = []
-        result = {key: snapshot.get(key) for key in
-                  ('running', 'capacity', 'ready', 'built', 'failed',
-                   'current', 'attempted', 'registering', 'in_use',
-                   'pending', 'failed_slots', 'proxy_status', 'proxy_ip',
-                   'message')}
-        slots = snapshot.get('slots') if isinstance(snapshot.get('slots'), list) else []
-        signature = tuple(
-            (item.get('slot'), item.get('state'), item.get('label'),
-             item.get('error'), item.get('model'), item.get('proxy'),
-             item.get('at'), item.get('used'), bool(item.get('recorded')))
-            for item in slots if isinstance(item, dict))
-        if signature != self._last_device_slots_signature:
-            result['slots'] = slots
-            self._last_device_slots_signature = signature
-        return result
+        return {key: snapshot.get(key) for key in
+                ('running', 'capacity', 'ready', 'built', 'failed',
+                 'current', 'attempted', 'proxy_status', 'proxy_ip',
+                 'message', 'slots')}
 
     def _live_result_paths(self, unit_id):
         """Return worker outputs, never the later merged duplicate file."""
@@ -500,16 +483,6 @@ class Node:
                     value.get('proxy_pool_size') or 1000)))
             except (TypeError, ValueError):
                 self.proxy_pool_size = 1000
-            try:
-                self.device_use_limit = max(
-                    0, min(100000, int(value.get('device_use_limit') or 0)))
-            except (TypeError, ValueError):
-                self.device_use_limit = 0
-            try:
-                self.device_header_reuse = max(
-                    1, min(1000, int(value.get('device_header_reuse') or 15)))
-            except (TypeError, ValueError):
-                self.device_header_reuse = 15
             clear_version = int(value.get('device_clear_version') or 0)
             if clear_version > self.device_clear_version:
                 self.builder.cancel()
@@ -529,7 +502,35 @@ class Node:
                 except (RuntimeError, ValueError) as exc:
                     # 不能静默吞：面板上看不到原因会以为节点没响应
                     self.builder._update(message=str(exc))
-            for unit_id in value.get('rejected', []):
+            # 自动补充：先补缺口；满池轮换时先在隔离目录注册新设备，
+            # 成功后才替换一台最老且未被任务占用的旧设备。
+            auto = bool(value.get('device_auto_rotate'))
+            limit = int(value.get('device_rotate_after') or 0)
+            if auto and not self.builder.state['running']:
+                snapshot = self.builder.snapshot()
+                capacity = int(snapshot.get('capacity') or self.builder.state['capacity'] or 0)
+                if capacity:
+                    try:
+                        if int(snapshot.get('ready') or 0) < capacity:
+                            # 先补既有缺口，不再额外淘汰。
+                            self.builder.start(capacity)
+                        elif limit:
+                            reserved = self.builder.reserved_slots()
+                            stale = self.builder.retirable(limit, exclude=reserved)
+                            if stale:
+                                candidates = [int(item['slot'])
+                                              for item in snapshot.get('slots') or []
+                                              if item.get('state') == 'ready'
+                                              and int(item['slot']) not in reserved]
+                                if not candidates:
+                                    candidates = [slot for slot in range(1, capacity + 1)
+                                                  if slot not in reserved]
+                                oldest = self.builder.oldest(1, candidates=candidates)
+                                if oldest:
+                                    self.builder.rotate(capacity, oldest[0])
+                    except (RuntimeError, ValueError):
+                        pass
+            for unit_id in value['rejected']:
                 if unit_id in self.active:
                     self.active[unit_id][1].set()
                 with self.db.transaction() as db:
@@ -588,7 +589,6 @@ class Node:
             descriptor.setdefault('retries', 0)
             descriptor.setdefault('proxy_ttl', self.proxy_ttl)
             descriptor.setdefault('proxy_pool_size', self.proxy_pool_size)
-            descriptor.setdefault('otp_reuse', self.device_header_reuse)
             self._prepare_auth_devices(descriptor)
         atomic_json(directory / 'manifest.json', descriptor)
         stop = self.context.Event()
@@ -604,27 +604,20 @@ class Node:
         return True
 
     def _prepare_auth_devices(self, descriptor):
-        """保留“进程 × 每进程线程”架构，并为各进程准备互斥设备槽位。
-
-        例如 2 进程 × 10 线程保持为 2×10，由协调器把 20 个槽位均分给
-        两个进程。每个进程内部的线程从本进程共享设备池借用设备；无可用
-        已注册设备时由线程自行注册，批次结束后归还。
-        """
-        rows = max(1, int(descriptor.get('rows') or 1))
-        processes = max(1, min(int(descriptor.get('processes') or 1), rows))
-        threads = max(1, int(descriptor.get('threads') or 1))
-        total_threads = min(rows, processes * threads)
+        """Use exactly the ready devices owned by this node; tasks do not resize the pool."""
+        snapshot = self.builder.snapshot()
+        slots = [int(item['slot']) for item in snapshot.get('slots') or []
+                 if item.get('state') == 'ready']
+        if not slots:
+            raise RuntimeError('节点没有已就绪设备，请先初始化设备池')
+        processes = max(1, min(int(descriptor.get('processes') or 1),
+                               int(descriptor.get('rows') or 1), len(slots)))
+        capacity = max(slots)
         descriptor.pop('device_capacity', None)
         descriptor['processes'] = processes
-        descriptor['threads'] = threads
-        descriptor['device_pool_capacity'] = total_threads
-        descriptor['device_slots'] = list(range(1, total_threads + 1))
-        descriptor['device_use_limit'] = max(
-            0, int(descriptor.get('device_use_limit') or 0))
-        descriptor['otp_reuse'] = max(
-            1, min(1000, int(descriptor.get('otp_reuse') or self.device_header_reuse)))
-        self.device_use_limit = descriptor['device_use_limit']
-        self.builder.reserve(descriptor['device_slots'])
+        descriptor['device_pool_capacity'] = capacity
+        descriptor['device_slots'] = slots
+        self.builder.reserve(slots)
 
     def start(self):
         self.thread = threading.Thread(target=self.loop, daemon=True, name='node-agent')
@@ -639,12 +632,6 @@ class Node:
         self.upload_thread.start()
         atexit.register(self.close)
 
-    def _heartbeat_delay(self):
-        with self.lock:
-            busy = bool(self.active)
-        building = bool(self.builder.state.get('running'))
-        return self.interval if busy or building else max(self.interval, 3.0)
-
     def _heartbeat_loop(self):
         while not self.stop.is_set():
             with self.lock:
@@ -657,11 +644,7 @@ class Node:
                     with self.lock:
                         self.connected = False
                         self.error = message[:240]
-            # Active work keeps one-second live progress.  An idle node has no
-            # rows or leases to report, so three seconds is enough to remain
-            # comfortably inside the controller's 12-second offline window
-            # while cutting fleet-wide idle heartbeat traffic by two thirds.
-            self.stop.wait(self._heartbeat_delay())
+            self.stop.wait(self.interval)
 
     def _upload_loop(self):
         while not self.stop.is_set():
@@ -739,325 +722,3 @@ class Node:
                 'max_threads': self.max_threads, 'active_processes': active_processes,
                 'confirmed': confirmed, 'outbox': outbox, 'processed': processed, 'telemetry': dict(self.telemetry.latest),
                 'hostname': socket.gethostname(), 'server_time': time.time()}
-
-    @staticmethod
-    def _diagnostic_counts(value):
-        if not isinstance(value, dict):
-            return {}
-        output = {}
-        for key, count in value.items():
-            if len(output) >= 40:
-                break
-            try:
-                output[str(key)[:60]] = int(count)
-            except (TypeError, ValueError):
-                continue
-        return output
-
-    @classmethod
-    def _diagnostic_stage_metrics(cls, value):
-        """Keep only bounded numeric stage aggregates from worker progress."""
-        if not isinstance(value, dict):
-            return None
-        output = {'enabled': bool(value.get('enabled'))}
-        for key in ('retry_waiting', 'elapsed_ms', 'process_cpu_ms',
-                    'process_core_equivalents'):
-            if value.get(key) is None:
-                continue
-            try:
-                number = float(value[key])
-                output[key] = int(number) if key == 'retry_waiting' else round(number, 3)
-            except (TypeError, ValueError):
-                pass
-        output['errors'] = cls._diagnostic_counts(value.get('errors'))
-        stages = {}
-        raw_stages = value.get('stages')
-        if isinstance(raw_stages, dict):
-            for raw_name, raw_stage in list(raw_stages.items())[:80]:
-                if not isinstance(raw_stage, dict):
-                    continue
-                stage = {}
-                for key in ('active', 'completed', 'window_samples'):
-                    try:
-                        stage[key] = max(0, int(raw_stage.get(key) or 0))
-                    except (TypeError, ValueError):
-                        pass
-                for key in ('average_ms', 'p50_ms', 'p95_ms', 'p99_ms',
-                            'maximum_ms', 'wall_total_ms', 'thread_cpu_total_ms'):
-                    try:
-                        stage[key] = round(max(0.0, float(raw_stage.get(key) or 0)), 3)
-                    except (TypeError, ValueError):
-                        pass
-                stages[str(raw_name)[:60]] = stage
-        output['stages'] = stages
-        return output
-
-    @staticmethod
-    def _diagnostic_stage_summary(values):
-        """Merge process snapshots without claiming unobservable global percentiles."""
-        metrics = [value for value in values
-                   if isinstance(value, dict) and value.get('enabled')]
-        if not metrics:
-            return {'enabled': False, 'processes': 0, 'stages': {}, 'errors': {}}
-        stages, errors = {}, {}
-        process_cpu_ms = 0.0
-        for value in metrics:
-            process_cpu_ms += float(value.get('process_cpu_ms') or 0)
-            for key, count in (value.get('errors') or {}).items():
-                errors[key] = errors.get(key, 0) + int(count)
-            for name, stage in (value.get('stages') or {}).items():
-                merged = stages.setdefault(name, {
-                    'active': 0, 'completed': 0, 'wall_total_ms': 0.0,
-                    'thread_cpu_total_ms': 0.0, 'maximum_ms': 0.0,
-                    'p50_ms_max': 0.0, 'p95_ms_max': 0.0, 'p99_ms_max': 0.0})
-                merged['active'] += int(stage.get('active') or 0)
-                merged['completed'] += int(stage.get('completed') or 0)
-                merged['wall_total_ms'] += float(stage.get('wall_total_ms') or 0)
-                merged['thread_cpu_total_ms'] += float(
-                    stage.get('thread_cpu_total_ms') or 0)
-                for source, target in (('maximum_ms', 'maximum_ms'),
-                                       ('p50_ms', 'p50_ms_max'),
-                                       ('p95_ms', 'p95_ms_max'),
-                                       ('p99_ms', 'p99_ms_max')):
-                    merged[target] = max(merged[target], float(stage.get(source) or 0))
-        for stage in stages.values():
-            completed = stage['completed']
-            stage['average_ms'] = round(
-                stage['wall_total_ms'] / completed, 3) if completed else 0.0
-            for key, number in tuple(stage.items()):
-                if isinstance(number, float):
-                    stage[key] = round(number, 3)
-        return {'enabled': True, 'processes': len(metrics),
-                'process_cpu_ms': round(process_cpu_ms, 3),
-                'errors': dict(sorted(errors.items())),
-                'stages': dict(sorted(stages.items()))}
-
-    @classmethod
-    def _diagnostic_state(cls, value):
-        """Return execution counters without credentials, paths or row content."""
-        if not isinstance(value, dict):
-            return None
-        output = {}
-        integer_fields = (
-            'processed', 'workers', 'worker_limit', 'configured_process_limit',
-            'cpu_reserve', 'threads_per_process', 'active_threads_per_process',
-            'active_threads_total', 'queue_low_water', 'queue_target', 'queued',
-            'in_flight')
-        for key in integer_fields:
-            if value.get(key) is not None:
-                try:
-                    output[key] = int(value[key])
-                except (TypeError, ValueError):
-                    pass
-        for key in ('started', 'elapsed'):
-            if value.get(key) is not None:
-                try:
-                    output[key] = round(float(value[key]), 6)
-                except (TypeError, ValueError):
-                    pass
-        if 'ok' in value:
-            output['ok'] = bool(value.get('ok'))
-        if isinstance(value.get('active_threads_by_process'), list):
-            output['active_threads_by_process'] = [
-                max(0, int(item)) for item in value['active_threads_by_process'][:32]]
-        if value.get('counts') is not None:
-            output['counts'] = cls._diagnostic_counts(value.get('counts'))
-        if value.get('stage_metrics') is not None:
-            output['stage_metrics'] = cls._diagnostic_stage_metrics(
-                value.get('stage_metrics'))
-        pool = value.get('proxy_pool')
-        if isinstance(pool, dict):
-            safe_pool = {}
-            for key in ('target', 'known', 'available', 'in_use', 'fresh',
-                        'created', 'reused', 'refreshed', 'discarded',
-                        'failures', 'quarantined', 'waiters'):
-                if pool.get(key) is not None:
-                    try:
-                        safe_pool[key] = int(pool[key])
-                    except (TypeError, ValueError):
-                        pass
-            if safe_pool:
-                output['proxy_pool'] = safe_pool
-        if value.get('error'):
-            # Executor errors are already bounded.  Return only the exception
-            # class so a provider URL or credential can never cross this API.
-            output['error_type'] = str(value['error']).split(':', 1)[0][:80]
-        return output
-
-    @staticmethod
-    def _diagnostic_average(values):
-        if not values:
-            return None
-        return {'samples': len(values), 'average': round(sum(values) / len(values), 3),
-                'maximum': round(max(values), 3), 'total': round(sum(values), 3)}
-
-    @classmethod
-    def _diagnostic_debug(cls, path, recent_limit):
-        """Read a bounded JSONL tail and expose only an explicit safe schema."""
-        if not path.is_file():
-            return {'available': False, 'events': {}, 'recent': [],
-                    'srp': {'samples': 0, 'states': {}, 'math_backends': {}}}
-        size = path.stat().st_size
-        byte_limit = 2 * 1024 * 1024
-        with path.open('rb') as stream:
-            offset = max(0, size - byte_limit)
-            stream.seek(offset)
-            if offset:
-                stream.readline()
-            raw_lines = stream.readlines()
-        raw_lines = raw_lines[-2000:]
-        events, recent, malformed = Counter(), [], 0
-        srp_states, math_backends = Counter(), Counter()
-        metrics = {key: [] for key in (
-            'compute_cpu_ms', 'compute_wall_ms', 'lane_wait_ms',
-            'request_ms', 'request_thread_cpu_ms')}
-        allowed = (
-            'at', 'event', 'pid', 'thread', 'row', 'slot', 'attempt',
-            'attempt_limit', 'sampled', 'proxy_acquire_ms', 'device_lease_ms',
-            'device_identity_ms', 'request_ms', 'request_thread_cpu_ms',
-            'request_non_cpu_ms', 'process_cpu_ms_during_request',
-            'process_core_equivalents_during_request', 'http', 'apple_ec',
-            'trace_sample_every', 'device_was_ready', 'device_registered',
-            'status', 'stage', 'kind', 'retryable', 'release',
-            'port_changed', 'pair_changed', 'recorded_retries',
-            'configured_retries', 'ok', 'processed', 'counts')
-        for raw in raw_lines:
-            try:
-                item = json.loads(raw)
-                if not isinstance(item, dict):
-                    raise ValueError('not an object')
-            except (UnicodeDecodeError, ValueError, TypeError):
-                malformed += 1
-                continue
-            event = str(item.get('event') or 'unknown')[:80]
-            events[event] += 1
-            backend = item.get('srp_math_backend')
-            if event == 'worker_start' and backend:
-                math_backends[str(backend)[:40]] += 1
-            srp = item.get('srp') if isinstance(item.get('srp'), dict) else None
-            if srp is not None:
-                srp_states[str(srp.get('state') or 'unknown')[:40]] += 1
-                for key in ('compute_cpu_ms', 'compute_wall_ms', 'lane_wait_ms'):
-                    try:
-                        if srp.get(key) is not None:
-                            metrics[key].append(float(srp[key]))
-                    except (TypeError, ValueError):
-                        pass
-            for key in ('request_ms', 'request_thread_cpu_ms'):
-                try:
-                    if item.get(key) is not None:
-                        metrics[key].append(float(item[key]))
-                except (TypeError, ValueError):
-                    pass
-            if recent_limit:
-                safe = {key: item[key] for key in allowed if key in item and
-                        isinstance(item[key], (str, int, float, bool, type(None)))}
-                if isinstance(item.get('counts'), dict):
-                    safe['counts'] = cls._diagnostic_counts(item['counts'])
-                if srp is not None:
-                    safe['srp'] = {key: srp.get(key) for key in
-                                   ('scope', 'state', 'challenge_observed',
-                                    'compute_cpu_ms', 'compute_wall_ms',
-                                    'lane_wait_ms')}
-                recent.append(safe)
-                recent = recent[-recent_limit:]
-        return {
-            'available': True, 'file_bytes': size, 'tail_bytes': min(size, byte_limit),
-            'lines_scanned': len(raw_lines), 'malformed_lines': malformed,
-            'truncated': size > byte_limit or len(raw_lines) >= 2000,
-            'events': dict(sorted(events.items())), 'recent': recent,
-            'srp': {
-                'samples': sum(srp_states.values()),
-                'states': dict(sorted(srp_states.items())),
-                'math_backends': dict(sorted(math_backends.items())),
-                **{key: cls._diagnostic_average(values)
-                   for key, values in metrics.items()},
-            },
-        }
-
-    def task_log(self, payload):
-        """Return a bounded, credential-free diagnostic view of one local task."""
-        if not isinstance(payload, dict):
-            raise ValueError('请求体必须是任务对象')
-        task_object = payload.get('task', payload)
-        if not isinstance(task_object, dict):
-            raise ValueError('task 必须是对象')
-        unit_id = task_object.get('id') or task_object.get('task_id') or task_object.get('unit_id')
-        if (not isinstance(unit_id, str) or not re.fullmatch(r'[0-9a-f]{32}', unit_id)):
-            raise ValueError('任务标识必须是 32 位小写十六进制字符串')
-        try:
-            recent_limit = integer(payload.get('recent', 20), '最近日志条数', 0, 100)
-        except ValueError:
-            raise
-        with self.db.connect() as db:
-            task = db.execute('SELECT * FROM tasks WHERE id=?', (unit_id,)).fetchone()
-        if task is None:
-            raise ValueError('本节点没有这个任务')
-        descriptor = json.loads(task['descriptor'])
-        for key, actual in (('job_id', task['job_id']), ('seq', task['seq'])):
-            if task_object.get(key) is not None and str(task_object[key]) != str(actual):
-                raise ValueError(f'任务对象的 {key} 与节点记录不一致')
-        supplied_token = task_object.get('lease_token', task_object.get('token'))
-        if supplied_token is not None and str(supplied_token) != str(descriptor.get('token') or ''):
-            raise ValueError('任务对象的 lease_token 与节点记录不一致')
-        directory = (self.spool / unit_id).resolve()
-        if directory.parent != self.spool.resolve():
-            raise ValueError('任务目录无效')
-        progress = self._diagnostic_state(read_json(directory / 'progress.json', {}))
-        done = self._diagnostic_state(read_json(directory / 'done.json', {}))
-        worker_states = []
-        workers = directory / 'workers'
-        if workers.is_dir():
-            for worker in sorted(path for path in workers.iterdir() if path.is_dir())[:200]:
-                worker_states.append({
-                    'worker': worker.name[:80],
-                    'progress': self._diagnostic_state(read_json(worker / 'progress.json', {})),
-                    'done': self._diagnostic_state(read_json(worker / 'done.json', {})),
-                })
-        stage_sources = [entry['progress'].get('stage_metrics')
-                         for entry in worker_states
-                         if isinstance(entry.get('progress'), dict)
-                         and isinstance(entry['progress'].get('stage_metrics'), dict)]
-        if not stage_sources and isinstance(progress, dict):
-            stage_sources = [progress.get('stage_metrics')]
-        stage_summary = self._diagnostic_stage_summary(stage_sources)
-        telemetry = {key: self.telemetry.latest.get(key) for key in
-                     ('cpu_percent', 'memory_percent', 'upload_bps', 'download_bps',
-                      'network_bytes', 'sampled_at', 'scope')
-                     if key in self.telemetry.latest}
-        return {
-            'ok': True, 'public_endpoint': True, 'credentials_recorded': False,
-            'node': {'hostname': socket.gethostname(), 'max_processes': self.max_processes,
-                     'max_threads': self.max_threads, 'telemetry': telemetry},
-            'task': {
-                'id': task['id'], 'job_id': task['job_id'], 'seq': task['seq'],
-                'status': task['status'], 'rows': int(descriptor.get('rows') or 0),
-                'processed': int((progress or {}).get('processed', task['processed']) or 0),
-                'created': task['created'], 'updated': task['updated'],
-                'error_type': (str(task['error']).split(':', 1)[0][:80]
-                               if task['error'] else None),
-            },
-            'configuration': {
-                'mode': descriptor.get('mode'),
-                'processes': int(descriptor.get('processes') or 1),
-                'threads': int(descriptor.get('threads') or 1),
-                'timeout': float(descriptor.get('timeout') or 0),
-                'retries': int(descriptor.get('retries') or 0),
-                'auth_protocol': descriptor.get('_auth_protocol',
-                                                descriptor.get('auth_protocol')),
-                'device_mode': descriptor.get('_device_mode',
-                                              descriptor.get('device_mode')),
-                'logging': {
-                    # 1000条压测默认记录首条、每20条中的1条以及所有超时；
-                    # 不是全量账号日志，避免诊断本身改变CPU和吞吐。
-                    'mode': ('sampled_performance_plus_timeouts'
-                             if descriptor.get('_proxy_debug') else 'off'),
-                    'sample_every': 20 if descriptor.get('_proxy_debug') else None,
-                    'sampling_strategy': 'first_and_every_n_plus_slow_and_timeout',
-                },
-            },
-            'progress': progress, 'done': done, 'workers': worker_states,
-            'stage_summary': stage_summary,
-            'debug': self._diagnostic_debug(directory / 'proxy-debug.jsonl', recent_limit),
-            'server_time': time.time(),
-        }

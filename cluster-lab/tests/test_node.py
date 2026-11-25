@@ -2,7 +2,6 @@ import hashlib
 import io
 import json
 import multiprocessing as mp
-import os
 from pathlib import Path
 import tempfile
 import threading
@@ -10,8 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from clusterlab.node import Node
-from clusterlab.device_build import DeviceBuilder, REGISTRATION_TIMEOUT, _register
-from clusterlab.web import create_app
+from clusterlab.device_build import REGISTRATION_TIMEOUT, _register
 
 
 class Response:
@@ -34,65 +32,8 @@ def _construct_node_in_spawned_child(root):
 
 
 class NodeRecoveryTests(unittest.TestCase):
-    def test_device_snapshot_counts_only_available_unexhausted_devices_as_ready(self):
-        class Pool:
-            key = 'fake'
-
-            def __init__(inner, root, _origin, max_devices):
-                inner.root = Path(root)
-                inner.max_devices = max_devices
-
-            def inspect(inner, slot):
-                return {'state': 'ready', 'device_id': f'device-{slot}'}
-
-            def slot_directory(inner, slot):
-                return inner.root / 'slot' / str(slot)
-
-        class FakeNode:
-            def __init__(inner, root):
-                inner.root = Path(root)
-                inner.origin = 'https://example.invalid'
-                inner.max_processes = 1
-                inner.max_threads = 3
-                inner.device_use_limit = 20
-
-        with tempfile.TemporaryDirectory() as root:
-            node = FakeNode(root)
-            target = node.root / 'device-pool'
-            target.mkdir()
-            (target / 'target.json').write_text('{"capacity":3}')
-            builder = DeviceBuilder(node)
-            with patch('clusterlab.device_build._load_fastcheck',
-                       return_value=(Pool, None, None)), \
-                 patch.object(builder, 'usage',
-                              return_value={'1': 20, '2': 3, '3': 3}), \
-                 patch.object(builder, 'registry', return_value={}), \
-                 patch.object(builder, '_recover_slot', return_value={}), \
-                 patch.object(builder, '_active_task_lease',
-                              side_effect=lambda _pool, slot: slot == 2):
-                snapshot = builder.snapshot()
-            self.assertEqual(snapshot['ready'], 1)
-            self.assertEqual(snapshot['in_use'], 1)
-            self.assertEqual(snapshot['pending'], 1)
-            self.assertEqual([item['state'] for item in snapshot['slots']],
-                             ['pending', 'in_use', 'ready'])
-            self.assertEqual(snapshot['slots'][0]['used'], 20)
-
     def test_device_registration_allows_realistic_provisioning_time(self):
-        self.assertEqual(REGISTRATION_TIMEOUT, 20)
-
-    def test_auth_device_slots_follow_four_by_250_regardless_of_initial_target(self):
-        with tempfile.TemporaryDirectory() as root:
-            node = Node(root)
-            try:
-                descriptor = {'rows': 10000, 'processes': 4, 'threads': 250,
-                              'device_slot_limit': 30, 'device_use_limit': 20}
-                node._prepare_auth_devices(descriptor)
-                self.assertEqual(descriptor['device_pool_capacity'], 1000)
-                self.assertEqual(descriptor['device_slots'], list(range(1, 1001)))
-                self.assertEqual(descriptor['device_use_limit'], 20)
-            finally:
-                node.close()
+        self.assertGreaterEqual(REGISTRATION_TIMEOUT, 90)
 
     def test_registration_error_sanitizer_never_masks_original_failure(self):
         class Sink:
@@ -201,92 +142,6 @@ class NodeRecoveryTests(unittest.TestCase):
             finally:
                 legacy.close()
 
-    def test_idle_heartbeat_uses_three_second_backoff_but_busy_stays_live(self):
-        self.assertEqual(self.node._heartbeat_delay(), 3.0)
-        self.node.active[self.unit] = (object(), threading.Event())
-        self.assertEqual(self.node._heartbeat_delay(), self.node.interval)
-        self.node.active.clear()
-        self.node.builder.state['running'] = True
-        self.assertEqual(self.node._heartbeat_delay(), self.node.interval)
-
-    def test_public_task_log_returns_bounded_sanitized_json(self):
-        directory = self.node.spool / self.unit
-        descriptor = {
-            'token': 'top-secret-lease', 'rows': 300, 'threads': 250,
-            'processes': 4, 'mode': 'auth', 'timeout': 20, 'retries': 1,
-            'proxy_api': 'https://user:password@proxy.invalid/list',
-            'device_root': '/private/device-pool', 'auth_protocol': 'gsa'}
-        descriptor.update(_proxy_debug=True, _proxy_debug_mode='sampled',
-                          _proxy_debug_sample_every=37)
-        with self.node.db.transaction() as db:
-            db.execute('UPDATE tasks SET descriptor=?,status=?,processed=? WHERE id=?',
-                       (json.dumps(descriptor), 'running', 120, self.unit))
-        (directory / 'manifest.json').write_text(json.dumps(descriptor), 'utf-8')
-        (directory / 'progress.json').write_text(json.dumps({
-            'processed': 120, 'workers': 3, 'worker_limit': 3,
-            'configured_process_limit': 4, 'cpu_reserve': 1,
-            'threads_per_process': 250, 'active_threads_per_process': 333,
-            'counts': {'wrong_password': 110, 'locked': 10},
-            'stage_metrics': {
-                'enabled': True, 'retry_waiting': 7, 'process_cpu_ms': 900.0,
-                'process_core_equivalents': 0.9, 'errors': {'tls': 4},
-                'stages': {'auth_request': {
-                    'active': 12, 'completed': 120, 'window_samples': 120,
-                    'average_ms': 1500, 'p50_ms': 1100, 'p95_ms': 3000,
-                    'p99_ms': 5000, 'maximum_ms': 7000,
-                    'wall_total_ms': 180000, 'thread_cpu_total_ms': 800}}},
-            'proxy_pool': {'available': 240, 'endpoint': 'socks5://secret'}}), 'utf-8')
-        (directory / 'proxy-debug.jsonl').write_text('\n'.join((
-            json.dumps({'event': 'worker_start', 'srp_math_backend': 'gmpy2',
-                        'proxy': 'socks5://user:pass@host'}),
-            json.dumps({'event': 'auth_timing', 'row': 7, 'request_ms': 210.0,
-                        'request_thread_cpu_ms': 4.0,
-                        'endpoint': 'user:pass@10.0.0.1:1080',
-                        'detail': 'password=hunter2',
-                        'srp': {'scope': 'sampled_attempt_leaf_phases',
-                                'state': 'observed', 'compute_cpu_ms': 8.5,
-                                'compute_wall_ms': 9.0, 'lane_wait_ms': 2.0}}),
-        )) + '\n', 'utf-8')
-        self.node.telemetry.latest = {'cpu_percent': 81.2, 'memory_percent': 33.0}
-
-        client = create_app('node', self.node, password='not-used-here').test_client()
-        response = client.post('/node-api/task-log', json={
-            'task': {'id': self.unit, 'job_id': 'b' * 32, 'seq': 1},
-            'recent': 10})
-        self.assertEqual(response.status_code, 200)
-        value = response.get_json()
-        self.assertTrue(value['public_endpoint'])
-        self.assertEqual(value['progress']['worker_limit'], 3)
-        self.assertEqual(value['progress']['cpu_reserve'], 1)
-        self.assertEqual(value['node']['telemetry']['cpu_percent'], 81.2)
-        self.assertEqual(value['configuration']['logging'], {
-            'mode': 'sampled_performance_plus_timeouts', 'sample_every': 20,
-            'sampling_strategy': 'first_and_every_n_plus_slow_and_timeout'})
-        self.assertEqual(value['debug']['srp']['compute_cpu_ms']['total'], 8.5)
-        self.assertEqual(value['debug']['srp']['math_backends'], {'gmpy2': 1})
-        self.assertEqual(value['stage_summary']['errors'], {'tls': 4})
-        self.assertEqual(value['stage_summary']['stages']['auth_request']['active'], 12)
-        self.assertEqual(value['progress']['stage_metrics']['retry_waiting'], 7)
-        encoded = json.dumps(value)
-        for secret in ('top-secret-lease', 'user:password', 'hunter2',
-                       '10.0.0.1', '/private/device-pool', 'proxy.invalid'):
-            self.assertNotIn(secret, encoded)
-
-    def test_task_log_rejects_path_and_identity_mismatch(self):
-        with self.assertRaisesRegex(ValueError, '32 位'):
-            self.node.task_log({'task': {'id': '../../etc/passwd'}})
-        with self.assertRaisesRegex(ValueError, 'job_id'):
-            self.node.task_log({'task': {'id': self.unit, 'job_id': 'c' * 32}})
-        with self.assertRaisesRegex(ValueError, 'lease_token'):
-            self.node.task_log({'task': {'id': self.unit, 'lease_token': 'wrong'}})
-
-    def test_public_task_log_rejects_oversize_body_before_json_decode(self):
-        client = create_app('node', self.node, password='not-used-here').test_client()
-        response = client.post('/node-api/task-log', data=b'{' + b'x' * 20000,
-                               content_type='application/json')
-        self.assertEqual(response.status_code, 400)
-        self.assertIn('16 KiB', response.get_json()['error'])
-
     def test_stalled_coordinator_is_terminated_and_reported(self):
         class WedgedProcess:
             def __init__(inner):
@@ -381,27 +236,6 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(captured['devices']['proxy_ip'], '1.2.3.4:80')
         self.assertEqual(captured['devices']['message'], '正在注册第 4 台')
 
-    def test_unchanged_device_rows_are_not_retransmitted_each_heartbeat(self):
-        captured = []
-        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
-                 'enabled': True, 'rejected': [], 'confirmed': []}
-        snapshot = {'running': False, 'capacity': 1, 'ready': 1, 'built': 0,
-                    'failed': 0, 'current': 0, 'attempted': 1,
-                    'slots': [{'slot': 1, 'state': 'ready', 'label': 'B64:test',
-                               'used': 3, 'recorded': True}]}
-
-        def request(*_args, **kwargs):
-            captured.append(kwargs['json']['devices'])
-            return Response(value)
-
-        with patch.object(self.node.builder, 'snapshot', return_value=snapshot), \
-             patch.object(self.node, '_request', side_effect=request):
-            self.node._heartbeat()
-            self.node._heartbeat()
-        self.assertEqual(captured[0]['slots'], snapshot['slots'])
-        self.assertNotIn('slots', captured[1])
-        self.assertEqual(captured[1]['ready'], 1)
-
     def test_heartbeat_reports_update_status_and_schedules_new_generation(self):
         with self.node.db.transaction() as db:
             db.execute("UPDATE tasks SET status='confirmed'")
@@ -462,7 +296,7 @@ class NodeRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '结果待上传'):
             self.node.connect('http://127.0.0.1:18772','x'*32)
 
-    def test_auth_task_adds_on_demand_slots_up_to_worker_concurrency(self):
+    def test_auth_task_uses_only_this_nodes_ready_devices(self):
         descriptor = {'mode': 'auth', 'rows': 10000, 'seq': 2,
                       'processes': 10, 'device_capacity': 30}
         ready = {'slots': [
@@ -471,41 +305,18 @@ class NodeRecoveryTests(unittest.TestCase):
         with patch.object(self.node.builder, 'snapshot', return_value=ready), \
              patch.object(self.node.builder, 'start') as start:
             self.node._prepare_auth_devices(descriptor)
-        self.assertEqual(descriptor['device_pool_capacity'], 10)
-        self.assertEqual(descriptor['device_slots'], list(range(1, 11)))
-        self.assertEqual(descriptor['processes'], 10)
-        self.assertEqual(descriptor['threads'], 1)
+        self.assertEqual(descriptor['device_pool_capacity'], 9)
+        self.assertEqual(descriptor['device_slots'], [2, 7, 9])
+        self.assertEqual(descriptor['processes'], 3)
         self.assertNotIn('device_capacity', descriptor)
         start.assert_not_called()
-        self.assertEqual(self.node.builder.reserved, set(range(1, 11)))
+        self.assertEqual(self.node.builder.reserved, {2, 7, 9})
         self.node.builder.release(descriptor['device_slots'])
 
-    def test_auth_task_with_empty_pool_registers_from_worker_threads(self):
+    def test_auth_task_refuses_to_run_without_ready_devices(self):
         with patch.object(self.node.builder, 'snapshot', return_value={'slots': []}):
-            descriptor = {'mode': 'auth', 'rows': 50, 'processes': 2, 'threads': 25}
-            self.node._prepare_auth_devices(descriptor)
-        self.assertEqual(descriptor['device_pool_capacity'], 50)
-        self.assertEqual(descriptor['device_slots'], list(range(1, 51)))
-        self.assertEqual(descriptor['processes'], 2)
-        self.assertEqual(descriptor['threads'], 25)
-
-    def test_two_processes_by_ten_threads_preserves_shape_and_twenty_slots(self):
-        descriptor = {'mode': 'auth', 'rows': 40,
-                      'processes': 2, 'threads': 10}
-        self.node._prepare_auth_devices(descriptor)
-        self.assertEqual((descriptor['processes'], descriptor['threads']), (2, 10))
-        self.assertEqual(descriptor['device_pool_capacity'], 20)
-        self.assertEqual(descriptor['device_slots'], list(range(1, 21)))
-
-    def test_four_processes_by_250_threads_expose_1000_configured_slots(self):
-        with patch.object(self.node.builder, 'snapshot', return_value={'slots': []}):
-            descriptor = {'mode': 'auth', 'rows': 1000,
-                          'processes': 4, 'threads': 250}
-            self.node._prepare_auth_devices(descriptor)
-        self.assertEqual(descriptor['device_pool_capacity'], 1000)
-        self.assertEqual(len(descriptor['device_slots']), 1000)
-        self.assertEqual(descriptor['device_slots'][0], 1)
-        self.assertEqual(descriptor['device_slots'][-1], 1000)
+            with self.assertRaisesRegex(RuntimeError, '没有已就绪设备'):
+                self.node._prepare_auth_devices({'mode': 'auth', 'rows': 50, 'processes': 10})
 
     def test_background_builder_never_registers_without_a_proxy(self):
         class Pool:
@@ -521,65 +332,11 @@ class NodeRecoveryTests(unittest.TestCase):
             self.node.builder._run(1)
         self.assertEqual(self.node.builder.state['ready'], 0)
         self.assertEqual(self.node.builder.state['failed'], 1)
-        self.assertIn('代理获取失败', self.node.builder.state['message'])
+        self.assertIn('禁止直连注册', self.node.builder.state['message'])
         self.assertEqual(self.node.builder.state['proxy_status'], 'failed')
         self.assertEqual(self.node.builder.state['proxy_ip'], '')
         self.assertEqual(self.node.builder.state['slot_errors']['1'], '代理获取失败')
         self.assertFalse((self.node.root / 'device-pool' / 'registrations').exists())
-
-    def test_background_builder_switches_exit_after_registration_failure(self):
-        class Pool:
-            ready = False
-
-            def __init__(inner, *_args, **_kwargs):
-                pass
-
-            def inspect(inner, _slot):
-                return {'state': 'ready' if type(inner).ready else 'missing'}
-
-        proxies = iter(['socks5h://bad-exit', 'socks5h://good-exit'])
-
-        def provision(payload):
-            if payload['proxy'].endswith('good-exit'):
-                Pool.ready = True
-                return {'ok': True, 'model': 'MacBookPro14,3'}
-            return {'ok': False, 'error': '20秒超时'}
-
-        Pool.ready = False
-        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)), \
-             patch.object(self.node.builder, '_proxy', side_effect=lambda: next(proxies)), \
-             patch.object(self.node.builder, '_provision', side_effect=provision), \
-             patch.object(self.node.builder, '_record', return_value=True) as record:
-            self.node.builder._run(1)
-        self.assertEqual(self.node.builder.state['ready'], 1)
-        self.assertEqual(self.node.builder.state['failed'], 0)
-        record.assert_called_once_with(1, 'socks5h://good-exit', 'MacBookPro14,3')
-
-    def test_device_builder_cancel_terminates_current_registration_process(self):
-        class Process:
-            alive = True
-            terminated = False
-
-            def is_alive(inner):
-                return inner.alive
-
-            def terminate(inner):
-                inner.terminated = True
-                inner.alive = False
-
-            def join(inner, _timeout=None):
-                return None
-
-            def kill(inner):
-                inner.alive = False
-
-        process = Process()
-        self.node.builder.state['running'] = True
-        self.node.builder.provision_process = process
-        self.node.builder.cancel()
-        self.assertTrue(self.node.builder.stop.is_set())
-        self.assertTrue(process.terminated)
-        self.assertEqual(self.node.builder.state['message'], '正在停止')
 
     def test_snapshot_distinguishes_registering_failed_and_pending_slots(self):
         class Pool:
@@ -591,55 +348,11 @@ class NodeRecoveryTests(unittest.TestCase):
 
         self.node.builder.state.update(running=True, capacity=3, current=2,
                                        slot_errors={'1': 'AnisetteError: HTTP 503'})
-        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)), \
-             patch.object(self.node.builder, 'usage', return_value={'1': 11, '2': 17, '3': 9}), \
-             patch.object(self.node.builder, 'registry', return_value={
-                 '1': {'at': '2026-01-01 01:02:03'},
-                 '2': {'at': '2026-01-01 01:02:04'},
-                 '3': {'at': '2026-01-01 01:02:05'},
-             }):
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)):
             snapshot = self.node.builder.snapshot()
         self.assertEqual([row['state'] for row in snapshot['slots']],
                          ['failed', 'registering', 'pending'])
         self.assertEqual(snapshot['slots'][0]['error'], 'AnisetteError: HTTP 503')
-        self.assertEqual([row['used'] for row in snapshot['slots']], [0, 0, 0])
-        self.assertEqual([row['at'] for row in snapshot['slots']], ['', '', ''])
-
-    def test_snapshot_reports_task_registration_and_use_counts(self):
-        class Pool:
-            def __init__(inner, root, *_args, **_kwargs):
-                inner.root = Path(root)
-
-            def slot_directory(inner, slot):
-                path = inner.root / 'devices' / str(slot)
-                path.mkdir(parents=True, exist_ok=True)
-                return path
-
-            def inspect(inner, slot):
-                states = {1: 'ready', 2: 'pending', 3: 'missing'}
-                return {'state': states[slot], 'device_id': f'device-{slot}'}
-
-        root = self.node.root / 'device-pool'
-        for slot in (1, 2, 3):
-            path = root / 'devices' / str(slot)
-            path.mkdir(parents=True, exist_ok=True)
-            (path / '.lease-state.json').write_text(json.dumps({
-                'state': 'in_use', 'pid': os.getpid(), 'slot': slot,
-            }))
-        self.node.builder.state['capacity'] = 3
-        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)), \
-             patch.object(self.node.builder, 'usage', return_value={}), \
-             patch.object(self.node.builder, 'registry', return_value={}):
-            snapshot = self.node.builder.snapshot()
-        self.assertEqual([row['state'] for row in snapshot['slots']],
-                         ['in_use', 'registering', 'registering'])
-        # A leased device is not currently available and therefore must not
-        # inflate the ready count.
-        self.assertEqual(snapshot['ready'], 0)
-        self.assertEqual(snapshot['in_use'], 1)
-        self.assertEqual(snapshot['registering'], 2)
-        self.assertEqual(snapshot['pending'], 0)
-        self.assertEqual(snapshot['failed_slots'], 0)
 
     def test_ready_legacy_device_recovers_model_and_registration_time(self):
         class Pool:
@@ -662,7 +375,6 @@ class NodeRecoveryTests(unittest.TestCase):
         state = directory / 'origin-key.json'
         state.write_text('{}')
         (self.node.root / 'device-pool' / 'usage.json').write_text('{"1":123}')
-        self.node.device_use_limit = 1000
         with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)):
             snapshot = self.node.builder.snapshot()
         self.assertEqual(snapshot['attempted'], 1)
@@ -710,13 +422,171 @@ class NodeRecoveryTests(unittest.TestCase):
             self.node._heartbeat()
         start.assert_not_called()
 
-    def test_heartbeat_without_manual_request_does_not_start_device_builder(self):
+    def test_auto_rotation_registers_one_replacement_before_removing_any_device(self):
         value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
-                 'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 0}
+                 'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 0,
+                 'device_auto_rotate': True, 'device_rotate_after': 20}
+        complete = {'running': False, 'capacity': 30, 'ready': 30, 'built': 0,
+                    'failed': 0, 'current': 0, 'attempted': 30, 'slots': []}
         with patch.object(self.node, '_request', return_value=Response(value)), \
+             patch.object(self.node.builder, 'snapshot', return_value=complete), \
+             patch.object(self.node.builder, 'reserved_slots', return_value=set()), \
+             patch.object(self.node.builder, 'retirable', return_value=[7]) as retirable, \
+             patch.object(self.node.builder, 'oldest', return_value=[1]) as oldest, \
+             patch.object(self.node.builder, 'rotate') as rotate, \
+             patch.object(self.node.builder, 'retire') as retire, \
              patch.object(self.node.builder, 'start') as start:
             self.node._heartbeat()
+        retirable.assert_called_once_with(20, exclude=set())
+        oldest.assert_called_once_with(1, candidates=list(range(1, 31)))
+        rotate.assert_called_once_with(30, 1)
+        retire.assert_not_called()
         start.assert_not_called()
+
+    def test_auto_rotation_keeps_all_reserved_devices_untouched(self):
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 0,
+                 'device_auto_rotate': True, 'device_rotate_after': 20}
+        complete = {'running': False, 'capacity': 30, 'ready': 30, 'built': 0,
+                    'failed': 0, 'current': 0, 'attempted': 30, 'slots': []}
+        reserved = set(range(1, 31))
+        with patch.object(self.node, '_request', return_value=Response(value)), \
+             patch.object(self.node.builder, 'snapshot', return_value=complete), \
+             patch.object(self.node.builder, 'reserved_slots', return_value=reserved), \
+             patch.object(self.node.builder, 'retirable', return_value=[]) as retirable, \
+             patch.object(self.node.builder, 'rotate') as rotate, \
+             patch.object(self.node.builder, 'start') as start:
+            self.node._heartbeat()
+        retirable.assert_called_once_with(20, exclude=reserved)
+        rotate.assert_not_called()
+        start.assert_not_called()
+
+    def test_auto_rotation_fills_an_existing_gap_before_starting_a_replacement(self):
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 0,
+                 'device_auto_rotate': True, 'device_rotate_after': 20}
+        incomplete = {'running': False, 'capacity': 30, 'ready': 29, 'built': 0,
+                      'failed': 0, 'current': 0, 'attempted': 30, 'slots': []}
+        with patch.object(self.node, '_request', return_value=Response(value)), \
+             patch.object(self.node.builder, 'snapshot', return_value=incomplete), \
+             patch.object(self.node.builder, 'retirable') as retirable, \
+             patch.object(self.node.builder, 'rotate') as rotate, \
+             patch.object(self.node.builder, 'start') as start:
+            self.node._heartbeat()
+        start.assert_called_once_with(30)
+        retirable.assert_not_called()
+        rotate.assert_not_called()
+
+    def test_failed_staged_rotation_keeps_the_live_device(self):
+        live = self.node.root / 'device-pool' / 'origin' / 'devices' / '01'
+        live.mkdir(parents=True)
+        (live / 'old').write_text('old', 'utf-8')
+
+        class Pool:
+            def __init__(inner, root, _origin, max_devices):
+                inner.base = Path(root) / 'origin'
+                inner.max_devices = max_devices
+
+            def slot_directory(inner, slot):
+                return inner.base / 'devices' / f'{slot:02d}'
+
+            def inspect(inner, slot):
+                return {'state': 'missing'}
+
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)), \
+             patch.object(self.node.builder, '_proxy', return_value='socks5h://proxy'), \
+             patch.object(self.node.builder, '_provision', return_value={'ok': False, 'error': 'failed'}), \
+             patch.object(self.node.builder, '_commit_rotation') as commit:
+            self.node.builder._run_rotation(1, 1)
+        self.assertEqual((live / 'old').read_text('utf-8'), 'old')
+        commit.assert_not_called()
+        self.assertIn('原设备已保留', self.node.builder.state['message'])
+
+    def test_successful_staged_rotation_swaps_then_removes_the_oldest_device(self):
+        class Pool:
+            def __init__(inner, root, _origin, max_devices):
+                inner.base = Path(root) / 'origin'
+                inner.max_devices = max_devices
+
+            def slot_directory(inner, slot):
+                return inner.base / 'devices' / f'{slot:02d}'
+
+            def inspect(inner, slot):
+                directory = inner.slot_directory(slot)
+                return {'state': 'ready' if (directory / 'ready').exists() else 'missing'}
+
+        live_root = self.node.root / 'device-pool'
+        staging_root = self.node.root / 'device-pool-rotation'
+        old = live_root / 'origin' / 'devices' / '01'
+        new = staging_root / 'origin' / 'devices' / '01'
+        old.mkdir(parents=True)
+        new.mkdir(parents=True)
+        (old / 'ready').write_text('old', 'utf-8')
+        (old / 'old-only').write_text('old', 'utf-8')
+        (new / 'ready').write_text('new', 'utf-8')
+        (new / 'new-only').write_text('new', 'utf-8')
+        (live_root / 'usage.json').write_text('{"1":20,"2":7}', 'utf-8')
+        health = live_root / 'origin' / 'health.json'
+        health.write_text('{"devices":{"1":{"failures":5},"2":{}},"events":[[1,1],[2,2]]}', 'utf-8')
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)):
+            changed = self.node.builder._commit_rotation(
+                staging_root, 1, 30, 'socks5h://proxy', 'MacBookPro14,3')
+        self.assertTrue(changed)
+        self.assertEqual((old / 'ready').read_text('utf-8'), 'new')
+        self.assertTrue((old / 'new-only').exists())
+        self.assertFalse((old / 'old-only').exists())
+        self.assertEqual(json.loads((live_root / 'usage.json').read_text()), {'2': 7})
+        saved_health = json.loads(health.read_text())
+        self.assertNotIn('1', saved_health['devices'])
+        self.assertEqual(saved_health['events'], [[2, 2]])
+        registration = json.loads(
+            (live_root / 'registrations' / '001.json').read_text('utf-8'))
+        self.assertEqual(registration['model'], 'MacBookPro14,3')
+        self.assertEqual(registration['slot'], 1)
+        self.assertFalse(list(old.parent.glob('.rotation-backup-*')))
+
+    def test_rotation_commit_failure_restores_the_original_device(self):
+        class Pool:
+            def __init__(inner, root, _origin, max_devices):
+                inner.base = Path(root) / 'origin'
+                inner.max_devices = max_devices
+
+            def slot_directory(inner, slot):
+                return inner.base / 'devices' / f'{slot:02d}'
+
+            def inspect(inner, slot):
+                directory = inner.slot_directory(slot)
+                return {'state': 'ready' if (directory / 'ready').exists() else 'missing'}
+
+        live_root = self.node.root / 'device-pool'
+        staging_root = self.node.root / 'device-pool-rotation'
+        old = live_root / 'origin' / 'devices' / '01'
+        new = staging_root / 'origin' / 'devices' / '01'
+        old.mkdir(parents=True)
+        new.mkdir(parents=True)
+        (old / 'ready').write_text('old', 'utf-8')
+        (old / 'old-only').write_text('old', 'utf-8')
+        (new / 'ready').write_text('new', 'utf-8')
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)), \
+             patch.object(self.node.builder, '_record', return_value=False):
+            with self.assertRaisesRegex(OSError, '注册记录'):
+                self.node.builder._commit_rotation(
+                    staging_root, 1, 30, 'socks5h://proxy', 'MacBookPro14,3')
+        self.assertEqual((old / 'ready').read_text('utf-8'), 'old')
+        self.assertTrue((old / 'old-only').exists())
+        self.assertFalse(list(old.parent.glob('.rotation-backup-*')))
+
+    def test_oldest_rotation_candidate_uses_birth_time_and_excludes_busy_slots(self):
+        registrations = self.node.root / 'device-pool' / 'registrations'
+        registrations.mkdir(parents=True)
+        for slot, born in ((1, 30), (2, 10), (3, 20)):
+            (registrations / f'{slot:03d}.json').write_text(json.dumps({
+                'slot': slot, 'ts': born, 'proxy': '', 'model': '', 'at': ''}), 'utf-8')
+        (self.node.root / 'device-pool' / 'usage.json').write_text(
+            '{"1":20,"2":20,"3":20}', 'utf-8')
+        eligible = self.node.builder.retirable(20, exclude={2})
+        self.assertEqual(eligible, [1, 3])
+        self.assertEqual(self.node.builder.oldest(1, candidates=eligible), [3])
 
     def test_remote_http_requires_explicit_test_override(self):
         with self.assertRaisesRegex(ValueError, 'HTTPS'):

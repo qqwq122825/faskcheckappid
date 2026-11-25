@@ -17,11 +17,8 @@ from clusterlab.executor import (
 
 
 class FakePool:
-    def __init__(self, root, *_args, **_kwargs):
-        self.root = Path(root)
-
-    def slot_directory(self, slot):
-        return self.root / 'fake-devices' / f'{int(slot):03d}'
+    def __init__(self, *_args, **_kwargs):
+        pass
 
     def info(self, *_args, **_kwargs):
         return {}

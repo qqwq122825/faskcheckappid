@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, fmt, state } from '../composables/useCluster'
 
 const visible = ref(false), nodeId = ref(''), capacity = ref(2), error = ref('')
+const autoRotate = ref(false), savingAuto = ref(false), rotateAfter = ref(20)
 // 每次刷新都从全局状态里取最新节点，设备池进度才会跟着心跳走
 const node = computed(() => state.value?.nodes?.find((n: any) => n.id === nodeId.value))
 const busy = ref(false), clearing = ref(false), timer = 0 as any
@@ -12,14 +13,6 @@ const busy = ref(false), clearing = ref(false), timer = 0 as any
 const pool = computed(() => node.value?.telemetry?.device_pool || {})
 const building = computed(() => Boolean(pool.value.running))
 const ready = computed(() => pool.value.ready || 0)
-const registering = computed(() => Math.max(0, Number(pool.value.registering) || 0))
-const inUse = computed(() => Math.max(0, Number(pool.value.in_use) || 0))
-const pending = computed(() => Math.max(0, Number(pool.value.pending) || 0))
-const failed = computed(() => Math.max(0, Number(pool.value.failed_slots) || Number(pool.value.failed) || 0))
-const registrationActive = computed(() => building.value || registering.value > 0)
-const slotLimit = computed(() => Math.max(1,
-  Math.min(Number(node.value?.desired_processes) || 1, Number(node.value?.max_processes) || 1) *
-  Math.min(Number(node.value?.desired_threads) || 1, Number(node.value?.max_threads) || 1)))
 const completed = computed(() => (Number(pool.value.built) || 0) + (Number(pool.value.failed) || 0))
 // 节点扫描会提前生成 20 个 pending 身份，后端 attempted 因而可能瞬间变成 20。
 // 初始化进行中以当前槽位为准：正在注册第 9 台，代表前 8 台已经尝试。
@@ -42,7 +35,6 @@ const rows = computed(() => {
       slot: item.slot,
       label: item.label || `#${item.slot}`,
       state: item.state === 'ready' ? '已就绪'
-        : item.state === 'in_use' ? '使用中'
         : item.state === 'registering' ? '正在注册'
           : item.state === 'failed' ? '注册失败'
             : item.state === 'pending' ? '待注册' : '未开始',
@@ -66,6 +58,9 @@ const rows = computed(() => {
 
 function show(value: any) {
   nodeId.value = value?.id || ''
+  const settings = state.value?.settings || {}
+  autoRotate.value = Boolean(settings.device_auto_rotate ?? false)
+  rotateAfter.value = Number(settings.device_rotate_after ?? 20) || 20
   capacity.value = Math.max(1, Number(value?.telemetry?.device_pool?.capacity) || 2)
   error.value = ''
   visible.value = true
@@ -75,8 +70,8 @@ defineExpose({ show })
 async function initialize() {
   error.value = ''
   if (!node.value?.id) { error.value = '节点不可用'; return }
-  if (!Number.isInteger(capacity.value) || capacity.value < 1 || capacity.value > slotLimit.value) {
-    error.value = `设备数量应为 1–${slotLimit.value} 的整数`; return
+  if (!Number.isInteger(capacity.value) || capacity.value < 1 || capacity.value > 200) {
+    error.value = '设备数量应为 1–200 的整数'; return
   }
   busy.value = true
   try {
@@ -85,6 +80,18 @@ async function initialize() {
   } catch (exc: any) {
     error.value = exc?.message || '请求失败'
   } finally { busy.value = false }
+}
+async function toggleAuto(next: boolean) {
+  savingAuto.value = true
+  try {
+    const saved = await api('/api/settings/rotation', { device_rotate_after: rotateAfter.value || 20,
+                                                        device_auto_rotate: next }, 'POST')
+    if (state.value) state.value.settings = { ...(state.value.settings || {}), ...saved }
+    ElMessage.success(next ? '已开启自动补充：任务运行中持续换新设备' : '已关闭自动补充')
+  } catch (exc: any) {
+    autoRotate.value = !next
+    error.value = exc?.message || '保存失败'
+  } finally { savingAuto.value = false }
 }
 async function cancelBuild() {
   try { await api(`/api/nodes/${node.value.id}/devices`, { capacity: 0 }, 'POST'); ElMessage.success('已请求停止') }
@@ -113,16 +120,24 @@ async function clearPool() {
               title="节点未上报状态，无法读取设备池。" />
     <section class="device-pool-target">
       <div class="section-heading"><h2>初始化设备</h2>
-        <el-tag :type="registrationActive ? 'warning' : ready ? 'success' : 'info'">
-          {{ registrationActive ? `注册中 ${registering} 台` : ready ? '已就绪' : '未开始' }}</el-tag>
+        <el-tag :type="building ? 'warning' : ready ? 'success' : 'info'">
+          {{ building ? '初始化中' : ready ? '已就绪' : '未开始' }}</el-tag>
       </div>
       <el-form label-position="top" @submit.prevent="initialize">
         <el-form-item label="设备数量">
-          <el-input-number v-model="capacity" :min="1" :max="slotLimit" :step="1" :precision="0" :disabled="building || busy" />
-          <span class="field-note">预注册数量由总控设置；点击“开始初始化设备池”才会注册设备。槽位自动跟随节点并发（当前 {{ slotLimit }}），缺失设备由工作线程按需注册。</span>
+          <el-input-number v-model="capacity" :min="1" :max="200" :step="1" :precision="0" :disabled="building || busy" />
+          <span class="field-note">选择数量后，点击“开始初始化设备池”才会注册设备。</span>
+        </el-form-item>
+        <el-form-item label="自动补充">
+          <el-switch v-model="autoRotate" :loading="savingAuto" :disabled="savingAuto"
+                     @change="toggleAuto" active-text="持续先增后换并补齐" />
+          <span class="field-note">
+            开启后，原有设备保持可用；节点先注册一台替换设备，
+            只有新设备成功后才移除出生日期最早且空闲的旧设备。
+          </span>
         </el-form-item>
         <div class="actions">
-          <el-button type="primary" native-type="submit" :loading="busy" :disabled="building">开始初始化设备池</el-button>
+          <el-button type="primary" native-type="submit" :loading="busy" :disabled="building || savingAuto">开始初始化设备池</el-button>
           <el-button v-if="building" @click="cancelBuild">停止</el-button>
           <el-tooltip :disabled="!node?.active" content="节点仍有工作包在执行，请先停止任务" placement="top">
             <span><el-button type="danger" plain :loading="clearing"
@@ -135,16 +150,13 @@ async function clearPool() {
       </el-form>
     </section>
     <div class="device-pool-summary">
-      <div><span>槽位总数</span><strong>{{ fmt(pool.capacity ?? capacity) }}</strong></div>
+      <div><span>目标数量</span><strong>{{ fmt(pool.capacity ?? capacity) }}</strong></div>
+      <div><span>已尝试</span><strong>{{ fmt(actual) }}</strong></div>
       <div><span>就绪设备</span><strong>{{ fmt(ready) }}</strong></div>
-      <div><span>使用中</span><strong>{{ fmt(inUse) }}</strong></div>
-      <div><span>注册中</span><strong>{{ fmt(registering) }}</strong></div>
-      <div><span>待注册</span><strong>{{ fmt(pending) }}</strong></div>
-      <div><span>注册失败</span><strong>{{ fmt(failed) }}</strong></div>
     </div>
     <section>
       <div class="section-heading device-list-heading"><h2>设备列表</h2>
-        <span class="muted">{{ registering ? `正在注册 ${registering} 台 · 使用中 ${inUse} 台` : building && pool.current ? `正在注册第 ${pool.current} 台` : `就绪 ${ready} 台` }}</span>
+        <span class="muted">{{ building && pool.current ? `正在注册第 ${pool.current} 台` : '等待中' }}</span>
       </div>
       <el-table :data="rows" empty-text="尚未初始化设备" stripe max-height="360">
         <el-table-column prop="label" label="设备标识" width="145" />

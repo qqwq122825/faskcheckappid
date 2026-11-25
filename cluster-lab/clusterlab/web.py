@@ -1,7 +1,6 @@
 import hashlib
 from datetime import datetime
 import io
-import json
 import os
 from pathlib import Path
 import secrets
@@ -112,9 +111,9 @@ def create_app(role, service, password=None):
         def configure_web_secondary_auth():
             return jsonify(service.configure_web_secondary_auth(request.get_json() or {}))
 
-        @app.post('/api/settings/device-use-limit')
-        def configure_device_use_limit():
-            return jsonify(service.configure_device_use_limit(request.get_json() or {}))
+        @app.post('/api/settings/rotation')
+        def configure_rotation():
+            return jsonify(service.configure_rotation(request.get_json() or {}))
 
         @app.post('/api/settings/proxy')
         def configure_proxy():
@@ -227,11 +226,6 @@ def create_app(role, service, password=None):
         def delete_job(job_id):
             return jsonify(service.delete_job(job_id))
 
-        @app.post('/api/jobs/batch-delete')
-        def batch_delete_jobs():
-            data = request.get_json(silent=True) or {}
-            return jsonify(service.delete_jobs(data.get('ids') or []))
-
         @app.post('/api/jobs/<job_id>/<action>')
         def job_action(job_id, action):
             service.job_action(job_id, action)
@@ -242,8 +236,7 @@ def create_app(role, service, password=None):
             offset = int(request.args.get('offset', 0))
             limit = int(request.args.get('limit', 100))
             category = request.args.get('category', 'all')
-            search = request.args.get('search', '')
-            return jsonify(service.read_rows(job_id, offset, limit, category, search))
+            return jsonify(service.read_rows(job_id, offset, limit, category))
 
         @app.get('/api/jobs/<job_id>/results')
         def download_results(job_id):
@@ -289,23 +282,6 @@ def create_app(role, service, password=None):
             return jsonify(service.accept_result(request.node_id, unit_id, request.form.get('lease_token'),
                                                  result.stream, request.form.get('checksum')))
     else:
-        @app.post('/node-api/task-log')
-        def node_task_log():
-            # Deliberately outside /api/: this read-only diagnostic endpoint is
-            # public by deployment requirement and therefore has no login or
-            # CSRF dependency.  Keep its input tiny even though uploads use a
-            # much larger application-wide body limit.
-            if request.content_length and request.content_length > 16 * 1024:
-                raise ValueError('任务日志请求体不能超过 16 KiB')
-            raw = request.stream.read(16 * 1024 + 1)
-            if len(raw) > 16 * 1024:
-                raise ValueError('任务日志请求体不能超过 16 KiB')
-            try:
-                data = json.loads(raw or b'{}')
-            except (UnicodeDecodeError, ValueError, TypeError):
-                raise ValueError('任务日志请求体必须是 JSON 对象') from None
-            return jsonify(service.task_log(data))
-
         @app.post('/api/devices/build')
         def devices_build():
             data = request.get_json() or {}
