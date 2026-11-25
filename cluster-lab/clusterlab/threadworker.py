@@ -762,6 +762,13 @@ def _commit_ready_rows(pending_rows, next_row, output, output_digest, counters):
     return next_row, committed
 
 
+def _queue_completed_row(pending_rows, row, encoded, status, completed_counts):
+    """Count completed work immediately while preserving ordered file output."""
+    pending_rows[row] = (encoded, status)
+    completed_counts[status] += 1
+    return sum(completed_counts.values())
+
+
 def _run_thread_auth(directory, descriptor, stop):
     directory = Path(directory)
     started = time.time()
@@ -839,19 +846,22 @@ def _run_thread_auth(directory, descriptor, stop):
     pending_rows = {}
     next_write_row = first_row
     processed = 0
+    completed = 0
+    completed_counts = collections.Counter()
     output_digest = hashlib.sha256()
 
     output = output_path.open('wb')
     output_path.chmod(0o600)
     try:
         def sink(row, line, device, result):
-            nonlocal next_write_row, processed
+            nonlocal next_write_row, processed, completed
             status = _result_bucket(result_bucket, result)
             record = build_record(row, line, result, status, device,
                                   device_label=device.label, debug=debug_enabled)
             encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
             with sink_lock:
-                pending_rows[row] = (encoded, status)
+                completed = _queue_completed_row(
+                    pending_rows, row, encoded, status, completed_counts)
                 next_write_row, committed = _commit_ready_rows(
                     pending_rows, next_write_row, output, output_digest, counters)
                 processed += committed
@@ -876,10 +886,13 @@ def _run_thread_auth(directory, descriptor, stop):
         last_progress = time.monotonic()
         while next_write_row < first_row + rows and not stop.is_set():
             if time.monotonic() - last_progress >= 0.25:
-                output.flush()
+                with sink_lock:
+                    output.flush()
+                    live_processed = completed
+                    live_counts = dict(completed_counts)
                 atomic_json(directory / 'progress.json', {
-                    'processed': processed, 'started': started,
-                    'counts': dict(counters),
+                    'processed': live_processed, 'started': started,
+                    'counts': live_counts,
                     'workers': thread_count, 'worker_limit': thread_count,
                     'threads_per_process': thread_count,
                     'active_threads_per_process': thread_count,

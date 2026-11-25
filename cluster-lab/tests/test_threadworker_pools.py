@@ -8,7 +8,7 @@ import unittest
 
 from clusterlab.threadworker import (Context, DeviceSlot, ProxySource, ThreadDevicePool,
                                      Worker, _commit_ready_rows,
-                                     _is_proxy_quality_failure)
+                                     _is_proxy_quality_failure, _queue_completed_row)
 
 
 class FakeDevicePool:
@@ -38,6 +38,23 @@ class ThreadWorkerPoolTests(unittest.TestCase):
         self.assertEqual((3, 2), (next_row, committed))
         self.assertEqual(b'one\ntwo\n', output.getvalue())
         self.assertEqual({'wrong_password': 1, 'locked': 1}, dict(counts))
+
+    def test_live_progress_counts_completed_rows_before_ordered_commit(self):
+        pending = {}
+        completed_counts = collections.Counter()
+        committed_counts = collections.Counter()
+        output = io.BytesIO()
+        digest = hashlib.sha256()
+
+        completed = _queue_completed_row(
+            pending, 2, b'two\n', 'locked', completed_counts)
+        next_row, committed = _commit_ready_rows(
+            pending, 1, output, digest, committed_counts)
+
+        self.assertEqual(1, completed)
+        self.assertEqual({'locked': 1}, dict(completed_counts))
+        self.assertEqual((1, 0), (next_row, committed))
+        self.assertEqual(b'', output.getvalue())
 
     def test_proxy_refill_scales_with_process_concurrency(self):
         large = ProxySource('http://invalid/{num}', threads=1000, target=1000)
