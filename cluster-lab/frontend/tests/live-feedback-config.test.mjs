@@ -46,11 +46,8 @@ test('Controller exposes guarded rolling Git updates with visible node phases', 
   assert.match(nodes, /版本 \{\{ node\.version \|\| '—' \}\}/)
 })
 
-test('Device rows use short Base64 labels instead of reusable slot numbers', () => {
-  const drawer = source('src/components/DevicePoolDrawer.vue')
+test('Results use short device labels without exposing reusable slot numbers', () => {
   const results = source('src/components/ResultList.vue')
-  assert.match(drawer, /label: item\.label \|\| `#\$\{item\.slot\}`/)
-  assert.match(drawer, /prop="label" label="设备标识"/)
   assert.match(results, /prop="device_display" label="设备"/)
   assert.doesNotMatch(results, /label="二次验证方式"/)
   assert.doesNotMatch(results, /prop="device" label="设备"/)
@@ -131,26 +128,14 @@ test('Large task totals use a non-overlapping responsive feedback grid', () => {
   assert.match(styles, /@media\(max-width:600px\)\{\.feedback-grid\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)/)
 })
 
-test('Device pool starts initialization only from its explicit action and shows persisted registration history', () => {
-  const drawer = source('src/components/DevicePoolDrawer.vue')
-  assert.match(drawer, /开始初始化设备池/)
-  assert.match(drawer, /点击“开始初始化设备池”才会注册设备/)
-  assert.match(drawer, /代理异常：未获取到可用代理，请确认新节点出口 IP 已加入白名单/)
-  assert.match(drawer, /代理正常/)
-  assert.match(drawer, /pool\.value\.proxy_ip/)
-  assert.match(drawer, /building\.value\s*\? Math\.max\(completed\.value/)
-  assert.match(drawer, /Number\(pool\.value\.current\).*?- 1/)
-  assert.match(drawer, /Math\.max\(Number\(pool\.value\.attempted\).*?completed\.value\)/)
-  assert.match(drawer, /@submit\.prevent="initialize"/)
-  assert.match(drawer, /api\(`\/api\/nodes\/\$\{node\.value\.id\}\/devices`, \{ capacity: capacity\.value \}, 'POST'\)/)
-  assert.match(drawer, /pool\.value\.attempted/)
-  assert.match(drawer, /注册出口 IP/)
-  assert.ok(drawer.indexOf('label="注册出口 IP"') < drawer.indexOf('label="注册结果"'),
-    '注册出口 IP 应放在注册结果前，窄抽屉无需横向滚动即可看到')
-  assert.match(drawer, /item\.state === 'ready' \? '成功' : item\.error \|\| '—'/)
-  assert.match(drawer, /注册时间/)
-  assert.match(drawer, /已用账号/)
-  assert.match(drawer, /item\.used/)
+test('Settings use one compact cell-based card and explain automatic devices', () => {
+  const settings = source('src/views/Settings.vue')
+  assert.equal((settings.match(/<el-card/g) || []).length, 1)
+  assert.match(settings, /class="setting-cell"/)
+  assert.match(settings, /高级设置/)
+  assert.match(settings, /自动管理，不需要手工初始化设备池/)
+  assert.match(settings, /缺失时.*线程自行注册/)
+  assert.doesNotMatch(settings, /开始初始化设备池|一键清空设备/)
 })
 
 test('Task detail lists all valid rows by page and caps each other category at 100', () => {
@@ -199,16 +184,6 @@ test('Deleting a running task explicitly stops its node work', () => {
   assert.match(table, /confirmButtonText: '删除并停止任务'/)
   assert.match(table, /:disabled="row\.status === 'preparing'"/)
   assert.match(table, /已通知节点停止/)
-})
-
-test('Device pool has a guarded one-click clear action', () => {
-  const drawer = source('src/components/DevicePoolDrawer.vue')
-  assert.match(drawer, /ElMessageBox/)
-  assert.match(drawer, /一键清空设备/)
-  assert.match(drawer, /'DELETE'/)
-  assert.match(drawer, /所有设备身份、注册记录和使用计数都会删除/)
-  assert.match(drawer, /Boolean\(node\?\.active\)/)
-  assert.match(drawer, /pool\.capacity \?\? capacity/)
 })
 
 test('GSA result categories expose invalid and locked business states', () => {

@@ -561,6 +561,9 @@ class Node:
         threads = max(1, int(descriptor.get('threads') or 1))
         capacity = min(rows, threads)
         slots = list(range(1, capacity + 1))
+        # A running task owns these stable slots.  Manual device operations must
+        # not rotate or clear identities that worker threads are actively using.
+        self.builder.reserve(slots)
         descriptor.pop('device_capacity', None)
         descriptor['processes'] = 1
         descriptor['device_pool_capacity'] = capacity

@@ -67,94 +67,57 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
   } finally { webSecondaryAuthBusy.value = false }
 }
 </script>
-<template><div class="settings-grid">
-  <el-card v-if="!isNode" shadow="never" class="section-card">
-    <template #header><h2>任务分片设置</h2></template>
-    <el-form label-position="top" @submit.prevent="save">
-      <el-form-item label="单个分片最大条数"><el-input-number v-model="maxUnitRows" :min="50" :max="100000" :step="1000" :precision="0" :disabled="busy" /><span class="field-note">最多 100,000 条，同时受 32 MiB 字节上限约束。</span></el-form-item>
-      <p class="muted">上传任务时可以选择更小的分片。例如 10,000 条数据，按每片 1,000 条生成 10 片，由空闲节点依次领取。</p>
-      <p class="muted">保存后仅对新任务生效；已有任务和在途分片保持原配置。</p>
-      <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
-      <el-button type="primary" native-type="submit" :loading="busy">保存分片设置</el-button>
-    </el-form>
-  </el-card>
-  <el-card v-if="!isNode" shadow="never" class="section-card">
-    <template #header><h2>Web 二次验证</h2></template>
-    <el-form label-position="top">
-      <el-form-item label="细分 GSA au=repair 结果">
-        <el-switch v-model="webSecondaryAuth" :loading="webSecondaryAuthBusy" :disabled="webSecondaryAuthBusy"
-                   active-text="开启 Web 校验" inactive-text="关闭 Web 校验"
-                   @change="saveWebSecondaryAuth" />
-        <span class="field-note">
-          仅对 GSA 返回 au=repair 的账号追加一次 Web 校验。authType=sa/non-sa 归入密码正确；
-          hsa/hsa2 保留为双重验证。Web HTTP 0 或 503 按任务设置的重试次数重试。
-        </span>
-      </el-form-item>
-      <el-descriptions :column="1" border>
-        <el-descriptions-item label="当前状态">{{ webSecondaryAuth ? '已开启' : '已关闭' }}</el-descriptions-item>
-        <el-descriptions-item label="生效范围">新领取的工作包</el-descriptions-item>
-      </el-descriptions>
-    </el-form>
-  </el-card>
-  <el-card v-if="!isNode" shadow="never" class="section-card">
-    <template #header><h2>出口代理</h2></template>
-    <el-form label-position="top" @submit.prevent="addProxy">
-      <el-form-item label="代理 API 地址">
-        <el-input v-model="proxyApi" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }"
-                  spellcheck="false" :disabled="proxyBusy"
-                  placeholder="粘贴提取链接；也可一次粘贴多个，每行一个" />
-        <span class="field-note">
-          最多 16 个。总控按节点创建顺序轮询分配。任务开始先按线程数取满代理；水位低于 50% 时补到目标，新代理优先，其余按队列平均轮转复用。
-          密码在页面上只显示为 ***。
-        </span>
-      </el-form-item>
-      <el-form-item label="代理协议（全部配置共用）">
-        <el-select v-model="proxyScheme" style="width:220px" :disabled="proxyBusy">
-          <el-option label="socks5h（隧道住宅代理常用）" value="socks5h" />
-          <el-option label="socks5" value="socks5" />
-          <el-option label="http" value="http" />
-          <el-option label="https" value="https" />
-        </el-select>
-      </el-form-item>
-      <el-descriptions :column="1" border>
-        <el-descriptions-item label="当前状态">
-          {{ state?.settings?.proxy_configured ? `已配置 ${state.settings.proxy_count} 个` : '未配置' }}
-        </el-descriptions-item>
-      </el-descriptions>
-      <el-table v-if="state?.settings?.proxy_apis?.length" :data="state.settings.proxy_apis" border>
-        <el-table-column type="index" label="#" width="60" />
-        <el-table-column label="已保存代理 API" min-width="520">
-          <template #default="scope"><span class="proxy-api-value">{{ scope.row }}</span></template>
-        </el-table-column>
-        <el-table-column label="分配" width="120"><template #default="scope">节点 {{ scope.$index + 1 }}、{{ scope.$index + 1 + state.settings.proxy_count }}…</template></el-table-column>
-        <el-table-column label="操作" width="100"><template #default="scope"><el-button type="danger" text :disabled="proxyBusy" @click="removeProxy(scope.$index)">删除</el-button></template></el-table-column>
-      </el-table>
-      <el-alert v-if="proxyError" :title="proxyError" type="error" :closable="false" show-icon />
-      <el-button type="primary" native-type="submit" :loading="proxyBusy">添加代理配置</el-button>
-    </el-form>
-  </el-card>
-  <el-card v-if="!isNode" shadow="never" class="section-card">
-    <template #header><h2>代理调试日志</h2></template>
-    <el-form label-position="top">
-      <el-form-item label="记录超时代理与实际出口 IP">
-        <el-switch v-model="proxyDebug" :loading="proxyDebugBusy" :disabled="proxyDebugBusy"
-                   active-text="开启调试日志" inactive-text="关闭调试日志"
-                   @change="saveProxyDebug" />
-        <span class="field-note">
-          开启后，节点直接回传 Apple 原始英文原因，结果页不再用中文覆盖，并额外记录代理出口与诊断详情；关闭后，节点只回传快捷分类，总控显示中文原因，新工作包不再创建 proxy-debug.jsonl，已有日志保留。
-          仅排查代理问题时开启，避免产生大量日志。
-        </span>
-      </el-form-item>
-      <el-descriptions :column="1" border>
-        <el-descriptions-item label="当前状态">{{ proxyDebug ? '已开启' : '已关闭' }}</el-descriptions-item>
-        <el-descriptions-item label="生效范围">新领取的工作包</el-descriptions-item>
-      </el-descriptions>
-    </el-form>
-  </el-card>
-  <el-card shadow="never" class="section-card"><template #header><h2>当前部署</h2></template><el-descriptions :column="1" border><el-descriptions-item label="版本">{{ session?.version }}</el-descriptions-item><el-descriptions-item label="服务角色">{{ isNode ? '执行节点' : '集群总控' }}</el-descriptions-item><el-descriptions-item label="管理登录">{{ session?.password_required ? '已启用密码登录' : '未启用密码登录' }}</el-descriptions-item><el-descriptions-item label="任务导出">TXT 原始记录，一行一条，保持原顺序</el-descriptions-item></el-descriptions></el-card>
-</div></template>
+<template><el-card shadow="never" class="settings-card">
+  <template #header><div class="settings-title"><div><h2>系统设置</h2><p>常用配置集中在一个页面，高级选项默认收起。</p></div><el-tag effect="plain">v{{ session?.version }}</el-tag></div></template>
+
+  <template v-if="!isNode">
+    <section class="setting-cell">
+      <div class="cell-copy"><h3>任务分片</h3><p>只影响新任务；已有任务保持原配置。</p></div>
+      <form class="cell-control inline-control" @submit.prevent="save">
+        <el-input-number v-model="maxUnitRows" :min="50" :max="100000" :step="1000" :precision="0" :disabled="busy" />
+        <el-button type="primary" native-type="submit" :loading="busy">保存</el-button>
+        <span class="control-note">50–100,000 条，且不超过 32 MiB</span>
+      </form>
+      <el-alert v-if="error" class="cell-alert" :title="error" type="error" :closable="false" show-icon />
+    </section>
+
+    <section class="setting-cell setting-cell--top">
+      <div class="cell-copy"><h3>出口代理</h3><p>每个节点自动轮询使用一条代理 API。</p></div>
+      <form class="cell-control proxy-control" @submit.prevent="addProxy">
+        <div class="proxy-input-row">
+          <el-input v-model="proxyApi" type="textarea" :autosize="{ minRows: 2, maxRows: 3 }" spellcheck="false" :disabled="proxyBusy" placeholder="粘贴代理提取链接；多个链接时每行一个" />
+          <div class="proxy-actions"><el-select v-model="proxyScheme" :disabled="proxyBusy"><el-option label="socks5h" value="socks5h" /><el-option label="socks5" value="socks5" /><el-option label="http" value="http" /><el-option label="https" value="https" /></el-select><el-button type="primary" native-type="submit" :loading="proxyBusy">添加代理配置</el-button></div>
+        </div>
+        <p class="control-note">任务开始先按线程数取满代理，水位低于 50% 时补到目标；新代理优先，其余按队列平均轮转复用。按节点创建顺序轮询分配，密码仅显示为 ***。</p>
+        <div v-if="state?.settings?.proxy_apis?.length" class="proxy-list">
+          <div v-for="(api, index) in state.settings.proxy_apis" :key="`${index}-${api}`" class="proxy-row"><span class="proxy-index">{{ Number(index) + 1 }}</span><code>{{ api }}</code><span class="proxy-node">节点 {{ Number(index) + 1 }}、{{ Number(index) + 1 + Number(state.settings.proxy_count) }}…</span><el-button type="danger" text :disabled="proxyBusy" @click="removeProxy(Number(index))">删除</el-button></div>
+        </div>
+        <el-alert v-if="proxyError" :title="proxyError" type="error" :closable="false" show-icon />
+      </form>
+    </section>
+
+    <section class="setting-cell">
+      <div class="cell-copy"><h3>设备策略</h3><p>自动管理，不需要手工初始化设备池。</p></div>
+      <div class="cell-control policy-strip"><span><b>1</b> 个进程</span><span><b>每线程 1 个</b> 内存设备</span><span><b>缺失时</b> 线程自行注册</span></div>
+    </section>
+
+    <el-collapse class="advanced-settings">
+      <el-collapse-item name="advanced">
+        <template #title><div class="advanced-title"><span>高级设置</span><small>二次验证、诊断日志和部署信息</small></div></template>
+        <section class="setting-cell">
+          <div class="cell-copy"><h3>Web 二次验证</h3><p>仅对 GSA 返回 au=repair 的新工作包做细分。</p></div>
+          <div class="cell-control switch-control"><el-switch v-model="webSecondaryAuth" :loading="webSecondaryAuthBusy" :disabled="webSecondaryAuthBusy" active-text="开启" inactive-text="关闭" @change="saveWebSecondaryAuth" /><span class="control-note">authType=sa/non-sa 归入密码正确；hsa/hsa2 保留为双重验证。Web HTTP 0 或 503 按任务设置的重试次数重试。</span></div>
+        </section>
+        <section class="setting-cell">
+          <div class="cell-copy"><h3>代理调试日志</h3><p>仅排查代理问题时开启。</p></div>
+          <div class="cell-control switch-control"><el-switch v-model="proxyDebug" :loading="proxyDebugBusy" :disabled="proxyDebugBusy" active-text="开启" inactive-text="关闭" @change="saveProxyDebug" /><span class="control-note">开启后节点直接回传 Apple 原始英文原因并写入 proxy-debug.jsonl；关闭后节点只回传快捷分类，总控显示中文原因。避免产生大量日志。</span></div>
+        </section>
+        <section class="setting-cell deployment-cell"><div class="cell-copy"><h3>当前部署</h3><p>服务与登录状态。</p></div><div class="cell-control deployment-values"><span>v{{ session?.version }}</span><span>{{ isNode ? '执行节点' : '集群总控' }}</span><span>{{ session?.password_required ? '密码登录已启用' : '未启用密码登录' }}</span></div></section>
+      </el-collapse-item>
+    </el-collapse>
+  </template>
+  <section v-else class="setting-cell deployment-cell"><div class="cell-copy"><h3>当前部署</h3><p>节点本地只显示部署信息。</p></div><div class="cell-control deployment-values"><span>v{{ session?.version }}</span><span>执行节点</span><span>{{ session?.password_required ? '密码登录已启用' : '未启用密码登录' }}</span></div></section>
+</el-card></template>
 <style scoped>
-.settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 20px; align-items: start; }
-.settings-grid :deep(.section-card) { margin: 0; min-width: 0; }
-@media (max-width: 760px) { .settings-grid { grid-template-columns: 1fr; } }
+.settings-card{max-width:1180px;margin:0 auto;border-radius:14px}.settings-card :deep(.el-card__header){padding:22px 26px}.settings-card :deep(.el-card__body){padding:0}.settings-title{display:flex;align-items:center;justify-content:space-between;gap:20px}.settings-title h2,.cell-copy h3{margin:0}.settings-title p,.cell-copy p{margin:6px 0 0;color:var(--el-text-color-secondary)}.setting-cell{display:grid;grid-template-columns:210px minmax(0,1fr);gap:26px;padding:24px 26px;border-top:1px solid var(--el-border-color-lighter);align-items:center}.setting-cell--top{align-items:start}.cell-copy h3{font-size:17px}.cell-copy p{font-size:13px;line-height:1.55}.cell-control{min-width:0}.inline-control{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.control-note{color:var(--el-text-color-secondary);font-size:13px;line-height:1.55}.cell-alert{grid-column:2}.proxy-input-row{display:grid;grid-template-columns:minmax(0,1fr) 130px;gap:12px}.proxy-actions{display:flex;flex-direction:column;gap:10px}.proxy-control>.control-note{display:block;margin:10px 0}.proxy-list{border:1px solid var(--el-border-color-lighter);border-radius:9px;overflow:hidden;margin-top:12px}.proxy-row{display:grid;grid-template-columns:34px minmax(0,1fr) 150px 60px;gap:10px;align-items:center;padding:10px 12px}.proxy-row+.proxy-row{border-top:1px solid var(--el-border-color-lighter)}.proxy-index{color:var(--el-text-color-secondary)}.proxy-row code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}.proxy-node{color:var(--el-text-color-secondary);font-size:12px}.policy-strip,.deployment-values{display:flex;gap:10px;flex-wrap:wrap}.policy-strip span,.deployment-values span{padding:10px 14px;border:1px solid var(--el-border-color-lighter);border-radius:9px;background:var(--el-fill-color-lighter);font-size:13px}.advanced-settings{border-top:1px solid var(--el-border-color-lighter);border-bottom:0}.advanced-settings :deep(.el-collapse-item__header){height:58px;padding:0 26px;border-bottom:0}.advanced-settings :deep(.el-collapse-item__content){padding:0}.advanced-settings :deep(.el-collapse-item__wrap){border-bottom:0}.advanced-title{display:flex;align-items:center;gap:12px;font-weight:600}.advanced-title small{font-weight:400;color:var(--el-text-color-secondary)}.switch-control{display:flex;align-items:center;gap:16px}.deployment-cell{padding-bottom:26px}@media(max-width:760px){.setting-cell{grid-template-columns:1fr;gap:14px;padding:20px}.cell-alert{grid-column:1}.proxy-input-row{grid-template-columns:1fr}.proxy-actions{flex-direction:row}.proxy-actions :deep(.el-select){flex:1}.proxy-row{grid-template-columns:24px minmax(0,1fr) 48px}.proxy-node{display:none}.switch-control{align-items:flex-start;flex-direction:column}}
 </style>
