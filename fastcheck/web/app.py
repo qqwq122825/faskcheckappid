@@ -1,6 +1,5 @@
 from dataclasses import asdict,fields
 from datetime import timedelta
-import io
 import json
 import os
 from pathlib import Path
@@ -9,7 +8,6 @@ import tempfile
 import threading
 import time
 from types import SimpleNamespace
-import zipfile
 
 from flask import Flask,jsonify,request,session,send_file
 from werkzeug.security import check_password_hash
@@ -23,6 +21,7 @@ from fastcheck.status import result_bucket
 from fastcheck.version import VERSION
 from .bootstrap import ROOT,data_root
 from .runtime import JobManager,TERMINAL
+from .log_archive import build_log_archive,LogArchiveTooLarge
 from fastcheck.device_build import DeviceBuilder
 
 
@@ -297,16 +296,11 @@ def create_app(data_dir=None):
 
     @app.get('/api/jobs/<job_id>/logs')
     def logs(job_id):
-        directory=manager.directory(job_id);buffer=io.BytesIO()
-        names=('events.jsonl','results.jsonl','summary.json','debug.jsonl','debug-summary.json','state.json')
-        if sum((directory/name).stat().st_size for name in names if (directory/name).exists())>64*1024*1024:
+        directory=manager.directory(job_id)
+        try:
+            buffer=build_log_archive(directory)
+        except LogArchiveTooLarge:
             return jsonify(error='日志较大，请从服务器任务目录获取。'),413
-        with zipfile.ZipFile(buffer,'w',zipfile.ZIP_DEFLATED) as archive:
-            for name in names:
-                if (directory/name).exists():archive.write(directory/name,name)
-            details=directory/'exports/undetermined-details.jsonl'
-            if details.exists():archive.write(details,'undetermined-details.jsonl')
-        buffer.seek(0)
         return send_file(buffer,as_attachment=True,download_name='logs-'+job_id+'.zip')
 
     @app.errorhandler(ValueError)

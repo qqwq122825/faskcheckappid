@@ -107,7 +107,8 @@ class _Client:
             self._sess = sess
             return
         with phase(diagnostics, "tls_setup"):
-            ctx = ssl.create_default_context()
+            from .apple_trust import gsa_context
+            ctx = gsa_context()    # 进程级单例
         handlers = [urllib.request.HTTPSHandler(context=ctx),
                     urllib.request.HTTPCookieProcessor(self.jar)]
         if proxy:

@@ -7,6 +7,10 @@ idna==3.20
 PySocks==1.7.1
 websockets==16.1.1
 python-socks==3.2.1
+
+# Optional asyncio GSA engine (fastcheck.protocols.gsa_async).
+aiohttp>=3.10,<4
+aiohttp-socks>=0.10,<1
 # Native GMP modular arithmetic accelerates the per-account Apple SRP proof.
 gmpy2==2.3.2
 Flask==3.1.3

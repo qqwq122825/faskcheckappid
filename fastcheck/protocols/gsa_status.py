@@ -116,7 +116,8 @@ def _mock_verdict(email: str, stage: str) -> dict:
 # --------------------------------------------------------------------------- #
 def _fetch_anisette(url: str, timeout: float = 8.0) -> dict:
     req = urllib.request.Request(url.rstrip("/") + "/", headers={"User-Agent": "anisette"})
-    ctx = ssl.create_default_context()
+    from .apple_trust import gsa_context
+    ctx = gsa_context()          # 复用进程级单例，避免重复扫 CA（Linux 上一次 24-28ms）
     # 明确禁用系统代理：注入服务器是直连的，若系统代理配置了却没启动
     # （很常见：Clash 关了但 IE 代理还留着），urllib 会连 127.0.0.1 直接失败。
     opener = urllib.request.build_opener(
@@ -694,6 +695,30 @@ def check(email: str, password: str, proxy: str | None, timeout: float = 15.0,
     return last or _result("error", "no attempt made", started, stage="check")
 
 
+# 内部耗时统计（供 simple.py 读取）；键为阶段名，值为 CPU 秒列表
+STAGE_CPU = {}
+_STAGE_LOCK = threading.Lock()
+
+
+def _mark(stage, t0):
+    dt = time.thread_time() - t0
+    with _STAGE_LOCK:
+        STAGE_CPU.setdefault(stage, []).append(dt)
+    return dt
+
+
+def reset_stage_cpu():
+    with _STAGE_LOCK:
+        STAGE_CPU.clear()
+
+
+def stage_cpu_summary():
+    import statistics as _st
+    with _STAGE_LOCK:
+        return {k: (len(v), _st.median(v) * 1000, max(v) * 1000)
+                for k, v in STAGE_CPU.items() if v}
+
+
 def _once(email: str, password: str, proxy: str | None, timeout: float,
           cancel, started: float, diagnostics=None, *, identity=None) -> dict:
     ident = identity if identity is not None else _pick_anisette()
@@ -701,10 +726,13 @@ def _once(email: str, password: str, proxy: str | None, timeout: float,
         return _result("error", "no anisette (servers unreachable)", started,
                        kind="anisette", stage="init")
     try:
+        _t = time.thread_time()
         with phase(diagnostics, "srp_init"):
             srp = SRPClient(email, password)
+        _mark('srp_ctor', _t)
     except Exception as exc:                          # noqa: BLE001
         return _result("error", f"srp init: {exc}", started, kind="protocol", stage="init")
+    _t = time.thread_time()
     with phase(diagnostics, "client_setup"):
         try:
             cpd = _build_cpd(ident, email)
@@ -712,15 +740,20 @@ def _once(email: str, password: str, proxy: str | None, timeout: float,
             return _result("error", "Anisette 客户端元数据不完整或格式错误，未提交认证请求", started,
                            kind="anisette", stage="init")
         session = _session_for(proxy)
+    _mark('client_setup', _t)
 
+    _t = time.thread_time()
     init_body = plistlib.dumps({
         "Header": {"Version": "1.0.1"},
         "Request": {"cpd": cpd, "u": email, "A2k": srp.A_bytes,
                     "ps": ["s2k", "s2k_fo"], "o": "init"},
     })
+    _mark('init_dumps', _t)
+    _t = time.thread_time()
     with phase(diagnostics, "http_init") as timing:
         init = session.post(init_body, cpd, timeout, diagnostics=diagnostics, request_phase="http_init",
                             client_info=_client_info(ident),user_agent=ident.get('User-Agent'))
+        _mark('http_init_total', _t)
         _TLS.current_http=init.http_status
         timing["http"] = init.http_status
         if init.apple_ec is not None:
@@ -744,24 +777,30 @@ def _once(email: str, password: str, proxy: str | None, timeout: float,
     try:
         if "c" not in response:
             raise KeyError("c")
+        _t = time.thread_time()
         with phase(diagnostics, "srp_challenge") as timing:
             timing["iterations"] = response["i"]
             m1 = srp.process_challenge(response["s"], response["B"], response["i"],
                                        response["sp"])
+        _mark('srp_challenge', _t)
     except KeyError as exc:
         return _result("error", f"init missing {exc}", started, kind="protocol", stage="init")
     except Exception as exc:                          # noqa: BLE001
         return _result("error", f"srp: {type(exc).__name__}", started,
                        kind="protocol", stage="init")
 
+    _t = time.thread_time()
     done_body = plistlib.dumps({
         "Header": {"Version": "1.0.1"},
         "Request": {"cpd": cpd, "u": email, "M1": m1, "c": response["c"],
                     "o": "complete"},
     })
+    _mark('done_dumps', _t)
+    _t = time.thread_time()
     with phase(diagnostics, "http_complete") as timing:
         done = session.post(done_body, cpd, timeout, diagnostics=diagnostics, request_phase="http_complete",
                             client_info=_client_info(ident),user_agent=ident.get('User-Agent'))
+        _mark('http_complete_total', _t)
         _TLS.current_http=done.http_status
         timing["http"] = done.http_status
         if done.apple_ec is not None:

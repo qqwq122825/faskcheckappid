@@ -194,21 +194,37 @@ class JobManager:
         return sorted(values,key=lambda v:v['created_at'],reverse=True)[:100]
 
     def clear_history(self):
-        """删除全部历史任务目录；有非终态任务时拒绝执行。"""
+        """Remove terminal history only after checking every persisted task."""
         with self.lock:
             for job_id in list(self.owned):
                 if self.get(job_id)['state'] not in TERMINAL:
                     raise RuntimeError('有任务正在运行，先停止再清空。')
-            removed = 0
-            for path in (self.root/'jobs').glob('*/state.json'):
-                try:
-                    shutil.rmtree(path.parent)
-                    removed += 1
-                except OSError:
-                    continue
-            with self.result_lock:
-                self.result_cache.clear()
-            return removed
+            try:
+                # Other Web instances and surviving workers use the same lease.
+                # Hold it until removal finishes, not just during the preflight.
+                with file_lease(self.root/'.job.lock'):
+                    paths = list((self.root/'jobs').glob('*/state.json'))
+                    for path in paths:
+                        try:
+                            state = self.get(path.parent.name)
+                        except (OSError, ValueError, TypeError, KeyError):
+                            raise RuntimeError('任务状态读取失败，请核对后再清空。') from None
+                        if not isinstance(state, dict) or state.get('state') not in TERMINAL:
+                            raise RuntimeError('有任务正在运行，先停止再清空。')
+                    # Validate all entries before deleting any of them. Serialize
+                    # removal with result readers and cache invalidation as well.
+                    removed = 0
+                    with self.result_lock:
+                        for path in paths:
+                            try:
+                                shutil.rmtree(path.parent)
+                                removed += 1
+                            except OSError:
+                                continue
+                        self.result_cache.clear()
+                    return removed
+            except PoolError:
+                raise RuntimeError('有任务占用运行资源，先停止再清空。') from None
 
     def read_results(self,job_id,category='all',offset=0,limit=100):
         """Read live worker records and the final merged log without duplicates.

@@ -6,6 +6,7 @@ persisted. The circuit-breaker thresholds are local policy, not Apple rules.
 from __future__ import annotations
 
 import base64
+import copy
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import portalocker
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import random
 import tempfile
+import threading
 import time
 from urllib.parse import urlsplit
 import uuid
@@ -98,6 +100,87 @@ class RegisteredStore(StateStore):
         return state
 
 
+class _MemoryState:
+    """One slot's process-local state with a persistent write-through store."""
+
+    def __init__(self, persistent):
+        self.persistent = persistent
+        self.state = None
+        self.lock = threading.RLock()
+
+
+class MemoryStore:
+    """StateStore-compatible in-memory hot path.
+
+    State is loaded from disk once per process and all subsequent header calls
+    use the slot-local memory copy.  Registration success remains write-through
+    so a later process can reuse the same identity.
+    """
+
+    def __init__(self, backing, *, registered=False):
+        self.backing = backing
+        self.registered = bool(registered)
+        self.origin = backing.persistent.origin
+        self.path = backing.persistent.path
+
+    @contextmanager
+    def lock(self, timeout):
+        timeout = max(0.0, float(timeout))
+        acquired = self.backing.lock.acquire(timeout=timeout)
+        if not acquired:
+            raise AnisetteError('state_busy')
+        try:
+            yield
+        finally:
+            self.backing.lock.release()
+
+    def load(self):
+        if self.backing.state is None:
+            if self.registered and not self.path.exists():
+                raise PoolError("设备状态缺失，请先运行 prepare。")
+            self.backing.state = self.backing.persistent.load()
+        state = copy.deepcopy(self.backing.state)
+        if self.registered and not state.get('adi_pb'):
+            raise PoolError("设备尚未完成注册，请先运行 prepare。")
+        return state
+
+    def save(self, state):
+        state = copy.deepcopy(state)
+        self.backing.persistent.save(state)
+        self.backing.state = state
+
+
+def count_registered_devices(root, origin):
+    """Return the number of persisted, fully registered device identities.
+
+    Device registration state is written atomically by ``StateStore``.  Reading
+    the small JSON envelopes directly is much cheaper than constructing a
+    ``DevicePool`` and calling ``inspect`` for every slot, which matters because
+    the live dashboard refreshes this value continuously.
+    """
+    key = hashlib.sha256(origin.encode()).hexdigest()[:24]
+    devices = Path(root) / key / "devices"
+    if not devices.is_dir():
+        return 0
+    total = 0
+    for path in devices.glob(f"*/{key}.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            state = payload.get("state")
+            if not isinstance(state, dict) or not state.get("adi_pb"):
+                continue
+            identifier = base64.b64decode(state.get("identifier", ""), validate=True)
+            adi_pb = base64.b64decode(state["adi_pb"], validate=True)
+            if len(identifier) == 16 and adi_pb:
+                total += 1
+        except (OSError, ValueError, TypeError, KeyError):
+            # A concurrently replaced, truncated, or invalid state is not a
+            # registered device.  The next live refresh will count it once the
+            # atomic write has completed.
+            continue
+    return total
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     attempts: int = 2
@@ -111,7 +194,8 @@ class RetryPolicy:
 
 class DevicePool:
     def __init__(self, root, origin, *, client_factory=Client, policy=None,
-                 clock=time.time, sleeper=time.sleep, max_devices=5):
+                 clock=time.time, sleeper=time.sleep, max_devices=5,
+                 in_memory=False):
         parsed = urlsplit(origin)
         if (not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment
                 or any(ord(c) < 32 for c in origin)
@@ -129,6 +213,9 @@ class DevicePool:
         self.key = key
         self.timing_error = None
         self.max_devices = max_devices
+        self.in_memory = bool(in_memory)
+        self._memory_states = {}
+        self._memory_states_lock = threading.Lock()
 
     def slot_directory(self, slot):
         if type(slot) is not int or not 1 <= slot <= self.max_devices:
@@ -136,8 +223,16 @@ class DevicePool:
         return self.base / "devices" / f"{slot:02d}"
 
     def store(self, slot, *, registered=False):
-        factory = RegisteredStore if registered else StateStore
-        return factory(self.origin, directory=self.slot_directory(slot))
+        directory = self.slot_directory(slot)
+        if not self.in_memory:
+            factory = RegisteredStore if registered else StateStore
+            return factory(self.origin, directory=directory)
+        with self._memory_states_lock:
+            backing = self._memory_states.get(slot)
+            if backing is None:
+                backing = _MemoryState(StateStore(self.origin, directory=directory))
+                self._memory_states[slot] = backing
+        return MemoryStore(backing, registered=registered)
 
     def inspect(self, slot):
         path = self.slot_directory(slot) / f"{self.key}.json"

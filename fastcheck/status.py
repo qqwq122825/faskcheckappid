@@ -21,6 +21,8 @@ _APPLE_REASON_BUCKETS = (
     ('the account does not exist', 'not_found'),
 )
 
+ACCOUNT_INFORMATION_INCORRECT = 'your account information was entered incorrectly'
+
 
 def _normalized_apple_reason(*values):
     """Normalize Apple prose without changing the raw reason we persist."""
@@ -48,12 +50,21 @@ def apple_reason_bucket(result):
     return None
 
 
+def account_information_incorrect(result):
+    """This Apple reason is retryable until the caller exhausts its attempts."""
+    values = (result.get('apple_message'), result.get('reason'), result.get('detail'))
+    return any(ACCOUNT_INFORMATION_INCORRECT in _normalized_apple_reason(value)
+               for value in values if value)
+
+
 def result_bucket(result):
     status = result.get('status')
     try:
         apple_ec = int(result.get('apple_ec'))
     except (TypeError, ValueError):
         apple_ec = None
+    if result.get('retry_exhausted') == 'account_information_incorrect':
+        return 'wrong_password'
     if result.get('kind') == 'timeout' or status == 'timeout':
         return 'timeout'
     # 请求没有拿到任何 HTTP 响应时，协议层统一记录 http=0。它不是业务
