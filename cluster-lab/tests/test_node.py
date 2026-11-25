@@ -134,11 +134,11 @@ class NodeRecoveryTests(unittest.TestCase):
         self.node.close()
         self.temp.cleanup()
 
-    def test_node_forces_single_process_and_preserves_thread_limit(self):
+    def test_legacy_ten_by_one_hundred_service_becomes_single_process(self):
         with tempfile.TemporaryDirectory() as root:
             legacy = Node(root, max_processes=10, max_threads=100)
             try:
-                self.assertEqual((legacy.max_processes, legacy.max_threads), (1, 100))
+                self.assertEqual((legacy.max_processes, legacy.max_threads), (1, 500))
             finally:
                 legacy.close()
 

@@ -58,9 +58,14 @@ class Node:
             self.instance_lock_file = None
         else:
             self.primary_instance = True
-        integer(max_processes, '本机进程上限', 1, 200)
+        requested_processes = integer(max_processes, '本机进程上限', 1, 200)
+        requested_threads = integer(max_threads, '本机线程上限', 1, 512)
         self.max_processes = 1
-        self.max_threads = integer(max_threads, '本机线程上限', 1, 512)
+        # Existing node services still launch with the historical 10×100
+        # arguments.  Treat that exact pair as a legacy profile so the new
+        # 1×300 default is not silently capped at 100 threads.
+        self.max_threads = (500 if (requested_processes, requested_threads) == (10, 100)
+                            else requested_threads)
         self.allow_http, self.interval = allow_http, interval
         self.instance = uuid.uuid4().hex
         self.context = mp.get_context('spawn')
