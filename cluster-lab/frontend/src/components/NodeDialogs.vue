@@ -2,7 +2,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { addNodeOpen, api, busy, mutate, refresh } from '../composables/useCluster'
 const token = ref(''), error = ref(''), name = ref('')
-const form = reactive({ processes: 4, threads: 250 })
+const form = reactive({ processes: 1, threads: 300 })
 watch(addNodeOpen, open => { if (open) { token.value = ''; error.value = ''; name.value = '' } })
 async function submit() {
   if (!name.value.trim()) { error.value = '请输入节点名称'; return }
@@ -12,8 +12,8 @@ async function submit() {
   finally { busy.value = false }
 }
 const configOpen = ref(false), node = ref<any>(null), configError = ref('')
-const config = reactive({ processes: 4, threads: 250 })
-const totalConcurrency = computed(() => Number(config.processes) * Number(config.threads))
+const config = reactive({ processes: 1, threads: 300 })
+const totalConcurrency = computed(() => Number(config.threads))
 function configure(value: any) {
   node.value = value; configError.value = ''
   Object.assign(config, { processes: value.desired_processes, threads: value.desired_threads })
@@ -24,7 +24,7 @@ async function save() {
   catch (e) { configError.value = (e as Error).message }
 }
 function useMaximum() {
-  config.processes = Math.min(4, Number(node.value?.max_processes || 4))
+  config.processes = 1
   config.threads = Math.min(500, Number(node.value?.max_threads || 500))
 }
 defineExpose({ configure })
@@ -32,11 +32,11 @@ defineExpose({ configure })
 <template>
   <el-dialog v-model="addNodeOpen" :title="token ? '节点已创建' : '添加节点'" width="580px" :close-on-click-modal="false" :show-close="!busy">
     <template v-if="token"><el-alert title="接入凭证仅显示这一次，请妥善保存。" type="warning" :closable="false" show-icon /><p>到节点页面填写总控地址与下方凭证，保存即可连接。</p><el-input :model-value="token" readonly type="textarea" :rows="3" aria-label="新节点接入凭证" /><p class="muted">关闭后不会再次显示凭证。</p></template>
-    <el-form v-else label-position="top" @submit.prevent="submit"><el-form-item label="节点名称"><el-input v-model="name" placeholder="例如：工作节点 01" maxlength="80" /></el-form-item><div class="form-grid"><el-form-item label="工作进程数"><el-input-number v-model="form.processes" :min="1" :max="4" /></el-form-item><el-form-item label="每进程线程数"><el-input-number v-model="form.threads" :min="1" :max="500" /></el-form-item></div><p class="muted">4 核节点默认使用 4 进程 × 250 线程，最高可设 4 × 500。线程按需提交代理请求，200ms 内合并取号；拿不到设备时由该线程注册。</p><el-alert v-if="error" :title="error" type="error" :closable="false" /></el-form>
+    <el-form v-else label-position="top" @submit.prevent="submit"><el-form-item label="节点名称"><el-input v-model="name" placeholder="例如：工作节点 01" maxlength="80" /></el-form-item><el-form-item label="线程数"><el-input-number v-model="form.threads" :min="1" :max="500" /></el-form-item><p class="muted">节点固定使用 1 个工作进程，默认 300 线程。任务开始先按线程数取满代理；线程复用设备和代理。</p><el-alert v-if="error" :title="error" type="error" :closable="false" /></el-form>
     <template #footer><el-button v-if="token" type="primary" @click="addNodeOpen = false">已保存，关闭</el-button><template v-else><el-button :disabled="busy" @click="addNodeOpen = false">取消</el-button><el-button type="primary" :loading="busy" @click="submit">创建节点</el-button></template></template>
   </el-dialog>
   <el-dialog v-model="configOpen" :title="`${node?.name || ''} · 节点设置`" width="620px" :close-on-click-modal="false" :show-close="!busy">
-    <el-form label-position="top"><div class="form-grid"><el-form-item label="工作进程数"><el-input-number v-model="config.processes" :min="1" :max="Math.min(4, node?.max_processes || 4)" /></el-form-item><el-form-item label="每进程线程数"><el-input-number v-model="config.threads" :min="1" :max="Math.min(500, node?.max_threads || 500)" /></el-form-item></div><p class="muted">默认 4 × 250，最高 4 × 500；当前总并发 {{ totalConcurrency }}。等待线程的代理请求会在 200ms 内按需合并，返回后每线程独占一条，设备状态留在线程内存。</p><el-button plain @click="useMaximum">使用本机上限</el-button><el-alert v-if="configError" :title="configError" type="error" :closable="false" /></el-form>
+    <el-form label-position="top"><el-form-item label="线程数"><el-input-number v-model="config.threads" :min="1" :max="Math.min(500, node?.max_threads || 500)" /></el-form-item><p class="muted">固定 1 个工作进程；当前总并发 {{ totalConcurrency }}。代理池目标等于线程数，默认 300；新代理优先使用，可用代理按队列轮转复用。</p><el-button plain @click="useMaximum">使用本机上限</el-button><el-alert v-if="configError" :title="configError" type="error" :closable="false" /></el-form>
     <template #footer><el-button :disabled="busy" @click="configOpen = false">取消</el-button><el-button type="primary" :loading="busy" @click="save">保存配置</el-button></template>
   </el-dialog>
 </template>

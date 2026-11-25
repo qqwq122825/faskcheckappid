@@ -17,10 +17,10 @@ class ControllerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.service = Controller(self.temp.name)
-        self.node = self.service.add_node('test-node', 2, 4)
+        self.node = self.service.add_node('test-node', 1, 4)
         self.heartbeat(devices={'running': False, 'capacity': 30, 'ready': 30,
                                 'built': 30, 'failed': 0, 'attempted': 30})
-        self.service.configure_node(self.node['id'], {'processes': 2, 'threads': 4,
+        self.service.configure_node(self.node['id'], {'processes': 1, 'threads': 4,
                                                        'enabled': True})
 
     def tearDown(self):
@@ -31,36 +31,36 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.service.lease_seconds, 120)
 
     def test_saving_concurrency_without_enabled_preserves_accepting_state(self):
-        self.service.configure_node(self.node['id'], {'processes': 4, 'threads': 250})
+        self.service.configure_node(self.node['id'], {'processes': 1, 'threads': 250})
         saved = next(value for value in self.service.snapshot()['nodes']
                      if value['id'] == self.node['id'])
         self.assertTrue(saved['enabled'])
-        self.assertEqual((saved['desired_processes'], saved['desired_threads']), (4, 250))
+        self.assertEqual((saved['desired_processes'], saved['desired_threads']), (1, 250))
 
     def test_new_node_can_start_without_device_prefill(self):
-        node = self.service.add_node('auto-devices', 4, 250)
+        node = self.service.add_node('auto-devices', 1, 300)
         with self.service.db.connect() as db:
             saved = db.execute('SELECT device_request,enabled FROM nodes WHERE id=?',
                                (node['id'],)).fetchone()
         response = self.service.heartbeat(node['id'], {
             'session': 'auto-device-session', 'hostname': 'new-node', 'version': 'test',
-            'max_processes': 4, 'max_threads': 500, 'active': [], 'interrupted': []})
+            'max_processes': 1, 'max_threads': 500, 'active': [], 'interrupted': []})
         self.assertEqual(saved['device_request'], 0)
         self.assertFalse(saved['enabled'])
         self.assertNotIn('device_request', response)
         self.assertFalse(response['enabled'])
-        self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
+        self.service.configure_node(node['id'], {'processes': 1, 'threads': 300,
                                                   'enabled': True})
         self.assertTrue(self.service.snapshot()['nodes'][-1]['enabled'])
 
     def test_rolling_update_drains_limits_parallelism_and_resumes_after_health(self):
-        other = self.service.add_node('second-update-node', 2, 4)
+        other = self.service.add_node('second-update-node', 1, 4)
         self.service.heartbeat(other['id'], {
             'session': 'second-update-session', 'hostname': 'second', 'version': '0.3.37',
-            'max_processes': 2, 'max_threads': 4, 'active': [], 'interrupted': [],
+            'max_processes': 1, 'max_threads': 4, 'active': [], 'interrupted': [],
             'devices': {'running': False, 'capacity': 30, 'ready': 30,
                         'built': 30, 'failed': 0, 'attempted': 30}})
-        self.service.configure_node(other['id'], {'processes': 2, 'threads': 4,
+        self.service.configure_node(other['id'], {'processes': 1, 'threads': 4,
                                                    'enabled': True})
         queued = self.service.request_updates([self.node['id'], other['id']], 'abc1234', 1)
         self.assertEqual(queued, {'queued': 2, 'ref': 'abc1234', 'parallel': 1})
@@ -86,7 +86,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(nodes[other['id']]['update_state'], 'dispatched')
 
     def test_rolling_update_rejects_offline_node_and_unsafe_ref(self):
-        offline = self.service.add_node('offline-update-node', 2, 4)
+        offline = self.service.add_node('offline-update-node', 1, 4)
         with self.assertRaisesRegex(Conflict, '节点离线'):
             self.service.request_updates([offline['id']], 'main', 1)
         with self.assertRaisesRegex(ValueError, '合法'):
@@ -267,7 +267,7 @@ class ControllerTests(unittest.TestCase):
             'https://proxy.example/two?token=***&num=200'])
         self.assertNotIn('proxy_pool_size', settings)
 
-        other = self.service.add_node('second-node', 2, 4)
+        other = self.service.add_node('second-node', 1, 4)
         self.service.heartbeat(other['id'], dict(session='second-session', max_processes=1,
                                max_threads=2, active=[]))
         with self.service.db.connect() as db:
@@ -301,22 +301,22 @@ class ControllerTests(unittest.TestCase):
         unit = self.service.lease(self.node['id'], 'test-session')
         self.assertIs(unit['_proxy_debug'], True)
 
-    def test_four_process_five_hundred_thread_capacity_is_accepted(self):
-        """4 核节点的用户可调上限为 4 进程 / 500 线程。"""
-        node = self.service.add_node('big', 4, 500)
-        self.service.heartbeat(node['id'], dict(session='big-session', max_processes=4,
+    def test_single_process_five_hundred_thread_capacity_is_accepted(self):
+        """节点固定一个进程，线程上限仍可配置到 500。"""
+        node = self.service.add_node('big', 1, 500)
+        self.service.heartbeat(node['id'], dict(session='big-session', max_processes=1,
                                                 max_threads=500, active=[], interrupted=[],
                                                 devices={'running': False, 'capacity': 30,
                                                          'ready': 30, 'built': 30,
                                                          'failed': 0, 'attempted': 30}))
-        self.service.configure_node(node['id'], {'processes': 4, 'threads': 500,
+        self.service.configure_node(node['id'], {'processes': 1, 'threads': 500,
                                                   'enabled': True})
         job = self.job()
         self.service.job_action(job, 'start')
         unit = self.service.lease(node['id'], 'big-session')
         self.assertIsNotNone(unit)
         self.assertEqual(unit['threads'], 500)
-        self.assertEqual(unit['processes'], 4)
+        self.assertEqual(unit['processes'], 1)
         self.assertIsNone(self.service.lease(node['id'], 'big-session'))
 
     def test_watchdog_interruption_requeues_same_package_without_blocking(self):
@@ -339,20 +339,23 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual((saved['status'], saved['attempt'], saved['processed']),
                          ('leased', 2, 0))
 
-    def test_legacy_ten_by_one_hundred_migrates_to_four_by_two_fifty(self):
-        node = self.service.add_node('legacy-10x100', 4, 250)
+    def test_legacy_multi_process_node_migrates_to_one_by_three_hundred(self):
+        node = self.service.add_node('legacy-10x100', 1, 300)
         with self.service.db.transaction() as db:
             db.execute('UPDATE nodes SET desired_processes=10,desired_threads=100 WHERE id=?',
                        (node['id'],))
+            db.execute("DELETE FROM controller_settings WHERE key='single_process_300_migrated'")
+        self.service.close()
+        self.service = Controller(self.temp.name)
         response = self.service.heartbeat(node['id'], {
             'session': 'legacy-session', 'version': '0.3.66',
-            'max_processes': 4, 'max_threads': 500, 'active': [], 'interrupted': []})
-        self.assertEqual((response['processes'], response['threads']), (4, 250))
-        self.assertEqual((response['desired_processes'], response['desired_threads']), (4, 250))
+            'max_processes': 1, 'max_threads': 500, 'active': [], 'interrupted': []})
+        self.assertEqual((response['processes'], response['threads']), (1, 300))
+        self.assertEqual((response['desired_processes'], response['desired_threads']), (1, 300))
         with self.service.db.connect() as db:
             saved = db.execute('SELECT desired_processes,desired_threads FROM nodes WHERE id=?',
                                (node['id'],)).fetchone()
-        self.assertEqual(tuple(saved), (4, 250))
+        self.assertEqual(tuple(saved), (1, 300))
 
     def test_lease_carries_job_timeout_and_indexed_package_bytes(self):
         job = self.service.create_job('indexed', io.BytesIO(b'hello\n' * 100), 50,
@@ -723,13 +726,13 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(sum(snapshot['row_counts'].values()), snapshot['rows'])
 
     def test_two_accepting_nodes_balance_10002_rows_as_5001_each(self):
-        other = self.service.add_node('second-balanced-node', 2, 4)
+        other = self.service.add_node('second-balanced-node', 1, 4)
         self.service.heartbeat(other['id'], {
             'session': 'second-balanced-session', 'hostname': 'second', 'version': 'test',
             'max_processes': 2, 'max_threads': 4, 'active': [], 'interrupted': [],
             'devices': {'running': False, 'capacity': 30, 'ready': 30,
                         'built': 30, 'failed': 0, 'attempted': 30}})
-        self.service.configure_node(other['id'], {'processes': 2, 'threads': 4,
+        self.service.configure_node(other['id'], {'processes': 1, 'threads': 4,
                                                    'enabled': True})
         job = self.service.create_job('balanced-10002', io.BytesIO(b'x\n' * 10002),
                                       10000, mode='auth')

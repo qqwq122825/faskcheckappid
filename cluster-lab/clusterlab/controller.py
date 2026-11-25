@@ -36,8 +36,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE TABLE IF NOT EXISTS nodes (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
  created REAL NOT NULL, last_seen REAL, session TEXT, hostname TEXT,
- enabled INTEGER NOT NULL DEFAULT 1, desired_processes INTEGER NOT NULL DEFAULT 4,
- desired_threads INTEGER NOT NULL DEFAULT 250, max_processes INTEGER,
+ enabled INTEGER NOT NULL DEFAULT 1, desired_processes INTEGER NOT NULL DEFAULT 1,
+ desired_threads INTEGER NOT NULL DEFAULT 300, max_processes INTEGER,
  max_threads INTEGER, version TEXT, last_total INTEGER NOT NULL DEFAULT 0,
  rate REAL NOT NULL DEFAULT 0, last_error TEXT,
  update_generation INTEGER NOT NULL DEFAULT 0,
@@ -275,7 +275,7 @@ def result_reason_cn(value, bucket=None):
 
 
 class Controller:
-    MAX_PROCESSES = 4
+    MAX_PROCESSES = 1
     MAX_THREADS = 500
     MAX_ACTIVE_UNITS = 512
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
@@ -324,6 +324,13 @@ class Controller:
                 if name not in columns:
                     db.execute(f'ALTER TABLE nodes ADD COLUMN {name} {definition}')
             db.execute("INSERT OR IGNORE INTO controller_settings(key,value) VALUES('update_parallel','2')")
+            migrated = db.execute(
+                "SELECT value FROM controller_settings WHERE key='single_process_300_migrated'"
+            ).fetchone()
+            if not migrated:
+                db.execute('UPDATE nodes SET desired_processes=1,desired_threads=300')
+                db.execute("INSERT INTO controller_settings(key,value) "
+                           "VALUES('single_process_300_migrated','1')")
             unit_columns = {row['name'] for row in db.execute('PRAGMA table_info(units)')}
             if 'result_counts' not in unit_columns:
                 db.execute('ALTER TABLE units ADD COLUMN result_counts TEXT')
@@ -436,7 +443,7 @@ class Controller:
                            (json.dumps(dict(counts), separators=(',', ':')),
                             self.RESULT_CLASSIFICATION_VERSION, unit['id']))
 
-    def add_node(self, name, processes=4, threads=250):
+    def add_node(self, name, processes=1, threads=300):
         name = str(name).strip()[:80]
         if not name:
             raise ValueError('请填写节点名称')
@@ -1252,20 +1259,6 @@ class Controller:
                 raise Conflict('同一节点身份已有另一个实例在线；请等待旧实例离线或使用独立接入凭证')
             desired_processes = node['desired_processes']
             desired_threads = node['desired_threads']
-            # 0.3.66 把 4 核节点从 10×100 改为 4×250，保持总并发 1000。
-            if desired_processes == 10 and desired_threads == 100 and max_p >= 4 and max_t >= 250:
-                desired_processes, desired_threads = 4, 250
-                db.execute('UPDATE nodes SET desired_processes=?,desired_threads=? WHERE id=?',
-                           (desired_processes, desired_threads, node_id))
-                event(db, 'node_config', '已将旧版 10×100 等并发迁移为 4×250', node_id=node_id)
-            # 0.3.5 前端把线程数上限错误限制为 32。
-            if desired_threads == 32 and max_t >= 100 and str(node['version'] or '') != '0.3.6':
-                desired_threads = 250
-                desired_processes = min(desired_processes, 4)
-                db.execute('UPDATE nodes SET desired_processes=?,desired_threads=? WHERE id=?',
-                           (desired_processes, desired_threads, node_id))
-                event(db, 'node_config', '已将旧版线程配置升级为 4 核节点配置',
-                      node_id=node_id)
             reject, confirmed, interrupted_ack, reported_ack = [], [], [], {}
             traffic_jobs = set()
             for value in interrupted:

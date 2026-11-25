@@ -134,11 +134,11 @@ class NodeRecoveryTests(unittest.TestCase):
         self.node.close()
         self.temp.cleanup()
 
-    def test_legacy_service_limits_are_migrated_to_four_by_five_hundred(self):
+    def test_node_forces_single_process_and_preserves_thread_limit(self):
         with tempfile.TemporaryDirectory() as root:
             legacy = Node(root, max_processes=10, max_threads=100)
             try:
-                self.assertEqual((legacy.max_processes, legacy.max_threads), (4, 500))
+                self.assertEqual((legacy.max_processes, legacy.max_threads), (1, 100))
             finally:
                 legacy.close()
 
@@ -302,9 +302,9 @@ class NodeRecoveryTests(unittest.TestCase):
         with patch.object(self.node.builder, 'snapshot',
                           side_effect=AssertionError('must not inspect device pool')):
             self.node._prepare_auth_devices(descriptor)
-        self.assertEqual(descriptor['device_pool_capacity'], 400)
-        self.assertEqual(descriptor['device_slots'], list(range(1, 401)))
-        self.assertEqual(descriptor['processes'], 2)
+        self.assertEqual(descriptor['device_pool_capacity'], 200)
+        self.assertEqual(descriptor['device_slots'], list(range(1, 201)))
+        self.assertEqual(descriptor['processes'], 1)
         self.assertNotIn('device_capacity', descriptor)
         self.assertEqual(self.node.builder.reserved, set())
 
@@ -313,7 +313,7 @@ class NodeRecoveryTests(unittest.TestCase):
         with patch.object(self.node.builder, 'snapshot',
                           side_effect=AssertionError('must not inspect device pool')):
             self.node._prepare_auth_devices(descriptor)
-        self.assertEqual(descriptor['processes'], 2)
+        self.assertEqual(descriptor['processes'], 1)
         self.assertEqual(descriptor['device_slots'], [1, 2])
 
     def test_background_builder_never_registers_without_a_proxy(self):

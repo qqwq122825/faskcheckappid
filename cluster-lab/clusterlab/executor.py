@@ -23,8 +23,7 @@ from .common import atomic_json
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
 PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
-PROXY_MICROBATCH_WINDOW_SECONDS = 0.2
-PROXY_MICROBATCH_MAX_SIZE = 1000
+PROXY_WATERMARK_RATIO = 0.5
 MIN_STALL_TIMEOUT_SECONDS = 180.0
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
@@ -32,159 +31,117 @@ PROXY_EXIT_IP_TIMEOUT = 4.0
 PROXY_EXIT_IP_MAX = 2048
 
 
-class _OnDemandProxyBatcher:
-    """Merge only currently waiting proxy requests into short API batches.
+class _WatermarkProxyPool:
+    """Small task-local pool with fair reuse and one low-water refill path."""
 
-    This deliberately is not a proxy pool: returned endpoints are handed
-    directly to the waiters in the current batch. Nothing is retained for a
-    later request, and there is no TTL, low-water mark, recycle or refill
-    state.
-    """
+    def __init__(self, fetch, target, low_water=None):
+        self.fetch = fetch
+        self.target = max(1, int(target))
+        self.low_water = max(1, int(low_water or self.target * PROXY_WATERMARK_RATIO))
+        self.condition = threading.Condition()
+        self.fresh = deque()
+        self.reusable = deque()
+        self.known = set()
+        self.leased = set()
+        self.uses = {}
+        self.refilling = False
 
-    def __init__(self, fetch, window=PROXY_MICROBATCH_WINDOW_SECONDS,
-                 max_batch=PROXY_MICROBATCH_MAX_SIZE):
-        self._fetch = fetch
-        self._window = max(0.0, float(window))
-        self._max_batch = max(1, int(max_batch))
-        self._condition = threading.Condition()
-        self._pending = deque()
-        self._coordinator_running = False
+    def bootstrap(self):
+        """Fetch the configured thread count once before workers start."""
+        self._refill(blocking=True)
+        return self.snapshot()
 
-    def request(self, stop=None):
-        request = {'event': threading.Event(), 'proxy': None, 'cancelled': False}
-        with self._condition:
-            self._pending.append(request)
-            self._condition.notify_all()
-            if not self._coordinator_running:
-                self._coordinator_running = True
-                threading.Thread(target=self._run, name='proxy-microbatch',
-                                 daemon=True).start()
-        while not request['event'].wait(0.1):
-            if stop is not None and stop.is_set():
-                request['cancelled'] = True
-                return None
-        return request['proxy']
-
-    def _run(self):
-        while True:
-            with self._condition:
-                if not self._pending:
-                    self._coordinator_running = False
-                    return
-                deadline = time.monotonic() + self._window
-                while len(self._pending) < self._max_batch:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    self._condition.wait(remaining)
-                batch = [self._pending.popleft()
-                         for _ in range(min(self._max_batch, len(self._pending)))]
-            try:
-                values = list(self._fetch(len(batch)) or ())
-            except Exception:                                      # noqa: BLE001
-                values = []
-            # Assign the exact provider-returned endpoint to one waiter only.
-            # Extra provider values are intentionally discarded, not stocked.
-            for index, request in enumerate(batch):
-                if not request['cancelled'] and index < len(values):
-                    request['proxy'] = values[index]
-                request['event'].set()
-
-
-class _CrossProcessProxyRequester:
-    """Let worker threads wait on a node-level microbatch broker."""
-
-    def __init__(self, request_queue, response_queue, client_id):
-        self._request_queue = request_queue
-        self._response_queue = response_queue
-        self._client_id = int(client_id)
-        self._lock = threading.Lock()
-        self._next_id = 0
-        self._pending = {}
-        threading.Thread(target=self._listen, name='proxy-microbatch-listener',
-                         daemon=True).start()
-
-    def request(self, stop=None):
-        with self._lock:
-            request_id = self._next_id
-            self._next_id += 1
-            request = {'event': threading.Event(), 'proxy': None}
-            self._pending[request_id] = request
-        self._request_queue.put((self._client_id, request_id))
-        while not request['event'].wait(0.1):
-            if stop is not None and stop.is_set():
-                with self._lock:
-                    self._pending.pop(request_id, None)
-                return None
-        return request['proxy']
-
-    def _listen(self):
-        while True:
-            response = self._response_queue.get()
-            if response is None:
-                return
-            request_id, proxy = response
-            with self._lock:
-                request = self._pending.pop(int(request_id), None)
-            if request is not None:
-                request['proxy'] = proxy
-                request['event'].set()
-
-
-class _NodeProxyMicrobatchBroker:
-    """Batch current proxy demand across every auth process on one node."""
-
-    def __init__(self, request_queue, response_queues, fetch,
-                 window=PROXY_MICROBATCH_WINDOW_SECONDS,
-                 max_batch=PROXY_MICROBATCH_MAX_SIZE):
-        self._request_queue = request_queue
-        self._response_queues = response_queues
-        self._fetch = fetch
-        self._window = max(0.0, float(window))
-        self._max_batch = max(1, int(max_batch))
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run,
-                                        name='node-proxy-microbatch', daemon=True)
-
-    def start(self):
-        self._thread.start()
-
-    def close(self):
-        self._stop.set()
-        self._request_queue.put(None)
-        self._thread.join(2)
-        for response_queue in self._response_queues:
-            response_queue.put(None)
-
-    def _run(self):
-        while not self._stop.is_set():
-            try:
-                first = self._request_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if first is None:
-                return
-            batch = [first]
-            deadline = time.monotonic() + self._window
-            while len(batch) < self._max_batch:
+    def acquire(self, wait=PROXY_ACQUIRE_WAIT_SECONDS):
+        deadline = time.monotonic() + max(0.0, float(wait))
+        with self.condition:
+            while True:
+                endpoint = None
+                if self.fresh:
+                    endpoint = self.fresh.popleft()
+                elif self.reusable:
+                    # Do not let one fast thread repeatedly take the same
+                    # endpoint while equally old exits are still busy.  A
+                    # reusable exit is eligible when it is in the least-used
+                    # generation; releases append at the tail for FIFO order.
+                    least_uses = min(self.uses.get(value, 0)
+                                     for value in self.known)
+                    for _index in range(len(self.reusable)):
+                        candidate = self.reusable.popleft()
+                        if (endpoint is None
+                                and self.uses.get(candidate, 0) <= least_uses):
+                            endpoint = candidate
+                        else:
+                            self.reusable.append(candidate)
+                if endpoint is not None:
+                    self.leased.add(endpoint)
+                    count = self.uses.get(endpoint, 0)
+                    self.uses[endpoint] = count + 1
+                    return (endpoint, 0.0, count)
+                if len(self.known) < self.target and not self.refilling:
+                    self._start_refill_locked()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    break
-                try:
-                    item = self._request_queue.get(timeout=remaining)
-                except queue.Empty:
-                    break
-                if item is None:
-                    self._stop.set()
-                    break
-                batch.append(item)
-            try:
-                values = list(self._fetch(len(batch)) or ())
-            except Exception:                                      # noqa: BLE001
-                values = []
-            for index, (client_id, request_id) in enumerate(batch):
-                proxy = values[index] if index < len(values) else None
-                self._response_queues[int(client_id)].put((request_id, proxy))
+                    return None
+                self.condition.wait(min(0.1, remaining))
+
+    def release(self, lease, healthy=True):
+        endpoint = lease[0] if lease else None
+        if not endpoint:
+            return
+        with self.condition:
+            self.leased.discard(endpoint)
+            if healthy and endpoint in self.known:
+                # Old proxies rotate at the tail, so reuse stays even.
+                self.reusable.append(endpoint)
+            else:
+                self.known.discard(endpoint)
+                self.uses.pop(endpoint, None)
+            self._ensure_watermark_locked()
+            self.condition.notify_all()
+
+    def discard(self, lease):
+        self.release(lease, healthy=False)
+
+    def snapshot(self):
+        with self.condition:
+            return {'target': self.target, 'low_water': self.low_water,
+                    'fresh': len(self.fresh), 'reusable': len(self.reusable),
+                    'available': len(self.fresh) + len(self.reusable),
+                    'in_use': len(self.leased), 'known': len(self.known),
+                    'refilling': self.refilling}
+
+    def _ensure_watermark_locked(self):
+        if len(self.known) < self.low_water and not self.refilling:
+            self._start_refill_locked()
+
+    def _start_refill_locked(self):
+        self.refilling = True
+        threading.Thread(target=self._refill, name='proxy-watermark-refill',
+                         daemon=True).start()
+
+    def _refill(self, blocking=False):
+        if blocking:
+            with self.condition:
+                if self.refilling:
+                    return
+                self.refilling = True
+        with self.condition:
+            missing = max(0, self.target - len(self.known))
+        try:
+            values = list(self.fetch(missing) or ()) if missing else []
+        except Exception:                                          # noqa: BLE001
+            values = []
+        with self.condition:
+            # New endpoints always enter the fresh queue and are selected
+            # before reusable ones. Identity is the complete provider string,
+            # so equal IPs on different ports remain independent exits.
+            for value in values:
+                endpoint = str(value or '').strip()
+                if endpoint and endpoint not in self.known:
+                    self.known.add(endpoint)
+                    self.fresh.append(endpoint)
+            self.refilling = False
+            self.condition.notify_all()
 
 
 def stall_timeout_seconds(descriptor, minimum=MIN_STALL_TIMEOUT_SECONDS,
@@ -193,14 +150,6 @@ def stall_timeout_seconds(descriptor, minimum=MIN_STALL_TIMEOUT_SECONDS,
     timeout = max(0.1, float(descriptor.get('timeout') or 20))
     attempts = max(0, int(descriptor.get('retries') or 0)) + 1
     return max(float(minimum), timeout * attempts + float(padding))
-
-
-def _partition_device_slots(slot_ids, process_count, process_index):
-    """Give every process a disjoint share of the full device pool."""
-    slots = [int(value) for value in slot_ids]
-    count = max(1, int(process_count))
-    index = max(0, int(process_index))
-    return slots[index::count] or [index + 1]
 
 
 def _slot_for_account(account, slot_ids):
@@ -679,8 +628,7 @@ def execute_unit(directory, descriptor, stop):
         atomic_json(directory / 'done.json', {'ok': False, 'processed': processed, 'error': type(exc).__name__})
 
 
-def _group_child(directory, descriptor, stop, proxy_pool=None,
-                 proxy_microbatch_channels=None):
+def _group_child(directory, descriptor, stop, proxy_pool=None):
     # 认证子进程属于吞吐型后台工作。降低它相对节点主进程的调度优先级，
     # 避免 SRP/PBKDF2/TLS 高负载时心跳线程拿不到 CPU 而误丢租约。
     worker_nice = 0
@@ -690,53 +638,24 @@ def _group_child(directory, descriptor, stop, proxy_pool=None,
         except (AttributeError, OSError):
             worker_nice = 0
     descriptor['_worker_nice'] = worker_nice
-    if proxy_pool is not None:
-        # Proxy stock is expendable; result files are independently flushed.
-        # A child must not wait at exit for its reusable-queue feeder to drain
-        # into a pipe nobody reads while the coordinator waits for this child.
-        for channel in (proxy_pool.fresh, proxy_pool.reusable):
-            channel.cancel_join_thread()
     runner = execute_auth_unit if descriptor.get('mode') == 'auth' else execute_unit
     if runner is execute_auth_unit:
-        proxy_requester = None
-        if proxy_microbatch_channels is not None:
-            request_queue, response_queue, client_id = proxy_microbatch_channels
-            proxy_requester = _CrossProcessProxyRequester(
-                request_queue, response_queue, client_id)
-        runner(directory, descriptor, stop, proxy_pool=proxy_pool,
-               proxy_requester=proxy_requester)
+        runner(directory, descriptor, stop, proxy_pool=proxy_pool)
     else:
         runner(directory, descriptor, stop)
 
 
-def _auth_worker_limit(configured, configured_processes=1, active_processes=None):
-    """Preserve total network concurrency across CPU-sized auth processes."""
-    configured = max(1, int(configured or 1))
-    configured_processes = max(1, int(configured_processes or 1))
-    active_processes = max(1, int(active_processes or configured_processes))
-    total_concurrency = configured_processes * configured
-    return (total_concurrency + active_processes - 1) // active_processes
-
-
-def _auth_process_limit(configured, rows, cpu_count=None):
-    """Use one GMP compute lane per logical CPU."""
-    configured = max(1, int(configured or 1))
-    rows = max(1, int(rows or 1))
-    logical_cpus = max(1, int(cpu_count or os.cpu_count() or 1))
-    return min(configured, rows, logical_cpus)
-
-
 def execute_unit_group(directory, descriptor, stop):
-    """Use one controller package as a complete node-sized work batch.
-
-    The controller leases at most one package to a node.  This coordinator
-    splits that package locally into contiguous ranges, starts the configured
-    process count, aggregates their progress, and merges ordered results.  The
-    controller therefore keeps only 10,000-row package metadata while a node
-    still uses all of its process and thread capacity.
-    """
+    """Run one package in one worker process with the configured thread count."""
     directory = Path(directory)
     descriptor = dict(descriptor)
+    configured_processes = max(1, int(descriptor.get('processes') or 1))
+    threads = max(1, int(descriptor.get('threads') or 1))
+    descriptor['processes'] = 1
+    descriptor['_node_process_count'] = 1
+    descriptor['_node_configured_process_count'] = 1
+    descriptor['_node_cpu_count'] = max(1, int(os.cpu_count() or 1))
+    descriptor['_active_threads_per_process'] = threads
     debug_path = None
     if _proxy_debug_enabled(descriptor):
         debug_path = directory / 'proxy-debug.jsonl'
@@ -744,234 +663,31 @@ def execute_unit_group(directory, descriptor, stop):
         descriptor['_proxy_debug_path'] = str(debug_path)
         _write_proxy_debug(
             debug_path, 'debug_start', job_id=str(descriptor.get('job_id') or ''),
-            unit_id=str(descriptor.get('id') or ''), rows=int(descriptor.get('rows') or 0),
-            processes=int(descriptor.get('processes') or 1),
-            threads=int(descriptor.get('threads') or 1),
+            unit_id=str(descriptor.get('id') or ''),
+            rows=int(descriptor.get('rows') or 0), processes=1, threads=threads,
+            requested_processes=configured_processes,
             retries=int(descriptor.get('retries') or 0),
             timeout=float(descriptor.get('timeout') or 20),
-            mode='timeout_full_trace', credentials_recorded=False)
-    started = time.time()
-    rows = max(0, int(descriptor.get('rows') or 0))
-    process_limit = max(1, int(descriptor.get('processes') or 1))
-    node_cpu_count = max(1, int(os.cpu_count() or 1))
-    process_count = min(process_limit, max(1, rows))
-    if descriptor.get('mode') == 'auth':
-        process_count = _auth_process_limit(process_limit, rows, node_cpu_count)
-    descriptor['_node_process_count'] = process_count
-    descriptor['_node_configured_process_count'] = process_limit
-    descriptor['_node_cpu_count'] = node_cpu_count
-    active_threads_per_process = (
-        _auth_worker_limit(descriptor.get('threads'), process_limit, process_count)
-        if descriptor.get('mode') == 'auth'
-        else max(1, int(descriptor.get('threads') or 1)))
-    descriptor['_active_threads_per_process'] = active_threads_per_process
-    context = mp.get_context('spawn')
-    # Production deliberately has no IP inventory. Waiting auth threads are
-    # collected for at most 200 ms and one provider request returns exactly
-    # their current demand (up to 1000); retrying threads submit new demand.
-    # The old injected pool path remains only for compatibility tests.
-    proxy_pool = None
-    if process_count == 1:
-        _group_child(directory, descriptor, stop, proxy_pool)
-        progress = read_progress = {}
-        try:
-            read_progress = json.loads((directory / 'progress.json').read_text('utf-8'))
-        except (OSError, ValueError):
-            pass
-        read_progress.update(workers=0, worker_limit=process_limit,
-                             active_process_limit=process_count,
-                             threads_per_process=int(descriptor.get('threads') or 1),
-                             active_threads_per_process=active_threads_per_process)
-        atomic_json(directory / 'progress.json', read_progress)
-        done = json.loads((directory / 'done.json').read_text('utf-8'))
-        atomic_json(directory / 'done.json', done)
-        return
+            mode='single_process_watermark', credentials_recorded=False)
 
-    workers_root = directory / 'workers'
-    workers_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    counts = [rows // process_count + (index < rows % process_count)
-              for index in range(process_count)]
-    child_descriptors = []
-    current_row = int(descriptor.get('first_row') or 1)
-    with (directory / 'input.part').open('rb') as source:
-        for index, count in enumerate(counts):
-            child_dir = workers_root / f'{index + 1:03d}'
-            child_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            for name in ('done.json', 'progress.json', 'results.jsonl'):
-                (child_dir / name).unlink(missing_ok=True)
-            child_input = child_dir / 'input.part'
-            with child_input.open('wb') as output:
-                child_input.chmod(0o600)
-                for _ in range(count):
-                    line = source.readline(65537)
-                    if not line:
-                        raise ValueError('input ended before local fan-out completed')
-                    if len(line) > 65536:
-                        raise ValueError('input record too long')
-                    output.write(line)
-            child = dict(descriptor, first_row=current_row, rows=count, processes=1)
-            if descriptor.get('mode') == 'auth':
-                # 每个进程分到一组不重叠槽位；30 台 / 10 进程时每进程 3 台，
-                # 避免整个子包的账号都累计到同一台设备。
-                assigned = descriptor.get('device_slots') or []
-                child['device_slots'] = _partition_device_slots(
-                    assigned or range(1, process_count + 1), process_count, index)
-                child['device_pool_capacity'] = int(
-                    descriptor.get('device_pool_capacity') or max(assigned))
-            atomic_json(child_dir / 'manifest.json', child)
-            child_descriptors.append((child_dir, child))
-            current_row += count
-        if source.read(1):
-            raise ValueError('input contains more rows than package descriptor')
-
-    children = []
-    proxy_broker = None
-    proxy_request_queue = None
-    proxy_response_queues = []
+    _group_child(directory, descriptor, stop)
+    progress = {}
     try:
-        if (descriptor.get('mode') == 'auth' and descriptor.get('proxy_api')
-                and process_count > 1):
-            _load_fastcheck()
-            from fastcheck.proxy_pool import fetch_proxies
-            scheme = descriptor.get('proxy_scheme') or 'socks5h'
-
-            def fetch_proxy_batch(count):
-                return fetch_proxies(
-                    descriptor['proxy_api'], count,
-                    scheme=None if scheme == 'http' else scheme)
-
-            proxy_request_queue = context.Queue()
-            proxy_response_queues = [context.Queue() for _ in child_descriptors]
-            proxy_broker = _NodeProxyMicrobatchBroker(
-                proxy_request_queue, proxy_response_queues, fetch_proxy_batch)
-            proxy_broker.start()
-        for index, (child_dir, child) in enumerate(child_descriptors):
-            child_stop = context.Event()
-            microbatch_channels = (
-                (proxy_request_queue, proxy_response_queues[index], index)
-                if proxy_broker is not None else None)
-            process = context.Process(target=_group_child,
-                                      args=(str(child_dir), child, child_stop, proxy_pool,
-                                            microbatch_channels),
-                                      name=f'package-worker-{index + 1:02d}')
-            process.start()
-            children.append((process, child_stop, child_dir))
-
-        last_write = 0.0
-        last_processed = -1
-        last_progress_at = time.monotonic()
-        stall_timeout = stall_timeout_seconds(descriptor)
-        while any(process.is_alive() for process, _, _ in children):
-            if stop.is_set():
-                for _, child_stop, _ in children:
-                    child_stop.set()
-            processed = 0
-            active = 0
-            live_counts = {}
-            for process, _, child_dir in children:
-                active += int(process.is_alive())
-                try:
-                    child_progress = json.loads((child_dir / 'progress.json').read_text('utf-8'))
-                    processed += int(child_progress.get('processed') or 0)
-                    for key, value in (child_progress.get('counts') or {}).items():
-                        live_counts[key] = live_counts.get(key, 0) + int(value)
-                except (OSError, ValueError):
-                    pass
-            now = time.monotonic()
-            if processed != last_processed:
-                last_processed = processed
-                last_progress_at = now
-            elif not stop.is_set() and now - last_progress_at >= stall_timeout:
-                raise RuntimeError(
-                    f'工作包无进度超过 {int(stall_timeout)} 秒，已中止并交回总控')
-            if now - last_write >= 0.25:
-                atomic_json(directory / 'progress.json',
-                            {'processed': processed, 'started': started,
-                             'workers': active, 'worker_limit': process_count,
-                             'configured_process_limit': process_limit,
-                             'threads_per_process': int(descriptor.get('threads') or 1),
-                             'active_threads_per_process': active_threads_per_process,
-                             'counts': live_counts})
-                last_write = now
-            time.sleep(0.05)
-
-        failures = []
-        for process, _, child_dir in children:
-            process.join()
-            done = {}
-            try:
-                done = json.loads((child_dir / 'done.json').read_text('utf-8'))
-            except (OSError, ValueError):
-                pass
-            if process.exitcode != 0 or not done.get('ok'):
-                failures.append(str(done.get('error') or f'worker_exit_{process.exitcode}'))
-        if failures:
-            raise RuntimeError(failures[0])
-
-        output_digest = hashlib.sha256()
-        processed = 0
-        merged_counts = {}
-        merged_output = directory / 'results.jsonl'
-        with merged_output.open('wb') as output:
-            merged_output.chmod(0o600)
-            for _, _, child_dir in children:
-                done = json.loads((child_dir / 'done.json').read_text('utf-8'))
-                processed += int(done['processed'])
-                for key, value in (done.get('counts') or {}).items():
-                    merged_counts[key] = merged_counts.get(key, 0) + int(value)
-                with (child_dir / 'results.jsonl').open('rb') as source:
-                    for block in iter(lambda: source.read(1024 * 1024), b''):
-                        output.write(block)
-                        output_digest.update(block)
-            output.flush()
-            os.fsync(output.fileno())
-        if processed != rows:
-            raise ValueError('local fan-out result count mismatch')
-        atomic_json(directory / 'progress.json',
-                    {'processed': processed, 'started': started, 'workers': 0,
-                     'worker_limit': process_count,
-                     'configured_process_limit': process_limit,
-                     'threads_per_process': int(descriptor.get('threads') or 1),
-                     'active_threads_per_process': active_threads_per_process,
-                     'counts': merged_counts})
-        atomic_json(directory / 'done.json',
-                    {'ok': True, 'processed': processed, 'counts': merged_counts,
-                     'checksum': output_digest.hexdigest(),
-                     'workers': process_count, 'elapsed': time.time() - started,
-                     'configured_process_limit': process_limit,
-                     'active_threads_per_process': active_threads_per_process})
-    except Exception as exc:                                      # noqa: BLE001
-        for process, child_stop, _ in children:
-            child_stop.set()
-            process.join(2)
-            if process.is_alive():
-                process.terminate()
-                process.join(2)
-        processed = 0
-        live_counts = {}
-        for _, _, child_dir in children:
-            try:
-                child_progress = json.loads((child_dir / 'progress.json').read_text('utf-8'))
-                processed += int(child_progress.get('processed') or 0)
-                for key, value in (child_progress.get('counts') or {}).items():
-                    live_counts[key] = live_counts.get(key, 0) + int(value)
-            except (OSError, ValueError):
-                pass
-        atomic_json(directory / 'progress.json',
-                    {'processed': processed, 'started': started, 'workers': 0,
-                     'worker_limit': process_count,
-                     'configured_process_limit': process_limit,
-                     'threads_per_process': int(descriptor.get('threads') or 1),
-                     'active_threads_per_process': active_threads_per_process,
-                     'counts': live_counts})
-        atomic_json(directory / 'done.json',
-                    {'ok': False, 'processed': processed,
-                     'error': f'{type(exc).__name__}: {exc}'[:300]})
-    finally:
-        if proxy_broker is not None:
-            proxy_broker.close()
-        for process, _, _ in children:
-            process.close()
+        progress = json.loads((directory / 'progress.json').read_text('utf-8'))
+    except (OSError, ValueError):
+        pass
+    progress.update(workers=0, worker_limit=1, configured_process_limit=1,
+                    active_process_limit=1, threads_per_process=threads,
+                    active_threads_per_process=threads)
+    atomic_json(directory / 'progress.json', progress)
+    try:
+        done = json.loads((directory / 'done.json').read_text('utf-8'))
+    except (OSError, ValueError):
+        done = {'ok': False, 'processed': int(progress.get('processed') or 0),
+                'error': 'worker_result_missing'}
+    done.update(workers=1, configured_process_limit=1,
+                active_threads_per_process=threads)
+    atomic_json(directory / 'done.json', done)
 
 
 def _load_fastcheck():
@@ -1053,20 +769,17 @@ def record_device_registration(device_root, slot, proxy, model=''):
         return False
 
 
-def execute_auth_unit(directory, descriptor, stop, proxy_pool=None,
-                      proxy_requester=None):
+def execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     """真实认证执行入口：任何异常都落成 done.json，避免节点只看到"进程退出"。"""
     try:
-        _execute_auth_unit(directory, descriptor, stop, proxy_pool=proxy_pool,
-                           proxy_requester=proxy_requester)
+        _execute_auth_unit(directory, descriptor, stop, proxy_pool=proxy_pool)
     except Exception as exc:                                       # noqa: BLE001
         atomic_json(Path(directory) / 'done.json',
                     {'ok': False, 'processed': 0,
                      'error': f'{type(exc).__name__}: {exc}'[:300]})
 
 
-def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None,
-                       proxy_requester=None):
+def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     from collections import Counter
     import heapq
@@ -1077,9 +790,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None,
     output_path = directory / 'results.jsonl'
     DevicePool, gsa_check, result_bucket = _load_fastcheck()
     proxy = descriptor.get('proxy')
-    proxy_batcher = proxy_requester
-    if (descriptor.get('proxy_api') and proxy_pool is None
-            and proxy_batcher is None):
+    fetch_proxy_batch = None
+    if descriptor.get('proxy_api') and proxy_pool is None:
         from fastcheck.proxy_pool import fetch_proxies
         scheme = descriptor.get('proxy_scheme') or 'socks5h'
 
@@ -1088,7 +800,6 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None,
                 descriptor['proxy_api'], count,
                 scheme=None if scheme == 'http' else scheme)
 
-        proxy_batcher = _OnDemandProxyBatcher(fetch_proxy_batch)
     elif not proxy:
         proxy = None
     origin = descriptor.get('origin') or 'https://new.ani.sidestore.io'
@@ -1106,10 +817,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None,
                                                 PROXY_RETRY_DELAY_SECONDS)))
     configured_workers = max(1, int(descriptor.get('threads') or 1))
     workers = max(1, int(descriptor.get('_active_threads_per_process') or
-                         _auth_worker_limit(
-                             configured_workers,
-                             descriptor.get('_node_configured_process_count') or 1,
-                             descriptor.get('_node_process_count') or 1)))
+                         configured_workers))
+    runtime_proxy_pool = fetch_proxy_batch is not None
+    if runtime_proxy_pool:
+        proxy_pool = _WatermarkProxyPool(fetch_proxy_batch, target=workers)
+        proxy_pool.bootstrap()
     debug_enabled = _proxy_debug_enabled(descriptor)
     debug_path = (descriptor.get('_proxy_debug_path') or
                   str(directory / 'proxy-debug.jsonl')) if debug_enabled else None
@@ -1138,7 +850,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None,
     identities, infos, device_labels = {}, {}, {}
     # Compatibility only: an explicitly injected legacy pool keeps the old
     # bootstrap path. Production execute_unit_group never creates such a pool.
-    for index in slot_ids if proxy_pool is not None else ():
+    for index in slot_ids if proxy_pool is not None and not runtime_proxy_pool else ():
         bootstrap_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
         bootstrap_started = time.monotonic() if debug_enabled else None
         bootstrap_lease = proxy_pool.acquire(wait=2.0) if proxy_pool is not None else None
@@ -1225,9 +937,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None,
                     break
             return None, None
         state = state_for_thread()
-        if proxy_batcher is not None and (force or not state['proxy']):
-            state['proxy'] = proxy_batcher.request(stop)
-        elif proxy_batcher is None and not state['proxy']:
+        if not state['proxy']:
             state['proxy'] = proxy
         return state['proxy'], None
 
@@ -1281,7 +991,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None,
             return row, line, {'status': 'unknown', 'kind': 'stopped'}
         account, password = _split_account(line)
         account_started = time.time() if account_started is None else account_started
-        worker_state = state_for_thread() if proxy_pool is None else None
+        worker_state = state_for_thread() if runtime_proxy_pool or proxy_pool is None else None
         if worker_state is not None:
             slot_id = worker_state['slot']
             _ignored, account_prefix = _slot_for_account(account, [slot_id])
@@ -1367,8 +1077,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None,
                                                    profile.get('model', ''))
                 # 每次协议请求使用当前线程自己的出口。
                 result = gsa_check(account, password, account_proxy, timeout=timeout,
-                                   retries=0 if (proxy_pool is not None or
-                                                 proxy_batcher is not None) else retries,
+                                   retries=0 if proxy_pool is not None else retries,
                                    cancel=stop.is_set, identity=identity)
                 if descriptor.get('_web_secondary_auth'):
                     def rotate_web(web_attempt):
@@ -1381,15 +1090,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None,
                             current_proxy = (_proxy_identity(account_proxy)
                                              if debug_enabled else current_proxy)
                             return account_proxy, account_proxy is not None
-                        if proxy_batcher is not None:
-                            account_proxy, lease = proxy_for(
-                                index + attempt + web_attempt, force=True)
-                            current_proxy = (_proxy_identity(account_proxy)
-                                             if debug_enabled else current_proxy)
-                            return account_proxy, account_proxy is not None
                         return account_proxy, False
 
-                    if proxy_pool is not None or proxy_batcher is not None:
+                    if proxy_pool is not None:
                         result = _refine_repair_auth_with_rotation(
                             result, account, password, account_proxy, timeout,
                             stop.is_set, retries, rotate_web)

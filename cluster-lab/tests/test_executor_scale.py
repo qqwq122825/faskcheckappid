@@ -3,7 +3,6 @@ import json
 import multiprocessing as mp
 import os
 from pathlib import Path
-import queue
 import sys
 import tempfile
 import threading
@@ -13,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (_CrossProcessProxyRequester, _NodeProxyMicrobatchBroker, _OnDemandProxyBatcher, _auth_process_limit, _auth_worker_limit, _device_id_label, _execute_auth_unit, _partition_device_slots,
+from clusterlab.executor import (_WatermarkProxyPool, _device_id_label, _execute_auth_unit,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_unit_group,
                                  record_device_registration, stall_timeout_seconds)
@@ -85,41 +84,11 @@ class RecordingStop:
         return False
 
 
-def _microbatch_process_client(request_queue, response_queue, client_id,
-                               start, ready, results):
-    requester = _CrossProcessProxyRequester(
-        request_queue, response_queue, client_id)
-    gate = threading.Barrier(11)
-    values = []
-    lock = threading.Lock()
-
-    def request():
-        gate.wait(3)
-        start.wait(3)
-        value = requester.request()
-        with lock:
-            values.append(value)
-
-    threads = [threading.Thread(target=request) for _ in range(10)]
-    for thread in threads:
-        thread.start()
-    gate.wait(3)
-    ready.put(client_id)
-    for thread in threads:
-        thread.join(5)
-    results.put(values)
-
 
 
 
 class ExecutorScaleTests(unittest.TestCase):
-    def test_node_broker_serves_real_spawned_process_threads(self):
-        context = mp.get_context('spawn')
-        requests = context.Queue()
-        responses = [context.Queue(), context.Queue()]
-        ready = context.Queue()
-        results = context.Queue()
-        start = context.Event()
+    def test_watermark_pool_bootstraps_exact_thread_count(self):
         calls = []
 
         def fetch(count):
@@ -127,95 +96,45 @@ class ExecutorScaleTests(unittest.TestCase):
             return [f'socks5h://192.0.2.{index + 1}:1080'
                     for index in range(count)]
 
-        broker = _NodeProxyMicrobatchBroker(requests, responses, fetch)
-        broker.start()
-        processes = [context.Process(
-            target=_microbatch_process_client,
-            args=(requests, responses[index], index, start, ready, results))
-            for index in range(2)]
-        for process in processes:
-            process.start()
-        self.assertEqual({ready.get(timeout=5), ready.get(timeout=5)}, {0, 1})
-        start.set()
-        received = results.get(timeout=8) + results.get(timeout=8)
-        for process in processes:
-            process.join(5)
-        broker.close()
+        pool = _WatermarkProxyPool(fetch, target=300)
+        snapshot = pool.bootstrap()
+        self.assertEqual(calls, [300])
+        self.assertEqual(snapshot['target'], 300)
+        self.assertEqual(snapshot['low_water'], 150)
+        self.assertEqual(snapshot['fresh'], 300)
+        self.assertEqual(snapshot['known'], 300)
 
-        self.assertFalse(any(process.is_alive() for process in processes))
-        self.assertEqual([process.exitcode for process in processes], [0, 0])
-        self.assertEqual(calls, [20])
-        self.assertEqual(len(received), 20)
-        self.assertEqual(len(set(received)), 20)
-
-    def test_node_broker_combines_1000_cross_process_requests_once(self):
-        requests = queue.Queue()
-        responses = [queue.Queue(), queue.Queue()]
+    def test_watermark_pool_rotates_evenly_and_prioritizes_refill(self):
         calls = []
-        fetched = threading.Event()
+        generation = 0
 
         def fetch(count):
+            nonlocal generation
+            generation += 1
             calls.append(count)
-            fetched.set()
-            # Same host with distinct ports proves the complete endpoint is
-            # distributed, rather than deduplicating by IP only.
-            return [f'socks5h://10.0.0.1:{10000 + index}'
-                    for index in range(count)]
+            return [f'socks5h://10.0.{generation}.{index}:1080'
+                    for index in range(1, count + 1)]
 
-        for request_id in range(1000):
-            requests.put((request_id % 2, request_id))
-        broker = _NodeProxyMicrobatchBroker(
-            requests, responses, fetch, window=0.2, max_batch=1000)
-        broker.start()
-        self.assertTrue(fetched.wait(2))
-        first = [responses[index % 2].get(timeout=2) for index in range(1000)]
+        pool = _WatermarkProxyPool(fetch, target=4, low_water=2)
+        pool.bootstrap()
+        first = [pool.acquire() for _ in range(4)]
+        for lease in first:
+            pool.release(lease, healthy=True)
+        second = [pool.acquire() for _ in range(4)]
+        self.assertEqual([lease[0] for lease in second],
+                         [lease[0] for lease in first])
+        for lease in second:
+            pool.release(lease, healthy=True)
 
-        self.assertEqual(calls, [1000])
-        self.assertEqual(len({proxy for _request_id, proxy in first}), 1000)
-        # Nothing from the 1000-response batch remains available to a later
-        # waiter; it creates a new num=1 request after another demand window.
-        requests.put((0, 1001))
-        request_id, proxy = responses[0].get(timeout=2)
-        self.assertEqual((request_id, proxy), (1001, 'socks5h://10.0.0.1:10000'))
-        self.assertEqual(calls, [1000, 1])
-        broker.close()
-
-    def test_proxy_microbatch_caps_each_call_and_keeps_no_inventory(self):
-        calls = []
-        guard = threading.Lock()
-
-        def fetch(count):
-            with guard:
-                call = len(calls) + 1
-                calls.append(count)
-            # The extra endpoint must be discarded rather than stocked.
-            return [f'socks5h://10.0.{call}.{index}:1080'
-                    for index in range(1, count + 2)]
-
-        batcher = _OnDemandProxyBatcher(fetch, window=0.03, max_batch=3)
-        gate = threading.Barrier(5)
-        values = []
-
-        def request():
-            gate.wait(2)
-            value = batcher.request()
-            with guard:
-                values.append(value)
-
-        threads = [threading.Thread(target=request) for _ in range(5)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(2)
-
-        self.assertFalse(any(thread.is_alive() for thread in threads))
-        self.assertEqual(calls, [3, 2])
-        self.assertEqual(len(values), 5)
-        self.assertEqual(len(set(values)), 5)
-        # A later request performs a fresh call even though earlier calls
-        # returned extras: the batcher keeps no inventory.
-        self.assertTrue(batcher.request())
-        self.assertEqual(calls, [3, 2, 1])
+        failed = [pool.acquire() for _ in range(3)]
+        for lease in failed:
+            pool.discard(lease)
+        deadline = time.time() + 2
+        while pool.snapshot()['refilling'] and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(calls, [4, 3])
+        replacement = [pool.acquire() for _ in range(3)]
+        self.assertTrue(all('10.0.2.' in lease[0] for lease in replacement))
 
     def test_raw_apple_reason_is_packaged_only_when_debug_is_enabled(self):
         result = {'apple_message': 'Your account information was entered incorrectly.'}
@@ -227,20 +146,11 @@ class ExecutorScaleTests(unittest.TestCase):
         self.assertEqual(stall_timeout_seconds({'timeout': 20, 'retries': 4}), 180)
         self.assertEqual(stall_timeout_seconds({'timeout': 60, 'retries': 4}), 360)
 
-    def test_native_srp_preserves_total_concurrency_with_cpu_sized_process_pool(self):
-        self.assertEqual(_auth_process_limit(10, rows=1000, cpu_count=4), 4)
-        self.assertEqual(_auth_process_limit(10, rows=1000, cpu_count=16), 10)
-        self.assertEqual(_auth_worker_limit(100, configured_processes=10,
-                                            active_processes=4), 250)
-        self.assertEqual(_auth_worker_limit(100, configured_processes=10,
-                                            active_processes=2), 500)
-        self.assertEqual(4 * _auth_worker_limit(100, 10, 4), 10 * 100)
-
     def test_device_id_uses_short_base64_label(self):
         self.assertEqual(_device_id_label('device-1'), 'B64:ZGV2aWNl')
         self.assertEqual(_device_id_label(''), '')
 
-    def test_waiting_workers_share_one_on_demand_proxy_microbatch(self):
+    def test_task_bootstraps_one_proxy_per_worker_then_reuses_evenly(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'input.part').write_text(
@@ -291,45 +201,41 @@ class ExecutorScaleTests(unittest.TestCase):
                        return_value={'client_info': 'test', 'user_agent': 'test'}):
                 _execute_auth_unit(root, descriptor, threading.Event())
 
-            self.assertEqual(proxy_calls, [('proxy-microbatch', 4)])
+            self.assertEqual(proxy_calls, [('MainThread', 4)])
             self.assertEqual(len(header_calls), 4)
             self.assertEqual({slot for _name, slot in header_calls}, {1, 2, 3, 4})
             by_thread = {}
             for name, endpoint in checked:
                 by_thread.setdefault(name, set()).add(endpoint)
             self.assertEqual(len(by_thread), 4)
-            self.assertTrue(all(len(endpoints) == 1 for endpoints in by_thread.values()))
-            self.assertEqual(len({next(iter(value)) for value in by_thread.values()}), 4)
+            endpoint_counts = {}
+            for _name, endpoint in checked:
+                endpoint_counts[endpoint] = endpoint_counts.get(endpoint, 0) + 1
+            self.assertEqual(sorted(endpoint_counts.values()), [2, 2, 2, 2])
 
-    def test_production_coordinator_never_constructs_a_shared_proxy_pool(self):
+    def test_production_coordinator_forces_one_process_and_keeps_thread_count(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'input.part').write_text('user----password\n', 'utf-8')
 
-            def child(directory, descriptor, _stop, proxy_pool):
-                self.assertIsNone(proxy_pool)
+            def child(directory, descriptor, _stop):
+                self.assertEqual(descriptor['processes'], 1)
+                self.assertEqual(descriptor['_active_threads_per_process'], 300)
                 atomic_json(Path(directory) / 'progress.json',
                             {'processed': 1, 'counts': {'valid': 1}})
                 atomic_json(Path(directory) / 'done.json',
                             {'ok': True, 'processed': 1, 'counts': {'valid': 1},
                              'checksum': 'fixture'})
 
-            descriptor = {'rows': 1, 'first_row': 1, 'processes': 1,
-                          'threads': 400, 'mode': 'auth',
+            descriptor = {'rows': 1, 'first_row': 1, 'processes': 4,
+                          'threads': 300, 'mode': 'auth',
                           'proxy_api': 'http://proxy.invalid/list'}
             with patch('clusterlab.executor._group_child', side_effect=child):
                 execute_unit_group(root, descriptor, threading.Event())
             done = json.loads((root / 'done.json').read_text('utf-8'))
             self.assertTrue(done['ok'])
-            self.assertNotIn('proxy_pool', done)
-
-    def test_full_device_pool_is_partitioned_without_overlap(self):
-        groups = [_partition_device_slots(range(1, 31), 10, index)
-                  for index in range(10)]
-        self.assertEqual(groups[0], [1, 11, 21])
-        self.assertEqual(groups[9], [10, 20, 30])
-        self.assertEqual(sorted(slot for group in groups for slot in group),
-                         list(range(1, 31)))
+            self.assertEqual(done['configured_process_limit'], 1)
+            self.assertEqual(done['active_threads_per_process'], 300)
 
     def test_account_hash_balances_and_exposes_base64_prefix(self):
         slots = list(range(1, 31))
@@ -710,7 +616,7 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(value['model'], 'MacBookPro14,3')
             self.assertRegex(value['at'], r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
 
-    def test_one_package_fans_out_to_processes_and_merges_in_row_order(self):
+    def test_one_package_runs_in_one_process_and_keeps_row_order(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             lines = [f'row-{row:04d}' for row in range(123)]
@@ -724,8 +630,8 @@ class ExecutorScaleTests(unittest.TestCase):
             records = [json.loads(line) for line in
                        (root / 'results.jsonl').read_text('utf-8').splitlines()]
             self.assertTrue(done['ok'], done)
-            self.assertEqual(done['workers'], 4)
-            self.assertEqual(progress['worker_limit'], 4)
+            self.assertEqual(done['workers'], 1)
+            self.assertEqual(progress['worker_limit'], 1)
             self.assertEqual(progress['counts'], {'valid': 123})
             self.assertEqual([record['row'] for record in records], list(range(7001, 7124)))
             self.assertEqual([record['account'] for record in records], lines)

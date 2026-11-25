@@ -42,7 +42,7 @@ class Node:
     # request/retry windows below.
     TASK_STALL_SECONDS = 210.0
 
-    def __init__(self, root, max_processes=2, max_threads=8, allow_http=False, interval=1.0):
+    def __init__(self, root, max_processes=1, max_threads=500, allow_http=False, interval=1.0):
         self.root = private_dir(root)
         self.spool = private_dir(self.root / 'spool')
         self.db = Database(self.root / 'node.sqlite3', SCHEMA)
@@ -58,12 +58,9 @@ class Node:
             self.instance_lock_file = None
         else:
             self.primary_instance = True
-        self.max_processes = integer(max_processes, '本机进程上限', 1, 200)
+        integer(max_processes, '本机进程上限', 1, 200)
+        self.max_processes = 1
         self.max_threads = integer(max_threads, '本机线程上限', 1, 512)
-        # 已部署的 systemd 仍传入旧参数 10×100。新版将它等并发
-        # 迁移为 4×250，并把节点可调上限公告为 4×500。
-        if (self.max_processes, self.max_threads) == (10, 100):
-            self.max_processes, self.max_threads = 4, 500
         self.allow_http, self.interval = allow_http, interval
         self.instance = uuid.uuid4().hex
         self.context = mp.get_context('spawn')
@@ -554,14 +551,13 @@ class Node:
         return True
 
     def _prepare_auth_devices(self, descriptor):
-        """Assign one stable local slot per configured worker, without prefill."""
+        """Assign one stable local device slot per thread in the single process."""
         rows = max(1, int(descriptor.get('rows') or 1))
-        processes = max(1, min(int(descriptor.get('processes') or 1), rows))
         threads = max(1, int(descriptor.get('threads') or 1))
-        capacity = min(rows, processes * threads)
+        capacity = min(rows, threads)
         slots = list(range(1, capacity + 1))
         descriptor.pop('device_capacity', None)
-        descriptor['processes'] = processes
+        descriptor['processes'] = 1
         descriptor['device_pool_capacity'] = capacity
         descriptor['device_slots'] = slots
 
