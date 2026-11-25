@@ -82,8 +82,6 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_scheme','sock
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('origin','https://new.ani.sidestore.io');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_rotate_after','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_auto_rotate','0');
-INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
-INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_pool_size','1000');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('web_secondary_auth','1');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('update_parallel','2');
@@ -449,7 +447,7 @@ class Controller:
             db.execute('INSERT INTO nodes(id,name,token_hash,created,enabled,desired_processes,desired_threads,device_request) '
                        'VALUES(?,?,?,?,?,?,?,?)',
                        (node_id, name, hashlib.sha256(token.encode()).hexdigest(), time.time(),
-                        0, processes, threads, self.DEFAULT_DEVICE_REQUEST))
+                        0, processes, threads, 0))
             event(db, 'node_added', f'已添加节点：{name}', node_id=node_id)
         return {'id': node_id, 'name': name, 'token': token}
 
@@ -470,11 +468,7 @@ class Controller:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:
                 raise ValueError('节点不存在')
-            initialization = self._device_initialization(node)
             enabled = bool(node['enabled']) if 'enabled' not in data else data['enabled']
-            if enabled and not node['enabled'] and not initialization['complete']:
-                raise Conflict(f'设备初始化完成后才能开始接单（'
-                               f'{initialization["ready"]}/{initialization["requested"]}）')
             active = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? AND status IN ('leased','running')", (node_id,)).fetchone()[0]
             if enabled and (node['stop_version'] > node['ack_stop_version'] or
                                     not node['enabled'] and node['stop_version'] > 0 and active):
@@ -630,11 +624,6 @@ class Controller:
                 'proxy_count': len(proxy_parts),
                 'proxy_configured': bool(proxy_parts),
                 'proxy_scheme': values.get('proxy_scheme', 'socks5h'),
-                'device_rotate_after': int(values.get('device_rotate_after', 0) or 0),
-                # column 声明是 INTEGER，存 '1' 会读回整数 1，比较时统一转字符串
-                'device_auto_rotate': str(values.get('device_auto_rotate', '0')) in ('1', 'True', 'true'),
-                'proxy_ttl': int(values.get('proxy_ttl', 50) or 50),
-                'proxy_pool_size': int(values.get('proxy_pool_size', 1000) or 1000),
                 'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true'),
                 'web_secondary_auth': str(values.get('web_secondary_auth', '1')) in
                                       ('1', 'True', 'true')}
@@ -724,21 +713,15 @@ class Controller:
 
     def configure_proxy(self, data):
         action = str(data.get('action') or 'replace').strip()
-        if action not in ('add', 'delete', 'clear', 'replace', 'resize'):
+        if action not in ('add', 'delete', 'clear', 'replace'):
             raise ValueError('代理配置操作无效')
         with self.db.connect() as db:
             current = {row['key']: row['value'] for row in db.execute(
                 "SELECT key,value FROM controller_settings "
-                "WHERE key IN ('proxy_api','proxy_scheme','proxy_pool_size')")}
+                "WHERE key IN ('proxy_api','proxy_scheme')")}
         scheme = str(data.get('proxy_scheme') or current.get('proxy_scheme') or 'socks5h').strip()
         if scheme not in ('socks5h', 'socks5', 'http', 'https'):
             raise ValueError('代理协议应为 socks5h / socks5 / http / https')
-        try:
-            pool_value = int(data.get('proxy_pool_size') or
-                             current.get('proxy_pool_size') or 1000)
-        except (TypeError, ValueError):
-            raise ValueError('单节点代理池容量应为 1–10000 的整数') from None
-        pool_size = integer(pool_value, '单节点代理池容量', 1, 10000)
         existing = [part for part in str(current.get('proxy_api') or '').split() if part]
         submitted = [part for part in str(data.get('proxy_api') or '').split() if part]
         if action == 'add':
@@ -755,8 +738,6 @@ class Controller:
             parts = existing[:index] + existing[index + 1:]
         elif action == 'clear':
             parts = []
-        elif action == 'resize':
-            parts = existing
         else:
             parts = list(dict.fromkeys(submitted))
         if len(parts) > 16:
@@ -770,15 +751,9 @@ class Controller:
         with self.db.transaction() as db:
             db.execute("UPDATE controller_settings SET value=? WHERE key='proxy_api'", (api,))
             db.execute("UPDATE controller_settings SET value=? WHERE key='proxy_scheme'", (scheme,))
-            db.execute("INSERT INTO controller_settings(key,value) VALUES('proxy_pool_size',?) "
-                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(pool_size),))
-            if action == 'resize':
-                event(db, 'controller_config',
-                      f'单节点代理池容量已设置为 {pool_size:,}；每次最多提取 1,000 条并在节点本地补齐')
-            else:
-                event(db, 'controller_config',
-                      f'代理 API 配置已更新，当前 {len(parts)} 个，按节点轮询分配'
-                      if parts else '代理 API 配置已清空')
+            event(db, 'controller_config',
+                  f'代理 API 配置已更新，当前 {len(parts)} 个，按节点轮询分配'
+                  if parts else '代理 API 配置已清空')
         return self.settings()
 
     def request_devices(self, node_id, capacity):
@@ -1409,7 +1384,7 @@ class Controller:
                                 now if final else None, node_id))
                     if update_state == 'success':
                         current = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
-                        if current['update_resume_enabled'] and self._device_initialization(current)['complete']:
+                        if current['update_resume_enabled']:
                             db.execute('UPDATE nodes SET enabled=1 WHERE id=?', (node_id,))
                         event(db, 'node_update_success',
                               f'节点更新成功：{current["update_ref"]}', node_id=node_id)
@@ -1430,12 +1405,7 @@ class Controller:
                     'desired_processes': desired_processes, 'desired_threads': desired_threads,
                     'rejected': reject, 'confirmed': confirmed, 'interrupted_ack': interrupted_ack,
                     'reported': reported_ack,
-                    'device_request': node['device_request'],
                     'device_clear_version': node['device_clear_version'],
-                    'device_rotate_after': self.settings().get('device_rotate_after', 0),
-                    'device_auto_rotate': bool(self.settings().get('device_auto_rotate')),
-                    'proxy_ttl': int(self.settings().get('proxy_ttl') or 50),
-                    'proxy_pool_size': int(self.settings().get('proxy_pool_size') or 1000),
                     'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds,
                     'update': update,
                     'server_time': now,
@@ -1497,12 +1467,10 @@ class Controller:
                 # 必须和心跳下发使用同一个节点专属配置，不能把全部 API
                 # 串成一个地址交给执行器。
                 config = self.proxy_for_node(node)
-                settings = self.settings()
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
-                               proxy_pool_size=int(settings.get('proxy_pool_size') or 1000),
-                               origin=settings.get('origin', 'https://new.ani.sidestore.io'),
-                               _proxy_debug=bool(settings.get('proxy_debug')),
-                               _web_secondary_auth=bool(settings.get('web_secondary_auth')))
+                               origin=self.settings().get('origin', 'https://new.ani.sidestore.io'),
+                               _proxy_debug=bool(self.settings().get('proxy_debug')),
+                               _web_secondary_auth=bool(self.settings().get('web_secondary_auth')))
             return payload
 
     def unit_for_node(self, node_id, unit_id, token):
@@ -1701,12 +1669,7 @@ class Controller:
                                not row['enabled'] and row['stop_version'] > 0 and stats[0]):
                     value['status'] = 'stopping'
                 value['telemetry'] = json.loads(row['telemetry_json']) if online else {}
-                initialization = self._device_initialization(row)
-                value.update(device_request=initialization['requested'],
-                             device_capacity=initialization['capacity'],
-                             device_ready=initialization['ready'],
-                             device_initialization_running=initialization['running'],
-                             device_initialization_complete=initialization['complete'])
+                value['device_initialization_complete'] = True
                 value['effective_processes'] = min(row['desired_processes'], row['max_processes']) if row['max_processes'] else None
                 value['effective_threads'] = min(row['desired_threads'], row['max_threads']) if row['max_threads'] else None
                 nodes.append(value)

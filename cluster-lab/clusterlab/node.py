@@ -87,8 +87,6 @@ class Node:
         self.update_status_path = self.root / 'update-status.json'
         self.telemetry = HostTelemetry()
         self.proxy_api, self.proxy_scheme = '', 'socks5h'
-        self.proxy_ttl = 50
-        self.proxy_pool_size = 1000
         self.origin = 'https://new.ani.sidestore.io'
         from .device_build import DeviceBuilder
         self.builder = DeviceBuilder(self)
@@ -474,15 +472,6 @@ class Node:
             # 总控下发的出口配置与设备初始化请求都在心跳响应里
             if 'config' in value:
                 self.apply_config(value['config'])
-            try:
-                self.proxy_ttl = max(5, min(3600, int(value.get('proxy_ttl') or 50)))
-            except (TypeError, ValueError):
-                self.proxy_ttl = 50
-            try:
-                self.proxy_pool_size = max(1, min(10000, int(
-                    value.get('proxy_pool_size') or 1000)))
-            except (TypeError, ValueError):
-                self.proxy_pool_size = 1000
             clear_version = int(value.get('device_clear_version') or 0)
             if clear_version > self.device_clear_version:
                 self.builder.cancel()
@@ -490,46 +479,9 @@ class Node:
                     self.builder.clear()
                     self.device_clear_version = clear_version
                     self._save_control()
-            requested = value.get('device_request') or 0
-            if requested and not self.builder.state['running']:
-                try:
-                    requested = int(requested)
-                    snapshot = self.builder.snapshot()
-                    # device_request is a persistent desired size. Do not restart a
-                    # completed build on every heartbeat; only fill missing slots.
-                    if int(snapshot.get('ready') or 0) < requested:
-                        self.builder.start(requested)
-                except (RuntimeError, ValueError) as exc:
-                    # 不能静默吞：面板上看不到原因会以为节点没响应
-                    self.builder._update(message=str(exc))
-            # 自动补充：先补缺口；满池轮换时先在隔离目录注册新设备，
-            # 成功后才替换一台最老且未被任务占用的旧设备。
-            auto = bool(value.get('device_auto_rotate'))
-            limit = int(value.get('device_rotate_after') or 0)
-            if auto and not self.builder.state['running']:
-                snapshot = self.builder.snapshot()
-                capacity = int(snapshot.get('capacity') or self.builder.state['capacity'] or 0)
-                if capacity:
-                    try:
-                        if int(snapshot.get('ready') or 0) < capacity:
-                            # 先补既有缺口，不再额外淘汰。
-                            self.builder.start(capacity)
-                        elif limit:
-                            reserved = self.builder.reserved_slots()
-                            stale = self.builder.retirable(limit, exclude=reserved)
-                            if stale:
-                                candidates = [int(item['slot'])
-                                              for item in snapshot.get('slots') or []
-                                              if item.get('state') == 'ready'
-                                              and int(item['slot']) not in reserved]
-                                if not candidates:
-                                    candidates = [slot for slot in range(1, capacity + 1)
-                                                  if slot not in reserved]
-                                oldest = self.builder.oldest(1, candidates=candidates)
-                                if oldest:
-                                    self.builder.rotate(capacity, oldest[0])
-                    except (RuntimeError, ValueError):
-                        pass
+            # No background device-pool maintenance. Auth worker threads load
+            # their own slot into process memory and register it lazily only
+            # when that slot is missing.
             for unit_id in value['rejected']:
                 if unit_id in self.active:
                     self.active[unit_id][1].set()
@@ -587,8 +539,6 @@ class Node:
             descriptor.setdefault('device_root', str(private_dir(self.root / 'device-pool')))
             descriptor.setdefault('timeout', 20)
             descriptor.setdefault('retries', 0)
-            descriptor.setdefault('proxy_ttl', self.proxy_ttl)
-            descriptor.setdefault('proxy_pool_size', self.proxy_pool_size)
             self._prepare_auth_devices(descriptor)
         atomic_json(directory / 'manifest.json', descriptor)
         stop = self.context.Event()
@@ -604,20 +554,16 @@ class Node:
         return True
 
     def _prepare_auth_devices(self, descriptor):
-        """Use exactly the ready devices owned by this node; tasks do not resize the pool."""
-        snapshot = self.builder.snapshot()
-        slots = [int(item['slot']) for item in snapshot.get('slots') or []
-                 if item.get('state') == 'ready']
-        if not slots:
-            raise RuntimeError('节点没有已就绪设备，请先初始化设备池')
-        processes = max(1, min(int(descriptor.get('processes') or 1),
-                               int(descriptor.get('rows') or 1), len(slots)))
-        capacity = max(slots)
+        """Assign one stable local slot per configured worker, without prefill."""
+        rows = max(1, int(descriptor.get('rows') or 1))
+        processes = max(1, min(int(descriptor.get('processes') or 1), rows))
+        threads = max(1, int(descriptor.get('threads') or 1))
+        capacity = min(rows, processes * threads)
+        slots = list(range(1, capacity + 1))
         descriptor.pop('device_capacity', None)
         descriptor['processes'] = processes
         descriptor['device_pool_capacity'] = capacity
         descriptor['device_slots'] = slots
-        self.builder.reserve(slots)
 
     def start(self):
         self.thread = threading.Thread(target=self.loop, daemon=True, name='node-agent')

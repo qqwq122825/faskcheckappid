@@ -296,27 +296,25 @@ class NodeRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '结果待上传'):
             self.node.connect('http://127.0.0.1:18772','x'*32)
 
-    def test_auth_task_uses_only_this_nodes_ready_devices(self):
-        descriptor = {'mode': 'auth', 'rows': 10000, 'seq': 2,
-                      'processes': 10, 'device_capacity': 30}
-        ready = {'slots': [
-            {'slot': 2, 'state': 'ready'}, {'slot': 4, 'state': 'failed'},
-            {'slot': 7, 'state': 'ready'}, {'slot': 9, 'state': 'ready'}]}
-        with patch.object(self.node.builder, 'snapshot', return_value=ready), \
-             patch.object(self.node.builder, 'start') as start:
+    def test_auth_task_assigns_one_slot_per_worker_without_prefill(self):
+        descriptor = {'mode': 'auth', 'rows': 1000, 'seq': 2,
+                      'processes': 2, 'threads': 200, 'device_capacity': 30}
+        with patch.object(self.node.builder, 'snapshot',
+                          side_effect=AssertionError('must not inspect device pool')):
             self.node._prepare_auth_devices(descriptor)
-        self.assertEqual(descriptor['device_pool_capacity'], 9)
-        self.assertEqual(descriptor['device_slots'], [2, 7, 9])
-        self.assertEqual(descriptor['processes'], 3)
+        self.assertEqual(descriptor['device_pool_capacity'], 400)
+        self.assertEqual(descriptor['device_slots'], list(range(1, 401)))
+        self.assertEqual(descriptor['processes'], 2)
         self.assertNotIn('device_capacity', descriptor)
-        start.assert_not_called()
-        self.assertEqual(self.node.builder.reserved, {2, 7, 9})
-        self.node.builder.release(descriptor['device_slots'])
+        self.assertEqual(self.node.builder.reserved, set())
 
-    def test_auth_task_refuses_to_run_without_ready_devices(self):
-        with patch.object(self.node.builder, 'snapshot', return_value={'slots': []}):
-            with self.assertRaisesRegex(RuntimeError, '没有已就绪设备'):
-                self.node._prepare_auth_devices({'mode': 'auth', 'rows': 50, 'processes': 10})
+    def test_auth_task_does_not_require_ready_devices(self):
+        descriptor = {'mode': 'auth', 'rows': 2, 'processes': 4, 'threads': 10}
+        with patch.object(self.node.builder, 'snapshot',
+                          side_effect=AssertionError('must not inspect device pool')):
+            self.node._prepare_auth_devices(descriptor)
+        self.assertEqual(descriptor['processes'], 2)
+        self.assertEqual(descriptor['device_slots'], [1, 2])
 
     def test_background_builder_never_registers_without_a_proxy(self):
         class Pool:
@@ -481,9 +479,9 @@ class NodeRecoveryTests(unittest.TestCase):
              patch.object(self.node.builder, 'retire') as retire, \
              patch.object(self.node.builder, 'start') as start:
             self.node._heartbeat()
-        retirable.assert_called_once_with(20, exclude=set())
-        oldest.assert_called_once_with(1, candidates=list(range(1, 31)))
-        rotate.assert_called_once_with(30, 1)
+        retirable.assert_not_called()
+        oldest.assert_not_called()
+        rotate.assert_not_called()
         retire.assert_not_called()
         start.assert_not_called()
 
@@ -501,7 +499,7 @@ class NodeRecoveryTests(unittest.TestCase):
              patch.object(self.node.builder, 'rotate') as rotate, \
              patch.object(self.node.builder, 'start') as start:
             self.node._heartbeat()
-        retirable.assert_called_once_with(20, exclude=reserved)
+        retirable.assert_not_called()
         rotate.assert_not_called()
         start.assert_not_called()
 
@@ -517,7 +515,7 @@ class NodeRecoveryTests(unittest.TestCase):
              patch.object(self.node.builder, 'rotate') as rotate, \
              patch.object(self.node.builder, 'start') as start:
             self.node._heartbeat()
-        start.assert_called_once_with(30)
+        start.assert_not_called()
         retirable.assert_not_called()
         rotate.assert_not_called()
 

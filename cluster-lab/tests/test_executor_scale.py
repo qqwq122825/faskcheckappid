@@ -12,9 +12,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from clusterlab.executor import (NodeProxyPool, _auth_process_limit, _auth_worker_limit, _device_id_label, _execute_auth_unit, _partition_device_slots,
+from clusterlab.executor import (_auth_process_limit, _auth_worker_limit, _device_id_label, _execute_auth_unit, _partition_device_slots,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
-                                 execute_unit_group, proxy_supplier_loop,
+                                 execute_unit_group,
                                  record_device_registration, stall_timeout_seconds)
 
 
@@ -84,10 +84,6 @@ class RecordingStop:
         return False
 
 
-def use_shared_proxy_pool(pool, output):
-    lease = pool.acquire(wait=1)
-    output.put(lease[0] if lease else None)
-    pool.release(lease, healthy=lease is not None)
 
 
 class ExecutorScaleTests(unittest.TestCase):
@@ -113,6 +109,90 @@ class ExecutorScaleTests(unittest.TestCase):
     def test_device_id_uses_short_base64_label(self):
         self.assertEqual(_device_id_label('device-1'), 'B64:ZGV2aWNl')
         self.assertEqual(_device_id_label(''), '')
+
+    def test_each_worker_fetches_one_proxy_and_keeps_its_device_in_memory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text(
+                ''.join(f'user-{index}----password\n' for index in range(8)), 'utf-8')
+            proxy_calls = []
+            header_calls = []
+            checked = []
+            guard = threading.Lock()
+            first_wave = threading.Barrier(4)
+            seen_threads = set()
+
+            class Pool(FakePool):
+                def info(inner, *_args, **_kwargs):
+                    raise AssertionError('.info.lock hot path must not be used')
+
+                def fetch_headers(inner, slot, *_args, **_kwargs):
+                    with guard:
+                        header_calls.append((threading.current_thread().name, slot))
+                    return {'slot': slot}
+
+            def fetch(_api, count, **_kwargs):
+                name = threading.current_thread().name
+                with guard:
+                    proxy_calls.append((name, count))
+                return [f'socks5h://{name}']
+
+            def check(_account, _password, proxy, **_kwargs):
+                name = threading.current_thread().name
+                with guard:
+                    first = name not in seen_threads
+                    seen_threads.add(name)
+                if first:
+                    first_wave.wait(2)
+                with guard:
+                    checked.append((name, proxy))
+                return {'status': 'valid', 'http': 200}
+
+            descriptor = {'rows': 8, 'first_row': 1, 'threads': 4,
+                          'device_pool_capacity': 4, 'device_slots': [1, 2, 3, 4],
+                          'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 1,
+                          'proxy_api': 'http://proxy.invalid/list',
+                          'proxy_scheme': 'socks5h'}
+            with patch('clusterlab.executor._load_fastcheck',
+                       return_value=(Pool, check, lambda result: result['status'])), \
+                 patch('fastcheck.proxy_pool.fetch_proxies', side_effect=fetch), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}):
+                _execute_auth_unit(root, descriptor, threading.Event())
+
+            self.assertEqual(len(proxy_calls), 4)
+            self.assertTrue(all(count == 1 for _name, count in proxy_calls))
+            self.assertEqual(len({name for name, _count in proxy_calls}), 4)
+            self.assertEqual(len(header_calls), 4)
+            self.assertEqual({slot for _name, slot in header_calls}, {1, 2, 3, 4})
+            by_thread = {}
+            for name, endpoint in checked:
+                by_thread.setdefault(name, set()).add(endpoint)
+            self.assertEqual(len(by_thread), 4)
+            self.assertTrue(all(len(endpoints) == 1 for endpoints in by_thread.values()))
+
+    def test_production_coordinator_never_constructs_a_shared_proxy_pool(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text('user----password\n', 'utf-8')
+
+            def child(directory, descriptor, _stop, proxy_pool):
+                self.assertIsNone(proxy_pool)
+                atomic_json(Path(directory) / 'progress.json',
+                            {'processed': 1, 'counts': {'valid': 1}})
+                atomic_json(Path(directory) / 'done.json',
+                            {'ok': True, 'processed': 1, 'counts': {'valid': 1},
+                             'checksum': 'fixture'})
+
+            descriptor = {'rows': 1, 'first_row': 1, 'processes': 1,
+                          'threads': 400, 'mode': 'auth',
+                          'proxy_api': 'http://proxy.invalid/list'}
+            with patch('clusterlab.executor._group_child', side_effect=child):
+                execute_unit_group(root, descriptor, threading.Event())
+            done = json.loads((root / 'done.json').read_text('utf-8'))
+            self.assertTrue(done['ok'])
+            self.assertNotIn('proxy_pool', done)
 
     def test_full_device_pool_is_partitioned_without_overlap(self):
         groups = [_partition_device_slots(range(1, 31), 10, index)
@@ -187,217 +267,6 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertFalse(_proxy_debug_enabled({'_proxy_debug': False}))
             self.assertTrue(_proxy_debug_enabled({'_proxy_debug': True}))
             self.assertTrue(_proxy_debug_enabled({}))
-
-    def test_node_proxy_pool_is_shared_across_spawned_processes(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=2, ttl=30)
-        output = context.Queue()
-        children = []
-        try:
-            pool.add_fresh(['socks5h://process-1', 'socks5h://process-2'])
-            children = [context.Process(target=use_shared_proxy_pool, args=(pool, output))
-                        for _index in range(2)]
-            for child in children:
-                child.start()
-            for child in children:
-                child.join(5)
-            self.assertEqual([child.exitcode for child in children], [0, 0])
-            self.assertEqual({output.get(timeout=1), output.get(timeout=1)},
-                             {'socks5h://process-1', 'socks5h://process-2'})
-            self.assertEqual(pool.snapshot()['reusable'], 2)
-        finally:
-            for child in children:
-                if child.is_alive():
-                    child.terminate()
-                    child.join(1)
-                child.close()
-            output.cancel_join_thread()
-            output.close()
-            pool.close()
-
-    def test_node_proxy_pool_prefers_fresh_then_reuses_recent_success(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=4, ttl=2)
-        try:
-            self.assertEqual(pool.add_fresh(['socks5h://fresh-1', 'socks5h://fresh-2']), 2)
-            first = pool.acquire(wait=.5)
-            self.assertEqual(first[0], 'socks5h://fresh-1')
-            pool.release(first, healthy=True)
-            second = pool.acquire(wait=.5)
-            self.assertEqual(second[0], 'socks5h://fresh-2')
-            reused = pool.acquire(wait=.5)
-            self.assertEqual(reused[0], 'socks5h://fresh-1')
-            self.assertEqual(reused[2], 1)
-            self.assertEqual(pool.snapshot()['reused'], 1)
-            pool.release(second, healthy=False)
-            self.assertEqual(pool.snapshot()['discarded'], 0)
-            self.assertEqual(pool.snapshot()['soft_failures'], 1)
-            pool.release(reused, healthy=True)
-        finally:
-            pool.close()
-
-    def test_node_proxy_pool_counts_busy_inventory_and_retires_after_three_failures(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=1, ttl=30, target=1)
-        try:
-            pool.add_fresh(['socks5h://unstable'])
-            for failure in range(1, 4):
-                lease = pool.acquire(wait=.5)
-                self.assertIsNotNone(lease)
-                busy = pool.snapshot()
-                self.assertEqual(busy['available'], 0)
-                self.assertEqual(busy['in_use'], 1)
-                self.assertEqual(busy['known'], 1)
-                pool.release(lease, healthy=False)
-                state = pool.snapshot()
-                self.assertEqual(state['soft_failures'], failure)
-                self.assertEqual(state['discarded'], int(failure == 3))
-            self.assertEqual(pool.snapshot()['known'], 0)
-        finally:
-            pool.close()
-
-    def test_node_proxy_pool_immediate_discard_removes_exit_and_requests_refill(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=1, ttl=50, target=1)
-        try:
-            pool.add_fresh(['socks5h://http-error'])
-            lease = pool.acquire(wait=.5)
-            pool.refill.clear()
-            pool.discard(lease)
-            state = pool.snapshot()
-            self.assertEqual(state['known'], 0)
-            self.assertEqual(state['discarded'], 1)
-            self.assertTrue(pool.refill.is_set())
-            # The deleted endpoint remains quarantined for its original TTL,
-            # while a different available endpoint can fill the empty slot.
-            self.assertEqual(pool.add_fresh(['socks5h://http-error']), 0)
-            self.assertEqual(pool.add_fresh(['socks5h://replacement']), 1)
-        finally:
-            pool.close()
-
-    def test_node_proxy_pool_never_leases_an_exit_that_is_already_in_use(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=2, ttl=50, target=2)
-        try:
-            pool.add_fresh(['socks5h://one', 'socks5h://two'])
-            first = pool.acquire(wait=.5)
-            second = pool.acquire(wait=.5)
-            self.assertEqual({first[0], second[0]},
-                             {'socks5h://one', 'socks5h://two'})
-            self.assertIsNone(pool.acquire(wait=.05))
-            pool.discard(first)
-            # The other worker still owns `second`; it cannot be leased again.
-            self.assertIsNone(pool.acquire(wait=.05))
-            pool.release(second, healthy=True)
-            available = pool.acquire(wait=.5)
-            self.assertEqual(available[0], second[0])
-            pool.release(available, healthy=True)
-        finally:
-            pool.close()
-
-    def test_node_proxy_pool_never_exceeds_configured_logical_capacity(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=2, ttl=30, target=2)
-        try:
-            pool.add_fresh(['socks5h://one', 'socks5h://two'])
-            first = pool.acquire(wait=.5)
-            second = pool.acquire(wait=.5)
-            self.assertEqual(pool.add_fresh(['socks5h://three']), 0)
-            self.assertEqual(pool.snapshot()['known'], 2)
-            pool.release(first, healthy=True)
-            pool.release(second, healthy=True)
-            self.assertEqual(pool.add_fresh(['socks5h://three']), 1)
-            self.assertEqual(pool.snapshot()['known'], 2)
-            self.assertEqual(pool.snapshot()['refreshed'], 1)
-        finally:
-            pool.close()
-
-    def test_node_proxy_pool_discards_expired_exit(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=2, ttl=1)
-        try:
-            pool.add_fresh(['socks5h://stale'], fetched_at=time.monotonic() - 2)
-            self.assertIsNone(pool.acquire(wait=.05))
-            self.assertEqual(pool.snapshot()['discarded'], 1)
-        finally:
-            pool.close()
-
-    def test_proxy_supplier_prefills_pool_and_reports_fetch_metrics(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=4, ttl=30)
-        stop = threading.Event()
-        calls = []
-
-        def fetcher(_url, count, scheme=None):
-            calls.append((count, scheme))
-            return [f'{scheme}://127.0.0.{index}:9000' for index in range(1, count + 1)]
-
-        thread = threading.Thread(target=proxy_supplier_loop,
-                                  args=(pool, 'http://proxy.test/list', 'socks5h', stop, fetcher))
-        thread.start()
-        until = time.monotonic() + 2
-        while pool.snapshot()['fresh'] < pool.target and time.monotonic() < until:
-            time.sleep(.01)
-        stop.set()
-        pool.refill.set()
-        thread.join(1)
-        try:
-            metrics = pool.snapshot()
-            self.assertEqual(metrics['fresh'], pool.target)
-            self.assertEqual(metrics['fetched'], pool.target)
-            self.assertEqual(metrics['fetch_calls'], 1)
-            self.assertEqual(calls, [(pool.target, 'socks5h')])
-        finally:
-            pool.close()
-
-    def test_partial_proxy_batch_marks_pool_ready_for_reuse(self):
-        context = mp.get_context('spawn')
-        pool = NodeProxyPool(context, concurrency=1000, ttl=50, target=1000)
-        try:
-            self.assertEqual(pool.add_fresh([
-                f'socks5h://partial-{index}' for index in range(200)
-            ]), 200)
-            self.assertTrue(pool.ready.is_set())
-            self.assertEqual(pool.snapshot()['available'], 200)
-            self.assertEqual(pool.snapshot()['target'], 1000)
-        finally:
-            pool.close()
-
-    def test_two_nodes_each_request_1000_then_reuse_sparse_provider_stock(self):
-        context = mp.get_context('spawn')
-        observed = []
-        for node in (1, 2):
-            pool = NodeProxyPool(context, concurrency=1000, ttl=50, target=1000)
-            stop = threading.Event()
-            calls = []
-
-            def fetcher(_url, count, scheme=None, node=node):
-                calls.append(count)
-                return [f'{scheme}://node-{node}-only-exit:9000']
-
-            thread = threading.Thread(
-                target=proxy_supplier_loop,
-                args=(pool, f'http://proxy.test/node-{node}', 'socks5h', stop, fetcher))
-            thread.start()
-            self.assertTrue(pool.ready.wait(1))
-            stop.set()
-            pool.refill.set()
-            thread.join(1)
-            try:
-                first = pool.acquire(wait=.5)
-                pool.release(first, healthy=True)
-                reused = pool.acquire(wait=.5)
-                observed.append((calls[0], first[0], reused[0], reused[2]))
-                pool.release(reused, healthy=True)
-            finally:
-                pool.close()
-
-        self.assertEqual(observed, [
-            (1000, 'socks5h://node-1-only-exit:9000',
-             'socks5h://node-1-only-exit:9000', 1),
-            (1000, 'socks5h://node-2-only-exit:9000',
-             'socks5h://node-2-only-exit:9000', 1),
-        ])
 
     def test_retry_delay_queue_frees_single_worker_for_next_account(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -763,7 +632,7 @@ class ExecutorScaleTests(unittest.TestCase):
                              {'valid': 500})
             self.assertEqual(done['checksum'], hashlib.sha256(payload).hexdigest())
             self.assertEqual(sum(usage_calls[0].values()), 500)
-            self.assertLess(abs(usage_calls[0][1] - usage_calls[0][2]), 50)
+            self.assertLessEqual(len(usage_calls[0]), 2)
             self.assertEqual(len(payload.splitlines()), 500)
 
     def test_auth_progress_is_time_based_instead_of_waiting_for_ten_results(self):

@@ -8,7 +8,6 @@ import base64
 import hashlib
 import ipaddress
 import json
-import math
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -21,10 +20,6 @@ from urllib.parse import urlsplit
 from .common import atomic_json
 
 
-PROXY_TTL_SECONDS = 50.0
-PROXY_FETCH_LIMIT = 1000
-PROXY_POOL_LIMIT = 10000
-PROXY_FAILURE_LIMIT = 3
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
 PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
@@ -456,342 +451,6 @@ class _ProxyExitIpDebug:
             thread.join(max(0.0, deadline - time.monotonic()))
 
 
-class NodeProxyPool:
-    """Fresh-first proxy pool shared by every process in one node package."""
-
-    def __init__(self, context, concurrency, ttl=PROXY_TTL_SECONDS, target=None):
-        concurrency = max(1, int(concurrency or 1))
-        requested_target = concurrency if target is None else max(1, int(target))
-        self.target = min(PROXY_POOL_LIMIT, requested_target)
-        self.low_water = max(1, min(self.target, concurrency // 2 or 1))
-        self.ttl = max(1.0, float(ttl))
-        self.fresh = context.Queue(maxsize=self.target)
-        self.reusable = context.Queue(maxsize=self.target)
-        self.fresh_count = context.Value('i', 0)
-        self.reusable_count = context.Value('i', 0)
-        self.in_use_count = context.Value('i', 0)
-        self.fetched = context.Value('q', 0)
-        self.fetch_calls = context.Value('q', 0)
-        self.fetch_errors = context.Value('q', 0)
-        self.reused = context.Value('q', 0)
-        self.discarded = context.Value('q', 0)
-        self.soft_failures = context.Value('q', 0)
-        self.waits = context.Value('q', 0)
-        self.duplicates = context.Value('q', 0)
-        self.refreshed = context.Value('q', 0)
-        # Supplier-local history: no Manager/RPC on the worker hot path.
-        self._recent_exits = {}
-        self.last_fetch_ms = context.Value('d', 0.0)
-        self.refill = context.Event()
-        self.refill.set()
-        self.ready = context.Event()
-
-    @staticmethod
-    def _add(counter, delta):
-        with counter.get_lock():
-            counter.value = max(0, counter.value + int(delta))
-            return counter.value
-
-    @staticmethod
-    def _value(counter):
-        with counter.get_lock():
-            return counter.value
-
-    @staticmethod
-    def _exit_key(value):
-        parsed = urlsplit(str(value))
-        return ((parsed.hostname or str(value)).lower(), parsed.port)
-
-    def add_fresh(self, values, fetched_at=None):
-        # Called by the single supplier; remember even in-flight/failed exits
-        # until their original expiry, without slowing worker acquisitions.
-        fetched_at = time.monotonic() if fetched_at is None else float(fetched_at)
-        expires_at = fetched_at + self.ttl
-        now = time.monotonic()
-        self._recent_exits = {key: expiry for key, expiry in self._recent_exits.items()
-                              if expiry > now}
-        if expires_at <= now:
-            self._add(self.discarded, sum(bool(value) for value in values))
-            return 0
-        added = 0
-        for value in values:
-            if not value:
-                continue
-            try:
-                key = self._exit_key(value)
-            except ValueError:
-                self._add(self.discarded, 1)
-                continue
-            if key in self._recent_exits:
-                self._add(self.duplicates, 1)
-                continue
-            # The two physical queues share one logical capacity. Without this
-            # guard, a full reusable queue plus scheduled fresh rotation could
-            # silently grow a target=10,000 pool toward 20,000 entries.
-            if self.snapshot()['known'] >= self.target:
-                oldest = self._take(self.fresh, self.fresh_count, 0.02)
-                if oldest is None:
-                    oldest = self._take(self.reusable, self.reusable_count, 0.02)
-                if oldest is None:  # every known exit is currently leased
-                    continue
-                self._add(self.discarded, 1)
-                self._add(self.refreshed, 1)
-            self._add(self.fresh_count, 1)
-            try:
-                self.fresh.put_nowait((str(value), expires_at, 0, 0))
-            except queue.Full:
-                self._add(self.fresh_count, -1)
-                # Keep acquiring independent of the API: rotate one old queued
-                # exit when full, never an exit already leased to a worker.
-                oldest = self._take(self.fresh, self.fresh_count, 0.02)
-                if oldest is not None:
-                    self._add(self.discarded, 1)
-                    self._add(self.refreshed, 1)
-                self._add(self.fresh_count, 1)
-                try:
-                    self.fresh.put_nowait((str(value), expires_at, 0, 0))
-                except queue.Full:
-                    self._add(self.fresh_count, -1)
-                    continue
-            self._recent_exits[key] = expires_at
-            added += 1
-        self._add(self.fetched, added)
-        # A rate-limited provider may return fewer exits than the requested
-        # target (for example 200 per minute for 1,000 workers).  Start work as
-        # soon as any usable stock exists; remaining workers now backpressure
-        # on the shared pool and reuse leases as they are returned.
-        if added:
-            self.ready.set()
-        return added
-
-    def _take(self, channel, counter, timeout=0.0):
-        while True:
-            try:
-                item = channel.get(timeout=timeout) if timeout else channel.get_nowait()
-            except queue.Empty:
-                return None
-            self._add(counter, -1)
-            timeout = 0.0
-            if float(item[1]) > time.monotonic():
-                return item
-            self._add(self.discarded, 1)
-
-    def acquire(self, wait=1.0):
-        # Never wait for a new API response while a healthy queued exit exists.
-        lease = self._take(self.fresh, self.fresh_count)
-        # multiprocessing.Queue publishes through a feeder thread.  Its shared
-        # count can therefore become visible a few milliseconds before get()
-        # can see the item.  Preserve fresh-first ordering instead of falling
-        # through to an already reusable exit during that short window.
-        if lease is None and self._value(self.fresh_count) > 0:
-            lease = self._take(self.fresh, self.fresh_count,
-                               min(0.02, max(0.0, float(wait))))
-        if lease is not None:
-            if self._value(self.fresh_count) < self.low_water:
-                self.refill.set()
-            self._add(self.in_use_count, 1)
-            return lease
-        self.refill.set()
-        lease = self._take(self.reusable, self.reusable_count)
-        if lease is not None:
-            self._add(self.reused, 1)
-            self._add(self.in_use_count, 1)
-            return (lease[0], lease[1], int(lease[2]) + 1,
-                    int(lease[3]) if len(lease) > 3 else 0)
-        # Queue feeder visibility can lag its published count. Only when both
-        # queues are empty do we allow the caller's bounded resource wait.
-        self._add(self.waits, 1)
-        deadline = time.monotonic() + max(0.0, float(wait))
-        while time.monotonic() < deadline:
-            lease = self._take(self.fresh, self.fresh_count,
-                               min(0.01, max(0.0, deadline - time.monotonic())))
-            if lease is not None:
-                self._add(self.in_use_count, 1)
-                return lease
-            lease = self._take(self.reusable, self.reusable_count)
-            if lease is not None:
-                self._add(self.reused, 1)
-                self._add(self.in_use_count, 1)
-                return (lease[0], lease[1], int(lease[2]) + 1,
-                        int(lease[3]) if len(lease) > 3 else 0)
-        return None
-
-    def release(self, lease, healthy):
-        if lease is None:
-            return
-        self._add(self.in_use_count, -1)
-        if float(lease[1]) <= time.monotonic():
-            self._add(self.discarded, 1)
-            return
-        failures = int(lease[3]) if len(lease) > 3 else 0
-        if not healthy:
-            failures += 1
-            self._add(self.soft_failures, 1)
-            if failures >= PROXY_FAILURE_LIMIT:
-                self._add(self.discarded, 1)
-                self.refill.set()
-                return
-        else:
-            failures = 0
-        reusable = (lease[0], lease[1], int(lease[2]), failures)
-        self._add(self.reusable_count, 1)
-        try:
-            self.reusable.put_nowait(reusable)
-        except queue.Full:
-            self._add(self.reusable_count, -1)
-            self._add(self.discarded, 1)
-            return
-
-    def discard(self, lease):
-        """Remove a leased exit immediately and request a replacement.
-
-        The supplier's recent-exit history still remembers the endpoint until
-        its original TTL, so an HTTP 0/503 exit cannot be fetched straight back
-        into the pool during the five-second retry delay.
-        """
-        if lease is None:
-            return
-        self._add(self.in_use_count, -1)
-        self._add(self.discarded, 1)
-        self.refill.set()
-
-    def prune_expired(self):
-        """Remove idle expired leases, even when no worker acquires an exit."""
-        removed = 0
-        for channel, counter in ((self.fresh, self.fresh_count),
-                                 (self.reusable, self.reusable_count)):
-            for _ in range(self._value(counter)):
-                try:
-                    lease = channel.get(timeout=0.02)
-                except queue.Empty:
-                    break
-                self._add(counter, -1)
-                if float(lease[1]) <= time.monotonic():
-                    self._add(self.discarded, 1)
-                    removed += 1
-                    continue
-                self._add(counter, 1)
-                try:
-                    channel.put_nowait(lease)
-                except queue.Full:
-                    self._add(counter, -1)
-                    self._add(self.discarded, 1)
-                    removed += 1
-        return removed
-
-    def note_fetch(self, milliseconds, error=False):
-        self._add(self.fetch_calls, 1)
-        if error:
-            self._add(self.fetch_errors, 1)
-        with self.last_fetch_ms.get_lock():
-            self.last_fetch_ms.value = max(0.0, float(milliseconds))
-
-    def snapshot(self):
-        with self.last_fetch_ms.get_lock():
-            last_fetch_ms = self.last_fetch_ms.value
-        available = self._value(self.fresh_count) + self._value(self.reusable_count)
-        in_use = self._value(self.in_use_count)
-        return {
-            'available': available,
-            'in_use': in_use,
-            'known': available + in_use,
-            'fresh': self._value(self.fresh_count),
-            'reusable': self._value(self.reusable_count),
-            'target': self.target,
-            'low_water': self.low_water,
-            'fetched': self._value(self.fetched),
-            'fetch_calls': self._value(self.fetch_calls),
-            'fetch_errors': self._value(self.fetch_errors),
-            'reused': self._value(self.reused),
-            'discarded': self._value(self.discarded),
-            'soft_failures': self._value(self.soft_failures),
-            'failure_limit': PROXY_FAILURE_LIMIT,
-            'waits': self._value(self.waits),
-            'duplicates': self._value(self.duplicates),
-            'refreshed': self._value(self.refreshed),
-            'last_fetch_ms': round(last_fetch_ms, 1),
-            'ttl_seconds': self.ttl,
-            'ready': self.ready.is_set(),
-        }
-
-    def close(self):
-        for channel in (self.fresh, self.reusable):
-            try:
-                # 队列可能在节点结束时仍有库存；等待 feeder 把无人读取的
-                # 整池数据写完可能卡住协调进程，关闭时直接丢弃剩余库存。
-                channel.cancel_join_thread()
-                channel.close()
-            except (OSError, ValueError):
-                pass
-
-
-def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=None):
-    """Fetch every second, rotate when full; workers use queued exits first."""
-    if fetcher is None:
-        from fastcheck.proxy_pool import fetch_proxies
-        fetcher = fetch_proxies
-    maintenance_stop = threading.Event()
-
-    def maintain():
-        # Expiry cleanup must not stall behind a slow external API call.
-        while not stop.is_set() and not maintenance_stop.is_set():
-            pool.prune_expired()
-            maintenance_stop.wait(1.0)
-
-    maintenance = threading.Thread(target=maintain, name='proxy-pool-expiry', daemon=True)
-    maintenance.start()
-    next_tick = time.monotonic()
-    try:
-        while not stop.is_set():
-            if stop.wait(max(0.0, next_tick - time.monotonic())):
-                return
-            pool.refill.clear()
-            # Busy leases are still valid inventory and will return to the
-            # reusable queue. Counting only queued exits made 1,000 workers
-            # look like 1,000 missing proxies and triggered needless refills.
-            needed = max(0, pool.target - pool.snapshot()['known'])
-            # Replace one TTL-window of inventory gradually instead of letting
-            # the initial batch expire at once. The supplier API accepts at
-            # most 1,000 exits per call; larger node pools fill incrementally.
-            refresh_batch = max(1, math.ceil(pool.target / pool.ttl))
-            count = min(PROXY_FETCH_LIMIT, max(refresh_batch, needed))
-            started = time.monotonic()
-            before = _proxy_pool_snapshot(pool) if debug_path else {}
-            try:
-                values = list(fetcher(api_url, count,
-                                      scheme=None if scheme == 'http' else scheme))
-                if stop.is_set():
-                    return
-                # A proxy gets its full TTL when it actually enters the node
-                # pool; slow supplier responses must not consume lease life.
-                added = pool.add_fresh(values)
-                milliseconds = (time.monotonic() - started) * 1000
-                pool.note_fetch(milliseconds)
-                if debug_path:
-                    _write_proxy_debug(
-                        debug_path, 'supplier_fetch', requested=count,
-                        returned=len(values), added=added,
-                        latency_ms=round(milliseconds, 2), pool_before=before,
-                        pool_after=_proxy_pool_snapshot(pool))
-            except Exception as exc:                               # noqa: BLE001
-                milliseconds = (time.monotonic() - started) * 1000
-                pool.note_fetch(milliseconds, error=True)
-                if debug_path:
-                    _write_proxy_debug(
-                        debug_path, 'supplier_error', requested=count,
-                        latency_ms=round(milliseconds, 2),
-                        error_type=type(exc).__name__, detail=_proxy_debug_detail(exc),
-                        pool_before=before, pool_after=_proxy_pool_snapshot(pool))
-            next_tick += 1.0
-            now = time.monotonic()
-            if next_tick < now:
-                # One in-flight request only; skip missed ticks, never pile up.
-                next_tick = now
-    finally:
-        maintenance_stop.set()
-        maintenance.join(1.5)
-
-
 def execute_unit(directory, descriptor, stop):
     directory = Path(directory)
     started = time.time()
@@ -943,36 +602,13 @@ def execute_unit_group(directory, descriptor, stop):
         else max(1, int(descriptor.get('threads') or 1)))
     descriptor['_active_threads_per_process'] = active_threads_per_process
     context = mp.get_context('spawn')
+    # Production deliberately has no shared IP pool. Every auth worker asks
+    # the provider for exactly one endpoint when it first runs and replaces
+    # only its own endpoint after a retryable failure. The old pool class stays
+    # importable for compatibility tests, but this coordinator never builds it.
     proxy_pool = None
     supplier_stop = None
     supplier_thread = None
-    if descriptor.get('mode') == 'auth' and descriptor.get('proxy_api'):
-        concurrency = process_count * active_threads_per_process
-        configured_target = max(1, int(descriptor.get('proxy_pool_size') or concurrency))
-        proxy_pool = NodeProxyPool(
-            context, concurrency,
-            ttl=float(descriptor.get('proxy_ttl') or PROXY_TTL_SECONDS),
-            target=min(PROXY_POOL_LIMIT, max(1, min(rows, configured_target))))
-        supplier_stop = threading.Event()
-        supplier_thread = threading.Thread(
-            target=proxy_supplier_loop,
-            args=(proxy_pool, descriptor['proxy_api'],
-                  descriptor.get('proxy_scheme') or 'socks5h', supplier_stop,
-                  None, debug_path),
-            name='node-proxy-supplier', daemon=True)
-        supplier_thread.start()
-        # Start workers only after the node has begun filling its own pool.
-        # Bound the wait so a broken supplier cannot block task cancellation.
-        prefill_started = time.monotonic()
-        prefill_deadline = prefill_started + min(30.0, proxy_pool.ttl)
-        while (not stop.is_set() and not proxy_pool.ready.is_set() and
-               time.monotonic() < prefill_deadline):
-            proxy_pool.ready.wait(0.1)
-        if debug_path:
-            _write_proxy_debug(
-                debug_path, 'pool_prefill', ready=proxy_pool.ready.is_set(),
-                wait_ms=round((time.monotonic() - prefill_started) * 1000, 2),
-                pool=_proxy_pool_snapshot(proxy_pool))
     if process_count == 1:
         try:
             _group_child(directory, descriptor, stop, proxy_pool)
@@ -1283,20 +919,19 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     output_path = directory / 'results.jsonl'
     DevicePool, gsa_check, result_bucket = _load_fastcheck()
     proxy = descriptor.get('proxy')
-    proxies = []
+    fetch_one_proxy = None
     if descriptor.get('proxy_api') and proxy_pool is None:
         from fastcheck.proxy_pool import fetch_proxies
         scheme = descriptor.get('proxy_scheme') or 'socks5h'
-        # 一次多提几条，包内按账号分摊：一条隧道只承担一个账号，
-        # 比整包共用一条出口的失败率低得多。上限 1000 避免把配额一次抽干。
-        worker_count = max(1, int(descriptor.get('threads') or 1))
-        demand = min(1000, max(int(descriptor.get('rows') or 0), worker_count * 4, 20))
-        try:
-            proxies = fetch_proxies(descriptor['proxy_api'], demand,
-                                    scheme=None if scheme == 'http' else scheme)
-        except Exception:                                          # noqa: BLE001
-            proxies = []
-        proxy = proxies[0] if proxies else None
+
+        def fetch_one_proxy():
+            try:
+                values = fetch_proxies(
+                    descriptor['proxy_api'], 1,
+                    scheme=None if scheme == 'http' else scheme)
+                return values[0] if values else None
+            except Exception:                                      # noqa: BLE001
+                return None
     elif not proxy:
         proxy = None
     origin = descriptor.get('origin') or 'https://new.ani.sidestore.io'
@@ -1326,7 +961,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     processed = 0
     last_progress = time.monotonic()
 
-    pool = DevicePool(device_root, origin, max_devices=capacity)
+    try:
+        pool = DevicePool(device_root, origin, max_devices=capacity, in_memory=True)
+    except TypeError:
+        # Older test doubles retain the original constructor.
+        pool = DevicePool(device_root, origin, max_devices=capacity)
     from fastcheck.workers import device_profile
     if debug_enabled:
         _write_proxy_debug(debug_path, 'worker_start',
@@ -1340,7 +979,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     # 一个包内把账号摊到所有设备上：一台设备只承担 rows/capacity 条，
     # 比固定用 1 号设备更分散，明显降低单设备被风控的概率。
     identities, infos, device_labels = {}, {}, {}
-    for index in slot_ids:
+    # Compatibility only: an explicitly injected legacy pool keeps the old
+    # bootstrap path. Production execute_unit_group never creates such a pool.
+    for index in slot_ids if proxy_pool is not None else ():
         bootstrap_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
         bootstrap_started = time.monotonic() if debug_enabled else None
         bootstrap_lease = proxy_pool.acquire(wait=2.0) if proxy_pool is not None else None
@@ -1357,10 +998,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             identities[index] = None
             continue
         try:
-            base_info = pool.info(timeout, proxy=bootstrap_proxy, provider_direct=True)
             profile = device_profile(pool, index)
-            infos[index] = dict(base_info, client_info=profile['client_info'],
-                                user_agent=profile['user_agent'])
+            infos[index] = {'client_info': profile['client_info'],
+                            'user_agent': profile['user_agent']}
             inspected = pool.inspect(index)
             ready = inspected['state'] == 'ready'
             device_labels[index] = _device_id_label(inspected.get('device_id'))
@@ -1390,7 +1030,21 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     pool_before=bootstrap_before,
                     pool_after=_proxy_pool_snapshot(proxy_pool))
 
-    def proxy_for(index):
+    thread_state = threading.local()
+
+    def state_for_thread():
+        state = getattr(thread_state, 'value', None)
+        if state is not None:
+            return state
+        match = re.search(r'_(\d+)$', threading.current_thread().name)
+        worker_index = int(match.group(1)) if match else 0
+        slot_id = slot_ids[worker_index % len(slot_ids)]
+        state = {'slot': slot_id, 'proxy': None, 'identity': None,
+                 'info': None, 'device_label': ''}
+        thread_state.value = state
+        return state
+
+    def proxy_for(index, force=False):
         if proxy_pool is not None:
             # Pool exhaustion is backpressure, not an account result.  A
             # healthy exit may be busy in another worker and become reusable
@@ -1413,9 +1067,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 if now - empty_since >= PROXY_EMPTY_GRACE_SECONDS:
                     break
             return None, None
-        if not proxies:
-            return proxy, None
-        return proxies[index % len(proxies)], None
+        state = state_for_thread()
+        if fetch_one_proxy is not None and (force or not state['proxy']):
+            state['proxy'] = fetch_one_proxy()
+        elif fetch_one_proxy is None and not state['proxy']:
+            state['proxy'] = proxy
+        return state['proxy'], None
 
     def apple_retry_later(result):
         apple_text = ' '.join(str(result.get(key) or '').strip()
@@ -1461,19 +1118,28 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     identity_default = object()
 
     def one(row, index, line, start_attempt=0, account_started=None,
-            identity_override=identity_default, previous_proxy=None):
+            identity_override=identity_default, previous_proxy=None,
+            force_proxy=False):
         if stop.is_set():
             return row, line, {'status': 'unknown', 'kind': 'stopped'}
         account, password = _split_account(line)
         account_started = time.time() if account_started is None else account_started
-        slot_id, account_prefix = _slot_for_account(account, slot_ids)
+        worker_state = state_for_thread() if proxy_pool is None else None
+        if worker_state is not None:
+            slot_id = worker_state['slot']
+            _ignored, account_prefix = _slot_for_account(account, [slot_id])
+        else:
+            slot_id, account_prefix = _slot_for_account(account, slot_ids)
         # 空白行仍是输入文件中的一条记录，但不应触发真实认证请求。
         # 作为未判断结果落盘，保证小包按描述的 rows 正常完成。
         if not line.strip():
             return row, line, {'status': 'undetermined', 'kind': 'blank_record',
                                'slot': slot_id, 'device_key': account_prefix, 'elapsed': 0}
-        identity = (identities.get(slot_id) if identity_override is identity_default
-                    else identity_override)
+        if worker_state is not None:
+            identity = worker_state['identity']
+        else:
+            identity = (identities.get(slot_id) if identity_override is identity_default
+                        else identity_override)
         result = None
         previous_proxy = previous_proxy or {'endpoint': '', 'host': '', 'port': None}
         # 用户设置的重试次数仍是唯一上限；节点池只负责每次重试换出口，
@@ -1482,7 +1148,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         for attempt in range(start_attempt, attempt_limit):
             acquire_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
             acquire_started = time.monotonic() if debug_enabled else None
-            account_proxy, lease = proxy_for(index + attempt)
+            account_proxy, lease = proxy_for(index + attempt, force=force_proxy)
+            force_proxy = False
             acquire_ms = (round((time.monotonic() - acquire_started) * 1000, 2)
                           if debug_enabled else None)
             current_proxy = (_proxy_identity(account_proxy) if debug_enabled else
@@ -1498,10 +1165,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             }
             if descriptor.get('proxy_api') and not account_proxy:
                 result = {'status': 'error', 'kind': 'proxy', 'http': 0,
-                          'stage': 'init', 'detail': '代理池暂时无可用出口'}
+                          'stage': 'init', 'detail': '线程未能获取代理出口'}
                 if debug_enabled:
                     _write_proxy_debug(
-                        debug_path, 'pool_empty', row=row, slot=slot_id,
+                        debug_path, 'proxy_unavailable', row=row, slot=slot_id,
                         attempt=attempt, attempt_limit=attempt_limit,
                         request_sent=False, acquire_ms=acquire_ms, **switch,
                         pool_before=acquire_before,
@@ -1513,26 +1180,38 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                               _retry_attempt=attempt + 1,
                               _retry_started=account_started,
                               _retry_identity=identity,
-                              _retry_previous=current_proxy)
+                              _retry_previous=current_proxy,
+                              _retry_force_proxy=True)
                 return row, line, result
             request_started = time.monotonic() if debug_enabled else None
             try:
                 if identity is None:
                     # 预取失败的槽位在这里补一次
-                    info = pool.info(timeout, proxy=account_proxy, provider_direct=True)
-                    ready = pool.inspect(slot_id)['state'] == 'ready'
+                    inspected = pool.inspect(slot_id)
+                    ready = inspected['state'] == 'ready'
                     profile = device_profile(pool, slot_id)
-                    info = dict(info, client_info=profile['client_info'],
-                                user_agent=profile['user_agent'])
+                    # The per-device profile already supplies every field used
+                    # by the header client. Avoid DevicePool.info() and its
+                    # process-wide .info.lock entirely on the task hot path.
+                    info = {'client_info': profile['client_info'],
+                            'user_agent': profile['user_agent']}
                     identity = pool.fetch_headers(slot_id, info, max(timeout, 40),
                                                   registered=ready, proxy=account_proxy,
                                                   provider_direct=True)
+                    if worker_state is not None:
+                        worker_state['info'] = info
+                        worker_state['identity'] = identity
+                        worker_state['device_label'] = _device_id_label(
+                            pool.inspect(slot_id).get('device_id') or
+                            inspected.get('device_id'))
+                        device_labels[slot_id] = worker_state['device_label']
                     if not ready and pool.inspect(slot_id)['state'] == 'ready':
                         record_device_registration(device_root, slot_id, account_proxy,
                                                    profile.get('model', ''))
-                # 换 IP 重试由节点池处理，协议层每次只使用当前出口一次。
+                # 每次协议请求使用当前线程自己的出口。
                 result = gsa_check(account, password, account_proxy, timeout=timeout,
-                                   retries=0 if proxy_pool is not None else retries,
+                                   retries=0 if (proxy_pool is not None or
+                                                 fetch_one_proxy is not None) else retries,
                                    cancel=stop.is_set, identity=identity)
                 if descriptor.get('_web_secondary_auth'):
                     def rotate_web(web_attempt):
@@ -1545,14 +1224,15 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             current_proxy = (_proxy_identity(account_proxy)
                                              if debug_enabled else current_proxy)
                             return account_proxy, account_proxy is not None
-                        if len(proxies) > 1:
-                            account_proxy = proxies[(index + attempt + web_attempt) % len(proxies)]
+                        if fetch_one_proxy is not None:
+                            account_proxy, lease = proxy_for(
+                                index + attempt + web_attempt, force=True)
                             current_proxy = (_proxy_identity(account_proxy)
                                              if debug_enabled else current_proxy)
-                            return account_proxy, True
+                            return account_proxy, account_proxy is not None
                         return account_proxy, False
 
-                    if proxy_pool is not None or len(proxies) > 1:
+                    if proxy_pool is not None or fetch_one_proxy is not None:
                         result = _refine_repair_auth_with_rotation(
                             result, account, password, account_proxy, timeout,
                             stop.is_set, retries, rotate_web)
@@ -1595,6 +1275,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     proxy_pool.discard(lease)
                 else:
                     proxy_pool.release(lease, healthy=healthy_exit)
+            elif worker_state is not None and transport_failed:
+                # No global pool: only this worker forgets its failed endpoint.
+                # Its next retry obtains exactly one replacement directly.
+                worker_state['proxy'] = None
             if debug_enabled and (web_failed or int(result.get('web_attempts') or 0) > 1):
                 _write_proxy_debug(
                     debug_path, 'web_retry_result', row=row, slot=slot_id,
@@ -1632,6 +1316,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 # 这不是账号结论；下一次重新获取 Anisette 身份，避免用
                 # 同一份无效设备认证数据重复请求。
                 identity = None
+                if worker_state is not None:
+                    worker_state['identity'] = None
             previous_proxy = current_proxy
             if not transport_failed or attempt + 1 >= attempt_limit:
                 result['_proxy_retries'] = attempt
@@ -1642,11 +1328,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           _retry_attempt=attempt + 1,
                           _retry_started=account_started,
                           _retry_identity=identity,
-                          _retry_previous=current_proxy)
+                          _retry_previous=current_proxy,
+                          _retry_force_proxy=True)
             return row, line, result
         if result is None:
             result = {'status': 'error', 'kind': 'proxy', 'http': 0,
-                      'stage': 'init', 'detail': '代理池未返回结果', '_proxy_retries': 0}
+                      'stage': 'init', 'detail': '线程未获取代理结果', '_proxy_retries': 0}
         result['elapsed'] = round(time.time() - account_started, 2)
         result['slot'] = slot_id
         result['device_key'] = account_prefix
@@ -1669,7 +1356,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     with (directory / 'input.part').open('r', encoding='utf-8', errors='replace') as source, output_path.open('wb') as output:
         output_path.chmod(0o600)
         first_row = int(descriptor.get('first_row') or 1)
-        with ThreadPoolExecutor(max_workers=workers) as workers_pool:
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix='auth-worker') as workers_pool:
             # 普通账号持续填充线程；需要重试的账号进入时间堆，延迟到期
             # 后再提交，不占用工作线程，也不会阻塞后面的账号。
             pending = set()
@@ -1721,7 +1409,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             int(result.pop('_retry_attempt')),
                             result.pop('_retry_started'),
                             result.pop('_retry_identity'),
-                            result.pop('_retry_previous'))
+                            result.pop('_retry_previous'),
+                            bool(result.pop('_retry_force_proxy', False)))
                     retry_order += 1
                     heapq.heappush(delayed, (float(retry_at), retry_order, work))
                     continue

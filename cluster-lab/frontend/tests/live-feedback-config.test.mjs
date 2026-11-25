@@ -24,13 +24,13 @@ test('Task creation exposes retries and node settings allow up to 4 x 500', () =
   assert.doesNotMatch(nodes, /active-text="允许领取新工作包"/)
 })
 
-test('New nodes stay paused until all default devices are initialized', () => {
+test('New nodes do not wait for device-pool initialization', () => {
   const nodes = source('src/views/Nodes.vue')
   const dialogs = source('src/components/NodeDialogs.vue')
-  assert.match(nodes, /!node\.enabled && !node\.device_initialization_complete/)
-  assert.match(nodes, /设备初始化 \{\{ node\.device_ready \|\| 0 \}\}\/\{\{ node\.device_request \|\| 30 \}\}/)
+  assert.doesNotMatch(nodes, /device_initialization_complete|设备初始化/)
+  assert.match(nodes, /线程启动时自取代理和设备/)
   assert.match(nodes, /开始接单/)
-  assert.match(dialogs, /新节点先暂停接单并自动初始化 30 台设备/)
+  assert.match(dialogs, /拿不到设备时由该线程注册/)
   assert.doesNotMatch(dialogs, /允许领取新工作包/)
 })
 
@@ -75,11 +75,9 @@ test('Proxy settings add, list, delete, and explain node distribution', () => {
   const settings = source('src/views/Settings.vue')
   assert.match(settings, /action: 'add'/)
   assert.match(settings, /action: 'delete'/)
-  assert.match(settings, /action: 'resize'/)
-  assert.match(settings, /proxy_pool_size/)
-  assert.match(settings, /每个节点只维护自己的代理池/)
-  assert.match(settings, /单次最多从该节点的 API 提取 1,000 条/)
-  assert.match(settings, /代理明细不会每秒传回总控/)
+  assert.doesNotMatch(settings, /action: 'resize'|proxy_pool_size|代理池容量/)
+  assert.match(settings, /每个工作线程启动时直接提取 1 条代理/)
+  assert.match(settings, /不再维护 IP 池/)
   assert.match(settings, /添加代理配置/)
   assert.match(settings, /按节点创建顺序轮询分配/)
   assert.match(settings, /proxy_apis/)
@@ -242,16 +240,11 @@ test('Result list keeps one result-code column without web recheck fields', () =
 })
 
 
-test('Device refill switch reopens from persisted settings and publishes save immediately', () => {
-  const drawer = source('src/components/DevicePoolDrawer.vue')
-  assert.match(drawer, /const settings = state\.value\?\.settings/)
-  assert.match(drawer, /Boolean\(settings\.device_auto_rotate/)
-  assert.doesNotMatch(drawer, /telemetry\?\.device_auto_rotate/)
-  assert.match(drawer, /const saved = await api\('\/api\/settings\/rotation'/)
-  assert.match(drawer, /state\.value\.settings =/)
-  assert.match(drawer, /:disabled="building \|\| savingAuto"/)
-  assert.match(drawer, /先注册一台替换设备/)
-  assert.match(drawer, /新设备成功后才移除出生日期最早且空闲的旧设备/)
+test('Node and settings pages omit manual device-pool maintenance', () => {
+  const nodes = source('src/views/Nodes.vue')
+  const settings = source('src/views/Settings.vue')
+  assert.doesNotMatch(nodes, /DevicePoolDrawer|设备列表/)
+  assert.doesNotMatch(settings, /device_auto_rotate|device_rotate_after|设备轮换/)
 })
 
 test('Task detail shows one node-reported traffic card with the 1 GB estimate', () => {

@@ -37,7 +37,7 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(saved['enabled'])
         self.assertEqual((saved['desired_processes'], saved['desired_threads']), (4, 250))
 
-    def test_new_node_defaults_to_thirty_device_registrations(self):
+    def test_new_node_can_start_without_device_prefill(self):
         node = self.service.add_node('auto-devices', 4, 250)
         with self.service.db.connect() as db:
             saved = db.execute('SELECT device_request,enabled FROM nodes WHERE id=?',
@@ -45,21 +45,13 @@ class ControllerTests(unittest.TestCase):
         response = self.service.heartbeat(node['id'], {
             'session': 'auto-device-session', 'hostname': 'new-node', 'version': 'test',
             'max_processes': 4, 'max_threads': 500, 'active': [], 'interrupted': []})
-        self.assertEqual(saved['device_request'], 30)
+        self.assertEqual(saved['device_request'], 0)
         self.assertFalse(saved['enabled'])
-        self.assertEqual(response['device_request'], 30)
+        self.assertNotIn('device_request', response)
         self.assertFalse(response['enabled'])
-        with self.assertRaisesRegex(Conflict, '设备初始化完成后'):
-            self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
-                                                       'enabled': True})
-        self.service.heartbeat(node['id'], {
-            'session': 'auto-device-session', 'hostname': 'new-node', 'version': 'test',
-            'max_processes': 4, 'max_threads': 500, 'active': [], 'interrupted': [],
-            'devices': {'running': False, 'capacity': 30, 'ready': 30,
-                        'built': 30, 'failed': 0, 'attempted': 30}})
-        self.assertTrue(self.service.snapshot()['nodes'][-1]['device_initialization_complete'])
         self.service.configure_node(node['id'], {'processes': 4, 'threads': 250,
                                                   'enabled': True})
+        self.assertTrue(self.service.snapshot()['nodes'][-1]['enabled'])
 
     def test_rolling_update_drains_limits_parallelism_and_resumes_after_health(self):
         other = self.service.add_node('second-update-node', 2, 4)
@@ -100,25 +92,21 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '合法'):
             self.service.request_updates([self.node['id']], '../main', 1)
 
-    def test_rotation_partial_updates_preserve_switch_and_restart(self):
+    def test_legacy_rotation_values_are_not_exposed_as_runtime_settings(self):
         self.service.configure_rotation({'device_rotate_after': 20, 'device_auto_rotate': True})
         result = self.service.configure_rotation({'device_rotate_after': 37})
-        self.assertTrue(result['device_auto_rotate'])
+        self.assertNotIn('device_auto_rotate', result)
+        self.assertNotIn('device_rotate_after', result)
         self.service.close()
         self.service = Controller(self.temp.name)
-        self.assertTrue(self.service.settings()['device_auto_rotate'])
-        self.assertEqual(self.service.settings()['device_rotate_after'], 37)
-        for enabled in (False, True):
-            result = self.service.configure_rotation({'device_auto_rotate': enabled})
-            self.assertIs(result['device_auto_rotate'], enabled)
-            self.assertEqual(result['device_rotate_after'], 37)
+        self.assertNotIn('device_auto_rotate', self.service.settings())
+        self.assertNotIn('device_rotate_after', self.service.settings())
 
     def test_rotation_rejects_string_switch_without_changing_saved_state(self):
         self.service.configure_rotation({'device_rotate_after': 20, 'device_auto_rotate': True})
         with self.assertRaisesRegex(ValueError, '布尔'):
             self.service.configure_rotation({'device_auto_rotate': 'false'})
-        self.assertTrue(self.service.settings()['device_auto_rotate'])
-        self.assertEqual(self.service.settings()['device_rotate_after'], 20)
+        self.assertNotIn('device_auto_rotate', self.service.settings())
 
     def test_proxy_debug_switch_defaults_off_persists_and_rejects_non_boolean(self):
         self.assertFalse(self.service.settings()['proxy_debug'])
@@ -277,9 +265,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(settings['proxy_apis'], [
             'https://proxy.example/one?password=***&num=200',
             'https://proxy.example/two?token=***&num=200'])
-        settings = self.service.configure_proxy({
-            'action': 'resize', 'proxy_pool_size': 10000})
-        self.assertEqual(settings['proxy_pool_size'], 10000)
+        self.assertNotIn('proxy_pool_size', settings)
 
         other = self.service.add_node('second-node', 2, 4)
         self.service.heartbeat(other['id'], dict(session='second-session', max_processes=1,
@@ -296,7 +282,7 @@ class ControllerTests(unittest.TestCase):
             time.sleep(.01)
         unit = self.service.lease(self.node['id'], 'test-session')
         self.assertEqual(unit['proxy_api'], first)
-        self.assertEqual(unit['proxy_pool_size'], 10000)
+        self.assertNotIn('proxy_pool_size', unit)
         self.assertIs(unit['_proxy_debug'], False)
         self.assertIs(unit['_web_secondary_auth'], True)
         self.assertNotIn(second, unit['proxy_api'])
@@ -997,7 +983,7 @@ class ControllerTests(unittest.TestCase):
         response = self.service.heartbeat(self.node['id'], {
             'session': 'test-session', 'max_processes': 1, 'max_threads': 2,
             'active': [], 'ack_device_clear_version': 1})
-        self.assertEqual(response['device_request'], 0)
+        self.assertNotIn('device_request', response)
         self.assertEqual(response['device_clear_version'], 1)
         with self.service.db.connect() as db:
             node = db.execute('SELECT device_request,device_clear_version,'

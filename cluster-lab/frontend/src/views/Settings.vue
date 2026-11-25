@@ -4,13 +4,8 @@ import { ElMessage } from 'element-plus'
 import { session, isNode, state, busy, mutate } from '../composables/useCluster'
 const maxUnitRows = ref(10000), error = ref('')
 const proxyApi = ref(''), proxyScheme = ref('socks5h'), proxyError = ref(''), proxyBusy = ref(false)
-const proxyPoolSize = ref(1000), proxyPoolBusy = ref(false)
-const rotateAfter = ref(0), rotateBusy = ref(false)
 const proxyDebug = ref(false), proxyDebugBusy = ref(false)
 const webSecondaryAuth = ref(true), webSecondaryAuthBusy = ref(false)
-watch(() => state.value?.settings?.device_rotate_after, value => {
-  if (value != null) rotateAfter.value = value
-}, { immediate: true })
 watch(() => state.value?.settings?.max_unit_rows, value => {
   if (value != null) maxUnitRows.value = value
 }, { immediate: true })
@@ -23,9 +18,6 @@ watch(() => state.value?.settings?.proxy_debug, value => {
 watch(() => state.value?.settings?.web_secondary_auth, value => {
   if (value != null) webSecondaryAuth.value = Boolean(value)
 }, { immediate: true })
-watch(() => state.value?.settings?.proxy_pool_size, value => {
-  if (value != null) proxyPoolSize.value = Number(value)
-}, { immediate: true })
 async function save() {
   error.value = ''
   if (!Number.isInteger(maxUnitRows.value) || maxUnitRows.value < 50 || maxUnitRows.value > 100000) {
@@ -33,14 +25,6 @@ async function save() {
   }
   try { await mutate('/api/settings', { max_unit_rows: maxUnitRows.value }, '分片上限已保存，仅对新创建的任务生效') }
   catch (e) { error.value = (e as Error).message; ElMessage.error(error.value) }
-}
-async function saveRotation() {
-  rotateBusy.value = true
-  try {
-    await mutate('/api/settings/rotation', { device_rotate_after: rotateAfter.value },
-                 rotateAfter.value ? `每台设备用满 ${rotateAfter.value} 条后自动换新` : '设备轮换已关闭')
-  } catch (e) { ElMessage.error((e as Error).message) }
-  finally { rotateBusy.value = false }
 }
 async function addProxy() {
   proxyError.value = ''
@@ -59,17 +43,6 @@ async function removeProxy(index: number) {
   try { await mutate('/api/settings/proxy', { action: 'delete', index }, '代理配置已删除') }
   catch (e) { proxyError.value = (e as Error).message; ElMessage.error(proxyError.value) }
   finally { proxyBusy.value = false }
-}
-async function saveProxyPoolSize() {
-  if (!Number.isInteger(proxyPoolSize.value) || proxyPoolSize.value < 1 || proxyPoolSize.value > 10000) {
-    proxyError.value = '单节点代理池容量应为 1–10,000 的整数'; return
-  }
-  proxyPoolBusy.value = true
-  try {
-    await mutate('/api/settings/proxy', { action: 'resize', proxy_pool_size: proxyPoolSize.value },
-                 `单节点代理池容量已设置为 ${proxyPoolSize.value.toLocaleString()}`)
-  } catch (e) { proxyError.value = (e as Error).message; ElMessage.error(proxyError.value) }
-  finally { proxyPoolBusy.value = false }
 }
 async function saveProxyDebug(value: string | number | boolean) {
   const enabled = Boolean(value)
@@ -94,7 +67,7 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
   } finally { webSecondaryAuthBusy.value = false }
 }
 </script>
-<template>
+<template><div class="settings-grid">
   <el-card v-if="!isNode" shadow="never" class="section-card">
     <template #header><h2>任务分片设置</h2></template>
     <el-form label-position="top" @submit.prevent="save">
@@ -124,21 +97,6 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
     </el-form>
   </el-card>
   <el-card v-if="!isNode" shadow="never" class="section-card">
-    <template #header><h2>设备轮换</h2></template>
-    <el-form label-position="top" @submit.prevent="saveRotation">
-      <el-form-item label="每台设备用满多少条后自动换新">
-        <el-input-number v-model="rotateAfter" :min="0" :max="100000" :step="10" :precision="0" :disabled="rotateBusy" />
-        <span class="field-note">0 表示不轮换。设备在节点本地重新注册（约 6–8 秒），旧身份被删除。</span>
-      </el-form-item>
-      <el-descriptions :column="1" border>
-        <el-descriptions-item label="当前阈值">
-          {{ state?.settings?.device_rotate_after ? state.settings.device_rotate_after + ' 条/台' : '未启用' }}
-        </el-descriptions-item>
-      </el-descriptions>
-      <el-button type="primary" native-type="submit" :loading="rotateBusy">保存轮换设置</el-button>
-    </el-form>
-  </el-card>
-  <el-card v-if="!isNode" shadow="never" class="section-card">
     <template #header><h2>出口代理</h2></template>
     <el-form label-position="top" @submit.prevent="addProxy">
       <el-form-item label="代理 API 地址">
@@ -146,7 +104,7 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
                   spellcheck="false" :disabled="proxyBusy"
                   placeholder="粘贴提取链接；也可一次粘贴多个，每行一个" />
         <span class="field-note">
-          最多 16 个。总控按节点创建顺序轮询分配，同一节点的设备注册和任务执行使用同一个配置。
+          最多 16 个。总控按节点创建顺序轮询分配。每个工作线程启动时直接提取 1 条代理，不再维护 IP 池。
           密码在页面上只显示为 ***。
         </span>
       </el-form-item>
@@ -158,15 +116,6 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
           <el-option label="https" value="https" />
         </el-select>
       </el-form-item>
-      <el-form-item label="单节点代理池容量">
-        <el-input-number v-model="proxyPoolSize" :min="1" :max="10000" :step="1000"
-                         :precision="0" :disabled="proxyPoolBusy" />
-        <span class="field-note">
-          每个节点只维护自己的代理池；单次最多从该节点的 API 提取 1,000 条，库存不足时分批补齐。
-          代理明细不会每秒传回总控。
-        </span>
-      </el-form-item>
-      <el-button :loading="proxyPoolBusy" :disabled="proxyBusy" @click="saveProxyPoolSize">保存代理池容量</el-button>
       <el-descriptions :column="1" border>
         <el-descriptions-item label="当前状态">
           {{ state?.settings?.proxy_configured ? `已配置 ${state.settings.proxy_count} 个` : '未配置' }}
@@ -203,4 +152,9 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
     </el-form>
   </el-card>
   <el-card shadow="never" class="section-card"><template #header><h2>当前部署</h2></template><el-descriptions :column="1" border><el-descriptions-item label="版本">{{ session?.version }}</el-descriptions-item><el-descriptions-item label="服务角色">{{ isNode ? '执行节点' : '集群总控' }}</el-descriptions-item><el-descriptions-item label="管理登录">{{ session?.password_required ? '已启用密码登录' : '未启用密码登录' }}</el-descriptions-item><el-descriptions-item label="任务导出">TXT 原始记录，一行一条，保持原顺序</el-descriptions-item></el-descriptions></el-card>
-</template>
+</div></template>
+<style scoped>
+.settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 20px; align-items: start; }
+.settings-grid :deep(.section-card) { margin: 0; min-width: 0; }
+@media (max-width: 760px) { .settings-grid { grid-template-columns: 1fr; } }
+</style>
