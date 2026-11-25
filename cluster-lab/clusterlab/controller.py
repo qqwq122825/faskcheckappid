@@ -536,7 +536,7 @@ class Controller:
             if not row['last_seen'] or now - row['last_seen'] >= self.offline_seconds:
                 continue
             working = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? "
-                                 "AND status IN ('leased','running','unknown')", (row['id'],)).fetchone()[0]
+                                 "AND status IN ('leased','running')", (row['id'],)).fetchone()[0]
             if working:
                 db.execute("UPDATE nodes SET update_message=? WHERE id=?",
                            (f'等待 {working} 个在途工作包完成', row['id']))

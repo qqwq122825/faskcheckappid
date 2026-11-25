@@ -123,6 +123,19 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '合法'):
             self.service.request_updates([self.node['id']], '../main', 1)
 
+    def test_rolling_update_does_not_wait_for_nonexecuting_unknown_unit(self):
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        with self.service.db.transaction() as db:
+            db.execute("UPDATE units SET status='unknown' WHERE id=?", (unit['id'],))
+
+        self.service.request_updates([self.node['id']], 'main', 1)
+
+        node = next(value for value in self.service.snapshot()['nodes']
+                    if value['id'] == self.node['id'])
+        self.assertEqual('dispatched', node['update_state'])
+
     def test_device_use_limit_migrates_legacy_rotation_threshold(self):
         self.service.close()
         database = Path(self.temp.name) / 'controller.sqlite3'
