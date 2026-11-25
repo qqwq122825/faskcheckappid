@@ -1340,7 +1340,17 @@ class Controller:
                     continue
                 traffic_jobs.add(unit['job_id'])
                 count = integer(value.get('processed', 0), '已处理数量', 0, unit['rows'])
-                live_counts = self.clean_live_counts(value.get('counts'), count, unit['rows'])
+                try:
+                    live_counts = self.clean_live_counts(
+                        value.get('counts'), count, unit['rows'])
+                except ValueError as exc:
+                    if str(exc) != '实时分类数超过已处理数':
+                        raise
+                    # Older thread workers counted out-of-order completions before
+                    # the same rows were committed to the ordered result stream.
+                    # Ignore only that inconsistent summary so one bad snapshot
+                    # cannot suppress liveness, stop ACKs, or rolling updates.
+                    live_counts = {}
                 reported_ack[unit['id']] = self._accept_live_records(
                     db, unit, value.get('records', []))
                 if (reported_ack[unit['id']] == int(unit['rows'])

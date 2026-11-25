@@ -520,6 +520,25 @@ class ControllerTests(unittest.TestCase):
             self.assertIsNone(db.execute('SELECT live_counts FROM units WHERE id=?',
                                          (unit['id'],)).fetchone()[0])
 
+    def test_inconsistent_live_counts_do_not_suppress_node_heartbeat(self):
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        before = self.service.snapshot()['nodes'][0]['last_seen']
+
+        response = self.service.heartbeat(self.node['id'], {
+            'session': 'test-session', 'version': 'old-thread-worker',
+            'max_processes': 1, 'max_threads': 2, 'interrupted': [],
+            'active': [{'id': unit['id'], 'token': unit['token'],
+                        'processed': 1, 'counts': {'wrong_password': 3}}]})
+
+        self.assertEqual([], response['rejected'])
+        state = next(value for value in self.service.snapshot()['jobs']
+                     if value['id'] == job)
+        self.assertEqual(1, state['processed'])
+        self.assertEqual(0, state['categorized']['wrong_password'])
+        self.assertGreaterEqual(self.service.snapshot()['nodes'][0]['last_seen'], before)
+
     def test_node_heartbeat_streams_rows_idempotently_and_completes_package(self):
         job = self.job(50)
         self.service.job_action(job, 'start')
