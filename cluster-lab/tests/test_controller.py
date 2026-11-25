@@ -119,6 +119,26 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(self.service.settings()['proxy_debug'])
         self.assertFalse(self.service.configure_debug({'proxy_debug': False})['proxy_debug'])
 
+    def test_device_policy_persists_and_is_attached_to_auth_leases(self):
+        self.assertEqual(self.service.settings()['public_header_use_limit'], 15)
+        self.assertEqual(self.service.settings()['device_use_limit'], 1000)
+        saved = self.service.configure_device_policy({
+            'public_header_use_limit': 7, 'device_use_limit': 321})
+        self.assertEqual((saved['public_header_use_limit'], saved['device_use_limit']),
+                         (7, 321))
+        job = self.job(50)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertEqual((unit['public_header_use_limit'], unit['device_use_limit']),
+                         (7, 321))
+
+    def test_refresh_devices_clears_then_rebuilds_to_effective_thread_count(self):
+        result = self.service.refresh_devices(self.node['id'])
+        self.assertEqual(result['requested'], 2)
+        response = self.heartbeat(ack_device_clear_version=0)
+        self.assertEqual(response['device_request'], 2)
+        self.assertEqual(response['device_clear_version'], result['version'])
+
     def test_web_secondary_auth_defaults_on_persists_and_rejects_non_boolean(self):
         self.assertTrue(self.service.settings()['web_secondary_auth'])
         self.assertFalse(self.service.configure_web_secondary_auth(
@@ -359,7 +379,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_lease_carries_job_timeout_and_indexed_package_bytes(self):
         job = self.service.create_job('indexed', io.BytesIO(b'hello\n' * 100), 50,
-                                      timeout=37, retries=3)
+                                      timeout=37, retries=3, item_timeout=55)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             state = next(j for j in self.service.snapshot()['jobs'] if j['id'] == job)
@@ -368,7 +388,8 @@ class ControllerTests(unittest.TestCase):
             time.sleep(.01)
         self.service.job_action(job, 'start')
         unit = self.service.lease(self.node['id'], 'test-session')
-        self.assertEqual((unit['timeout'], unit['retries']), (37, 3))
+        self.assertEqual((unit['timeout'], unit['retries'], unit['item_timeout']),
+                         (37, 3, 55))
         self.assertEqual(unit['bytes'], 300)
         indexed = self.service.unit_for_node(self.node['id'], unit['id'], unit['token'])
         self.assertEqual(b''.join(self.service.unit_blocks(indexed)), b'hello\n' * 50)
@@ -1201,6 +1222,8 @@ class ControllerTests(unittest.TestCase):
                                              'upload_bps':1024,'download_bps':-1,'network_bytes':123456,
                                              'worker_processes':2,'secret':'private',
                                              'device_pool': {'proxy_status': 'failed',
+                                                             'in_use': 18,
+                                                             'registering': 3,
                                                              'proxy_ip': 'user:pass@1.2.3.4:80',
                                                              'message': '代理获取失败，请检查白名单',
                                                              'slots': [{'slot': 1, 'used': 987,
@@ -1221,6 +1244,8 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(value['device_pool']['proxy_status'], 'failed')
         self.assertEqual(value['device_pool']['proxy_ip'], '1.2.3.4:80')
         self.assertEqual(value['device_pool']['message'], '代理获取失败，请检查白名单')
+        self.assertEqual(value['device_pool']['in_use'], 18)
+        self.assertEqual(value['device_pool']['registering'], 3)
 
 
 if __name__ == '__main__':

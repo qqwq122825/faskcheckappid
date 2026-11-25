@@ -6,6 +6,8 @@ const maxUnitRows = ref(10000), error = ref('')
 const proxyApi = ref(''), proxyScheme = ref('socks5h'), proxyError = ref(''), proxyBusy = ref(false)
 const proxyDebug = ref(false), proxyDebugBusy = ref(false)
 const webSecondaryAuth = ref(true), webSecondaryAuthBusy = ref(false)
+const publicHeaderUseLimit = ref(15), deviceUseLimit = ref(1000)
+const policyBusy = ref(false), policyError = ref('')
 watch(() => state.value?.settings?.max_unit_rows, value => {
   if (value != null) maxUnitRows.value = value
 }, { immediate: true })
@@ -17,6 +19,12 @@ watch(() => state.value?.settings?.proxy_debug, value => {
 }, { immediate: true })
 watch(() => state.value?.settings?.web_secondary_auth, value => {
   if (value != null) webSecondaryAuth.value = Boolean(value)
+}, { immediate: true })
+watch(() => state.value?.settings?.public_header_use_limit, value => {
+  if (value != null) publicHeaderUseLimit.value = Number(value)
+}, { immediate: true })
+watch(() => state.value?.settings?.device_use_limit, value => {
+  if (value != null) deviceUseLimit.value = Number(value)
 }, { immediate: true })
 async function save() {
   error.value = ''
@@ -66,6 +74,23 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
     ElMessage.error((e as Error).message)
   } finally { webSecondaryAuthBusy.value = false }
 }
+async function saveDevicePolicy() {
+  policyError.value = ''
+  if (!Number.isInteger(publicHeaderUseLimit.value) || publicHeaderUseLimit.value < 1) {
+    policyError.value = '公共头使用次数必须是正整数'; return
+  }
+  if (!Number.isInteger(deviceUseLimit.value) || deviceUseLimit.value < 1) {
+    policyError.value = '设备使用次数必须是正整数'; return
+  }
+  policyBusy.value = true
+  try {
+    await mutate('/api/settings/device-policy', {
+      public_header_use_limit: publicHeaderUseLimit.value,
+      device_use_limit: deviceUseLimit.value
+    }, '设备策略已保存，对新领取的工作包生效')
+  } catch (e) { policyError.value = (e as Error).message; ElMessage.error(policyError.value) }
+  finally { policyBusy.value = false }
+}
 </script>
 <template><el-card shadow="never" class="settings-card">
   <template #header><div class="settings-title"><div><h2>系统设置</h2><p>常用配置集中在一个页面，高级选项默认收起。</p></div><el-tag effect="plain">v{{ session?.version }}</el-tag></div></template>
@@ -97,8 +122,14 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
     </section>
 
     <section class="setting-cell">
-      <div class="cell-copy"><h3>设备策略</h3><p>自动管理，不需要手工初始化设备池。</p></div>
-      <div class="cell-control policy-strip"><span><b>1</b> 个进程</span><span><b>每线程 1 个</b> 内存设备</span><span><b>缺失时</b> 线程自行注册</span></div>
+      <div class="cell-copy"><h3>设备策略</h3><p>两个阈值统一下发到节点。</p></div>
+      <form class="cell-control policy-control" @submit.prevent="saveDevicePolicy">
+        <label><span>公共头刷新</span><el-input-number v-model="publicHeaderUseLimit" :min="1" :max="10000" :precision="0" :disabled="policyBusy" /><small>个账号后</small></label>
+        <label><span>设备淘汰</span><el-input-number v-model="deviceUseLimit" :min="1" :max="1000000" :step="100" :precision="0" :disabled="policyBusy" /><small>个账号后</small></label>
+        <el-button type="primary" native-type="submit" :loading="policyBusy">保存</el-button>
+        <p class="control-note">公共头到阈值后由线程自动更新；设备到阈值后删除旧身份，下一个账号使用当前出口重新注册。</p>
+        <el-alert v-if="policyError" :title="policyError" type="error" :closable="false" show-icon />
+      </form>
     </section>
 
     <el-collapse class="advanced-settings">

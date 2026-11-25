@@ -136,6 +136,22 @@ class ExecutorScaleTests(unittest.TestCase):
         replacement = [pool.acquire() for _ in range(3)]
         self.assertTrue(all('10.0.2.' in lease[0] for lease in replacement))
 
+    def test_empty_watermark_refills_are_rate_limited(self):
+        called = []
+
+        def fetch(_count):
+            called.append(time.monotonic())
+            return []
+
+        pool = _WatermarkProxyPool(fetch, target=1, refill_interval=.05)
+        pool.bootstrap()
+        self.assertIsNone(pool.acquire(wait=.01))
+        deadline = time.monotonic() + .5
+        while pool.snapshot()['refilling'] and time.monotonic() < deadline:
+            time.sleep(.005)
+        self.assertGreaterEqual(len(called), 2)
+        self.assertGreaterEqual(called[1] - called[0], .045)
+
     def test_raw_apple_reason_is_packaged_only_when_debug_is_enabled(self):
         result = {'apple_message': 'Your account information was entered incorrectly.'}
         self.assertEqual(_apple_reason_for_record(result, 'wrong_password'), '')
@@ -145,6 +161,8 @@ class ExecutorScaleTests(unittest.TestCase):
     def test_stall_budget_covers_all_retry_windows(self):
         self.assertEqual(stall_timeout_seconds({'timeout': 20, 'retries': 4}), 180)
         self.assertEqual(stall_timeout_seconds({'timeout': 60, 'retries': 4}), 360)
+        self.assertEqual(stall_timeout_seconds({'timeout': 25, 'retries': 2,
+                                                'item_timeout': 40}), 180)
 
     def test_device_id_uses_short_base64_label(self):
         self.assertEqual(_device_id_label('device-1'), 'B64:ZGV2aWNl')
@@ -420,7 +438,7 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(shared.discards, ['socks5h://service-busy'])
             self.assertEqual(stop.waits, [])
 
-    def test_auth_unit_retries_22421_with_fresh_identity_and_keeps_apple_reason(self):
+    def test_auth_unit_retries_22421_with_fresh_identity_and_hides_apple_reason(self):
         class RefreshingPool(FakePool):
             fetch_count = 0
 
@@ -464,7 +482,7 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(checked, [
                 ('socks5h://first-exit', 1), ('socks5h://second-exit', 2)])
             self.assertEqual((record['status'], record['attempts']), ('need_2fa', 1))
-            self.assertEqual(record['reason'], 'au=trustedDeviceSecondaryAuth')
+            self.assertEqual(record['reason'], '')
             self.assertEqual(shared.releases, [
                 ('socks5h://bootstrap', True),
                 ('socks5h://second-exit', True),
@@ -507,10 +525,40 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(checked, [
                 'socks5h://first-exit', 'socks5h://second-exit', 'socks5h://third-exit'])
             self.assertEqual((record['status'], record['attempts']), ('timeout', 2))
-            self.assertEqual(record['reason'], reason)
+            self.assertEqual(record['reason'], '')
             self.assertEqual(stop.waits, [])
             self.assertEqual(shared.discards, [
                 'socks5h://first-exit', 'socks5h://second-exit', 'socks5h://third-exit'])
+
+    def test_account_budget_stops_retry_and_caps_request_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text('account----password\n', encoding='utf-8')
+            descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': .1,
+                          'item_timeout': .2, 'retries': 2, '_retry_delay': 0}
+            shared = ScriptedProxyPool([
+                'socks5h://bootstrap', 'socks5h://first-exit',
+                'socks5h://second-exit'])
+            request_timeouts = []
+
+            def check(_account, _password, _proxy, **kwargs):
+                request_timeouts.append(kwargs['timeout'])
+                time.sleep(.25)
+                return {'status': 'error', 'kind': 'network', 'http': 0}
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool, check, lambda _result: 'timeout')), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+
+            record = json.loads((root / 'results.jsonl').read_text())
+            self.assertEqual(len(request_timeouts), 1)
+            self.assertLessEqual(request_timeouts[0], .2)
+            self.assertEqual((record['status'], record['attempts']), ('timeout', 0))
 
     def test_auth_unit_retries_transient_apple_codes_with_new_ip_and_identity(self):
         class RefreshingPool(FakePool):
@@ -670,6 +718,40 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertLessEqual(len(usage_calls[0]), 2)
             self.assertEqual(len(payload.splitlines()), 500)
 
+    def test_public_header_limit_refreshes_and_device_limit_retires_slot(self):
+        class CountingPool(FakePool):
+            headers = 0
+            resets = 0
+
+            def fetch_headers(self, *_args, **_kwargs):
+                type(self).headers += 1
+                return {'header-generation': type(self).headers}
+
+            def reset(self, _slot):
+                type(self).resets += 1
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            device_root = root / 'devices'
+            device_root.mkdir()
+            (device_root / 'usage.json').write_text('{"1":1}', encoding='utf-8')
+            (root / 'input.part').write_text(
+                'first----password\nsecond----password\n', encoding='utf-8')
+            descriptor = {'rows': 2, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_root': str(device_root),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5,
+                          'public_header_use_limit': 1, 'device_use_limit': 1}
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    CountingPool, lambda *_args, **_kwargs: {'status': 'valid'},
+                    lambda result: result['status'])), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test',
+                                     'model': 'TestModel'}):
+                _execute_auth_unit(root, descriptor, threading.Event())
+            self.assertEqual(CountingPool.headers, 2)
+            self.assertEqual(CountingPool.resets, 2)
+            self.assertEqual(json.loads((device_root / 'usage.json').read_text())['1'], 1)
+
     def test_auth_progress_is_time_based_instead_of_waiting_for_ten_results(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -717,7 +799,7 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(record['status'], 'invalid')
             self.assertEqual(record['protocol'], 'GSA')
             self.assertEqual((record['http'], record['code']), (200, '-20970'))
-            self.assertEqual(record['reason'], 'Apple init refused this request')
+            self.assertEqual(record['reason'], '')
             self.assertNotIn('gsa_code', record)
             self.assertNotIn('web_code', record)
             done = json.loads((root / 'done.json').read_text())

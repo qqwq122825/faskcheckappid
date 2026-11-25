@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
 import tempfile
 import threading
 import time
@@ -245,6 +246,13 @@ class DevicePool:
                     "device_id": str(uuid.UUID(bytes=identifier))}
         except (OSError, ValueError, KeyError, TypeError, AnisetteError):
             return {"slot": slot, "state": "invalid"}
+
+    def reset(self, slot):
+        """Retire one identity and forget its in-process state."""
+        directory = self.slot_directory(slot)
+        with self._memory_states_lock:
+            self._memory_states.pop(slot, None)
+        shutil.rmtree(directory, ignore_errors=True)
 
     def health(self):
         with file_lease(self.base / ".health.lock", wait=2):

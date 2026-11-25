@@ -128,13 +128,15 @@ test('Large task totals use a non-overlapping responsive feedback grid', () => {
   assert.match(styles, /@media\(max-width:600px\)\{\.feedback-grid\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)/)
 })
 
-test('Settings use one compact cell-based card and explain automatic devices', () => {
+test('Settings use one compact cell-based card with global header and device limits', () => {
   const settings = source('src/views/Settings.vue')
   assert.equal((settings.match(/<el-card/g) || []).length, 1)
   assert.match(settings, /class="setting-cell"/)
   assert.match(settings, /高级设置/)
-  assert.match(settings, /自动管理，不需要手工初始化设备池/)
-  assert.match(settings, /缺失时.*线程自行注册/)
+  assert.match(settings, /public_header_use_limit/)
+  assert.match(settings, /device_use_limit/)
+  assert.match(settings, /公共头刷新/)
+  assert.match(settings, /设备淘汰/)
   assert.doesNotMatch(settings, /开始初始化设备池|一键清空设备/)
 })
 
@@ -186,13 +188,12 @@ test('Deleting a running task explicitly stops its node work', () => {
   assert.match(table, /已通知节点停止/)
 })
 
-test('GSA result categories expose invalid and locked business states', () => {
+test('GSA result categories fold legacy invalid into locked', () => {
   const feedback = source('src/components/TaskFeedback.vue')
   const detail = source('src/views/JobDetail.vue')
-  assert.match(feedback, /label: '未激活'/)
   assert.match(feedback, /label: '不存在'/)
-  assert.match(feedback, /categories\.value\.invalid/)
-  assert.match(detail, /label: '未激活', value: 'invalid'/)
+  assert.doesNotMatch(feedback, /categories\.value\.invalid/)
+  assert.doesNotMatch(detail, /label: '未激活', value: 'invalid'/)
   assert.match(detail, /label: '不存在', value: 'not_found'/)
   assert.match(detail, /label: '锁定', value: 'locked'/)
   assert.match(feedback, /label: '其他错误'/)
@@ -218,11 +219,20 @@ test('Result list keeps one result-code column without web recheck fields', () =
 })
 
 
-test('Node and settings pages omit manual device-pool maintenance', () => {
+test('Node cards keep compact counts and expose one device management dialog', () => {
   const nodes = source('src/views/Nodes.vue')
   const settings = source('src/views/Settings.vue')
   assert.doesNotMatch(nodes, /DevicePoolDrawer|设备列表/)
+  assert.match(nodes, /设备管理/)
+  assert.match(nodes, /设备 \{\{ fmt\(node\.telemetry\?\.device_pool\?\.ready\) \}\}/)
+  assert.match(nodes, /使用中 \{\{ fmt\(node\.telemetry\?\.device_pool\?\.in_use\) \}\}/)
+  assert.match(nodes, /注册中 \{\{ fmt\(node\.telemetry\?\.device_pool\?\.registering\) \}\}/)
   assert.doesNotMatch(settings, /device_auto_rotate|device_rotate_after|设备轮换/)
+  const dialogs = source('src/components/NodeDialogs.vue')
+  assert.match(dialogs, /注册出口 IP/)
+  assert.match(dialogs, /一键删除/)
+  assert.match(dialogs, /一键刷新/)
+  assert.match(dialogs, /effective_threads/)
 })
 
 test('Task detail shows one node-reported traffic card with the 1 GB estimate', () => {
@@ -237,7 +247,7 @@ test('Task detail shows one node-reported traffic card with the 1 GB estimate', 
 test('Task summary omits the in-flight-record card and keeps its other ten metrics', () => {
   const feedback = source('src/components/TaskFeedback.vue')
   assert.doesNotMatch(feedback, /在途记录/)
-  for (const label of ['总数', '已确认', '剩余', '密码正确', '密码错误', '双重验证', '锁定', '未激活', '不存在', '请重试', '其他错误']) {
+  for (const label of ['总数', '已确认', '剩余', '密码正确', '密码错误', '双重验证', '锁定', '不存在', '请重试', '其他错误']) {
     assert.ok(feedback.includes(`label: '${label}'`))
   }
 })

@@ -332,10 +332,17 @@ class Node:
         except Exception:                                          # noqa: BLE001
             snapshot = dict(self.builder.state)
             snapshot['slots'] = []
-        return {key: snapshot.get(key) for key in
+        reserved = self.builder.reserved_slots()
+        slots = snapshot.get('slots') if isinstance(snapshot.get('slots'), list) else []
+        states = {int(item.get('slot') or 0): str(item.get('state') or '')
+                  for item in slots if isinstance(item, dict)}
+        result = {key: snapshot.get(key) for key in
                 ('running', 'capacity', 'ready', 'built', 'failed',
                  'current', 'attempted', 'proxy_status', 'proxy_ip',
                  'message', 'slots')}
+        result['in_use'] = len(reserved)
+        result['registering'] = sum(states.get(slot) != 'ready' for slot in reserved)
+        return result
 
     def _live_result_paths(self, unit_id):
         """Return worker outputs, never the later merged duplicate file."""
@@ -481,9 +488,12 @@ class Node:
                     self.builder.clear()
                     self.device_clear_version = clear_version
                     self._save_control()
-            # No background device-pool maintenance. Auth worker threads load
-            # their own slot into process memory and register it lazily only
-            # when that slot is missing.
+            requested = int(value.get('device_request') or 0)
+            if (requested > 0 and self.device_clear_version >= clear_version
+                    and not self.builder.state['running']):
+                snapshot = self.builder.snapshot()
+                if int(snapshot.get('ready') or 0) < requested:
+                    self.builder.start(requested)
             for unit_id in value['rejected']:
                 if unit_id in self.active:
                     self.active[unit_id][1].set()
@@ -539,8 +549,9 @@ class Node:
         # 认证模式需要本地设备目录；节点自己决定路径，不接受总控指定。
         if descriptor.get('mode') == 'auth':
             descriptor.setdefault('device_root', str(private_dir(self.root / 'device-pool')))
-            descriptor.setdefault('timeout', 20)
-            descriptor.setdefault('retries', 0)
+            descriptor.setdefault('timeout', 25)
+            descriptor.setdefault('retries', 2)
+            descriptor.setdefault('item_timeout', 40)
             self._prepare_auth_devices(descriptor)
         atomic_json(directory / 'manifest.json', descriptor)
         stop = self.context.Event()

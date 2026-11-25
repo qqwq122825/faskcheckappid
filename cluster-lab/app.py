@@ -5,6 +5,20 @@ import os
 from pathlib import Path
 
 
+def ensure_open_file_limit(threads):
+    """Raise the soft descriptor limit for one high-concurrency node."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        wanted = min(hard, max(4096, int(threads) * 8))
+        if wanted > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+            soft = wanted
+        return int(soft)
+    except (ImportError, OSError, ValueError):
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description='苹果集群系统 · 总控与节点')
     parser.add_argument('role', choices=('controller', 'node'))
@@ -31,6 +45,9 @@ def main():
                else Node(root, args.max_processes, args.max_threads, args.allow_http))
     application = create_app(args.role, service, password)
     if args.role == 'node':
+        open_files = ensure_open_file_limit(args.max_threads)
+        if open_files is not None:
+            print(f'文件描述符软上限：{open_files}', flush=True)
         service.start()
     print(f'苹果集群系统 {args.role} · http://{args.host}:{port}/', flush=True)
     print(f'数据目录：{root.resolve()}', flush=True)

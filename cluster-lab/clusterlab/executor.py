@@ -23,6 +23,7 @@ from .common import atomic_json
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
 PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
+PROXY_REFILL_INTERVAL_SECONDS = 1.0
 PROXY_WATERMARK_RATIO = 0.5
 MIN_STALL_TIMEOUT_SECONDS = 180.0
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
@@ -34,7 +35,8 @@ PROXY_EXIT_IP_MAX = 2048
 class _WatermarkProxyPool:
     """Small task-local pool with fair reuse and one low-water refill path."""
 
-    def __init__(self, fetch, target, low_water=None):
+    def __init__(self, fetch, target, low_water=None,
+                 refill_interval=PROXY_REFILL_INTERVAL_SECONDS):
         self.fetch = fetch
         self.target = max(1, int(target))
         self.low_water = max(1, int(low_water or self.target * PROXY_WATERMARK_RATIO))
@@ -45,6 +47,8 @@ class _WatermarkProxyPool:
         self.leased = set()
         self.uses = {}
         self.refilling = False
+        self.refill_interval = max(0.0, float(refill_interval))
+        self.next_refill_at = 0.0
 
     def bootstrap(self):
         """Fetch the configured thread count once before workers start."""
@@ -127,11 +131,15 @@ class _WatermarkProxyPool:
                 self.refilling = True
         with self.condition:
             missing = max(0, self.target - len(self.known))
+            delay = max(0.0, self.next_refill_at - time.monotonic())
+        if delay:
+            time.sleep(delay)
         try:
             values = list(self.fetch(missing) or ()) if missing else []
         except Exception:                                          # noqa: BLE001
             values = []
         with self.condition:
+            self.next_refill_at = time.monotonic() + self.refill_interval
             # New endpoints always enter the fresh queue and are selected
             # before reusable ones. Identity is the complete provider string,
             # so equal IPs on different ports remain independent exits.
@@ -147,9 +155,12 @@ class _WatermarkProxyPool:
 def stall_timeout_seconds(descriptor, minimum=MIN_STALL_TIMEOUT_SECONDS,
                           padding=60.0):
     """Return a no-progress budget larger than every configured retry."""
-    timeout = max(0.1, float(descriptor.get('timeout') or 20))
-    attempts = max(0, int(descriptor.get('retries') or 0)) + 1
-    return max(float(minimum), timeout * attempts + float(padding))
+    timeout = max(0.1, float(descriptor.get('timeout') or 25))
+    retries = descriptor.get('retries')
+    attempts = max(0, int(2 if retries is None else retries)) + 1
+    item_timeout = max(timeout, float(descriptor.get('item_timeout') or 40))
+    return max(float(minimum), timeout * attempts + float(padding),
+               item_timeout + float(padding))
 
 
 def _slot_for_account(account, slot_ids):
@@ -666,8 +677,10 @@ def execute_unit_group(directory, descriptor, stop):
             unit_id=str(descriptor.get('id') or ''),
             rows=int(descriptor.get('rows') or 0), processes=1, threads=threads,
             requested_processes=configured_processes,
-            retries=int(descriptor.get('retries') or 0),
-            timeout=float(descriptor.get('timeout') or 20),
+            retries=int(2 if descriptor.get('retries') is None
+                        else descriptor.get('retries')),
+            timeout=float(descriptor.get('timeout') or 25),
+            item_timeout=float(descriptor.get('item_timeout') or 40),
             mode='single_process_watermark', credentials_recorded=False)
 
     _group_child(directory, descriptor, stop)
@@ -722,9 +735,19 @@ def _split_account(line):
     return line.strip(), ''
 
 
-def _bump_usage(device_root, counts):
+def _usage_snapshot(device_root):
+    if not device_root:
+        return {}
+    try:
+        value = json.loads((Path(device_root) / 'usage.json').read_text('utf-8'))
+        return {int(slot): max(0, int(count)) for slot, count in value.items()}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
+def _bump_usage(device_root, counts, resets=()):
     """每个工作包合并写一次设备计数，并用进程锁防止覆盖。"""
-    if not device_root or not counts:
+    if not device_root or (not counts and not resets):
         return
     import portalocker
     path = Path(device_root) / 'usage.json'
@@ -736,6 +759,8 @@ def _bump_usage(device_root, counts):
                 data = json.loads(path.read_text('utf-8')) if path.exists() else {}
             except (OSError, ValueError):
                 data = {}
+            for slot in resets:
+                data[str(int(slot))] = 0
             for slot, count in counts.items():
                 key = str(int(slot))
                 data[key] = int(data.get(key) or 0) + int(count)
@@ -745,12 +770,7 @@ def _bump_usage(device_root, counts):
 
 
 def record_device_registration(device_root, slot, proxy, model=''):
-    """Persist the first observed registration facts for one device slot.
-
-    Each slot owns a separate file, so worker processes cannot overwrite one
-    another's history. O_EXCL also preserves the original time and proxy when
-    the same device is reused by later tasks.
-    """
+    """Persist the first registration facts for the current slot generation."""
     if not device_root:
         return False
     directory = Path(device_root) / 'registrations'
@@ -811,13 +831,18 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         slot_ids = [max(1, min(capacity, int(value))) for value in configured_slots]
     else:
         slot_ids = list(range(1, capacity + 1))
-    timeout = float(descriptor.get('timeout') or 20)
-    retries = max(0, int(descriptor.get('retries') or 0))
+    timeout = float(descriptor.get('timeout') or 25)
+    retry_value = descriptor.get('retries')
+    retries = max(0, int(2 if retry_value is None else retry_value))
+    item_timeout = max(timeout, float(descriptor.get('item_timeout') or 40))
+    public_header_use_limit = max(1, int(descriptor.get('public_header_use_limit') or 15))
+    device_use_limit = max(1, int(descriptor.get('device_use_limit') or 1000))
     retry_delay = max(0.0, float(descriptor.get('_retry_delay',
                                                 PROXY_RETRY_DELAY_SECONDS)))
     configured_workers = max(1, int(descriptor.get('threads') or 1))
     workers = max(1, int(descriptor.get('_active_threads_per_process') or
                          configured_workers))
+    header_gate = threading.Semaphore(min(100, workers))
     runtime_proxy_pool = fetch_proxy_batch is not None
     if runtime_proxy_pool:
         proxy_pool = _WatermarkProxyPool(fetch_proxy_batch, target=workers)
@@ -843,6 +868,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            threads=workers, configured_threads=configured_workers,
                            worker_nice=int(descriptor.get('_worker_nice') or 0),
                            retries=retries, timeout=timeout,
+                           item_timeout=item_timeout,
                            slots=slot_ids, credentials_recorded=False)
 
     # 一个包内把账号摊到所有设备上：一台设备只承担 rows/capacity 条，
@@ -873,9 +899,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             inspected = pool.inspect(index)
             ready = inspected['state'] == 'ready'
             device_labels[index] = _device_id_label(inspected.get('device_id'))
-            identities[index] = pool.fetch_headers(index, infos[index], max(timeout, 40),
-                                                   registered=ready, proxy=bootstrap_proxy,
-                                                   provider_direct=True)
+            with header_gate:
+                identities[index] = pool.fetch_headers(
+                    index, infos[index], max(timeout, 40), registered=ready,
+                    proxy=bootstrap_proxy, provider_direct=True)
             refreshed = pool.inspect(index)
             device_labels[index] = (_device_id_label(refreshed.get('device_id')) or
                                     device_labels[index])
@@ -908,7 +935,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         match = re.search(r'_(\d+)$', threading.current_thread().name)
         worker_index = int(match.group(1)) if match else 0
         slot_id = slot_ids[worker_index % len(slot_ids)]
-        state = {'slot': slot_id, 'proxy': None, 'identity': None,
+        state = {'slot': slot_id, 'proxy': None, 'identity': None, 'identity_uses': 0,
                  'info': None, 'device_label': ''}
         thread_state.value = state
         return state
@@ -983,6 +1010,33 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         return 'undetermined' if bucket in ('undetermined', 'unknown') else bucket
 
     identity_default = object()
+    usage_base = _usage_snapshot(device_root)
+    usage_counts = Counter()
+    usage_resets = set()
+    usage_lock = threading.Lock()
+
+    def retire_device_if_due(slot_id, worker_state):
+        with usage_lock:
+            used = int(usage_base.get(slot_id, 0)) + int(usage_counts.get(slot_id, 0))
+            if used < device_use_limit:
+                return False
+            pool.reset(slot_id)
+            usage_base[slot_id] = 0
+            usage_counts[slot_id] = 0
+            usage_resets.add(slot_id)
+            try:
+                (Path(device_root) / 'registrations' / f'{int(slot_id):03d}.json').unlink()
+            except OSError:
+                pass
+            if worker_state is not None:
+                worker_state.update(identity=None, identity_uses=0,
+                                    info=None, device_label='')
+            device_labels.pop(slot_id, None)
+            return True
+
+    def mark_device_used(slot_id):
+        with usage_lock:
+            usage_counts[slot_id] += 1
 
     def one(row, index, line, start_attempt=0, account_started=None,
             identity_override=identity_default, previous_proxy=None,
@@ -1002,6 +1056,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         if not line.strip():
             return row, line, {'status': 'undetermined', 'kind': 'blank_record',
                                'slot': slot_id, 'device_key': account_prefix, 'elapsed': 0}
+        if start_attempt == 0:
+            retire_device_if_due(slot_id, worker_state)
+            if (worker_state is not None
+                    and int(worker_state.get('identity_uses') or 0) >= public_header_use_limit):
+                worker_state['identity'] = None
+                worker_state['identity_uses'] = 0
         if worker_state is not None:
             identity = worker_state['identity']
         else:
@@ -1013,6 +1073,15 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         # 不会在“0 次重试”时暗中多发请求。
         attempt_limit = retries + 1
         for attempt in range(start_attempt, attempt_limit):
+            elapsed = time.time() - account_started
+            remaining_budget = item_timeout - elapsed
+            if remaining_budget <= 0:
+                result = {'status': 'error', 'kind': 'timeout', 'http': 0,
+                          'stage': 'budget', 'detail': '单账号总预算已耗尽',
+                          '_proxy_retries': max(0, attempt - 1),
+                          '_budget_hit': True}
+                break
+            attempt_timeout = max(0.1, min(timeout, remaining_budget))
             acquire_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
             acquire_started = time.monotonic() if debug_enabled else None
             account_proxy, lease = proxy_for(index + attempt, force=force_proxy)
@@ -1062,9 +1131,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     # process-wide .info.lock entirely on the task hot path.
                     info = {'client_info': profile['client_info'],
                             'user_agent': profile['user_agent']}
-                    identity = pool.fetch_headers(slot_id, info, max(timeout, 40),
-                                                  registered=ready, proxy=account_proxy,
-                                                  provider_direct=True)
+                    with header_gate:
+                        identity = pool.fetch_headers(
+                            slot_id, info, max(0.1, min(max(timeout, 40), remaining_budget)),
+                            registered=ready,
+                            proxy=account_proxy, provider_direct=True)
                     if worker_state is not None:
                         worker_state['info'] = info
                         worker_state['identity'] = identity
@@ -1075,8 +1146,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     if not ready and pool.inspect(slot_id)['state'] == 'ready':
                         record_device_registration(device_root, slot_id, account_proxy,
                                                    profile.get('model', ''))
+                if (worker_state is not None and start_attempt == 0 and attempt == 0):
+                    worker_state['identity_uses'] = int(worker_state.get('identity_uses') or 0) + 1
                 # 每次协议请求使用当前线程自己的出口。
-                result = gsa_check(account, password, account_proxy, timeout=timeout,
+                result = gsa_check(account, password, account_proxy,
+                                   timeout=attempt_timeout,
                                    retries=0 if proxy_pool is not None else retries,
                                    cancel=stop.is_set, identity=identity)
                 if descriptor.get('_web_secondary_auth'):
@@ -1094,11 +1168,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
                     if proxy_pool is not None:
                         result = _refine_repair_auth_with_rotation(
-                            result, account, password, account_proxy, timeout,
+                            result, account, password, account_proxy, attempt_timeout,
                             stop.is_set, retries, rotate_web)
                     else:
                         result = _refine_repair_auth(
-                            result, account, password, account_proxy, timeout,
+                            result, account, password, account_proxy, attempt_timeout,
                             stop.is_set, retries=retries)
             except Exception as exc:                               # noqa: BLE001
                 result = {'status': 'error', 'kind': type(exc).__name__, 'http': 0,
@@ -1106,6 +1180,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             request_ms = (round((time.monotonic() - request_started) * 1000, 2)
                           if debug_enabled else None)
             transport_failed = retryable_transport(result)
+            budget_hit = time.time() - account_started >= item_timeout
+            if budget_hit:
+                result['_budget_hit'] = True
             try:
                 result_http = int(result.get('http'))
             except (TypeError, ValueError):
@@ -1179,7 +1256,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 if worker_state is not None:
                     worker_state['identity'] = None
             previous_proxy = current_proxy
-            if not transport_failed or attempt + 1 >= attempt_limit:
+            if (not transport_failed or attempt + 1 >= attempt_limit
+                    or budget_hit):
                 result['_proxy_retries'] = attempt
                 break
             # Return this account to the coordinator's delayed retry heap.
@@ -1197,6 +1275,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         result['elapsed'] = round(time.time() - account_started, 2)
         result['slot'] = slot_id
         result['device_key'] = account_prefix
+        mark_device_used(slot_id)
         if debug_enabled and (auth_result_bucket(result) == 'timeout'
                               or (str(result.get('web_status') or '').casefold() == 'error'
                                   and result.get('web_http') in (0, 500, 502, 503, 504))):
@@ -1212,7 +1291,6 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     stop_flag = stop
     output_digest = hashlib.sha256()
-    usage_counts = Counter()
     with (directory / 'input.part').open('r', encoding='utf-8', errors='replace') as source, output_path.open('wb') as output:
         output_path.chmod(0o600)
         first_row = int(descriptor.get('first_row') or 1)
@@ -1310,7 +1388,6 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
                 output.write(encoded)
                 output_digest.update(encoded)
-                usage_counts[device] += 1
                 now = time.monotonic()
                 if now - last_progress >= 0.25:
                     # The node agent tails this local file once per second and
@@ -1324,7 +1401,10 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     if processed != int(descriptor.get('rows') or 0):
         raise ValueError('输入条数和工作包描述不一致')
-    _bump_usage(device_root, usage_counts)
+    if usage_resets:
+        _bump_usage(device_root, usage_counts, usage_resets)
+    else:
+        _bump_usage(device_root, usage_counts)
     atomic_json(directory / 'progress.json',
                 {'processed': processed, 'started': started,
                  'counts': dict(counters)})

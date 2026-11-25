@@ -115,6 +115,10 @@ def create_app(role, service, password=None):
         def configure_rotation():
             return jsonify(service.configure_rotation(request.get_json() or {}))
 
+        @app.post('/api/settings/device-policy')
+        def configure_device_policy():
+            return jsonify(service.configure_device_policy(request.get_json() or {}))
+
         @app.post('/api/settings/proxy')
         def configure_proxy():
             return jsonify(service.configure_proxy(request.get_json() or {}))
@@ -136,6 +140,11 @@ def create_app(role, service, password=None):
         @app.delete('/api/nodes/<node_id>/devices')
         def clear_devices(node_id):
             return jsonify(service.clear_devices(node_id))
+
+        @app.post('/api/nodes/<node_id>/devices/refresh')
+        def refresh_devices(node_id):
+            data = request.get_json() or {}
+            return jsonify(service.refresh_devices(node_id, data.get('capacity')))
 
         @app.post('/api/nodes/<node_id>/config')
         def configure_node(node_id):
@@ -168,8 +177,9 @@ def create_app(role, service, password=None):
             job_id = service.create_job_from_file(source, data.get('name') or '',
                                                   unit_rows, data.get('mode') or 'auth',
                                                   str(enqueue) == 'true',
-                                                  float(data.get('timeout') or 20),
-                                                  int(data.get('retries') or 0))
+                                                  float(data.get('timeout') or 25),
+                                                  int(data.get('retries') if data.get('retries') is not None else 2),
+                                                  item_timeout=float(data.get('item_timeout') or 40))
             return jsonify(id=job_id), 202
 
         @app.post('/api/jobs/stream')
@@ -187,10 +197,12 @@ def create_app(role, service, password=None):
             if not request.content_length:
                 raise ValueError('缺少 Content-Length，无法确认上传完整性')
             mode = request.args.get('mode', 'auth')
-            timeout = float(request.args.get('timeout') or 20)
-            retries = int(request.args.get('retries') or 0)
+            timeout = float(request.args.get('timeout') or 25)
+            retries = int(request.args.get('retries') if request.args.get('retries') is not None else 2)
+            item_timeout = float(request.args.get('item_timeout') or 40)
             job_id = service.create_job(name or '未命名任务', request.stream, unit_rows,
-                                        mode, enqueue == 'true', timeout, retries)
+                                        mode, enqueue == 'true', timeout, retries,
+                                        item_timeout=item_timeout)
             return jsonify(id=job_id, bytes=request.content_length), 202
 
         @app.post('/api/jobs')
@@ -203,10 +215,12 @@ def create_app(role, service, password=None):
             if enqueue not in ('true', 'false'):
                 raise ValueError('加入队列选项无效')
             mode = request.form.get('mode', 'auth')
-            timeout = float(request.form.get('timeout') or 20)
-            retries = int(request.form.get('retries') or 0)
+            timeout = float(request.form.get('timeout') or 25)
+            retries = int(request.form.get('retries') if request.form.get('retries') is not None else 2)
+            item_timeout = float(request.form.get('item_timeout') or 40)
             job_id = service.create_job(request.form.get('name') or uploaded.filename, uploaded.stream,
-                                        unit_rows, mode, enqueue == 'true', timeout, retries)
+                                        unit_rows, mode, enqueue == 'true', timeout, retries,
+                                        item_timeout=item_timeout)
             return jsonify(id=job_id), 202
 
         @app.post('/api/demo')

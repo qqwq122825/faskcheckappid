@@ -317,6 +317,21 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(descriptor['device_slots'], [1, 2])
         self.assertEqual(self.node.builder.reserved, {1, 2})
 
+    def test_device_status_summarizes_total_in_use_and_registering(self):
+        self.node.builder.reserved = {1, 2, 3}
+        snapshot = {'running': False, 'capacity': 4, 'ready': 2, 'built': 2,
+                    'failed': 0, 'current': 0, 'attempted': 3,
+                    'proxy_status': 'idle', 'proxy_ip': '', 'message': '',
+                    'slots': [{'slot': 1, 'state': 'ready'},
+                              {'slot': 2, 'state': 'missing'},
+                              {'slot': 3, 'state': 'registering'},
+                              {'slot': 4, 'state': 'ready'}]}
+        with patch.object(self.node.builder, 'snapshot', return_value=snapshot):
+            status = self.node._device_status()
+        self.assertEqual(status['ready'], 2)
+        self.assertEqual(status['in_use'], 3)
+        self.assertEqual(status['registering'], 2)
+
     def test_background_builder_never_registers_without_a_proxy(self):
         class Pool:
             def __init__(inner, *_args, **_kwargs):

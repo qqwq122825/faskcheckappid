@@ -6,14 +6,14 @@ import { api, busy, createTaskOpen, refresh, session, state } from '../composabl
 const router = useRouter()
 const name = ref(''), unitRows = ref(10000), file = ref<File>(), error = ref('')
 const files = ref<any[]>([]), chosen = ref(''), mode = ref<'new' | 'reuse'>('new')
-const timeout = ref(20), retries = ref(0)
+const timeout = ref(25), retries = ref(2), itemTimeout = ref(40)
 const uploadPercent = ref<number | null>(null)
 const maxUnitRows = computed(() => state.value?.settings?.max_unit_rows || 10000)
 watch(createTaskOpen, open => {
   if (open) {
     error.value = ''; file.value = undefined; name.value = ''
     unitRows.value = Math.min(10000, maxUnitRows.value)
-    timeout.value = 20; retries.value = 0
+    timeout.value = 25; retries.value = 2; itemTimeout.value = 40
     uploadPercent.value = null
     chosen.value = ''; mode.value = 'new'
     loadFiles()
@@ -38,7 +38,7 @@ function sizeText(bytes: number) {
 function uploadStream(selected: File): Promise<any> {
   const query = new URLSearchParams({ name: name.value.trim() || selected.name,
     unit_rows: String(unitRows.value), mode: 'auth', timeout: String(timeout.value),
-    retries: String(retries.value),
+    retries: String(retries.value), item_timeout: String(itemTimeout.value),
     enqueue: 'true' })
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
@@ -69,7 +69,8 @@ async function submit() {
     try {
       await api('/api/jobs/from-file', { source: chosen.value, name: name.value.trim(),
                                          unit_rows: unitRows.value, mode: 'auth', enqueue: 'true',
-                                         timeout: timeout.value, retries: retries.value }, 'POST')
+                                         timeout: timeout.value, retries: retries.value,
+                                         item_timeout: itemTimeout.value }, 'POST')
       createTaskOpen.value = false
       await refresh()
       await router.push('/jobs')
@@ -124,7 +125,11 @@ async function submit() {
         <el-input-number v-model="retries" :min="0" :max="5" :step="1" :precision="0" :disabled="busy" />
         <span class="field-note">0 表示不重试；对超时、TLS、5xx，以及 Apple 返回“Try again later”生效；密码错误、锁定等明确结论不重试。</span>
       </el-form-item>
-      <el-alert title="总控自动按每包最多 10,000 条建立字节索引；节点领包后使用全部进程和线程处理。" type="info" :closable="false" show-icon />
+      <el-form-item label="单账号总预算 / 秒">
+        <el-input-number v-model="itemTimeout" :min="timeout" :max="600" :step="5" :precision="0" :disabled="busy" />
+        <span class="field-note">默认 40 秒，包含换代理后的所有重试与等待；预算用完不再继续请求。</span>
+      </el-form-item>
+      <el-alert title="总控自动按每包最多 10,000 条建立字节索引；节点领包后在一个进程内使用全部线程处理。" type="info" :closable="false" show-icon />
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
       <p class="muted">创建后自动加入执行队列；前一个任务全部确认后，轮到本任务自动开始。</p>
     </el-form>

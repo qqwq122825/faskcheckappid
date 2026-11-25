@@ -17,7 +17,7 @@ from .common import atomic_json, read_json
 from .executor import _load_fastcheck, record_device_registration
 
 REGISTRATION_TIMEOUT = 90
-DEVICE_REGISTRATION_WORKERS = 10
+DEVICE_REGISTRATION_WORKERS = 100
 
 
 def device_label(device_id):
@@ -64,11 +64,13 @@ class DeviceBuilder:
             # The in-memory builder state resets on a service restart. Discover
             # the persisted slots so a task can still use the node's complete
             # device pool before any new initialization request is made.
-            pool = DevicePool(str(root), self.node.origin, max_devices=200)
+            pool = DevicePool(str(root), self.node.origin,
+                              max_devices=max(200, int(self.node.max_threads)))
             device_root = Path(getattr(pool, 'base', root)) / 'devices'
-            existing = [int(path.name) for path in device_root.iterdir()
-                        if path.is_dir() and path.name.isdigit()
-                        and 1 <= int(path.name) <= 200] if device_root.is_dir() else []
+            existing = ([int(path.name) for path in device_root.iterdir()
+                         if path.is_dir() and path.name.isdigit()
+                         and 1 <= int(path.name) <= max(200, int(self.node.max_threads))]
+                        if device_root.is_dir() else [])
             persisted_capacity = max(existing, default=0)
             limit = max(1, int(data.get('capacity') or 0), persisted_capacity)
             for slot in range(1, limit + 1):
@@ -123,8 +125,9 @@ class DeviceBuilder:
         with self.lock:
             if self.state['running']:
                 raise RuntimeError('正在初始化设备，请等待本轮结束')
-            if not 1 <= int(capacity) <= 200:
-                raise ValueError('设备数量应为 1–200')
+            maximum = max(1, min(500, int(self.node.max_threads)))
+            if not 1 <= int(capacity) <= maximum:
+                raise ValueError(f'设备数量应为 1–{maximum}')
             # 设备注册会连 Apple；没有代理就变成用机房 IP 注册，出生地不可改，
             # 宁可拒绝也不留这种设备。
             if not (self.node.proxy_api or '').strip():

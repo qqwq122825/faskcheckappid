@@ -69,6 +69,10 @@ class SyntheticServer:
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_request_timeout_keeps_independent_connect_cap(self):
+        self.assertEqual(gsa._requests_timeout(25), (10.0, 25.0))
+        self.assertEqual(gsa._requests_timeout(4), (4.0, 4.0))
+
     def setUp(self):
         self.network_guard = patch.object(socket.socket, "connect", side_effect=AssertionError("Network forbidden"))
         self.network_guard.start()

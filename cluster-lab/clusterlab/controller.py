@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS jobs (
  c_unknown INTEGER NOT NULL DEFAULT 0, c_web_recheck INTEGER NOT NULL DEFAULT 0,
  reported_rows INTEGER NOT NULL DEFAULT 0,
  traffic_bytes INTEGER NOT NULL DEFAULT 0,
- req_timeout REAL NOT NULL DEFAULT 20, req_retries INTEGER NOT NULL DEFAULT 0,
+ req_timeout REAL NOT NULL DEFAULT 25, req_retries INTEGER NOT NULL DEFAULT 2,
+ req_item_timeout REAL NOT NULL DEFAULT 40,
  device_capacity INTEGER NOT NULL DEFAULT 30,
  dual_recheck INTEGER NOT NULL DEFAULT 0
 );
@@ -85,6 +86,8 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_auto_rotate'
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('web_secondary_auth','1');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('update_parallel','2');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('public_header_use_limit','15');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_use_limit','1000');
 '''
 
 
@@ -302,10 +305,15 @@ class Controller:
             job_columns = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
             for name in ('c_valid', 'c_wrong', 'c_2fa', 'c_locked', 'c_timeout', 'c_invalid', 'c_not_found',
                          'c_unknown', 'c_web_recheck', 'reported_rows', 'traffic_bytes',
-                         'req_timeout', 'req_retries', 'device_capacity', 'dual_recheck'):
+                         'req_timeout', 'req_retries', 'req_item_timeout',
+                         'device_capacity', 'dual_recheck'):
                 if name not in job_columns:
-                    default = '20' if name == 'req_timeout' else ('30' if name == 'device_capacity' else '0')
-                    column_type = 'REAL' if name == 'req_timeout' else 'INTEGER'
+                    default = ('25' if name == 'req_timeout' else
+                               '2' if name == 'req_retries' else
+                               '40' if name == 'req_item_timeout' else
+                               '30' if name == 'device_capacity' else '0')
+                    column_type = ('REAL' if name in ('req_timeout', 'req_item_timeout')
+                                   else 'INTEGER')
                     db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {column_type} NOT NULL DEFAULT {default}')
             for name, definition in {'telemetry_json': "TEXT NOT NULL DEFAULT '{}'",
                                      'device_request': 'INTEGER NOT NULL DEFAULT 0',
@@ -579,23 +587,27 @@ class Controller:
             serial += 1
         return candidate
 
-    def _check_exec(self, timeout, retries):
+    def _check_exec(self, timeout, retries, item_timeout=40):
         value = float(timeout)
         if not 5 <= value <= 120:
             raise ValueError('单请求超时应为 5–120 秒')
         count = int(retries)
         if not 0 <= count <= 5:
             raise ValueError('重试次数应为 0–5 次')
-        return value, count
+        budget = float(item_timeout)
+        if not value <= budget <= 600:
+            raise ValueError('单账号总预算应不小于单请求超时，且不超过 600 秒')
+        return value, count, budget
 
     def create_job(self, name, stream, unit_rows=500, mode='auth', enqueue=False,
-                   timeout=20.0, retries=0, device_capacity=30, dual_recheck=False):
+                   timeout=25.0, retries=2, device_capacity=30,
+                   dual_recheck=False, item_timeout=40.0):
         integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
         if type(enqueue) is not bool:
             raise ValueError('加入队列选项无效')
         if mode not in ('digest', 'simulate', 'auth'):
             raise ValueError('执行模式应为 digest / simulate / auth')
-        timeout, retries = self._check_exec(timeout, retries)
+        timeout, retries, item_timeout = self._check_exec(timeout, retries, item_timeout)
         # 兼容旧调用参数，但任务不再决定节点设备数量。
         _ = device_capacity
         device_capacity = 0
@@ -611,10 +623,10 @@ class Controller:
             raise ValueError('文件为空')
         now = time.time()
         with self.db.transaction() as db:
-            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,device_capacity,dual_recheck) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,req_item_timeout,device_capacity,dual_recheck) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                        (job_id, str(name).strip()[:120] or '未命名任务', 'preparing', now, now,
                         str(target), target.stat().st_size, unit_rows, mode, now if enqueue else None,
-                        timeout, retries, device_capacity, 0))
+                        timeout, retries, item_timeout, device_capacity, 0))
             event(db, 'job_uploaded', '输入文件已保存，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
@@ -632,8 +644,23 @@ class Controller:
                 'proxy_configured': bool(proxy_parts),
                 'proxy_scheme': values.get('proxy_scheme', 'socks5h'),
                 'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true'),
+                'public_header_use_limit': int(values.get('public_header_use_limit', 15)),
+                'device_use_limit': int(values.get('device_use_limit', 1000)),
                 'web_secondary_auth': str(values.get('web_secondary_auth', '1')) in
                                       ('1', 'True', 'true')}
+
+    def configure_device_policy(self, data):
+        header_limit = integer(data.get('public_header_use_limit'), '公共头使用次数', 1, 10000)
+        device_limit = integer(data.get('device_use_limit'), '设备使用次数', 1, 1000000)
+        with self.db.transaction() as db:
+            for key, value in (('public_header_use_limit', header_limit),
+                               ('device_use_limit', device_limit)):
+                db.execute("INSERT INTO controller_settings(key,value) VALUES(?,?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           (key, str(value)))
+            event(db, 'controller_config',
+                  f'公共头每 {header_limit} 个账号刷新；设备每 {device_limit} 个账号淘汰并重新注册')
+        return self.settings()
 
     def proxy_for_node(self, node):
         """节点专属出口：按创建顺序把链接分给各节点，避免所有节点抢同一条配额。"""
@@ -765,7 +792,7 @@ class Controller:
 
     def request_devices(self, node_id, capacity):
         """把设备初始化意图挂到节点上，节点下次心跳取走执行。"""
-        capacity = integer(int(capacity), '设备数量', 0, 200)
+        capacity = integer(int(capacity), '设备数量', 1, 500)
         with self.db.transaction() as db:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:
@@ -793,6 +820,28 @@ class Controller:
                   node_id=node_id)
         return {'requested': True, 'version': version}
 
+    def refresh_devices(self, node_id, capacity=None):
+        """清空后按节点当前生效并发重建。"""
+        with self.db.transaction() as db:
+            node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
+            if not node:
+                raise ValueError('节点不存在')
+            if not node['last_seen'] or time.time() - node['last_seen'] > self.offline_seconds:
+                raise Conflict('节点离线，无法刷新设备')
+            active = db.execute("SELECT COUNT(*) FROM units WHERE node_id=? "
+                                "AND status IN ('leased','running','unknown')", (node_id,)).fetchone()[0]
+            if active:
+                raise Conflict(f'节点仍有 {active} 个工作包在执行，请先停止任务')
+            maximum = max(1, min(500, int(node['max_threads'] or 1)))
+            effective = max(1, min(int(node['desired_threads'] or 1), maximum))
+            target = integer(int(capacity or effective), '设备数量', 1, maximum)
+            version = int(node['device_clear_version'] or 0) + 1
+            db.execute('UPDATE nodes SET device_request=?,device_clear_version=? WHERE id=?',
+                       (target, version, node_id))
+            event(db, 'device_pool_refresh_requested',
+                  f'已请求节点清空并按 {target} 并发重建设备', node_id=node_id)
+        return {'requested': target, 'version': version}
+
     def stop_node(self, node_id):
         with self.db.transaction() as db:
             changed = db.execute('UPDATE nodes SET enabled=0,stop_version=stop_version+1 WHERE id=?', (node_id,)).rowcount
@@ -819,7 +868,11 @@ class Controller:
         if isinstance(pool, dict):
             result['device_pool'] = {key: pool.get(key) for key in
                                      ('running', 'capacity', 'ready', 'built', 'failed',
-                                      'current', 'attempted')}
+                                      'current', 'attempted', 'in_use', 'registering')}
+            for key in ('in_use', 'registering'):
+                count = result['device_pool'].get(key)
+                result['device_pool'][key] = (count if type(count) is int
+                                               and 0 <= count <= 10000 else 0)
             proxy_status = str(pool.get('proxy_status') or 'idle')
             result['device_pool']['proxy_status'] = (proxy_status if proxy_status in
                                                       ('idle', 'checking', 'ok', 'failed') else 'idle')
@@ -838,7 +891,7 @@ class Controller:
                      'used': (item.get('used') if type(item.get('used')) is int
                               and 0 <= item.get('used') <= 10**12 else 0),
                      'recorded': bool(item.get('recorded'))}
-                    for item in slots[:64] if isinstance(item, dict)]
+                    for item in slots[:500] if isinstance(item, dict)]
         return result
 
     @classmethod
@@ -1027,13 +1080,13 @@ class Controller:
         return result
 
     def create_job_from_file(self, source, name, unit_rows=10000, mode='auth', enqueue=False,
-                             timeout=20.0, retries=0, device_capacity=30,
-                             dual_recheck=False):
+                             timeout=25.0, retries=2, device_capacity=30,
+                             dual_recheck=False, item_timeout=40.0):
         """复用已上传的源文件创建任务，不再接收文件内容。"""
         integer(unit_rows, '每包记录数', 50, self.settings()['max_unit_rows'])
         if mode not in ('digest', 'simulate', 'auth'):
             raise ValueError('执行模式应为 digest / simulate / auth')
-        timeout, retries = self._check_exec(timeout, retries)
+        timeout, retries, item_timeout = self._check_exec(timeout, retries, item_timeout)
         # 兼容旧调用参数，但任务不再决定节点设备数量。
         _ = device_capacity
         device_capacity = 0
@@ -1048,11 +1101,11 @@ class Controller:
         job_id = uuid.uuid4().hex
         now = time.time()
         with self.db.transaction() as db:
-            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,device_capacity,dual_recheck) '
-                       'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,req_item_timeout,device_capacity,dual_recheck) '
+                       'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                        (job_id, str(name).strip()[:120] or path.name, 'preparing', now, now,
                         str(path), path.stat().st_size, unit_rows, mode, now if enqueue else None,
-                        timeout, retries, device_capacity, 0))
+                        timeout, retries, item_timeout, device_capacity, 0))
             event(db, 'job_uploaded', '复用已有输入文件，正在后台准备工作包', job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
@@ -1366,6 +1419,15 @@ class Controller:
             db.execute('UPDATE nodes SET telemetry_json=?,ack_stop_version=?,ack_device_clear_version=?,ack_update_generation=? WHERE id=?',
                        (json.dumps(cleaned_telemetry), ack_stop,
                         ack_device_clear, ack_update, node_id))
+            requested_devices = int(node['device_request'] or 0)
+            device_pool = cleaned_telemetry.get('device_pool') or {}
+            if (requested_devices and ack_device_clear >= int(node['device_clear_version'] or 0)
+                    and isinstance(device_pool, dict)
+                    and int(device_pool.get('ready') or 0) >= requested_devices
+                    and not bool(device_pool.get('running'))):
+                db.execute('UPDATE nodes SET device_request=0 WHERE id=?', (node_id,))
+                event(db, 'device_build_complete',
+                      f'节点已完成 {requested_devices} 台设备注册', node_id=node_id)
             if (status_generation == node['update_generation'] and update_state
                     and update_state != node['update_state']):
                 allowed = {'scheduled', 'fetching', 'installing', 'restarting',
@@ -1393,7 +1455,7 @@ class Controller:
                     and int(node['ack_update_generation'] or 0) < int(node['update_generation'] or 0)):
                 update = {'generation': int(node['update_generation']),
                           'ref': node['update_ref'], 'service': 'cluster-node'}
-            return {'node_id': node_id, 'name': node['name'], 'enabled': bool(node['enabled']),
+            response = {'node_id': node_id, 'name': node['name'], 'enabled': bool(node['enabled']),
                     'processes': min(desired_processes, max_p), 'threads': min(desired_threads, max_t),
                     'desired_processes': desired_processes, 'desired_threads': desired_threads,
                     'rejected': reject, 'confirmed': confirmed, 'interrupted_ack': interrupted_ack,
@@ -1404,6 +1466,9 @@ class Controller:
                     'server_time': now,
                     'config': {**self.proxy_for_node(node),
                                'origin': self.settings().get('origin') or 'https://new.ani.sidestore.io'}}
+            if int(node['device_request'] or 0) > 0:
+                response['device_request'] = int(node['device_request'])
+            return response
 
     def _rate_allows(self):
         """整个集群每秒最多派发 dispatch_per_second 个包；0 表示不限。"""
@@ -1434,7 +1499,7 @@ class Controller:
             # process/thread ceiling and recreate the old overload bug.
             if not node['enabled'] or active >= 1:
                 return None
-            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
+            unit = db.execute("SELECT u.*,j.mode,j.req_timeout,j.req_retries,j.req_item_timeout FROM units u JOIN jobs j ON j.id=u.job_id WHERE u.status='pending' AND j.id=(SELECT id FROM jobs WHERE status='running' ORDER BY queued_at,created,id LIMIT 1) ORDER BY u.seq LIMIT 1").fetchone()
             if not unit:
                 return None
             # A manually retried package must not inherit rows accepted under
@@ -1446,8 +1511,10 @@ class Controller:
             event(db, 'unit_leased', f'工作包 #{unit["seq"]} 已分配（{unit["rows"]:,} 条）', unit['job_id'], node_id)
             self._rate_record()
             payload = {'id': unit['id'], 'job_id': unit['job_id'], 'seq': unit['seq'],
-                       'timeout': unit['req_timeout'] if 'req_timeout' in unit.keys() else 20,
-                       'retries': unit['req_retries'] if 'req_retries' in unit.keys() else 0,
+                       'timeout': unit['req_timeout'] if 'req_timeout' in unit.keys() else 25,
+                       'retries': unit['req_retries'] if 'req_retries' in unit.keys() else 2,
+                       'item_timeout': (unit['req_item_timeout']
+                                        if 'req_item_timeout' in unit.keys() else 40),
                        'first_row': unit['first_row'], 'rows': unit['rows'],
                        'checksum': unit['checksum'], 'token': token, 'mode': unit['mode'],
                        'bytes': max(0, int(unit['byte_end']) - int(unit['byte_start'])),
@@ -1463,7 +1530,9 @@ class Controller:
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
                                origin=self.settings().get('origin', 'https://new.ani.sidestore.io'),
                                _proxy_debug=bool(self.settings().get('proxy_debug')),
-                               _web_secondary_auth=bool(self.settings().get('web_secondary_auth')))
+                               _web_secondary_auth=bool(self.settings().get('web_secondary_auth')),
+                               public_header_use_limit=int(self.settings().get('public_header_use_limit', 15)),
+                               device_use_limit=int(self.settings().get('device_use_limit', 1000)))
             return payload
 
     def unit_for_node(self, node_id, unit_id, token):

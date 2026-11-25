@@ -97,6 +97,12 @@ MOCK_CN = {"valid": "有效", "wrong_password": "密码错误",
            "security_lock": "安全锁定", "locked": "已锁定", "error": "请求失败"}
 
 
+def _requests_timeout(timeout: float):
+    """Give SOCKS connect/TLS and response reading independent limits."""
+    seconds = max(0.001, float(timeout))
+    return (min(_CONNECT_TIMEOUT_CAP, seconds), seconds)
+
+
 def mock_enabled() -> bool:
     """FASTCHECK_MOCK=1 -> no network at all (for UI / engine testing)."""
     return os.environ.get("FASTCHECK_MOCK", "") == "1"
@@ -436,11 +442,9 @@ class _Session:
                 context = trace.request(request_phase) if trace else nullcontext()
                 with context:
                     kwargs = {"stream": True} if trace else {}
-                    # Concretely: connect+TLS through the proxy may fail long
-                    # before the response body is due, so bound them separately.
-                    budget = timeout
-                    if isinstance(timeout, (int, float)) and timeout > _CONNECT_TIMEOUT_CAP:
-                        budget = (_CONNECT_TIMEOUT_CAP, timeout)
+                    # Connect/TLS is capped at 10 s while response reading keeps
+                    # the full configured allowance (25 s by default).
+                    budget = _requests_timeout(timeout)
                     with self._impl.post(GSA_URL, data=body, headers=headers, timeout=budget,
                                          allow_redirects=False, **kwargs) as resp:
                         code = resp.status_code
