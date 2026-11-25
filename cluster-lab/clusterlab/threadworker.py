@@ -749,6 +749,19 @@ def run_thread_auth(directory, descriptor, stop):
                      'error': f'{type(exc).__name__}: {exc}'[:300]})
 
 
+def _commit_ready_rows(pending_rows, next_row, output, output_digest, counters):
+    """Commit one contiguous result prefix and its matching classifications."""
+    committed = 0
+    while next_row in pending_rows:
+        chunk, status = pending_rows.pop(next_row)
+        output.write(chunk)
+        output_digest.update(chunk)
+        counters[status] += 1
+        committed += 1
+        next_row += 1
+    return next_row, committed
+
+
 def _run_thread_auth(directory, descriptor, stop):
     directory = Path(directory)
     started = time.time()
@@ -834,19 +847,14 @@ def _run_thread_auth(directory, descriptor, stop):
         def sink(row, line, device, result):
             nonlocal next_write_row, processed
             status = _result_bucket(result_bucket, result)
-            with sink_lock:
-                counters[status] += 1
             record = build_record(row, line, result, status, device,
                                   device_label=device.label, debug=debug_enabled)
             encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
             with sink_lock:
-                pending_rows[row] = encoded
-                while next_write_row in pending_rows:
-                    chunk = pending_rows.pop(next_write_row)
-                    output.write(chunk)
-                    output_digest.update(chunk)
-                    processed += 1
-                    next_write_row += 1
+                pending_rows[row] = (encoded, status)
+                next_write_row, committed = _commit_ready_rows(
+                    pending_rows, next_write_row, output, output_digest, counters)
+                processed += committed
 
         cfg = {
             'retries': retries,
@@ -901,6 +909,7 @@ def _run_thread_auth(directory, descriptor, stop):
                 encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
                 output.write(encoded)
                 output_digest.update(encoded)
+                counters['undetermined'] += 1
                 processed += 1
         output.flush()
     finally:
