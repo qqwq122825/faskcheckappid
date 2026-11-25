@@ -18,6 +18,29 @@ class FakeDevicePool:
 
 
 class ThreadWorkerPoolTests(unittest.TestCase):
+    def test_proxy_refill_scales_with_process_concurrency(self):
+        large = ProxySource('http://invalid/{num}', threads=1000, target=1000)
+        self.assertEqual(1000, large.refill_batch)
+        self.assertEqual(500, large.low_water)
+
+        small = ProxySource('http://invalid/{num}', threads=10, target=10)
+        self.assertEqual(10, small.refill_batch)
+        self.assertEqual(9, small.low_water)
+
+        explicit = ProxySource('http://invalid/{num}', threads=1000, target=1000,
+                               refill_batch=80, low_water=40)
+        self.assertEqual(80, explicit.refill_batch)
+        self.assertEqual(40, explicit.low_water)
+
+        requested = []
+        def fetch_once(count):
+            requested.append(count)
+            large._stop.set()
+            return []
+        large._fetch = fetch_once
+        large._supply_loop()
+        self.assertEqual([1000], requested)
+
     def test_proxy_is_reused_by_same_thread_and_bad_exit_is_quarantined(self):
         pool = ProxySource('http://invalid/{num}', threads=1, target=10,
                            low_water=2, ttl=50)

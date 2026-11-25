@@ -46,8 +46,8 @@ from .executor import (
 
 PROXY_TTL_SECONDS = 50.0
 PROXY_POOL_TARGET = 1000
-PROXY_LOW_WATER = 200
-PROXY_REFILL_BATCH = 200
+PROXY_LOW_WATER = None
+PROXY_REFILL_BATCH = None
 PROXY_LEASE_MARGIN = 8.0
 PROXY_QUARANTINE_SECONDS = 120.0
 ACCOUNTS_PER_IP = 9
@@ -68,6 +68,12 @@ class ProxySource:
         self.threads = max(1, int(threads))
         self.ttl = max(5.0, float(ttl))
         self.target = max(1, int(target))
+        # 固定每次补 200 条无法支撑 1000 线程在重试时快速淘汰坏出口。
+        # 默认按本进程并发数计算水位和补量；显式配置仍然优先。
+        if refill_batch is None:
+            refill_batch = min(self.target, max(200, self.threads))
+        if low_water is None:
+            low_water = min(self.target - 1, max(50, self.threads // 2))
         self.low_water = max(0, min(self.target - 1, int(low_water)))
         self.refill_batch = max(1, min(int(refill_batch), self.target))
         self.lease_margin = max(1.0, min(self.ttl - 1.0, float(lease_margin)))
