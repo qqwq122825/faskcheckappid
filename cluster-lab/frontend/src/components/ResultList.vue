@@ -33,7 +33,11 @@ const page = computed(() => Math.floor(offset.value / pageSize) + 1)
 const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 
 async function load(reset = false, showLoading = true) {
+  await loadPage(offset.value, reset, showLoading)
+}
+async function loadPage(pageOffset: number, reset = false, showLoading = true) {
   if (!props.job?.id) return
+  const requestedOffset = reset || !valid.value ? 0 : pageOffset
   if (reset || !valid.value) offset.value = 0
   if (reset) {
     // Never leave rows from the previous category under a new filter label.
@@ -48,10 +52,13 @@ async function load(reset = false, showLoading = true) {
   }
   try {
     const search = encodeURIComponent(accountSearch.value.trim())
-    const result = await api(`/api/jobs/${props.job.id}/rows?category=${category.value}&offset=${offset.value}&limit=${pageSize}&search=${search}`)
+    const result = await api(`/api/jobs/${props.job.id}/rows?category=${category.value}&offset=${requestedOffset}&limit=${pageSize}&search=${search}`)
     if (current !== generation) return
+    // Commit the page together with its rows, never before a successful GET.
+    offset.value = requestedOffset
     rows.value = Array.isArray(result.rows) ? result.rows : []
     total.value = Math.max(0, Number(result.total) || 0)
+    error.value = ''
   } catch (exc: any) {
     // A silent live refresh must not replace a valid table with a transient
     // network warning. Foreground category/page requests still surface errors.
@@ -76,12 +83,14 @@ async function refreshInBackground() {
   }
 }
 function changeCategory() { load(true) }
-function previous() { offset.value = Math.max(0, offset.value - pageSize); load() }
-function next() { offset.value += pageSize; load() }
+function previous() { void loadPage(Math.max(0, offset.value - pageSize)) }
+function next() { void loadPage(offset.value + pageSize) }
 const elapsed = (value: any) => value == null ? '—' : `${Number(value).toFixed(2)}s`
 const statusLabel = (row: any) => labels[row.status] || labels[category.value] || '其他错误'
 
 watch(accountSearch, () => {
+  // Invalidate old responses during the debounce, before the new query starts.
+  generation += 1
   clearTimeout(searchTimer)
   searchTimer = setTimeout(() => void load(true), 300)
 })

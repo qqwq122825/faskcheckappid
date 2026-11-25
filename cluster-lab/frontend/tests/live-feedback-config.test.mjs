@@ -251,9 +251,9 @@ test('Result list keeps one result-code column without web recheck fields', () =
 })
 
 
-test('Device use limit accepts every integer from 1 through 100000', () => {
+test('Device use limit accepts zero for long-term reuse through 100000', () => {
   const settings = source('src/views/Settings.vue')
-  assert.match(settings, /v-model="deviceUseLimit"[^>]*:min="1"[^>]*:max="100000"[^>]*:step="1"/)
+  assert.match(settings, /v-model="deviceUseLimit"[^>]*:min="0"[^>]*:max="100000"[^>]*:step="1"/)
   assert.doesNotMatch(settings, /v-model="deviceUseLimit"[^>]*:step="10"/)
 })
 
@@ -264,7 +264,7 @@ test('Device pool exposes only explicit initialization without background refill
   assert.match(drawer, /点击“开始初始化设备池”才会注册设备/)
   assert.match(drawer, /缺失设备由工作线程按需注册/)
   assert.match(settings, /settings\/device-use-limit/)
-  assert.match(settings, /后续线程缺设备时自行注册/)
+  assert.match(settings, /0 表示长期复用/)
 })
 
 test('Task detail shows one node-reported traffic card with the 1 GB estimate', () => {

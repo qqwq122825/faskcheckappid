@@ -6,6 +6,8 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 import base64
+import cProfile
+from functools import lru_cache
 import hashlib
 import ipaddress
 import json
@@ -15,6 +17,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import sys
 import threading
 import time
 from urllib.parse import urlsplit
@@ -47,11 +50,137 @@ PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
 PROXY_EXIT_IP_TIMEOUT = 4.0
 PROXY_EXIT_IP_MAX = 2048
 STAGE_SAMPLE_LIMIT = 2048
+STAGE_OBSERVATION_BATCH_LIMIT = 64
+CPU_PROFILE_SAMPLE_EVERY = 100
+CPU_PROFILE_INTERVAL_SECONDS = 5.0
+_CPU_PROFILE_LOCAL = threading.local()
+RESULT_CLASSIFIER_CACHE_SIZE = 256
+_RESULT_CLASSIFIER_FIELDS = (
+    'status', 'kind', 'http', 'apple_ec', 'apple_message', 'reason', 'detail',
+    'password_verified',
+)
 
 
-def _percentile(values, percentile):
-    """Return a deterministic nearest-rank percentile for bounded telemetry."""
-    ordered = sorted(float(value) for value in values)
+def _cache_result_classifier(classify, maxsize=RESULT_CLASSIFIER_CACHE_SIZE):
+    """Memoize the canonical classifier without changing its decisions.
+
+    These are all fields consumed by fastcheck.status.result_bucket. Account,
+    password, row, slot, elapsed time and network session state are not keys.
+    Type tags preserve password_verified=True versus password_verified=1.
+    Unknown/injected classifiers and unusual inputs retain their original path.
+    The cache is bounded and scoped to one execution unit, never persisted.
+    """
+    if (getattr(classify, '__module__', None) != 'fastcheck.status'
+            or getattr(classify, '__name__', None) != 'result_bucket'):
+        return classify
+
+    @lru_cache(maxsize=max(1, int(maxsize)))
+    def cached(key):
+        return classify(dict(zip(_RESULT_CLASSIFIER_FIELDS,
+                                 (value for _type, value in key))))
+
+    def classify_cached(result):
+        if type(result) is not dict:
+            return classify(result)
+        values = tuple(result.get(field) for field in _RESULT_CLASSIFIER_FIELDS)
+        if any(type(value) not in (str, int, float, bool, type(None))
+               or (isinstance(value, str) and len(value) > 4096)
+               for value in values):
+            return classify(result)
+        return cached(tuple((type(value), value) for value in values))
+
+    classify_cached.cache_info = cached.cache_info
+    classify_cached.cache_clear = cached.cache_clear
+    return classify_cached
+
+
+class _CpuDiagnostics:
+    """Debug-only current-thread CPU attribution, never wall-clock profiling.
+
+    Process CPU includes every thread; function costs cover only the profiled
+    thread and must not be extrapolated to all workers. No arguments, locals,
+    account contents, proxy URLs or response bodies are recorded.
+    """
+
+    def __init__(self, path, role, profiler, metadata=None):
+        self.path, self.role, self.profiler = path, role, profiler
+        self.metadata = dict(metadata or {})
+        self.wall = self.last_wall = time.monotonic()
+        self.thread_cpu = self.last_thread_cpu = time.thread_time()
+        self.process_cpu = self.last_process_cpu = time.process_time()
+        self.os_cpu = self.last_os_cpu = os.times()
+
+    def emit(self, final=False):
+        # Diagnostics must never replace an account result or its exception.
+        try:
+            self._emit(final)
+        except Exception:
+            pass
+
+    def _emit(self, final):
+        wall, thread_cpu = time.monotonic(), time.thread_time()
+        process_cpu, os_cpu = time.process_time(), os.times()
+        window_ms = max(0.001, (wall - self.last_wall) * 1000)
+        entries = []
+        for entry in self.profiler.getstats():
+            code = entry.code
+            if isinstance(code, str):
+                module, line, name = 'builtins/native', 0, code[:180]
+            else:
+                module = Path(code.co_filename).name
+                line, name = code.co_firstlineno, code.co_name
+            entries.append({'module': module, 'line': line, 'function': name,
+                            'calls': entry.callcount,
+                            'self_cpu_ms': round(entry.inlinetime * 1000, 4),
+                            'inclusive_cpu_ms': round(entry.totaltime * 1000, 4)})
+        _write_proxy_debug(
+            self.path, 'cpu_function_profile', role=self.role,
+            timer='time.thread_time', scope='current_thread_only',
+            final=bool(final), active_calls_may_be_incomplete=not final,
+            wall_elapsed_ms=round((wall - self.wall) * 1000, 3),
+            thread_cpu_ms=round((thread_cpu - self.thread_cpu) * 1000, 3),
+            process_cpu_ms=round((process_cpu - self.process_cpu) * 1000, 3),
+            window_ms=round(window_ms, 3),
+            window_thread_cpu_ms=round((thread_cpu - self.last_thread_cpu) * 1000, 3),
+            window_process_cpu_ms=round((process_cpu - self.last_process_cpu) * 1000, 3),
+            window_process_cores=round(
+                (process_cpu - self.last_process_cpu) * 1000 / window_ms, 3),
+            window_process_user_ms=round((os_cpu.user - self.last_os_cpu.user) * 1000, 3),
+            window_process_system_ms=round((os_cpu.system - self.last_os_cpu.system) * 1000, 3),
+            self_cpu_total_ms=round(sum(x['self_cpu_ms'] for x in entries), 3),
+            top_self_cpu=sorted(entries, key=lambda x: x['self_cpu_ms'], reverse=True)[:20],
+            top_inclusive_cpu=sorted(entries, key=lambda x: x['inclusive_cpu_ms'], reverse=True)[:10],
+            profiler_overhead_included=True, **self.metadata)
+        self.last_wall, self.last_thread_cpu = wall, thread_cpu
+        self.last_process_cpu, self.last_os_cpu = process_cpu, os_cpu
+
+
+def _cpu_checkpoint():
+    probe = getattr(_CPU_PROFILE_LOCAL, 'probe', None)
+    if probe is not None and time.monotonic() - probe.last_wall >= CPU_PROFILE_INTERVAL_SECONDS:
+        probe.emit()
+
+
+def _profile_cpu_call(path, role, callback, *args, profile_metadata=None):
+    """Run unchanged work; profile only when explicitly given a debug path."""
+    if not path or sys.getprofile() is not None:
+        return callback(*args)
+    profiler = cProfile.Profile(timer=time.thread_time)
+    probe = _CpuDiagnostics(path, role, profiler, profile_metadata)
+    previous = getattr(_CPU_PROFILE_LOCAL, 'probe', None)
+    _CPU_PROFILE_LOCAL.probe = probe
+    try:
+        profiler.enable()
+        return callback(*args)
+    finally:
+        profiler.disable()
+        probe.emit(final=True)
+        _CPU_PROFILE_LOCAL.probe = previous
+
+
+def _percentile(values, percentile, *, presorted=False):
+    """Return a nearest-rank percentile; reuse a sorted snapshot when supplied."""
+    ordered = values if presorted else sorted(float(value) for value in values)
     if not ordered:
         return 0.0
     rank = max(0, min(len(ordered) - 1,
@@ -110,6 +239,19 @@ class StageTelemetry:
         self.observe(name, (time.monotonic() - wall_started) * 1000.0,
                      (time.thread_time() - cpu_started) * 1000.0, active_delta=-1)
 
+    def _observe_unlocked(self, name, wall, cpu, active_delta=0):
+        if active_delta:
+            self.active[name] = max(
+                0, self.active.get(name, 0) + int(active_delta))
+        self.completed[name] = self.completed.get(name, 0) + 1
+        self.wall_ms[name] = self.wall_ms.get(name, 0.0) + wall
+        self.cpu_ms[name] = self.cpu_ms.get(name, 0.0) + cpu
+        self.maximum_ms[name] = max(self.maximum_ms.get(name, 0.0), wall)
+        samples = self.samples.get(name)
+        if samples is None:
+            samples = self.samples[name] = deque(maxlen=STAGE_SAMPLE_LIMIT)
+        samples.append(wall)
+
     def observe(self, stage, wall_ms, cpu_ms=0.0, active_delta=0):
         if not self.enabled:
             return
@@ -117,15 +259,24 @@ class StageTelemetry:
         wall = max(0.0, float(wall_ms or 0.0))
         cpu = max(0.0, float(cpu_ms or 0.0))
         with self.lock:
-            if active_delta:
-                self.active[name] = max(
-                    0, self.active.get(name, 0) + int(active_delta))
-            self.completed[name] = self.completed.get(name, 0) + 1
-            self.wall_ms[name] = self.wall_ms.get(name, 0.0) + wall
-            self.cpu_ms[name] = self.cpu_ms.get(name, 0.0) + cpu
-            self.maximum_ms[name] = max(self.maximum_ms.get(name, 0.0), wall)
-            samples = self.samples.setdefault(name, deque(maxlen=STAGE_SAMPLE_LIMIT))
-            samples.append(wall)
+            self._observe_unlocked(name, wall, cpu, active_delta)
+
+    def observe_many(self, observations):
+        """Publish a bounded batch of phase observations with one lock.
+
+        Every observation is retained. The rolling window is updated in
+        phase batches rather than at each callback; tail batches flush when
+        the attempt finishes, including exception/cancellation paths.
+        """
+        if not self.enabled or not observations:
+            return
+        records = [(str(name or 'unknown')[:60],
+                    max(0.0, float(wall or 0.0)),
+                    max(0.0, float(cpu or 0.0)))
+                   for name, wall, cpu in observations]
+        with self.lock:
+            for name, wall, cpu in records:
+                self._observe_unlocked(name, wall, cpu)
 
     def record_error(self, category):
         if not self.enabled:
@@ -137,36 +288,46 @@ class StageTelemetry:
     def snapshot(self, retry_waiting=0):
         if not self.enabled:
             return {'enabled': False}
+        # Copy one consistent view under the writer lock.  Sorting and formatting
+        # must not hold up every worker's observe()/begin()/record_error().
         with self.lock:
-            names = sorted(set(self.active) | set(self.completed))
-            stages = {}
-            for name in names:
-                values = list(self.samples.get(name, ()))
-                completed = int(self.completed.get(name, 0))
-                total = float(self.wall_ms.get(name, 0.0))
-                stages[name] = {
-                    'active': int(self.active.get(name, 0)),
-                    'completed': completed,
-                    'window_samples': len(values),
-                    'average_ms': round(total / completed, 3) if completed else 0.0,
-                    'p50_ms': _percentile(values, 50),
-                    'p95_ms': _percentile(values, 95),
-                    'p99_ms': _percentile(values, 99),
-                    'maximum_ms': round(float(self.maximum_ms.get(name, 0.0)), 3),
-                    'wall_total_ms': round(total, 3),
-                    'thread_cpu_total_ms': round(float(self.cpu_ms.get(name, 0.0)), 3),
-                }
+            active = dict(self.active)
+            completed_counts = dict(self.completed)
+            wall_totals = dict(self.wall_ms)
+            cpu_totals = dict(self.cpu_ms)
+            maxima = dict(self.maximum_ms)
+            samples = {name: tuple(values) for name, values in self.samples.items()}
+            errors = dict(self.errors)
             elapsed_ms = max(0.001, (time.monotonic() - self.started_wall) * 1000.0)
             process_cpu_ms = max(0.0, (time.process_time() - self.started_cpu) * 1000.0)
-            return {
-                'enabled': True,
-                'retry_waiting': max(0, int(retry_waiting or 0)),
-                'elapsed_ms': round(elapsed_ms, 3),
-                'process_cpu_ms': round(process_cpu_ms, 3),
-                'process_core_equivalents': round(process_cpu_ms / elapsed_ms, 3),
-                'errors': dict(sorted(self.errors.items())),
-                'stages': stages,
+        names = sorted(set(active) | set(completed_counts))
+        stages = {}
+        for name in names:
+            # p50/p95/p99 use the same window; sort it once, not three times.
+            values = sorted(float(value) for value in samples.get(name, ()))
+            completed = int(completed_counts.get(name, 0))
+            total = float(wall_totals.get(name, 0.0))
+            stages[name] = {
+                'active': int(active.get(name, 0)),
+                'completed': completed,
+                'window_samples': len(values),
+                'average_ms': round(total / completed, 3) if completed else 0.0,
+                'p50_ms': _percentile(values, 50, presorted=True),
+                'p95_ms': _percentile(values, 95, presorted=True),
+                'p99_ms': _percentile(values, 99, presorted=True),
+                'maximum_ms': round(float(maxima.get(name, 0.0)), 3),
+                'wall_total_ms': round(total, 3),
+                'thread_cpu_total_ms': round(float(cpu_totals.get(name, 0.0)), 3),
             }
+        return {
+            'enabled': True,
+            'retry_waiting': max(0, int(retry_waiting or 0)),
+            'elapsed_ms': round(elapsed_ms, 3),
+            'process_cpu_ms': round(process_cpu_ms, 3),
+            'process_core_equivalents': round(process_cpu_ms / elapsed_ms, 3),
+            'errors': dict(sorted(errors.items())),
+            'stages': stages,
+        }
 
 
 def stall_timeout_seconds(descriptor, minimum=MIN_STALL_TIMEOUT_SECONDS,
@@ -281,6 +442,7 @@ class DeviceAuthLease:
         self.use_limit = DEVICE_USE_LIMIT
         self.retire_on_release = False
         self.released = False
+        self._on_release = None
 
     @classmethod
     def try_acquire(cls, pool, slot):
@@ -298,19 +460,26 @@ class DeviceAuthLease:
         except portalocker.exceptions.LockException:
             handle.close()
             return None
-        initial_state = pool.inspect(int(slot)).get('state') or 'missing'
-        if initial_state not in ('ready', 'missing'):
-            portalocker.unlock(handle)
-            handle.close()
-            return None
-        now = time.time()
-        previous = read_json(state_path, {})
-        atomic_json(state_path, {
-            'state': 'in_use', 'slot': int(slot), 'pid': os.getpid(),
-            'acquired_at': now,
-            'last_used_at': previous.get('last_used_at'),
-        })
-        return cls(handle, state_path, slot, initial_state, pool)
+        try:
+            initial_state = pool.inspect(int(slot)).get('state') or 'missing'
+            if initial_state not in ('ready', 'missing'):
+                portalocker.unlock(handle)
+                handle.close()
+                return None
+            now = time.time()
+            previous = read_json(state_path, {})
+            atomic_json(state_path, {
+                'state': 'in_use', 'slot': int(slot), 'pid': os.getpid(),
+                'acquired_at': now,
+                'last_used_at': previous.get('last_used_at'),
+            })
+            return cls(handle, state_path, slot, initial_state, pool)
+        except BaseException:
+            try:
+                portalocker.unlock(handle)
+            finally:
+                handle.close()
+            raise
 
     def reset_registered_usage(self, device_root):
         """A newly registered identity starts at zero uses."""
@@ -383,9 +552,16 @@ class DeviceAuthLease:
                 'last_used': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now)),
             })
         finally:
-            portalocker.unlock(self.handle)
-            self.handle.close()
-            self.released = True
+            try:
+                portalocker.unlock(self.handle)
+            finally:
+                try:
+                    self.handle.close()
+                finally:
+                    self.released = True
+                    callback, self._on_release = self._on_release, None
+                    if callback is not None:
+                        callback(self.slot)
 
 
 class DeviceLeaseAllocator:
@@ -445,7 +621,13 @@ class DeviceLeaseAllocator:
                 slot = self.available.popleft()
                 self.available_slots.remove(slot)
 
-            lease = DeviceAuthLease.try_acquire(self.pool, slot)
+            try:
+                lease = DeviceAuthLease.try_acquire(self.pool, slot)
+            except BaseException:
+                with self.available_changed:
+                    self._publish_locked(slot)
+                    self.available_changed.notify()
+                raise
             if lease is None:
                 # An old process may still hold the file lease after a rolling
                 # restart.  This is a rare safety path; normal in-process
@@ -1033,6 +1215,19 @@ class NodeProxyPool:
         self.refill = context.Event()
         self.refill.set()
         self.ready = context.Event()
+        # Keep hundreds of threads in one worker from contending on Queue's
+        # process-shared timed read lock. Only one local waiter polls the
+        # shared channels; the others sleep on a normal threading lock.
+        self._local_acquire_state = (os.getpid(), threading.Lock())
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state.pop('_local_acquire_state', None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._local_acquire_state = (os.getpid(), threading.Lock())
 
     @staticmethod
     def _add(counter, delta):
@@ -1131,6 +1326,24 @@ class NodeProxyPool:
             self._add(self.discarded, 1)
 
     def acquire(self, wait=1.0):
+        wait = max(0.0, float(wait))
+        deadline = time.monotonic() + wait
+        state = self._local_acquire_state
+        if state[0] != os.getpid():
+            # A fork must not inherit a possibly held parent-thread lock.
+            state = self._local_acquire_state = (os.getpid(), threading.Lock())
+        gate = state[1]
+        if not gate.acquire(timeout=wait):
+            self._add(self.waits, 1)
+            return None
+        try:
+            # The gate wait consumes the caller's existing timeout budget.
+            # It must not add a second full wait or change lease ownership.
+            return self._acquire_shared(max(0.0, deadline - time.monotonic()))
+        finally:
+            gate.release()
+
+    def _acquire_shared(self, wait):
         # Never wait for a new API response while a healthy queued exit exists.
         lease = self._take(self.fresh, self.fresh_count)
         # multiprocessing.Queue publishes through a feeder thread.  Its shared
@@ -1317,6 +1530,12 @@ class NodeProxyPool:
 
 
 def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=None):
+    return _profile_cpu_call(
+        debug_path, 'proxy_supplier', _proxy_supplier_loop_impl,
+        pool, api_url, scheme, stop, fetcher, debug_path)
+
+
+def _proxy_supplier_loop_impl(pool, api_url, scheme, stop, fetcher=None, debug_path=None):
     """Fill shortages and prefetch replacements once exits are 45s old."""
     if fetcher is None:
         from fastcheck.proxy_pool import fetch_proxies
@@ -1336,6 +1555,9 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
         while not stop.is_set():
             if stop.wait(max(0.0, next_tick - time.monotonic())):
                 return
+            if debug_path:
+                _cpu_checkpoint()
+            refill_signaled = pool.refill.is_set() if debug_path else False
             pool.refill.clear()
             # Busy leases count as inventory and will return to the reusable
             # queue. Refill to the target only after total known inventory
@@ -1349,11 +1571,26 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
             # merely because it has been in the pool for 45 seconds.
             aging = pool.count_aging()
             count = min(PROXY_FETCH_LIMIT, max(needed, aging))
+            if debug_path:
+                _write_proxy_debug(
+                    debug_path, 'supplier_decision',
+                    policy='refill_when_total_known_below_low_water',
+                    reason=('below_low_water' if needed else
+                            'aging_inventory' if aging else 'inventory_above_low_water'),
+                    refill_signaled=refill_signaled,
+                    signaled_but_no_fetch=bool(refill_signaled and not count),
+                    pool=state, needed=needed, aging=aging, requested=count,
+                    scheduled_lag_ms=round(max(0.0, time.monotonic() - next_tick) * 1000, 3))
             if count <= 0:
                 next_tick += 1.0
                 continue
             started = time.monotonic()
+            fetch_cpu_started = time.thread_time()
             before = _proxy_pool_snapshot(pool) if debug_path else {}
+            if debug_path:
+                _write_proxy_debug(
+                    debug_path, 'supplier_fetch_start', requested=count,
+                    pool_before=before, timeout_note='one_inflight_fetch_blocks_supplier_ticks')
             try:
                 values = list(fetcher(api_url, count,
                                       scheme=None if scheme == 'http' else scheme))
@@ -1369,6 +1606,7 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
                         debug_path, 'supplier_fetch', requested=count,
                         returned=len(values), added=added,
                         latency_ms=round(milliseconds, 2), pool_before=before,
+                        thread_cpu_ms=round((time.thread_time() - fetch_cpu_started) * 1000, 3),
                         pool_after=_proxy_pool_snapshot(pool))
             except Exception as exc:                               # noqa: BLE001
                 milliseconds = (time.monotonic() - started) * 1000
@@ -1377,6 +1615,7 @@ def proxy_supplier_loop(pool, api_url, scheme, stop, fetcher=None, debug_path=No
                     _write_proxy_debug(
                         debug_path, 'supplier_error', requested=count,
                         latency_ms=round(milliseconds, 2),
+                        thread_cpu_ms=round((time.thread_time() - fetch_cpu_started) * 1000, 3),
                         error_type=type(exc).__name__, detail=_proxy_debug_detail(exc),
                         pool_before=before, pool_after=_proxy_pool_snapshot(pool))
             next_tick += 1.0
@@ -1491,11 +1730,12 @@ def _group_child(directory, descriptor, stop, proxy_pool=None):
         # into a pipe nobody reads while the coordinator waits for this child.
         for channel in (proxy_pool.fresh, proxy_pool.reusable):
             channel.cancel_join_thread()
-    runner = execute_auth_unit if descriptor.get('mode') == 'auth' else execute_unit
-    if runner is execute_auth_unit:
-        runner(directory, descriptor, stop, proxy_pool=proxy_pool)
+    if descriptor.get('mode') == 'auth':
+        # 线程模式：不再走旧的多进程 execute_auth_unit。
+        from .threadworker import run_thread_auth
+        run_thread_auth(directory, descriptor, stop)
     else:
-        runner(directory, descriptor, stop)
+        execute_unit(directory, descriptor, stop)
 
 
 def _auth_worker_limit(configured, configured_processes=1, active_processes=None):
@@ -1516,13 +1756,12 @@ def _auth_process_limit(configured, rows, cpu_count=None):
 
 
 def execute_unit_group(directory, descriptor, stop):
-    """Use one controller package as a complete node-sized work batch.
+    """One controller package per node-sized work batch.
 
-    The controller leases at most one package to a node.  This coordinator
-    splits that package locally into contiguous ranges, starts the configured
-    process count, aggregates their progress, and merges ordered results.  The
-    controller therefore keeps only 10,000-row package metadata while a node
-    still uses all of its process and thread capacity.
+    Auth packages preserve the configured process count. Each child process owns
+    its own N-thread IP pool and an exclusive partition of device slots; the
+    coordinator only splits input and merges ordered results. Simulate/digest
+    packages use the same fan-out/merge shell with their offline executor.
     """
     directory = Path(directory)
     descriptor = dict(descriptor)
@@ -1543,13 +1782,12 @@ def execute_unit_group(directory, descriptor, stop):
             mode='sampled_performance_plus_timeouts',
             sample_every=descriptor['_performance_sample_every'],
             credentials_recorded=False)
+    # 认证任务也保留进程 fan-out；每个子进程再启动自己的线程、IP 池与设备池。
     started = time.time()
     rows = max(0, int(descriptor.get('rows') or 0))
     process_limit = max(1, int(descriptor.get('processes') or 1))
     node_cpu_count = max(1, int(os.cpu_count() or 1))
     process_count = min(process_limit, max(1, rows))
-    if descriptor.get('mode') == 'auth':
-        process_count = _auth_process_limit(process_limit, rows, node_cpu_count)
     descriptor['_node_process_count'] = process_count
     descriptor['_node_configured_process_count'] = process_limit
     descriptor['_node_cpu_count'] = node_cpu_count
@@ -1575,36 +1813,11 @@ def execute_unit_group(directory, descriptor, stop):
     if descriptor.get('mode') == 'auth' and process_count == 1:
         descriptor['threads'] = active_threads_by_process[0]
     context = mp.get_context('spawn')
+    # IP 池必须是进程内对象：每个认证子进程启动时预取“线程数”个 IP，
+    # 不在协调器创建跨进程共享队列。
     proxy_pool = None
     supplier_stop = None
     supplier_thread = None
-    if descriptor.get('mode') == 'auth' and descriptor.get('proxy_api'):
-        concurrency = sum(active_threads_by_process)
-        configured_target = max(1, int(descriptor.get('proxy_pool_size') or concurrency))
-        proxy_pool = NodeProxyPool(
-            context, concurrency,
-            ttl=float(descriptor.get('proxy_ttl') or PROXY_TTL_SECONDS),
-            target=min(PROXY_POOL_LIMIT, max(1, min(rows, configured_target))))
-        supplier_stop = threading.Event()
-        supplier_thread = threading.Thread(
-            target=proxy_supplier_loop,
-            args=(proxy_pool, descriptor['proxy_api'],
-                  descriptor.get('proxy_scheme') or 'socks5h', supplier_stop,
-                  None, debug_path),
-            name='node-proxy-supplier', daemon=True)
-        supplier_thread.start()
-        # Start workers only after the node has begun filling its own pool.
-        # Bound the wait so a broken supplier cannot block task cancellation.
-        prefill_started = time.monotonic()
-        prefill_deadline = prefill_started + min(30.0, proxy_pool.ttl)
-        while (not stop.is_set() and not proxy_pool.ready.is_set() and
-               time.monotonic() < prefill_deadline):
-            proxy_pool.ready.wait(0.1)
-        if debug_path:
-            _write_proxy_debug(
-                debug_path, 'pool_prefill', ready=proxy_pool.ready.is_set(),
-                wait_ms=round((time.monotonic() - prefill_started) * 1000, 2),
-                pool=_proxy_pool_snapshot(proxy_pool))
     if process_count == 1:
         try:
             _group_child(directory, descriptor, stop, proxy_pool)
@@ -2009,6 +2222,14 @@ def execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
 
 def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
+    path = ((descriptor.get('_proxy_debug_path') or
+             str(Path(directory) / 'proxy-debug.jsonl'))
+            if _proxy_debug_enabled(descriptor) else None)
+    return _profile_cpu_call(path, 'auth_coordinator', _execute_auth_unit_impl,
+                             directory, descriptor, stop, proxy_pool)
+
+
+def _execute_auth_unit_impl(directory, descriptor, stop, proxy_pool=None):
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     from collections import Counter
     import heapq
@@ -2018,6 +2239,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     started = time.time()
     output_path = directory / 'results.jsonl'
     DevicePool, gsa_check, result_bucket = _load_fastcheck()
+    result_bucket = _cache_result_classifier(result_bucket)
     proxy = descriptor.get('proxy')
     proxies = []
     if descriptor.get('proxy_api') and proxy_pool is None:
@@ -2210,6 +2432,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             phase_ms = Counter()
             phase_cpu_ms = Counter()
             phase_counts = Counter()
+            phase_observations = []
             connection_counts = Counter()
 
             def collect_phase(event):
@@ -2229,9 +2452,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     phase_cpu_ms[phase] += max(
                         0.0, float(event.get('cpu_ms') or 0))
                     phase_counts[phase] += 1
-                    stage_telemetry.observe(
+                    phase_observations.append((
                         'phase_' + phase, event.get('ms') or 0,
-                        event.get('cpu_ms') or 0)
+                        event.get('cpu_ms') or 0))
+                    if len(phase_observations) >= STAGE_OBSERVATION_BATCH_LIMIT:
+                        stage_telemetry.observe_many(phase_observations)
+                        phase_observations.clear()
                 except (TypeError, ValueError):
                     return
 
@@ -2280,6 +2506,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             device_registered = False
             registration_failed = False
             identity_loaded = False
+            auth_call_entered = False
+            identity_age_ms = None
+            error_origin_stage = 'wait_device'
             try:
                 device_started = time.monotonic() if debug_enabled else None
                 device_wait_token = stage_telemetry.begin('wait_device')
@@ -2317,21 +2546,22 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                                 time.monotonic() + DEVICE_REGISTRATION_TIMEOUT_SECONDS
                                 if not ready else None)
                             try:
-                                info_timeout = (max(
-                                    0.1, registration_deadline - time.monotonic())
-                                    if registration_deadline is not None else timeout)
-                                info = pool.info(info_timeout, proxy=account_proxy,
-                                                 provider_direct=True)
                                 device_was_ready = ready
+                                error_origin_stage = 'device_profile'
                                 profile = device_profile(pool, slot_id)
-                                info = dict(info, client_info=profile['client_info'],
-                                            user_agent=profile['user_agent'])
+                                # The provider-wide info contains these same two
+                                # fields, both of which were immediately replaced
+                                # by the persistent per-device profile anyway.
+                                # Do not contend on .info.lock for unused values.
+                                info = {'client_info': profile['client_info'],
+                                        'user_agent': profile['user_agent']}
                                 identity_timeout = (
                                     max(0.1, registration_deadline - time.monotonic())
                                     if registration_deadline is not None else max(timeout, 40))
                                 if (registration_deadline is not None
                                         and identity_timeout <= 0.1):
                                     raise TimeoutError('设备注册超过20秒')
+                                error_origin_stage = 'device_headers'
                                 identity = pool.fetch_headers(
                                     slot_id, info, identity_timeout, registered=ready,
                                     proxy=account_proxy, provider_direct=True)
@@ -2368,18 +2598,28 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 # Only the actual external request consumes one use.  The
                 # twentieth request retires this identity in release().
                 device_use = device_allocator.consume(device_lease)
+                if debug_enabled and slot_id in identity_fetched_at:
+                    identity_age_ms = round(max(
+                        0.0, time.monotonic() - identity_fetched_at[slot_id]) * 1000, 3)
                 # 换 IP 重试由节点池处理，协议层每次只使用当前出口一次。
                 auth_token = stage_telemetry.begin('auth_request')
                 try:
+                    error_origin_stage = 'gsa_auth'
+                    auth_call_entered = True
                     result = gsa_check(
                         account, password, account_proxy, timeout=timeout,
                         retries=0 if proxy_pool is not None else retries,
                         cancel=stop.is_set, identity=identity,
                         diagnostics=(collect_phase if trace_sampled else None))
                 finally:
-                    stage_telemetry.end(auth_token)
+                    try:
+                        stage_telemetry.observe_many(phase_observations)
+                    finally:
+                        phase_observations.clear()
+                        stage_telemetry.end(auth_token)
                 result['_device_use'] = device_use
                 if descriptor.get('_web_secondary_auth'):
+                    error_origin_stage = 'web_refine'
                     def rotate_web(web_attempt):
                         nonlocal account_proxy, lease, current_proxy
                         if proxy_pool is not None:
@@ -2418,7 +2658,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     identity_fetched_at.pop(device_lease.slot, None)
                     device_labels[device_lease.slot] = ''
                 result = {'status': 'error', 'kind': type(exc).__name__, 'http': 0,
-                          'stage': 'init', 'detail': str(exc)[:180]}
+                          'stage': 'init', 'detail': str(exc)[:180],
+                          '_exception_origin_stage': error_origin_stage}
             finally:
                 if device_lease is not None:
                     device_allocator.release(device_lease)
@@ -2487,6 +2728,12 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                         connection_counts, trace_sampled),
                     device_was_ready=device_was_ready,
                     device_registered=device_registered,
+                    auth_call_entered=auth_call_entered,
+                    error_origin_stage=(result.get('_exception_origin_stage') or
+                                        ('web_refine' if web_failed else
+                                         'gsa_auth' if auth_call_entered else None)),
+                    identity_age_ms=identity_age_ms,
+                    device_use=result.get('_device_use'),
                     http=result_http, apple_ec=apple_ec,
                     status=str(result.get('status') or ''),
                     stage=str(result.get('stage') or ''))
@@ -2538,7 +2785,14 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 _write_proxy_debug(
                     debug_path, debug_event,
                     row=row, slot=slot_id, attempt=attempt, attempt_limit=attempt_limit,
-                    request_sent=True, acquire_ms=acquire_ms, request_ms=request_ms,
+                    request_sent=auth_call_entered,
+                    auth_call_entered=auth_call_entered,
+                    error_origin_stage=(result.get('_exception_origin_stage') or
+                                        ('web_refine' if web_failed else
+                                         'gsa_auth' if auth_call_entered else None)),
+                    identity_age_ms=identity_age_ms,
+                    apple_ec=apple_ec, device_use=result.get('_device_use'),
+                    acquire_ms=acquire_ms, request_ms=request_ms,
                     endpoint=current_proxy['endpoint'], host=current_proxy['host'],
                     port=current_proxy['port'], **switch, http=result_http,
                     status=str(result.get('status') or ''), kind=str(result.get('kind') or ''),
@@ -2589,6 +2843,26 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
 
     stop_flag = stop
     output_digest = hashlib.sha256()
+    cpu_sample_every = max(1, int(descriptor.get('_cpu_profile_sample_every')
+                                  or CPU_PROFILE_SAMPLE_EVERY))
+    last_classifier_report = time.monotonic()
+
+    def run_one(*work):
+        if not debug_enabled or not _performance_trace_sampled(
+                descriptor.get('job_id'), work[0],
+                int(descriptor.get('first_row') or 1), cpu_sample_every):
+            return one(*work)
+        return _profile_cpu_call(
+            debug_path, 'sampled_account', one, *work,
+            profile_metadata={'row': int(work[0]), 'sample_every': cpu_sample_every})
+
+    if debug_enabled:
+        _write_proxy_debug(
+            debug_path, 'cpu_diagnostics_start', timer='time.thread_time',
+            account_sample_every=cpu_sample_every,
+            coordinator_interval_seconds=CPU_PROFILE_INTERVAL_SECONDS,
+            function_profile_scope='current_thread_only',
+            profiler_overhead_included=True, arguments_recorded=False)
     with (directory / 'input.part').open('r', encoding='utf-8', errors='replace') as source, output_path.open('wb') as output:
         output_path.chmod(0o600)
         first_row = int(descriptor.get('first_row') or 1)
@@ -2602,6 +2876,17 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             index = 0
             exhausted = False
             while not exhausted or pending or ready or delayed:
+                if debug_enabled:
+                    _cpu_checkpoint()
+                    if (hasattr(result_bucket, 'cache_info')
+                            and time.monotonic() - last_classifier_report >= 5.0):
+                        info = result_bucket.cache_info()
+                        _write_proxy_debug(
+                            debug_path, 'classification_cache', hits=info.hits,
+                            misses=info.misses, entries=info.currsize,
+                            capacity=info.maxsize, decision_rules_changed=False,
+                            inputs_recorded=False)
+                        last_classifier_report = time.monotonic()
                 if stop_flag.is_set():
                     raise InterruptedError('租约失效或节点关闭')
                 now = time.monotonic()
@@ -2625,7 +2910,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                         index += 1
                     else:
                         break
-                    pending.add(workers_pool.submit(one, *work))
+                    pending.add(workers_pool.submit(run_one if debug_enabled else one, *work))
                     refill_count -= 1
                 if not pending:
                     if delayed:
@@ -2658,91 +2943,95 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                                          len(delayed))})
                         last_progress = now
                     continue
-                future = finished.pop()
-                pending.remove(future)
-                row, line, result = future.result()
-                retry_at = result.pop('_retry_at', None)
-                if retry_at is not None:
-                    work = (row, row - first_row, line,
-                            int(result.pop('_retry_attempt')),
-                            result.pop('_retry_started'),
-                            result.pop('_retry_identity'),
-                            result.pop('_retry_previous'),
-                            int(result.pop('_registration_retries', 0)))
-                    retry_order += 1
-                    heapq.heappush(delayed, (float(retry_at), retry_order, work))
-                    continue
-                status = auth_result_bucket(result)
-                counters[status] += 1
-                processed += 1
-                # sha256/bytes 是总控的必需字段（结果完整性校验），认证模式同样补齐
-                raw_line = line.encode('utf-8')
-                account, password = _split_account(line)
-                device = result.get('slot') or slot_ids[(row - first_row) % len(slot_ids)]
-                business_code = result.get('apple_ec')
-                if business_code is None and result.get('kind') == 'format_error':
-                    # 面板"结果码"直接显示 format_error，避免和 Apple 的 -20970 混淆。
-                    business_code = 'format_error'
-                if business_code is None:
-                    business_code = (result.get('detail') or result.get('kind') or '')[:180]
-                reason = _apple_reason_for_record(result, status, debug_enabled)
-                # Registration/format/proxy failures did not send an account
-                # request and must not consume a device use.  A successful
-                # request always carries the exact value returned by consume().
-                device_usage = (int(result['_device_use'])
-                                if result.get('_device_use') is not None else
-                                device_allocator.current_usage(device))
-                record = {'row': row, 'account': account, 'password': password, 'status': status,
-                          'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
-                          'stage': result.get('stage') or '', 'http': result.get('http'),
-                          'code': str(business_code)[:180], 'reason': reason,
-                          'protocol': 'GSA',
-                          'device': device,
-                          'device_key': result.get('device_key') or '',
-                          'device_label': device_labels.get(device, ''),
-                          'device_usage': device_usage,
-                          'elapsed': result.get('elapsed'),
-                          'attempts': max(
-                              int(result.get('_proxy_retries') or 0),
-                              max(0, int(result.get('web_attempts') or 0) - 1))}
-                for key in ('two_factor_method', 'web_auth_type', 'web_http',
-                            'web_status', 'web_stage', 'web_kind', 'web_detail',
-                            'web_attempts', 'web_server', 'web_via',
-                            'web_retry_after', 'web_content_type',
-                            'web_response_bytes', 'web_response_sha256',
-                            'web_response_keys', 'web_service_error_codes',
-                            'web_has_session_headers', 'web_has_set_cookie',
-                            'web_proxy_rotations', 'web_rotation_exhausted'):
-                    if result.get(key) not in (None, ''):
-                        record[key] = result[key]
-                submit_token = stage_telemetry.begin('result_submit')
-                try:
-                    encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
-                    output.write(encoded)
-                    output_digest.update(encoded)
-                finally:
-                    stage_telemetry.end(submit_token)
-                now = time.monotonic()
-                if now - last_progress >= 0.25:
-                    # The node agent tails this local file once per second and
-                    # sends one bounded batch.  Flush here without any network
-                    # work in the worker process.  Persist the disjoint device
-                    # counters at the same cadence so the pool page reports
-                    # live use instead of showing zero until the whole package
-                    # (possibly tens of thousands of rows) finishes.
-                    output.flush()
-                    device_allocator.flush_usage()
-                    atomic_json(directory / 'progress.json',
-                                {'processed': processed, 'started': started,
-                                 'counts': dict(counters),
-                                 'queue_low_water': LOCAL_QUEUE_LOW_WATER,
-                                 'queue_target': LOCAL_QUEUE_TARGET,
-                                 'queued': sum(1 for future in pending
-                                               if not future.running() and not future.done()),
-                                 'in_flight': sum(1 for future in pending
-                                                  if future.running()),
-                                 'stage_metrics': stage_telemetry.snapshot(len(delayed))})
-                    last_progress = now
+                # Collect the entire completion batch without repeatedly
+                # scanning the pending set; keep cancellation responsive.
+                for future in finished:
+                    if stop_flag.is_set():
+                        raise InterruptedError('租约失效或节点关闭')
+                    pending.remove(future)
+                    row, line, result = future.result()
+                    retry_at = result.pop('_retry_at', None)
+                    if retry_at is not None:
+                        work = (row, row - first_row, line,
+                                int(result.pop('_retry_attempt')),
+                                result.pop('_retry_started'),
+                                result.pop('_retry_identity'),
+                                result.pop('_retry_previous'),
+                                int(result.pop('_registration_retries', 0)))
+                        retry_order += 1
+                        heapq.heappush(delayed, (float(retry_at), retry_order, work))
+                        continue
+                    status = auth_result_bucket(result)
+                    counters[status] += 1
+                    processed += 1
+                    # sha256/bytes 是总控的必需字段（结果完整性校验），认证模式同样补齐
+                    raw_line = line.encode('utf-8')
+                    account, password = _split_account(line)
+                    device = result.get('slot') or slot_ids[(row - first_row) % len(slot_ids)]
+                    business_code = result.get('apple_ec')
+                    if business_code is None and result.get('kind') == 'format_error':
+                        # 面板"结果码"直接显示 format_error，避免和 Apple 的 -20970 混淆。
+                        business_code = 'format_error'
+                    if business_code is None:
+                        business_code = (result.get('detail') or result.get('kind') or '')[:180]
+                    reason = _apple_reason_for_record(result, status, debug_enabled)
+                    # Registration/format/proxy failures did not send an account
+                    # request and must not consume a device use.  A successful
+                    # request always carries the exact value returned by consume().
+                    device_usage = (int(result['_device_use'])
+                                    if result.get('_device_use') is not None else
+                                    device_allocator.current_usage(device))
+                    record = {'row': row, 'account': account, 'password': password, 'status': status,
+                              'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
+                              'stage': result.get('stage') or '', 'http': result.get('http'),
+                              'code': str(business_code)[:180], 'reason': reason,
+                              'protocol': 'GSA',
+                              'device': device,
+                              'device_key': result.get('device_key') or '',
+                              'device_label': device_labels.get(device, ''),
+                              'device_usage': device_usage,
+                              'elapsed': result.get('elapsed'),
+                              'attempts': max(
+                                  int(result.get('_proxy_retries') or 0),
+                                  max(0, int(result.get('web_attempts') or 0) - 1))}
+                    for key in ('two_factor_method', 'web_auth_type', 'web_http',
+                                'web_status', 'web_stage', 'web_kind', 'web_detail',
+                                'web_attempts', 'web_server', 'web_via',
+                                'web_retry_after', 'web_content_type',
+                                'web_response_bytes', 'web_response_sha256',
+                                'web_response_keys', 'web_service_error_codes',
+                                'web_has_session_headers', 'web_has_set_cookie',
+                                'web_proxy_rotations', 'web_rotation_exhausted'):
+                        if result.get(key) not in (None, ''):
+                            record[key] = result[key]
+                    submit_token = stage_telemetry.begin('result_submit')
+                    try:
+                        encoded = (json.dumps(record, separators=(',', ':')) + '\n').encode()
+                        output.write(encoded)
+                        output_digest.update(encoded)
+                    finally:
+                        stage_telemetry.end(submit_token)
+                    now = time.monotonic()
+                    if now - last_progress >= 0.25:
+                        # The node agent tails this local file once per second and
+                        # sends one bounded batch.  Flush here without any network
+                        # work in the worker process.  Persist the disjoint device
+                        # counters at the same cadence so the pool page reports
+                        # live use instead of showing zero until the whole package
+                        # (possibly tens of thousands of rows) finishes.
+                        output.flush()
+                        device_allocator.flush_usage()
+                        atomic_json(directory / 'progress.json',
+                                    {'processed': processed, 'started': started,
+                                     'counts': dict(counters),
+                                     'queue_low_water': LOCAL_QUEUE_LOW_WATER,
+                                     'queue_target': LOCAL_QUEUE_TARGET,
+                                     'queued': sum(1 for future in pending
+                                                   if not future.running() and not future.done()),
+                                     'in_flight': sum(1 for future in pending
+                                                      if future.running()),
+                                     'stage_metrics': stage_telemetry.snapshot(len(delayed))})
+                        last_progress = now
 
     if processed != int(descriptor.get('rows') or 0):
         raise ValueError('输入条数和工作包描述不一致')

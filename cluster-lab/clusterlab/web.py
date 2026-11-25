@@ -227,6 +227,11 @@ def create_app(role, service, password=None):
         def delete_job(job_id):
             return jsonify(service.delete_job(job_id))
 
+        @app.post('/api/jobs/batch-delete')
+        def batch_delete_jobs():
+            data = request.get_json(silent=True) or {}
+            return jsonify(service.delete_jobs(data.get('ids') or []))
+
         @app.post('/api/jobs/<job_id>/<action>')
         def job_action(job_id, action):
             service.job_action(job_id, action)

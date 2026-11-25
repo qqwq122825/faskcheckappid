@@ -5,7 +5,7 @@ import { session, isNode, state, busy, mutate } from '../composables/useCluster'
 const maxUnitRows = ref(10000), error = ref('')
 const proxyApi = ref(''), proxyScheme = ref('socks5h'), proxyError = ref(''), proxyBusy = ref(false)
 const proxyPoolSize = ref(1000), proxyPoolBusy = ref(false)
-const deviceUseLimit = ref(20), deviceUseLimitBusy = ref(false)
+const deviceUseLimit = ref(0), deviceUseLimitBusy = ref(false)
 const proxyDebug = ref(false), proxyDebugBusy = ref(false)
 const webSecondaryAuth = ref(true), webSecondaryAuthBusy = ref(false)
 watch(() => state.value?.settings?.device_use_limit, value => {
@@ -38,6 +38,7 @@ async function saveDeviceUseLimit() {
   deviceUseLimitBusy.value = true
   try {
     await mutate('/api/settings/device-use-limit', { device_use_limit: deviceUseLimit.value },
+                 deviceUseLimit.value === 0 ? '设备身份已设置为长期复用' :
                  `每台设备最多使用 ${deviceUseLimit.value} 次`)
   } catch (e) { ElMessage.error((e as Error).message) }
   finally { deviceUseLimitBusy.value = false }
@@ -127,12 +128,12 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
     <template #header><h2>设备使用上限</h2></template>
     <el-form label-position="top" @submit.prevent="saveDeviceUseLimit">
       <el-form-item label="每台设备最多使用次数">
-        <el-input-number v-model="deviceUseLimit" :min="1" :max="100000" :step="1" :precision="0" :disabled="deviceUseLimitBusy" />
-        <span class="field-note">达到上限后由工作线程退役该设备；后续线程缺设备时自行注册。</span>
+        <el-input-number v-model="deviceUseLimit" :min="0" :max="100000" :step="1" :precision="0" :disabled="deviceUseLimitBusy" />
+        <span class="field-note">0 表示长期复用；大于 0 时达到上限后由工作线程退役并重新注册。</span>
       </el-form-item>
       <el-descriptions :column="1" border>
         <el-descriptions-item label="当前上限">
-          {{ state?.settings?.device_use_limit + ' 次/台' }}
+          {{ state?.settings?.device_use_limit === 0 ? '长期复用' : state?.settings?.device_use_limit + ' 次/台' }}
         </el-descriptions-item>
       </el-descriptions>
       <el-button type="primary" native-type="submit" :loading="deviceUseLimitBusy">保存使用上限</el-button>

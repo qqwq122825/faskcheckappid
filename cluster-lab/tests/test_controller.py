@@ -140,11 +140,11 @@ class ControllerTests(unittest.TestCase):
         self.service = Controller(self.temp.name)
         self.assertEqual(self.service.settings()['device_use_limit'], 37)
 
-    def test_device_use_limit_rejects_zero_without_changing_saved_state(self):
+    def test_device_use_limit_zero_means_long_term_reuse(self):
         self.service.configure_device_use_limit({'device_use_limit': 20})
-        with self.assertRaisesRegex(ValueError, '最多使用次数'):
-            self.service.configure_device_use_limit({'device_use_limit': 0})
-        self.assertEqual(self.service.settings()['device_use_limit'], 20)
+        result = self.service.configure_device_use_limit({'device_use_limit': 0})
+        self.assertEqual(result['device_use_limit'], 0)
+        self.assertEqual(self.service.settings()['device_use_limit'], 0)
 
     def test_proxy_debug_switch_defaults_off_persists_and_rejects_non_boolean(self):
         self.assertFalse(self.service.settings()['proxy_debug'])
@@ -999,6 +999,16 @@ class ControllerTests(unittest.TestCase):
         payload, checksum = self.output(unit)
         with self.assertRaises(Conflict):
             self.service.accept_result(self.node['id'], unit['id'], unit['token'], io.BytesIO(payload), checksum)
+
+    def test_batch_delete_removes_selected_jobs_and_deduplicates_ids(self):
+        first, second = self.queued_job(50, 50), self.queued_job(50, 50)
+        result = self.service.delete_jobs([first, second, first])
+        self.assertEqual(result['deleted'], 2)
+        self.assertEqual(result['skipped'], [])
+        self.assertEqual(result['errors'], {})
+        remaining = {job['id'] for job in self.service.snapshot()['jobs']}
+        self.assertNotIn(first, remaining)
+        self.assertNotIn(second, remaining)
 
     def test_delete_running_job_revokes_node_work_and_advances_queue(self):
         first, second = self.queued_job(100, 50), self.queued_job(50, 50)

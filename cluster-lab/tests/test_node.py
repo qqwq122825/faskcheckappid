@@ -474,6 +474,7 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(descriptor['device_pool_capacity'], 10)
         self.assertEqual(descriptor['device_slots'], list(range(1, 11)))
         self.assertEqual(descriptor['processes'], 10)
+        self.assertEqual(descriptor['threads'], 1)
         self.assertNotIn('device_capacity', descriptor)
         start.assert_not_called()
         self.assertEqual(self.node.builder.reserved, set(range(1, 11)))
@@ -486,6 +487,15 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(descriptor['device_pool_capacity'], 50)
         self.assertEqual(descriptor['device_slots'], list(range(1, 51)))
         self.assertEqual(descriptor['processes'], 2)
+        self.assertEqual(descriptor['threads'], 25)
+
+    def test_two_processes_by_ten_threads_preserves_shape_and_twenty_slots(self):
+        descriptor = {'mode': 'auth', 'rows': 40,
+                      'processes': 2, 'threads': 10}
+        self.node._prepare_auth_devices(descriptor)
+        self.assertEqual((descriptor['processes'], descriptor['threads']), (2, 10))
+        self.assertEqual(descriptor['device_pool_capacity'], 20)
+        self.assertEqual(descriptor['device_slots'], list(range(1, 21)))
 
     def test_four_processes_by_250_threads_expose_1000_configured_slots(self):
         with patch.object(self.node.builder, 'snapshot', return_value={'slots': []}):

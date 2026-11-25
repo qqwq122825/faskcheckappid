@@ -93,7 +93,7 @@ class Node:
         self.proxy_api, self.proxy_scheme = '', 'socks5h'
         self.proxy_ttl = 50
         self.proxy_pool_size = 1000
-        self.device_use_limit = 20
+        self.device_use_limit = 0
         self.origin = 'https://new.ani.sidestore.io'
         from .device_build import DeviceBuilder
         self.builder = DeviceBuilder(self)
@@ -501,9 +501,9 @@ class Node:
                 self.proxy_pool_size = 1000
             try:
                 self.device_use_limit = max(
-                    1, min(100000, int(value.get('device_use_limit') or 20)))
+                    0, min(100000, int(value.get('device_use_limit') or 0)))
             except (TypeError, ValueError):
-                self.device_use_limit = 20
+                self.device_use_limit = 0
             clear_version = int(value.get('device_clear_version') or 0)
             if clear_version > self.device_clear_version:
                 self.builder.cancel()
@@ -523,7 +523,7 @@ class Node:
                 except (RuntimeError, ValueError) as exc:
                     # 不能静默吞：面板上看不到原因会以为节点没响应
                     self.builder._update(message=str(exc))
-            for unit_id in value['rejected']:
+            for unit_id in value.get('rejected', []):
                 if unit_id in self.active:
                     self.active[unit_id][1].set()
                 with self.db.transaction() as db:
@@ -597,27 +597,25 @@ class Node:
         return True
 
     def _prepare_auth_devices(self, descriptor):
-        """Expose the configured device slots; missing slots register on demand."""
-        snapshot = self.builder.snapshot()
-        ready_slots = [int(item['slot']) for item in snapshot.get('slots') or []
-                       if item.get('state') == 'ready']
+        """保留“进程 × 每进程线程”架构，并为各进程准备互斥设备槽位。
+
+        例如 2 进程 × 10 线程保持为 2×10，由协调器把 20 个槽位均分给
+        两个进程。每个进程内部的线程从本进程共享设备池借用设备；无可用
+        已注册设备时由线程自行注册，批次结束后归还。
+        """
         rows = max(1, int(descriptor.get('rows') or 1))
         processes = max(1, min(int(descriptor.get('processes') or 1), rows))
         threads = max(1, int(descriptor.get('threads') or 1))
-        # 总控数量只决定预注册多少台。设备槽位不再单独设上限：
-        # 它直接跟随节点配置，4×250 就是1000个互斥槽位。未预注册
-        # 的空槽位由拿不到READY设备的工作线程按需注册。
-        requested = min(rows, processes * threads)
-        capacity = max(requested, 1)
-        slots = list(range(1, capacity + 1))
+        total_threads = min(rows, processes * threads)
         descriptor.pop('device_capacity', None)
         descriptor['processes'] = processes
-        descriptor['device_pool_capacity'] = capacity
-        descriptor['device_slots'] = slots
+        descriptor['threads'] = threads
+        descriptor['device_pool_capacity'] = total_threads
+        descriptor['device_slots'] = list(range(1, total_threads + 1))
         descriptor['device_use_limit'] = max(
-            1, int(descriptor.get('device_use_limit') or 20))
+            0, int(descriptor.get('device_use_limit') or 0))
         self.device_use_limit = descriptor['device_use_limit']
-        self.builder.reserve(slots)
+        self.builder.reserve(descriptor['device_slots'])
 
     def start(self):
         self.thread = threading.Thread(target=self.loop, daemon=True, name='node-agent')
