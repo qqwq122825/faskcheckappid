@@ -5,6 +5,7 @@ import { session, isNode, state, busy, mutate } from '../composables/useCluster'
 const maxUnitRows = ref(10000), error = ref('')
 const proxyApi = ref(''), proxyScheme = ref('socks5h'), proxyError = ref(''), proxyBusy = ref(false)
 const proxyPoolSize = ref(1000), proxyPoolBusy = ref(false)
+const deviceHeaderReuse = ref(15)
 const deviceUseLimit = ref(0), deviceUseLimitBusy = ref(false)
 const proxyDebug = ref(false), proxyDebugBusy = ref(false)
 const webSecondaryAuth = ref(true), webSecondaryAuthBusy = ref(false)
@@ -25,6 +26,9 @@ watch(() => state.value?.settings?.web_secondary_auth, value => {
 }, { immediate: true })
 watch(() => state.value?.settings?.proxy_pool_size, value => {
   if (value != null) proxyPoolSize.value = Number(value)
+}, { immediate: true })
+watch(() => state.value?.settings?.device_header_reuse, value => {
+  if (value != null) deviceHeaderReuse.value = Number(value)
 }, { immediate: true })
 async function save() {
   error.value = ''
@@ -65,10 +69,15 @@ async function saveProxyPoolSize() {
   if (!Number.isInteger(proxyPoolSize.value) || proxyPoolSize.value < 1 || proxyPoolSize.value > 10000) {
     proxyError.value = '单节点代理池容量应为 1–10,000 的整数'; return
   }
+  if (!Number.isInteger(deviceHeaderReuse.value) || deviceHeaderReuse.value < 1 || deviceHeaderReuse.value > 1000) {
+    proxyError.value = '设备公共头使用次数应为 1–1,000 的整数'; return
+  }
   proxyPoolBusy.value = true
   try {
-    await mutate('/api/settings/proxy', { action: 'resize', proxy_pool_size: proxyPoolSize.value },
-                 `单节点代理池容量已设置为 ${proxyPoolSize.value.toLocaleString()}`)
+    await mutate('/api/settings/proxy', {
+      action: 'resize', proxy_pool_size: proxyPoolSize.value,
+      device_header_reuse: deviceHeaderReuse.value,
+    }, `代理池容量已保存；公共头每使用 ${deviceHeaderReuse.value} 次后更新`)
   } catch (e) { proxyError.value = (e as Error).message; ElMessage.error(proxyError.value) }
   finally { proxyPoolBusy.value = false }
 }
@@ -167,10 +176,21 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
           代理明细不会每秒传回总控。
         </span>
       </el-form-item>
-      <el-button :loading="proxyPoolBusy" :disabled="proxyBusy" @click="saveProxyPoolSize">保存代理池容量</el-button>
+      <el-form-item label="设备公共头使用次数">
+        <el-input-number v-model="deviceHeaderReuse" :min="1" :max="1000" :step="1"
+                         :precision="0" :disabled="proxyPoolBusy" />
+        <span class="field-note">
+          默认 15。线程累计使用满该次数后自行获取新公共头；只更新公共头，不退役设备身份。
+          保存后对新领取的工作包生效。
+        </span>
+      </el-form-item>
+      <el-button :loading="proxyPoolBusy" :disabled="proxyBusy" @click="saveProxyPoolSize">保存代理与公共头设置</el-button>
       <el-descriptions :column="1" border>
         <el-descriptions-item label="当前状态">
           {{ state?.settings?.proxy_configured ? `已配置 ${state.settings.proxy_count} 个` : '未配置' }}
+        </el-descriptions-item>
+        <el-descriptions-item label="公共头更新频率">
+          每 {{ state?.settings?.device_header_reuse ?? 15 }} 次/设备
         </el-descriptions-item>
       </el-descriptions>
       <el-table v-if="state?.settings?.proxy_apis?.length" :data="state.settings.proxy_apis" border>

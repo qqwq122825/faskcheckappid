@@ -317,8 +317,10 @@ class ControllerTests(unittest.TestCase):
             'https://proxy.example/one?password=***&num=200',
             'https://proxy.example/two?token=***&num=200'])
         settings = self.service.configure_proxy({
-            'action': 'resize', 'proxy_pool_size': 10000})
+            'action': 'resize', 'proxy_pool_size': 10000,
+            'device_header_reuse': 23})
         self.assertEqual(settings['proxy_pool_size'], 10000)
+        self.assertEqual(settings['device_header_reuse'], 23)
 
         other = self.service.add_node('second-node', 2, 4)
         self.service.heartbeat(other['id'], dict(session='second-session', max_processes=1,
@@ -336,6 +338,7 @@ class ControllerTests(unittest.TestCase):
         unit = self.service.lease(self.node['id'], 'test-session')
         self.assertEqual(unit['proxy_api'], first)
         self.assertEqual(unit['proxy_pool_size'], 10000)
+        self.assertEqual(unit['otp_reuse'], 23)
         self.assertIs(unit['_proxy_debug'], False)
         self.assertIs(unit['_web_secondary_auth'], True)
         self.assertNotIn(second, unit['proxy_api'])

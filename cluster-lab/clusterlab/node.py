@@ -94,6 +94,7 @@ class Node:
         self.proxy_ttl = 50
         self.proxy_pool_size = 1000
         self.device_use_limit = 0
+        self.device_header_reuse = 15
         self.origin = 'https://new.ani.sidestore.io'
         from .device_build import DeviceBuilder
         self.builder = DeviceBuilder(self)
@@ -504,6 +505,11 @@ class Node:
                     0, min(100000, int(value.get('device_use_limit') or 0)))
             except (TypeError, ValueError):
                 self.device_use_limit = 0
+            try:
+                self.device_header_reuse = max(
+                    1, min(1000, int(value.get('device_header_reuse') or 15)))
+            except (TypeError, ValueError):
+                self.device_header_reuse = 15
             clear_version = int(value.get('device_clear_version') or 0)
             if clear_version > self.device_clear_version:
                 self.builder.cancel()
@@ -582,6 +588,7 @@ class Node:
             descriptor.setdefault('retries', 0)
             descriptor.setdefault('proxy_ttl', self.proxy_ttl)
             descriptor.setdefault('proxy_pool_size', self.proxy_pool_size)
+            descriptor.setdefault('otp_reuse', self.device_header_reuse)
             self._prepare_auth_devices(descriptor)
         atomic_json(directory / 'manifest.json', descriptor)
         stop = self.context.Event()
@@ -614,6 +621,8 @@ class Node:
         descriptor['device_slots'] = list(range(1, total_threads + 1))
         descriptor['device_use_limit'] = max(
             0, int(descriptor.get('device_use_limit') or 0))
+        descriptor['otp_reuse'] = max(
+            1, min(1000, int(descriptor.get('otp_reuse') or self.device_header_reuse)))
         self.device_use_limit = descriptor['device_use_limit']
         self.builder.reserve(descriptor['device_slots'])
 

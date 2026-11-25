@@ -88,6 +88,7 @@ SELECT 'device_use_limit', CASE
  ELSE '0' END;
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_ttl','50');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_pool_size','1000');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_header_reuse','15');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('web_secondary_auth','1');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('update_parallel','2');
@@ -649,6 +650,8 @@ class Controller:
                 'device_use_limit': max(0, int(values.get('device_use_limit', 0) or 0)),
                 'proxy_ttl': int(values.get('proxy_ttl', 50) or 50),
                 'proxy_pool_size': int(values.get('proxy_pool_size', 1000) or 1000),
+                'device_header_reuse': max(
+                    1, min(1000, int(values.get('device_header_reuse', 15) or 15))),
                 'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true'),
                 'web_secondary_auth': str(values.get('web_secondary_auth', '1')) in
                                       ('1', 'True', 'true')}
@@ -726,7 +729,8 @@ class Controller:
         with self.db.connect() as db:
             current = {row['key']: row['value'] for row in db.execute(
                 "SELECT key,value FROM controller_settings "
-                "WHERE key IN ('proxy_api','proxy_scheme','proxy_pool_size')")}
+                "WHERE key IN ('proxy_api','proxy_scheme','proxy_pool_size',"
+                "'device_header_reuse')")}
         scheme = str(data.get('proxy_scheme') or current.get('proxy_scheme') or 'socks5h').strip()
         if scheme not in ('socks5h', 'socks5', 'http', 'https'):
             raise ValueError('代理协议应为 socks5h / socks5 / http / https')
@@ -736,6 +740,12 @@ class Controller:
         except (TypeError, ValueError):
             raise ValueError('单节点代理池容量应为 1–10000 的整数') from None
         pool_size = integer(pool_value, '单节点代理池容量', 1, 10000)
+        try:
+            reuse_value = int(data['device_header_reuse'] if 'device_header_reuse' in data
+                              else current.get('device_header_reuse') or 15)
+        except (TypeError, ValueError):
+            raise ValueError('设备公共头使用次数应为 1–1000 的整数') from None
+        header_reuse = integer(reuse_value, '设备公共头使用次数', 1, 1000)
         existing = [part for part in str(current.get('proxy_api') or '').split() if part]
         submitted = [part for part in str(data.get('proxy_api') or '').split() if part]
         if action == 'add':
@@ -769,9 +779,13 @@ class Controller:
             db.execute("UPDATE controller_settings SET value=? WHERE key='proxy_scheme'", (scheme,))
             db.execute("INSERT INTO controller_settings(key,value) VALUES('proxy_pool_size',?) "
                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(pool_size),))
+            db.execute("INSERT INTO controller_settings(key,value) VALUES('device_header_reuse',?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (str(header_reuse),))
             if action == 'resize':
                 event(db, 'controller_config',
-                      f'单节点代理池容量已设置为 {pool_size:,}；每次最多提取 1,000 条并在节点本地补齐')
+                      f'单节点代理池容量已设置为 {pool_size:,}；设备公共头每使用 '
+                      f'{header_reuse} 次后由线程自行更新')
             else:
                 event(db, 'controller_config',
                       f'代理 API 配置已更新，当前 {len(parts)} 个，按节点轮询分配'
@@ -1457,6 +1471,8 @@ class Controller:
                     'device_clear_version': node['device_clear_version'],
                     'proxy_ttl': int(self.settings().get('proxy_ttl') or 50),
                     'proxy_pool_size': int(self.settings().get('proxy_pool_size') or 1000),
+                    'device_header_reuse': int(
+                        self.settings().get('device_header_reuse') or 15),
                     'device_use_limit': max(
                         0, int(self.settings().get('device_use_limit') or 0)),
                     'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds,
@@ -1523,6 +1539,7 @@ class Controller:
                 settings = self.settings()
                 payload.update(proxy_api=config['api'], proxy_scheme=config['scheme'],
                                device_use_limit=max(0, int(settings.get('device_use_limit') or 0)),
+                               otp_reuse=int(settings.get('device_header_reuse') or 15),
                                proxy_pool_size=int(settings.get('proxy_pool_size') or 1000),
                                origin=settings.get('origin', 'https://new.ani.sidestore.io'),
                                _proxy_debug=bool(settings.get('proxy_debug')),
