@@ -104,7 +104,7 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
                   spellcheck="false" :disabled="proxyBusy"
                   placeholder="粘贴提取链接；也可一次粘贴多个，每行一个" />
         <span class="field-note">
-          最多 16 个。总控按节点创建顺序轮询分配。每个工作线程启动时直接提取 1 条代理，不再维护 IP 池。
+          最多 16 个。总控按节点创建顺序轮询分配。线程按需取号：首个请求合并 200ms，单批最多 1000 条，直接分发给等待线程，不维护 IP 池。
           密码在页面上只显示为 ***。
         </span>
       </el-form-item>

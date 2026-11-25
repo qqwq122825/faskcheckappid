@@ -23,11 +23,168 @@ from .common import atomic_json
 PROXY_ACQUIRE_WAIT_SECONDS = 5.0
 PROXY_EMPTY_GRACE_SECONDS = 60.0
 PROXY_RETRY_DELAY_SECONDS = 5.0
+PROXY_MICROBATCH_WINDOW_SECONDS = 0.2
+PROXY_MICROBATCH_MAX_SIZE = 1000
 MIN_STALL_TIMEOUT_SECONDS = 180.0
 PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
 PROXY_EXIT_IP_TIMEOUT = 4.0
 PROXY_EXIT_IP_MAX = 2048
+
+
+class _OnDemandProxyBatcher:
+    """Merge only currently waiting proxy requests into short API batches.
+
+    This deliberately is not a proxy pool: returned endpoints are handed
+    directly to the waiters in the current batch. Nothing is retained for a
+    later request, and there is no TTL, low-water mark, recycle or refill
+    state.
+    """
+
+    def __init__(self, fetch, window=PROXY_MICROBATCH_WINDOW_SECONDS,
+                 max_batch=PROXY_MICROBATCH_MAX_SIZE):
+        self._fetch = fetch
+        self._window = max(0.0, float(window))
+        self._max_batch = max(1, int(max_batch))
+        self._condition = threading.Condition()
+        self._pending = deque()
+        self._coordinator_running = False
+
+    def request(self, stop=None):
+        request = {'event': threading.Event(), 'proxy': None, 'cancelled': False}
+        with self._condition:
+            self._pending.append(request)
+            self._condition.notify_all()
+            if not self._coordinator_running:
+                self._coordinator_running = True
+                threading.Thread(target=self._run, name='proxy-microbatch',
+                                 daemon=True).start()
+        while not request['event'].wait(0.1):
+            if stop is not None and stop.is_set():
+                request['cancelled'] = True
+                return None
+        return request['proxy']
+
+    def _run(self):
+        while True:
+            with self._condition:
+                if not self._pending:
+                    self._coordinator_running = False
+                    return
+                deadline = time.monotonic() + self._window
+                while len(self._pending) < self._max_batch:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._condition.wait(remaining)
+                batch = [self._pending.popleft()
+                         for _ in range(min(self._max_batch, len(self._pending)))]
+            try:
+                values = list(self._fetch(len(batch)) or ())
+            except Exception:                                      # noqa: BLE001
+                values = []
+            # Assign the exact provider-returned endpoint to one waiter only.
+            # Extra provider values are intentionally discarded, not stocked.
+            for index, request in enumerate(batch):
+                if not request['cancelled'] and index < len(values):
+                    request['proxy'] = values[index]
+                request['event'].set()
+
+
+class _CrossProcessProxyRequester:
+    """Let worker threads wait on a node-level microbatch broker."""
+
+    def __init__(self, request_queue, response_queue, client_id):
+        self._request_queue = request_queue
+        self._response_queue = response_queue
+        self._client_id = int(client_id)
+        self._lock = threading.Lock()
+        self._next_id = 0
+        self._pending = {}
+        threading.Thread(target=self._listen, name='proxy-microbatch-listener',
+                         daemon=True).start()
+
+    def request(self, stop=None):
+        with self._lock:
+            request_id = self._next_id
+            self._next_id += 1
+            request = {'event': threading.Event(), 'proxy': None}
+            self._pending[request_id] = request
+        self._request_queue.put((self._client_id, request_id))
+        while not request['event'].wait(0.1):
+            if stop is not None and stop.is_set():
+                with self._lock:
+                    self._pending.pop(request_id, None)
+                return None
+        return request['proxy']
+
+    def _listen(self):
+        while True:
+            response = self._response_queue.get()
+            if response is None:
+                return
+            request_id, proxy = response
+            with self._lock:
+                request = self._pending.pop(int(request_id), None)
+            if request is not None:
+                request['proxy'] = proxy
+                request['event'].set()
+
+
+class _NodeProxyMicrobatchBroker:
+    """Batch current proxy demand across every auth process on one node."""
+
+    def __init__(self, request_queue, response_queues, fetch,
+                 window=PROXY_MICROBATCH_WINDOW_SECONDS,
+                 max_batch=PROXY_MICROBATCH_MAX_SIZE):
+        self._request_queue = request_queue
+        self._response_queues = response_queues
+        self._fetch = fetch
+        self._window = max(0.0, float(window))
+        self._max_batch = max(1, int(max_batch))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run,
+                                        name='node-proxy-microbatch', daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def close(self):
+        self._stop.set()
+        self._request_queue.put(None)
+        self._thread.join(2)
+        for response_queue in self._response_queues:
+            response_queue.put(None)
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                first = self._request_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if first is None:
+                return
+            batch = [first]
+            deadline = time.monotonic() + self._window
+            while len(batch) < self._max_batch:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    item = self._request_queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if item is None:
+                    self._stop.set()
+                    break
+                batch.append(item)
+            try:
+                values = list(self._fetch(len(batch)) or ())
+            except Exception:                                      # noqa: BLE001
+                values = []
+            for index, (client_id, request_id) in enumerate(batch):
+                proxy = values[index] if index < len(values) else None
+                self._response_queues[int(client_id)].put((request_id, proxy))
 
 
 def stall_timeout_seconds(descriptor, minimum=MIN_STALL_TIMEOUT_SECONDS,
@@ -522,7 +679,8 @@ def execute_unit(directory, descriptor, stop):
         atomic_json(directory / 'done.json', {'ok': False, 'processed': processed, 'error': type(exc).__name__})
 
 
-def _group_child(directory, descriptor, stop, proxy_pool=None):
+def _group_child(directory, descriptor, stop, proxy_pool=None,
+                 proxy_microbatch_channels=None):
     # 认证子进程属于吞吐型后台工作。降低它相对节点主进程的调度优先级，
     # 避免 SRP/PBKDF2/TLS 高负载时心跳线程拿不到 CPU 而误丢租约。
     worker_nice = 0
@@ -540,7 +698,13 @@ def _group_child(directory, descriptor, stop, proxy_pool=None):
             channel.cancel_join_thread()
     runner = execute_auth_unit if descriptor.get('mode') == 'auth' else execute_unit
     if runner is execute_auth_unit:
-        runner(directory, descriptor, stop, proxy_pool=proxy_pool)
+        proxy_requester = None
+        if proxy_microbatch_channels is not None:
+            request_queue, response_queue, client_id = proxy_microbatch_channels
+            proxy_requester = _CrossProcessProxyRequester(
+                request_queue, response_queue, client_id)
+        runner(directory, descriptor, stop, proxy_pool=proxy_pool,
+               proxy_requester=proxy_requester)
     else:
         runner(directory, descriptor, stop)
 
@@ -602,21 +766,13 @@ def execute_unit_group(directory, descriptor, stop):
         else max(1, int(descriptor.get('threads') or 1)))
     descriptor['_active_threads_per_process'] = active_threads_per_process
     context = mp.get_context('spawn')
-    # Production deliberately has no shared IP pool. Every auth worker asks
-    # the provider for exactly one endpoint when it first runs and replaces
-    # only its own endpoint after a retryable failure. The old pool class stays
-    # importable for compatibility tests, but this coordinator never builds it.
+    # Production deliberately has no IP inventory. Waiting auth threads are
+    # collected for at most 200 ms and one provider request returns exactly
+    # their current demand (up to 1000); retrying threads submit new demand.
+    # The old injected pool path remains only for compatibility tests.
     proxy_pool = None
-    supplier_stop = None
-    supplier_thread = None
     if process_count == 1:
-        try:
-            _group_child(directory, descriptor, stop, proxy_pool)
-        finally:
-            if supplier_stop is not None:
-                supplier_stop.set()
-                proxy_pool.refill.set()
-                supplier_thread.join(2)
+        _group_child(directory, descriptor, stop, proxy_pool)
         progress = read_progress = {}
         try:
             read_progress = json.loads((directory / 'progress.json').read_text('utf-8'))
@@ -626,20 +782,9 @@ def execute_unit_group(directory, descriptor, stop):
                              active_process_limit=process_count,
                              threads_per_process=int(descriptor.get('threads') or 1),
                              active_threads_per_process=active_threads_per_process)
-        if proxy_pool is not None:
-            read_progress['proxy_pool'] = proxy_pool.snapshot()
         atomic_json(directory / 'progress.json', read_progress)
-        try:
-            done = json.loads((directory / 'done.json').read_text('utf-8'))
-            if proxy_pool is not None:
-                done['proxy_pool'] = proxy_pool.snapshot()
-            atomic_json(directory / 'done.json', done)
-        finally:
-            if proxy_pool is not None and debug_path:
-                _write_proxy_debug(debug_path, 'debug_stop', ok=True,
-                                   pool=_proxy_pool_snapshot(proxy_pool))
-            if proxy_pool is not None:
-                proxy_pool.close()
+        done = json.loads((directory / 'done.json').read_text('utf-8'))
+        atomic_json(directory / 'done.json', done)
         return
 
     workers_root = directory / 'workers'
@@ -680,11 +825,34 @@ def execute_unit_group(directory, descriptor, stop):
             raise ValueError('input contains more rows than package descriptor')
 
     children = []
+    proxy_broker = None
+    proxy_request_queue = None
+    proxy_response_queues = []
     try:
+        if (descriptor.get('mode') == 'auth' and descriptor.get('proxy_api')
+                and process_count > 1):
+            _load_fastcheck()
+            from fastcheck.proxy_pool import fetch_proxies
+            scheme = descriptor.get('proxy_scheme') or 'socks5h'
+
+            def fetch_proxy_batch(count):
+                return fetch_proxies(
+                    descriptor['proxy_api'], count,
+                    scheme=None if scheme == 'http' else scheme)
+
+            proxy_request_queue = context.Queue()
+            proxy_response_queues = [context.Queue() for _ in child_descriptors]
+            proxy_broker = _NodeProxyMicrobatchBroker(
+                proxy_request_queue, proxy_response_queues, fetch_proxy_batch)
+            proxy_broker.start()
         for index, (child_dir, child) in enumerate(child_descriptors):
             child_stop = context.Event()
+            microbatch_channels = (
+                (proxy_request_queue, proxy_response_queues[index], index)
+                if proxy_broker is not None else None)
             process = context.Process(target=_group_child,
-                                      args=(str(child_dir), child, child_stop, proxy_pool),
+                                      args=(str(child_dir), child, child_stop, proxy_pool,
+                                            microbatch_channels),
                                       name=f'package-worker-{index + 1:02d}')
             process.start()
             children.append((process, child_stop, child_dir))
@@ -723,8 +891,7 @@ def execute_unit_group(directory, descriptor, stop):
                              'configured_process_limit': process_limit,
                              'threads_per_process': int(descriptor.get('threads') or 1),
                              'active_threads_per_process': active_threads_per_process,
-                             'counts': live_counts,
-                             **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
+                             'counts': live_counts})
                 last_write = now
             time.sleep(0.05)
 
@@ -766,15 +933,13 @@ def execute_unit_group(directory, descriptor, stop):
                      'configured_process_limit': process_limit,
                      'threads_per_process': int(descriptor.get('threads') or 1),
                      'active_threads_per_process': active_threads_per_process,
-                     'counts': merged_counts,
-                     **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
+                     'counts': merged_counts})
         atomic_json(directory / 'done.json',
                     {'ok': True, 'processed': processed, 'counts': merged_counts,
                      'checksum': output_digest.hexdigest(),
                      'workers': process_count, 'elapsed': time.time() - started,
                      'configured_process_limit': process_limit,
-                     'active_threads_per_process': active_threads_per_process,
-                     **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
+                     'active_threads_per_process': active_threads_per_process})
     except Exception as exc:                                      # noqa: BLE001
         for process, child_stop, _ in children:
             child_stop.set()
@@ -798,25 +963,15 @@ def execute_unit_group(directory, descriptor, stop):
                      'configured_process_limit': process_limit,
                      'threads_per_process': int(descriptor.get('threads') or 1),
                      'active_threads_per_process': active_threads_per_process,
-                     'counts': live_counts,
-                     **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
+                     'counts': live_counts})
         atomic_json(directory / 'done.json',
                     {'ok': False, 'processed': processed,
-                     'error': f'{type(exc).__name__}: {exc}'[:300],
-                     **({'proxy_pool': proxy_pool.snapshot()} if proxy_pool else {})})
+                     'error': f'{type(exc).__name__}: {exc}'[:300]})
     finally:
-        if supplier_stop is not None:
-            supplier_stop.set()
-            proxy_pool.refill.set()
-            supplier_thread.join(2)
+        if proxy_broker is not None:
+            proxy_broker.close()
         for process, _, _ in children:
             process.close()
-        if proxy_pool is not None and debug_path:
-            _write_proxy_debug(debug_path, 'debug_stop',
-                               ok=bool((directory / 'done.json').exists()),
-                               pool=_proxy_pool_snapshot(proxy_pool))
-        if proxy_pool is not None:
-            proxy_pool.close()
 
 
 def _load_fastcheck():
@@ -898,17 +1053,20 @@ def record_device_registration(device_root, slot, proxy, model=''):
         return False
 
 
-def execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
+def execute_auth_unit(directory, descriptor, stop, proxy_pool=None,
+                      proxy_requester=None):
     """真实认证执行入口：任何异常都落成 done.json，避免节点只看到"进程退出"。"""
     try:
-        _execute_auth_unit(directory, descriptor, stop, proxy_pool=proxy_pool)
+        _execute_auth_unit(directory, descriptor, stop, proxy_pool=proxy_pool,
+                           proxy_requester=proxy_requester)
     except Exception as exc:                                       # noqa: BLE001
         atomic_json(Path(directory) / 'done.json',
                     {'ok': False, 'processed': 0,
                      'error': f'{type(exc).__name__}: {exc}'[:300]})
 
 
-def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
+def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None,
+                       proxy_requester=None):
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     from collections import Counter
     import heapq
@@ -919,19 +1077,18 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     output_path = directory / 'results.jsonl'
     DevicePool, gsa_check, result_bucket = _load_fastcheck()
     proxy = descriptor.get('proxy')
-    fetch_one_proxy = None
-    if descriptor.get('proxy_api') and proxy_pool is None:
+    proxy_batcher = proxy_requester
+    if (descriptor.get('proxy_api') and proxy_pool is None
+            and proxy_batcher is None):
         from fastcheck.proxy_pool import fetch_proxies
         scheme = descriptor.get('proxy_scheme') or 'socks5h'
 
-        def fetch_one_proxy():
-            try:
-                values = fetch_proxies(
-                    descriptor['proxy_api'], 1,
-                    scheme=None if scheme == 'http' else scheme)
-                return values[0] if values else None
-            except Exception:                                      # noqa: BLE001
-                return None
+        def fetch_proxy_batch(count):
+            return fetch_proxies(
+                descriptor['proxy_api'], count,
+                scheme=None if scheme == 'http' else scheme)
+
+        proxy_batcher = _OnDemandProxyBatcher(fetch_proxy_batch)
     elif not proxy:
         proxy = None
     origin = descriptor.get('origin') or 'https://new.ani.sidestore.io'
@@ -1068,9 +1225,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                     break
             return None, None
         state = state_for_thread()
-        if fetch_one_proxy is not None and (force or not state['proxy']):
-            state['proxy'] = fetch_one_proxy()
-        elif fetch_one_proxy is None and not state['proxy']:
+        if proxy_batcher is not None and (force or not state['proxy']):
+            state['proxy'] = proxy_batcher.request(stop)
+        elif proxy_batcher is None and not state['proxy']:
             state['proxy'] = proxy
         return state['proxy'], None
 
@@ -1211,7 +1368,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 # 每次协议请求使用当前线程自己的出口。
                 result = gsa_check(account, password, account_proxy, timeout=timeout,
                                    retries=0 if (proxy_pool is not None or
-                                                 fetch_one_proxy is not None) else retries,
+                                                 proxy_batcher is not None) else retries,
                                    cancel=stop.is_set, identity=identity)
                 if descriptor.get('_web_secondary_auth'):
                     def rotate_web(web_attempt):
@@ -1224,7 +1381,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             current_proxy = (_proxy_identity(account_proxy)
                                              if debug_enabled else current_proxy)
                             return account_proxy, account_proxy is not None
-                        if fetch_one_proxy is not None:
+                        if proxy_batcher is not None:
                             account_proxy, lease = proxy_for(
                                 index + attempt + web_attempt, force=True)
                             current_proxy = (_proxy_identity(account_proxy)
@@ -1232,7 +1389,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                             return account_proxy, account_proxy is not None
                         return account_proxy, False
 
-                    if proxy_pool is not None or fetch_one_proxy is not None:
+                    if proxy_pool is not None or proxy_batcher is not None:
                         result = _refine_repair_auth_with_rotation(
                             result, account, password, account_proxy, timeout,
                             stop.is_set, retries, rotate_web)
