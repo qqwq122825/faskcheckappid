@@ -128,9 +128,10 @@ test('Large task totals use a non-overlapping responsive feedback grid', () => {
   assert.match(styles, /@media\(max-width:600px\)\{\.feedback-grid\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)/)
 })
 
-test('Settings use one compact cell-based card with global header and device limits', () => {
+test('Settings use a flat cell-based page with global header and device limits', () => {
   const settings = source('src/views/Settings.vue')
-  assert.equal((settings.match(/<el-card/g) || []).length, 1)
+  assert.equal((settings.match(/<el-card/g) || []).length, 0)
+  assert.match(settings, /class="settings-page"/)
   assert.match(settings, /class="setting-cell"/)
   assert.match(settings, /高级设置/)
   assert.match(settings, /public_header_use_limit/)
