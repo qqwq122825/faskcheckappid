@@ -134,17 +134,23 @@ test('Invalid request policy and duplicate submission do not send requests', asy
   assert.equal(fixture.busy.value, true, 'Existing submission retains ownership of busy state')
 })
 
-test('Opening creation resets defaults from settings and total budget follows timeout', () => {
+test('Opening creation keeps the device default at 30 and total budget follows timeout', () => {
   const fixture = setupFixture()
   const onOpen = fixture.watches.find(watch => watch.source === fixture.createTaskOpen)
   onOpen.callback(true)
   assert.equal(fixture.ui.publicHeaderUseLimit.value, 21)
-  assert.equal(fixture.ui.deviceUseLimit.value, 1800)
+  assert.equal(fixture.ui.deviceUseLimit.value, 30)
   assert.equal(fixture.ui.webSecondaryAuth.value, false)
   assert.equal(fixture.ui.unitRows.value, 10000)
   const onTimeout = fixture.watches.find(watch => watch.source === fixture.ui.timeout)
   onTimeout.callback(80)
   assert.equal(fixture.ui.itemTimeout.value, 80)
+})
+
+test('Detailed error logging is visible in request policy before the device card', () => {
+  assert.doesNotMatch(task, /deviceUseLimit\.value = Number\(state\.value\?\.settings\?\.device_use_limit/)
+  assert.match(task, /class="request-log-option"/)
+  assert.ok(task.indexOf('class="request-log-option"') < task.indexOf('class="device-policy-panel"'))
 })
 
 test('Dialog has task, request, and device sections with scrollable body and stable footer', () => {
