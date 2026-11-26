@@ -702,6 +702,23 @@ class Controller:
             raise ValueError('详细错误日志开关必须是布尔值')
         return value
 
+    @staticmethod
+    def _copy_nonblank_source(stream, output):
+        """Stream one upload while removing whitespace-only input records."""
+        kept = skipped = 0
+        while True:
+            line = stream.readline(65537)
+            if not line:
+                break
+            if isinstance(line, str):
+                line = line.encode('utf-8')
+            if not line.strip():
+                skipped += 1
+                continue
+            output.write(line)
+            kept += 1
+        return kept, skipped
+
     def create_job(self, name, stream, unit_rows=500, mode='auth', enqueue=False,
                    timeout=25.0, retries=2, device_capacity=30,
                    dual_recheck=False, item_timeout=40.0,
@@ -727,10 +744,10 @@ class Controller:
         target = self._source_path(name).resolve()
         with target.open('xb') as output:
             target.chmod(0o600)
-            shutil.copyfileobj(stream, output, 1024 * 1024)
+            _kept, skipped_blank = self._copy_nonblank_source(stream, output)
         if not target.stat().st_size:
             target.unlink()
-            raise ValueError('文件为空')
+            raise ValueError('文件没有有效记录')
         now = time.time()
         with self.db.transaction() as db:
             db.execute('INSERT INTO jobs(id,name,status,created,updated,source,bytes,unit_rows,mode,queued_at,req_timeout,req_retries,req_item_timeout,device_capacity,dual_recheck,public_header_use_limit,device_use_limit,web_secondary_auth,detailed_error_log) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -738,7 +755,10 @@ class Controller:
                         str(target), target.stat().st_size, unit_rows, mode, now if enqueue else None,
                         timeout, retries, item_timeout, device_capacity, 0, header_limit, device_limit,
                         int(web_secondary), int(detailed_errors)))
-            event(db, 'job_uploaded', '输入文件已保存，正在后台准备工作包', job_id=job_id)
+            message = '输入文件已保存，正在后台准备工作包'
+            if skipped_blank:
+                message += f'；已过滤 {skipped_blank:,} 条空白行'
+            event(db, 'job_uploaded', message, job_id=job_id)
         self.preparer.submit(self.prepare, job_id)
         return job_id
 
@@ -1340,7 +1360,8 @@ class Controller:
                 if len(line) > 65536:
                     raise ValueError('单行超过 64 KiB；请将超长记录拆分后重试')
                 line.decode('utf-8-sig' if rows == 0 else 'utf-8')
-                # Every source line remains a record, including blank lines.
+                # New uploads are normalized before this zero-copy byte index
+                # is built, so every remaining source line is a real record.
                 if unit_rows and unit_bytes + len(line) > byte_limit:
                     seq += 1
                     self._save_unit(job['id'], seq, first_row, unit_rows, job['source'],

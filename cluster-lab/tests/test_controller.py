@@ -1132,7 +1132,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(pending, 1000)
         self.assertEqual(after_version, before_version)
 
-    def test_10002_records_balance_packages_and_keep_final_blank_records(self):
+    def test_upload_filters_blank_records_before_building_packages(self):
         source = b''.join(f'account-{index:05d}\n'.encode() for index in range(10000)) + b'\n\n'
         job = self.service.create_job('10002 records', io.BytesIO(source), 10000)
         deadline = time.monotonic() + 5
@@ -1142,23 +1142,23 @@ class ControllerTests(unittest.TestCase):
                 break
             time.sleep(.01)
         self.assertEqual(state['status'], 'ready')
-        self.assertEqual((state['rows'], state['units']), (10002, 2))
+        self.assertEqual((state['rows'], state['units']), (10000, 1))
         with self.service.db.connect() as db:
             units = [dict(row) for row in db.execute(
                 'SELECT first_row,rows,path,byte_start,byte_end FROM units WHERE job_id=? ORDER BY seq',
                 (job,))]
         self.assertEqual([(unit['first_row'], unit['rows']) for unit in units],
-                         [(1, 5001), (5002, 5001)])
-        self.assertTrue(b''.join(self.service.unit_lines(units[1])).endswith(b'\n\n'))
+                         [(1, 10000)])
+        payload = b''.join(self.service.unit_lines(units[0]))
+        self.assertEqual(payload.count(b'\n'), 10000)
+        self.assertFalse(payload.endswith(b'\n\n'))
 
         self.service.job_action(job, 'start')
         first = self.service.lease(self.node['id'], 'test-session')
-        self.assertEqual(first['rows'], 5001)
+        self.assertEqual(first['rows'], 10000)
         self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
         self.confirm(first)
-        second = self.service.lease(self.node['id'], 'test-session')
-        self.assertEqual((second['first_row'], second['rows']), (5002, 5001))
-        self.confirm(second)
+        self.assertIsNone(self.service.lease(self.node['id'], 'test-session'))
         self.assertEqual(self.service.snapshot()['jobs'][0]['status'], 'completed')
 
     def test_one_hundred_million_row_high_offset_opens_only_target_shard(self):
