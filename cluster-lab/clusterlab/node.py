@@ -1,6 +1,7 @@
 import atexit
 import hashlib
 import importlib.metadata
+import ipaddress
 import json
 import multiprocessing as mp
 from pathlib import Path
@@ -92,7 +93,12 @@ class Node:
         control = read_json(self.root / 'control.json', {})
         self.stop_version = control.get('stop_version', 0)
         self.device_clear_version = control.get('device_clear_version', 0)
+        self.proxy_check_version = control.get('proxy_check_version', 0)
         self.update_generation = control.get('update_generation', 0)
+        self.proxy_check_path = self.root / 'proxy-check.json'
+        self.proxy_check = read_json(self.proxy_check_path, {})
+        if self.proxy_check.get('status') == 'checking':
+            self.proxy_check_version = max(0, self.proxy_check_version - 1)
         self.update_status_path = self.root / 'update-status.json'
         self.telemetry = HostTelemetry()
         try:
@@ -155,7 +161,76 @@ class Node:
         atomic_json(self.root / 'control.json',
                     {'stop_version': self.stop_version,
                      'device_clear_version': self.device_clear_version,
+                     'proxy_check_version': self.proxy_check_version,
                      'update_generation': self.update_generation})
+
+    @staticmethod
+    def _masked_proxy(value):
+        parsed = urlsplit(str(value or ''))
+        host = parsed.hostname or ''
+        return f'{parsed.scheme}://{host}:{parsed.port}' if host and parsed.port else host
+
+    def _proxy_check_snapshot(self):
+        with self.lock:
+            return dict(self.proxy_check) if isinstance(self.proxy_check, dict) else {}
+
+    def _run_proxy_check(self, version):
+        result = {'version': version, 'status': 'checking', 'stage': 'fetch',
+                  'scheme': self.proxy_scheme, 'proxy': '', 'exit_ip': '',
+                  'ip_status': None, 'ip_ms': None, 'google_status': None,
+                  'google_ms': None, 'message': '', 'checked_at': time.time()}
+        try:
+            if not self.proxy_api:
+                raise ValueError('节点未配置代理提取 API')
+            from fastcheck.proxy_pool import fetch_proxies
+            proxies = fetch_proxies(self.proxy_api, 1,
+                                     scheme=None if self.proxy_scheme == 'http'
+                                     else self.proxy_scheme)
+            if not proxies:
+                raise RuntimeError('代理 API 未返回地址')
+            proxy = proxies[0]
+            result['proxy'] = self._masked_proxy(proxy)
+            with requests.Session() as session:
+                session.trust_env = False
+                session.proxies.update({'http': proxy, 'https': proxy})
+                result['stage'] = 'exit_ip'
+                started = time.monotonic()
+                response = session.get('https://api.ipify.org?format=json', timeout=(5, 10),
+                                       allow_redirects=False)
+                result['ip_ms'] = round((time.monotonic() - started) * 1000)
+                result['ip_status'] = response.status_code
+                response.raise_for_status()
+                exit_ip = str(response.json().get('ip') or '')
+                ipaddress.ip_address(exit_ip)
+                result['exit_ip'] = exit_ip
+                result['stage'] = 'google'
+                started = time.monotonic()
+                response = session.get('https://www.google.com/generate_204', timeout=(5, 10),
+                                       allow_redirects=False)
+                result['google_ms'] = round((time.monotonic() - started) * 1000)
+                result['google_status'] = response.status_code
+                if response.status_code not in (200, 204):
+                    raise RuntimeError(f'Google HTTP {response.status_code}')
+            result.update(status='ok', stage='complete', message='出口地址与 Google 均可访问')
+        except Exception as exc:  # noqa: BLE001 - result must reach controller
+            result.update(status='failed', message=f'{type(exc).__name__}: {exc}'[:200])
+        result['checked_at'] = time.time()
+        with self.lock:
+            self.proxy_check = result
+            atomic_json(self.proxy_check_path, result)
+
+    def _schedule_proxy_check(self, version):
+        if type(version) is not int or version <= self.proxy_check_version:
+            return False
+        self.proxy_check_version = version
+        self.proxy_check = {'version': version, 'status': 'checking', 'stage': 'queued',
+                            'scheme': self.proxy_scheme, 'message': '',
+                            'checked_at': time.time()}
+        atomic_json(self.proxy_check_path, self.proxy_check)
+        self._save_control()
+        threading.Thread(target=self._run_proxy_check, args=(version,), daemon=True,
+                         name='proxy-check').start()
+        return True
 
     def _update_status(self):
         value = read_json(self.update_status_path, {})
@@ -471,7 +546,8 @@ class Node:
                            'ack_update_generation': self.update_generation,
                            'update_status': self._update_status(),
                            'telemetry': dict(self.telemetry.latest, **self.runtime_info,
-                                             worker_processes=self._active_worker_count()),
+                                             worker_processes=self._active_worker_count(),
+                                             proxy_check=self._proxy_check_snapshot()),
                            'devices': self._device_status(),
                            'error': '; '.join(report_errors)[:200]}) as response:
             value = response.json()
@@ -500,6 +576,7 @@ class Node:
             # 总控下发的出口配置与设备初始化请求都在心跳响应里
             if 'config' in value:
                 self.apply_config(value['config'])
+            self._schedule_proxy_check(value.get('proxy_check_version', 0))
             clear_version = int(value.get('device_clear_version') or 0)
             if clear_version > self.device_clear_version:
                 self.builder.cancel()

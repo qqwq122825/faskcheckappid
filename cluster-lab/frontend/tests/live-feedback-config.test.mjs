@@ -56,6 +56,15 @@ test('Controller exposes guarded rolling Git updates with visible node phases', 
   assert.match(nodes, /版本 \{\{ node\.version \|\| '—' \}\}/)
 })
 
+test('Node proxy check fetches on the node and reports exit plus Google status', () => {
+  const nodes = source('src/views/Nodes.vue')
+  assert.match(nodes, /校验代理状态/)
+  assert.match(nodes, /\/api\/nodes\/\$\{node\.id\}\/proxy-check/)
+  assert.match(nodes, /出口 \$\{check\.exit_ip\}/)
+  assert.match(nodes, /Google HTTP \$\{check\.google_status\}/)
+  assert.match(nodes, /node\.telemetry\?\.proxy_check/)
+})
+
 test('Results use short device labels without exposing reusable slot numbers', () => {
   const results = source('src/components/ResultList.vue')
   assert.match(results, /prop="device_display" label="设备"/)

@@ -35,6 +35,55 @@ class NodeRecoveryTests(unittest.TestCase):
     def test_device_registration_allows_realistic_provisioning_time(self):
         self.assertGreaterEqual(REGISTRATION_TIMEOUT, 90)
 
+    def test_proxy_check_fetches_one_proxy_and_tests_exit_then_google(self):
+        class ProbeResponse:
+            def __init__(self, status, payload=None):
+                self.status_code, self.payload = status, payload or {}
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f'HTTP {self.status_code}')
+
+            def json(self):
+                return self.payload
+
+        class ProbeSession:
+            requested = []
+
+            def __init__(self):
+                self.proxies, self.trust_env = {}, True
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def get(self, url, **kwargs):
+                self.requested.append(url)
+                return (ProbeResponse(200, {'ip': '203.0.113.9'}) if 'ipify' in url
+                        else ProbeResponse(204))
+
+        with tempfile.TemporaryDirectory() as root:
+            node = Node(root)
+            try:
+                node.proxy_api, node.proxy_scheme = 'https://supplier.test/api', 'http'
+                with patch('fastcheck.proxy_pool.fetch_proxies',
+                           return_value=['http://user:secret@10.0.0.2:8080']) as fetch, \
+                     patch('clusterlab.node.requests.Session', ProbeSession):
+                    node._run_proxy_check(7)
+                check = node._proxy_check_snapshot()
+                fetch.assert_called_once_with('https://supplier.test/api', 1, scheme=None)
+                self.assertEqual(ProbeSession.requested,
+                                 ['https://api.ipify.org?format=json',
+                                  'https://www.google.com/generate_204'])
+                self.assertEqual(check['status'], 'ok')
+                self.assertEqual(check['exit_ip'], '203.0.113.9')
+                self.assertEqual(check['google_status'], 204)
+                self.assertNotIn('secret', check['proxy'])
+            finally:
+                node.close()
+
     def test_registration_error_sanitizer_never_masks_original_failure(self):
         class Sink:
             value = None

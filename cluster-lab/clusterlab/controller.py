@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS nodes (
  ack_update_generation INTEGER NOT NULL DEFAULT 0,
  update_ref TEXT NOT NULL DEFAULT '', update_state TEXT NOT NULL DEFAULT '',
  update_message TEXT NOT NULL DEFAULT '', update_resume_enabled INTEGER NOT NULL DEFAULT 0,
- update_started REAL, update_finished REAL
+ update_started REAL, update_finished REAL,
+ proxy_check_version INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS units (
  id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), seq INTEGER NOT NULL,
@@ -340,6 +341,7 @@ class Controller:
                                      'ack_stop_version': 'INTEGER NOT NULL DEFAULT 0',
                                      'device_clear_version': 'INTEGER NOT NULL DEFAULT 0',
                                      'ack_device_clear_version': 'INTEGER NOT NULL DEFAULT 0',
+                                     'proxy_check_version': 'INTEGER NOT NULL DEFAULT 0',
                                      'update_generation': 'INTEGER NOT NULL DEFAULT 0',
                                      'ack_update_generation': 'INTEGER NOT NULL DEFAULT 0',
                                      'update_ref': "TEXT NOT NULL DEFAULT ''",
@@ -880,6 +882,20 @@ class Controller:
                   f'已请求节点清空并按 {target} 并发重建设备', node_id=node_id)
         return {'requested': target, 'version': version}
 
+    def request_proxy_check(self, node_id):
+        """让指定在线节点提取一条新代理，并验证出口地址与 Google。"""
+        with self.db.transaction() as db:
+            node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
+            if not node:
+                raise ValueError('节点不存在')
+            if not node['last_seen'] or time.time() - node['last_seen'] > self.offline_seconds:
+                raise Conflict('节点离线，无法校验代理')
+            version = int(node['proxy_check_version'] or 0) + 1
+            db.execute('UPDATE nodes SET proxy_check_version=? WHERE id=?', (version, node_id))
+            event(db, 'proxy_check_requested', '已请求节点提取一条代理并校验出口与 Google',
+                  node_id=node_id)
+        return {'requested': True, 'version': version}
+
     def stop_node(self, node_id):
         with self.db.transaction() as db:
             changed = db.execute('UPDATE nodes SET enabled=0,stop_version=stop_version+1 WHERE id=?', (node_id,)).rowcount
@@ -933,6 +949,28 @@ class Controller:
                               and 0 <= item.get('used') <= 10**12 else 0),
                      'recorded': bool(item.get('recorded'))}
                     for item in slots[:500] if isinstance(item, dict)]
+        proxy_check = value.get('proxy_check')
+        if isinstance(proxy_check, dict):
+            status = str(proxy_check.get('status') or 'idle')
+            if status not in ('idle', 'checking', 'ok', 'failed'):
+                status = 'failed'
+            check = {
+                'version': (proxy_check.get('version') if type(proxy_check.get('version')) is int
+                            and 0 <= proxy_check.get('version') <= 10**9 else 0),
+                'status': status,
+                'stage': str(proxy_check.get('stage') or '')[:24],
+                'scheme': str(proxy_check.get('scheme') or '')[:16],
+                'proxy': mask_proxy(str(proxy_check.get('proxy') or ''))[:96],
+                'exit_ip': str(proxy_check.get('exit_ip') or '')[:64],
+                'message': str(proxy_check.get('message') or '')[:200],
+            }
+            for key in ('ip_status', 'ip_ms', 'google_status', 'google_ms'):
+                number = proxy_check.get(key)
+                check[key] = number if type(number) is int and 0 <= number <= 10**9 else None
+            checked_at = proxy_check.get('checked_at')
+            check['checked_at'] = (float(checked_at) if type(checked_at) in (int, float)
+                                   and math.isfinite(checked_at) and checked_at >= 0 else None)
+            result['proxy_check'] = check
         return result
 
     @classmethod
@@ -1505,6 +1543,7 @@ class Controller:
                     'rejected': reject, 'confirmed': confirmed, 'interrupted_ack': interrupted_ack,
                     'reported': reported_ack,
                     'device_clear_version': node['device_clear_version'],
+                    'proxy_check_version': node['proxy_check_version'],
                     'stop_version': node['stop_version'], 'lease_seconds': self.lease_seconds,
                     'update': update,
                     'server_time': now,

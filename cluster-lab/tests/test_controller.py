@@ -30,6 +30,21 @@ class ControllerTests(unittest.TestCase):
     def test_default_lease_allows_cpu_bound_heartbeat_jitter(self):
         self.assertEqual(self.service.lease_seconds, 120)
 
+    def test_proxy_check_is_dispatched_and_sanitized_in_snapshot(self):
+        requested = self.service.request_proxy_check(self.node['id'])
+        self.assertEqual(requested, {'requested': True, 'version': 1})
+        response = self.heartbeat(telemetry={'proxy_check': {
+            'version': 1, 'status': 'ok', 'stage': 'complete', 'scheme': 'http',
+            'proxy': 'http://user:secret@10.0.0.2:8080', 'exit_ip': '203.0.113.8',
+            'ip_status': 200, 'ip_ms': 31, 'google_status': 204, 'google_ms': 47,
+            'message': '出口地址与 Google 均可访问', 'checked_at': 123.5}})
+        self.assertEqual(response['proxy_check_version'], 1)
+        check = next(node for node in self.service.snapshot()['nodes']
+                     if node['id'] == self.node['id'])['telemetry']['proxy_check']
+        self.assertEqual(check['exit_ip'], '203.0.113.8')
+        self.assertEqual(check['google_status'], 204)
+        self.assertNotIn('secret', check['proxy'])
+
     def test_saving_concurrency_without_enabled_preserves_accepting_state(self):
         self.service.configure_node(self.node['id'], {'processes': 1, 'threads': 250})
         saved = next(value for value in self.service.snapshot()['nodes']

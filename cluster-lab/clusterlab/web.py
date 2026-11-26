@@ -160,6 +160,10 @@ def create_app(role, service, password=None):
             service.configure_node(node_id, request.get_json() or {})
             return jsonify(ok=True)
 
+        @app.post('/api/nodes/<node_id>/proxy-check')
+        def check_node_proxy(node_id):
+            return jsonify(service.request_proxy_check(node_id)), 202
+
         @app.post('/api/nodes/<node_id>/stop')
         def stop_node(node_id):
             service.stop_node(node_id)
