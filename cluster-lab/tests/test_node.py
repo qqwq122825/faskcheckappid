@@ -99,6 +99,14 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(output.value['error'],
                          'RuntimeError: password=*** endpoint failed')
 
+    def test_registration_uses_existing_worker_instead_of_spawning_python(self):
+        payload = {'slot': 7}
+        expected = {'ok': True, 'model': 'iMac14,1'}
+        with patch('clusterlab.device_build._registration_result', return_value=expected) as run:
+            result = self.node.builder._provision(payload)
+        self.assertEqual(result, expected)
+        run.assert_called_once_with(payload)
+
     def test_spawned_child_cannot_interrupt_parent_live_task(self):
         with tempfile.TemporaryDirectory() as root:
             primary = Node(root)
@@ -406,7 +414,6 @@ class NodeRecoveryTests(unittest.TestCase):
                 return {'state': 'missing'}
 
         with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)), \
-             patch('clusterlab.device_build.mp.get_context', return_value=object()), \
              patch.object(self.node.builder, '_proxy', return_value=None):
             self.node.builder._run(1)
         self.assertEqual(self.node.builder.state['ready'], 0)

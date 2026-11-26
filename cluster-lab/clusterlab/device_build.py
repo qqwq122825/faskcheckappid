@@ -4,10 +4,8 @@ from __future__ import annotations
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
-import multiprocessing as mp
 import os
 from pathlib import Path
-import queue
 import re
 import shutil
 import threading
@@ -223,38 +221,18 @@ class DeviceBuilder:
             self.thread.start()
 
     def _provision(self, payload):
-        """Run one registration in a spawned process and return its safe result."""
-        context = mp.get_context('spawn')
-        output = context.Queue(maxsize=8)
-        process = context.Process(target=_register, args=(payload, output),
-                                  name=f'device-{payload["slot"]}')
-        result = None
-        started = False
-        try:
-            process.start()
-            started = True
-            # Residential exits can need 40–60 seconds for the first complete
-            # Apple provisioning exchange. Keep the existing safety margin.
-            deadline = time.monotonic() + payload['timeout'] + 30
-            while time.monotonic() < deadline:
-                if self.stop.is_set():
-                    result = {'ok': False, 'cancelled': True, 'error': '已取消'}
-                    break
-                try:
-                    result = output.get(timeout=.2)
-                    break
-                except queue.Empty:
-                    if not process.is_alive():
-                        break
-        finally:
-            if started and process.is_alive():
-                process.terminate(); process.join(2)
-                if process.is_alive():
-                    process.kill(); process.join(1)
-            output.cancel_join_thread(); output.close()
-            if started:
-                process.close()
-        return result
+        """Register one slot in its existing worker thread.
+
+        The registration call already has a bounded network timeout.  Spawning a
+        fresh Python interpreter for every slot made a 100-way registration burst
+        repeatedly import the whole application (including the optional SRP math
+        module), saturating small nodes even though provisioning itself does not
+        perform SRP.  Slots own independent stores, so the existing thread pool is
+        the isolation boundary needed here.
+        """
+        if self.stop.is_set():
+            return {'ok': False, 'cancelled': True, 'error': '已取消'}
+        return _registration_result(payload)
 
     def _run_slot(self, root, capacity, slot, verify_exit_ip=False):
         """Build one missing slot; callers may run independent slots in parallel."""
@@ -574,9 +552,14 @@ class DeviceBuilder:
 
 
 def _register(payload, output):
-    """子进程：给一个槽位做 provisioning。"""
+    """Compatibility entry point for isolated registration probes."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    output.put(_registration_result(payload))
+
+
+def _registration_result(payload):
+    """Give one slot a provisioned identity and return a sanitized result."""
     try:
         DevicePool, _, _ = _load_fastcheck()
         # 注册时就定下型号：设备身份一旦写死，之后执行必须报同一个型号，
@@ -590,9 +573,9 @@ def _register(payload, output):
             info = dict(info, client_info=profile['client_info'], user_agent=profile['user_agent'])
             pool.fetch_headers(payload['slot'], info, payload['timeout'], registered=False,
                                proxy=payload['proxy'], provider_direct=True)
-        output.put({'ok': True, 'model': profile['model']})
+        return {'ok': True, 'model': profile['model']}
     except Exception as exc:                                       # noqa: BLE001
         detail = re.sub(r'(?i)\b(?:https?|socks5h?)://\S+', '[endpoint]', str(exc))
         detail = re.sub(r'(?i)(token|password|passwd|secret|key)=\S+', r'\1=***', detail)
         error = type(exc).__name__ + (f': {detail[:96]}' if detail else '')
-        output.put({'ok': False, 'error': error})
+        return {'ok': False, 'error': error}
