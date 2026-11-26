@@ -719,6 +719,9 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result_record_bucket(
             {'status': 'timeout', 'http': 200, 'code': '-20970'}), 'timeout')
         self.assertEqual(result_record_bucket(
+            {'status': 'locked', 'http': 200, 'code': '-20970',
+             'reason': '', 'attempts': 0}), 'locked')
+        self.assertEqual(result_record_bucket(
             {'status': 'timeout', 'http': 200, 'code': '-20970',
              'reason_key': 'gsa_20970_unlabelled'}), 'timeout')
         self.assertEqual(result_reason_cn(
@@ -727,6 +730,9 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result_reason_cn(
             {'status': 'timeout', 'reason_key': 'transport_timeout'}),
             '网络请求未取得 HTTP 响应，已按任务设置重试')
+        self.assertEqual(result_reason_cn(
+            {'status': 'undetermined', 'code': 'blank_record'}),
+            '输入文件包含空白行，未发起请求')
         self.assertEqual(result_record_bucket(
             {'status': 'invalid', 'http': 200, 'code': '-22421'}), 'timeout')
         self.assertEqual(result_record_bucket(

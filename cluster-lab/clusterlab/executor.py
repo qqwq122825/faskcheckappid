@@ -2266,8 +2266,13 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                       'attempts': max(
                           int(result.get('_proxy_retries') or 0),
                           max(0, int(result.get('web_attempts') or 0) - 1))}
-            if detailed_error_enabled:
-                record['reason_key'] = _apple_reason_key(result, status)
+            # The bounded reason key is part of the result contract, not debug
+            # data.  Always keep it so the controller can distinguish an
+            # explicit lock from an unlabeled -20970 without storing Apple's
+            # verbose text.  Only ``reason`` remains opt-in above.
+            reason_key = _apple_reason_key(result, status)
+            if reason_key:
+                record['reason_key'] = reason_key
             for key in ('two_factor_method', 'web_auth_type', 'web_http',
                         'web_status', 'web_stage', 'web_kind', 'web_detail',
                         'web_attempts', 'web_server', 'web_via',

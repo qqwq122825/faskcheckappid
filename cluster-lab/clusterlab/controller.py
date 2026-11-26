@@ -152,6 +152,7 @@ _ERROR_REASON_CN = {
     'service_unavailable': '服务暂时不可用，已按任务设置重试',
     'gsa_20970_unlabelled': 'GSA 返回 -20970 且无消息，已按任务设置重试并归为超时',
     'apple_transient_code': 'Apple 设备或服务状态暂不可用，已按任务设置重试',
+    'blank_record': '输入文件包含空白行，未发起请求',
 }
 
 _ERROR_REASON_BUCKETS = {
@@ -162,6 +163,7 @@ _ERROR_REASON_BUCKETS = {
     'account_info_incorrect': 'timeout', 'account_not_found': 'not_found',
     'transport_timeout': 'timeout', 'service_unavailable': 'timeout',
     'gsa_20970_unlabelled': 'timeout', 'apple_transient_code': 'timeout',
+    'blank_record': 'undetermined',
 }
 
 
@@ -224,6 +226,11 @@ def result_record_bucket(value):
     reason_bucket = apple_reason_bucket(value)
     if reason_bucket:
         return reason_bucket
+    # A current node only emits ``locked`` after matching an explicit Apple
+    # lock/inactive message.  Preserve that terminal verdict even for older
+    # rows created before the compact reason_key was always transmitted.
+    if value.get('status') == 'locked':
+        return 'locked'
     codes = []
     for key in ('code', 'apple_ec', 'gsa_code'):
         try:
@@ -257,6 +264,8 @@ def result_reason_cn(value, bucket=None):
     keyed = _ERROR_REASON_CN.get(str(value.get('reason_key') or ''))
     if keyed:
         return keyed
+    if str(value.get('code') or '') == 'blank_record':
+        return _ERROR_REASON_CN['blank_record']
     raw = str(value.get('reason') or value.get('apple_message') or '').strip()
     low = normalized_apple_reason(raw)
     translations = (
@@ -338,7 +347,7 @@ class Controller:
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'not_found',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 14
+    RESULT_CLASSIFICATION_VERSION = 15
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')
