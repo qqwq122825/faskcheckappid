@@ -74,7 +74,7 @@ class DeviceBuilder:
                          and 1 <= int(path.name) <= max(200, configured)]
                         if device_root.is_dir() else [])
             persisted_capacity = max(existing, default=0)
-            limit = max(1, int(data.get('capacity') or 0), persisted_capacity)
+            limit = max(0, int(data.get('capacity') or 0), persisted_capacity)
             for slot in range(1, limit + 1):
                 inspected = pool.inspect(slot)
                 state = inspected['state']

@@ -477,6 +477,21 @@ class NodeRecoveryTests(unittest.TestCase):
                          ['failed', 'registering', 'pending'])
         self.assertEqual(snapshot['slots'][0]['error'], 'AnisetteError: HTTP 503')
 
+    def test_empty_snapshot_has_no_synthetic_missing_slot(self):
+        class Pool:
+            def __init__(inner, *_args, **_kwargs):
+                inner.base = self.node.root / 'device-pool' / 'pool'
+
+            def inspect(inner, slot):
+                return {'state': 'missing', 'device_id': ''}
+
+        self.node.builder.state.update(running=False, capacity=0)
+        with patch('clusterlab.device_build._load_fastcheck', return_value=(Pool, None, None)):
+            snapshot = self.node.builder.snapshot()
+        self.assertEqual(snapshot['ready'], 0)
+        self.assertEqual(snapshot['capacity'], 0)
+        self.assertEqual(snapshot['slots'], [])
+
     def test_ready_legacy_device_recovers_model_and_registration_time(self):
         class Pool:
             key = 'origin-key'
