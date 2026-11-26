@@ -950,7 +950,7 @@ class Controller:
                      'recorded': bool(item.get('recorded'))}
                     for item in slots[:500] if isinstance(item, dict)]
         proxy_check = value.get('proxy_check')
-        if isinstance(proxy_check, dict):
+        if isinstance(proxy_check, dict) and proxy_check:
             status = str(proxy_check.get('status') or 'idle')
             if status not in ('idle', 'checking', 'ok', 'failed'):
                 status = 'failed'

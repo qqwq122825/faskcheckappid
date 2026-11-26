@@ -45,6 +45,12 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(check['google_status'], 204)
         self.assertNotIn('secret', check['proxy'])
 
+    def test_empty_proxy_check_is_not_reported_as_a_failure(self):
+        self.heartbeat(telemetry={'proxy_check': {}})
+        telemetry = next(node for node in self.service.snapshot()['nodes']
+                         if node['id'] == self.node['id'])['telemetry']
+        self.assertNotIn('proxy_check', telemetry)
+
     def test_saving_concurrency_without_enabled_preserves_accepting_state(self):
         self.service.configure_node(self.node['id'], {'processes': 1, 'threads': 250})
         saved = next(value for value in self.service.snapshot()['nodes']
