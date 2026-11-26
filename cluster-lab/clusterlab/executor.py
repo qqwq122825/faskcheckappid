@@ -330,22 +330,20 @@ def stall_timeout_seconds(descriptor, minimum=MIN_STALL_TIMEOUT_SECONDS,
     timeout = max(0.1, float(descriptor.get('timeout') or 25))
     retries = descriptor.get('retries')
     attempts = max(0, int(2 if retries is None else retries)) + 1
-    item_timeout = max(timeout, float(descriptor.get('item_timeout') or 40))
-    return max(float(minimum), timeout * attempts + float(padding),
-               item_timeout + float(padding))
+    return max(float(minimum), timeout * attempts + float(padding))
 
 
-def _gsa_per_hop_timeout(configured_timeout, remaining_account_budget):
+def _gsa_per_hop_timeout(configured_timeout, remaining_attempt_time):
     """Match 并发3: every GSA hop receives the configured timeout.
 
     Dividing 25 seconds across SOCKS connect/read and both GSA hops produced a
     6.25-second requests timeout. Healthy provider exits routinely need more
     than that for one phase, so the split turned successful work into long
     retry chains. The reference engine passes the full per-hop value and only
-    checks the account budget between attempts.
+    checks the per-attempt deadline after each result.
     """
     configured = max(0.001, float(configured_timeout))
-    remaining = max(0.001, float(remaining_account_budget))
+    remaining = max(0.001, float(remaining_attempt_time))
     return max(0.001, min(configured, remaining))
 
 
@@ -1002,7 +1000,6 @@ def execute_unit_group(directory, descriptor, stop):
             retries=int(2 if descriptor.get('retries') is None
                         else descriptor.get('retries')),
             timeout=float(descriptor.get('timeout') or 25),
-            item_timeout=float(descriptor.get('item_timeout') or 40),
             mode='process_owned_watermark', proxy_pool_owner='process',
             credentials_recorded=False)
 
@@ -1381,9 +1378,9 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     timeout = float(descriptor.get('timeout') or 25)
     retry_value = descriptor.get('retries')
     retries = max(0, int(2 if retry_value is None else retry_value))
-    # The configured timeout is the whole-account deadline.  Legacy larger
-    # item_timeout values remain readable but no longer extend one account.
-    item_timeout = timeout
+    # ``timeout`` applies independently to every configured attempt.  There is
+    # deliberately no whole-account budget: retries each receive a fresh full
+    # timeout and the retry count is the only total-attempt limit.
     public_header_use_limit = max(1, int(descriptor.get('public_header_use_limit') or 15))
     device_use_limit = max(1, int(descriptor.get('device_use_limit') or 30))
     retry_delay = max(0.0, float(descriptor.get('_retry_delay',
@@ -1422,7 +1419,6 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                            threads=workers, configured_threads=configured_workers,
                            worker_nice=int(descriptor.get('_worker_nice') or 0),
                            retries=retries, timeout=timeout,
-                           item_timeout=item_timeout,
                            slots=slot_ids, loaded_device_count=len(loaded_devices),
                            device_owner='process', credentials_recorded=False)
 
@@ -1816,14 +1812,6 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         # 不会在“0 次重试”时暗中多发请求。
         attempt_limit = retries + 1
         for attempt in range(start_attempt, attempt_limit):
-            elapsed = 0.0 if account_started is None else time.time() - account_started
-            remaining_budget = item_timeout - elapsed
-            if remaining_budget <= 0:
-                result = {'status': 'error', 'kind': 'timeout', 'http': 0,
-                          'stage': 'budget', 'detail': '单账号总预算已耗尽',
-                          '_proxy_retries': max(0, attempt - 1),
-                          '_budget_hit': True}
-                break
             acquire_before = _proxy_pool_snapshot(proxy_pool) if debug_enabled else {}
             acquire_started = time.monotonic() if debug_enabled else None
             account_proxy, lease = proxy_for(index + attempt, force=force_proxy)
@@ -1862,6 +1850,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                               _retry_force_proxy=True)
                 return row, line, result
             request_started = time.monotonic() if debug_enabled else None
+            attempt_started = time.time()
             try:
                 if identity is None:
                     identity_lock = (worker_state.get('identity_lock')
@@ -1920,8 +1909,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 # 只有真正要发 GSA 请求时才开始 25 秒计时。
                 if account_started is None:
                     account_started = time.time()
-                remaining_budget = item_timeout - (time.time() - account_started)
-                attempt_timeout = _gsa_per_hop_timeout(timeout, remaining_budget)
+                attempt_timeout = _gsa_per_hop_timeout(timeout, timeout)
                 if (worker_state is not None and start_attempt == 0 and attempt == 0):
                     worker_state['identity_uses'] = int(worker_state.get('identity_uses') or 0) + 1
                 # 每次协议请求使用当前线程自己的出口。
@@ -1946,7 +1934,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                         result = _refine_repair_auth_with_rotation(
                             result, account, password, account_proxy, attempt_timeout,
                             stop.is_set, retries, rotate_web,
-                            deadline=account_started + item_timeout)
+                            deadline=attempt_started + attempt_timeout)
                     else:
                         result = _refine_repair_auth(
                             result, account, password, account_proxy, attempt_timeout,
@@ -1961,16 +1949,18 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                           'stage': 'init', 'detail': str(exc)[:180]}
             request_ms = (round((time.monotonic() - request_started) * 1000, 2)
                           if debug_enabled else None)
-            transport_failed = retryable_transport(result)
-            budget_hit = (account_started is not None
-                          and time.time() - account_started >= item_timeout)
-            if budget_hit:
-                # A response arriving after the account deadline is no longer
-                # a verdict.  Record timeout, discard this exit, and advance.
+            attempt_elapsed = time.time() - attempt_started
+            attempt_timed_out = attempt_elapsed >= attempt_timeout
+            if attempt_timed_out:
+                # A verdict arriving after its per-attempt deadline is stale.
+                # Drop the current SOCKS route and use the next configured
+                # retry on a fresh exit.  There is no separate total budget.
                 result = {'status': 'error', 'kind': 'timeout', 'http': 0,
-                          'stage': 'account_deadline',
-                          'detail': f'账号验证超过 {timeout:g} 秒',
-                          '_proxy_retries': attempt, '_budget_hit': True}
+                          'stage': 'attempt_deadline',
+                          'detail': f'单次验证超过 {attempt_timeout:g} 秒',
+                          '_proxy_retries': attempt,
+                          '_attempt_timed_out': True}
+            transport_failed = retryable_transport(result)
             try:
                 result_http = int(result.get('http'))
             except (TypeError, ValueError):
@@ -2058,8 +2048,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                 if worker_state is not None:
                     worker_state['identity'] = None
             previous_proxy = current_proxy
-            if (not transport_failed or attempt + 1 >= attempt_limit
-                    or budget_hit):
+            if not transport_failed or attempt + 1 >= attempt_limit:
                 result['_proxy_retries'] = attempt
                 break
             # Return this account to the coordinator's delayed retry heap.

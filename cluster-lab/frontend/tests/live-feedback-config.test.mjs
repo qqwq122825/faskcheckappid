@@ -11,7 +11,7 @@ test('Task creation exposes retries and node UI shows two processes by 250 threa
   const task = source('src/components/CreateTaskDialog.vue')
   const nodes = source('src/components/NodeDialogs.vue')
   assert.match(task, /超时后重试次数/)
-  assert.match(task, /总预算 \/ 秒/)
+  assert.doesNotMatch(task, /总预算|itemTimeout|item_timeout/)
   assert.match(task, /v-model="retries"/)
   assert.doesNotMatch(task, /预计设备池数量/)
   assert.doesNotMatch(task, /device_capacity/)

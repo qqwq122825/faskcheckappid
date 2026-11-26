@@ -6,18 +6,17 @@ import { api, busy, createTaskOpen, refresh, session, state } from '../composabl
 const router = useRouter()
 const name = ref(''), unitRows = ref(10000), file = ref<File>(), error = ref('')
 const files = ref<any[]>([]), chosen = ref(''), mode = ref<'new' | 'reuse'>('new')
-const timeout = ref(25), retries = ref(2), itemTimeout = ref(40)
+const timeout = ref(25), retries = ref(2)
 const publicHeaderUseLimit = ref(15), deviceUseLimit = ref(30)
 const webSecondaryAuth = ref(true)
 const detailedErrorLog = ref(false)
-watch(timeout, value => { if (itemTimeout.value < value) itemTimeout.value = value })
 const uploadPercent = ref<number | null>(null)
 const maxUnitRows = computed(() => state.value?.settings?.max_unit_rows || 10000)
 watch(createTaskOpen, open => {
   if (open) {
     error.value = ''; file.value = undefined; name.value = ''
     unitRows.value = Math.min(10000, maxUnitRows.value)
-    timeout.value = 25; retries.value = 2; itemTimeout.value = 40
+    timeout.value = 25; retries.value = 2
     publicHeaderUseLimit.value = Number(state.value?.settings?.public_header_use_limit || 15)
     // The task form always starts from the safe per-task default.  A previous
     // task or the legacy global setting must not silently carry a large value
@@ -49,7 +48,7 @@ function sizeText(bytes: number) {
 function uploadStream(selected: File): Promise<any> {
   const query = new URLSearchParams({ name: name.value.trim() || selected.name,
     unit_rows: String(unitRows.value), mode: 'auth', timeout: String(timeout.value),
-    retries: String(retries.value), item_timeout: String(itemTimeout.value),
+    retries: String(retries.value),
     public_header_use_limit: String(publicHeaderUseLimit.value), device_use_limit: String(deviceUseLimit.value),
     web_secondary_auth: String(webSecondaryAuth.value),
     detailed_error_log: String(detailedErrorLog.value),
@@ -82,9 +81,8 @@ async function submit() {
     error.value = '设备淘汰应为 1–1,000,000 个账号'; return
   }
   if (!Number.isInteger(timeout.value) || timeout.value < 5 || timeout.value > 120 ||
-      !Number.isInteger(retries.value) || retries.value < 0 || retries.value > 5 ||
-      !Number.isInteger(itemTimeout.value) || itemTimeout.value < timeout.value || itemTimeout.value > 600) {
-    error.value = '请检查请求策略：超时 5–120 秒，重试 0–5 次，总预算不少于单次超时且不超过 600 秒'; return
+      !Number.isInteger(retries.value) || retries.value < 0 || retries.value > 5) {
+    error.value = '请检查请求策略：单次超时 5–120 秒，重试 0–5 次'; return
   }
   if (mode.value === 'reuse') {
     if (!chosen.value) { error.value = '请选择一个已上传的文件'; return }
@@ -96,7 +94,6 @@ async function submit() {
       await api('/api/jobs/from-file', { source: chosen.value, name: name.value.trim(),
                                          unit_rows: unitRows.value, mode: 'auth', enqueue: 'true',
                                          timeout: timeout.value, retries: retries.value,
-                                         item_timeout: itemTimeout.value,
                                          public_header_use_limit: publicHeaderUseLimit.value,
                                          device_use_limit: deviceUseLimit.value,
                                          web_secondary_auth: webSecondaryAuth.value,
@@ -152,10 +149,8 @@ async function submit() {
             <div class="request-fields">
               <el-form-item label="单次超时 / 秒" for="task-timeout"><el-input-number id="task-timeout" v-model="timeout" :min="5" :max="120" :step="5" :precision="0" :disabled="busy" controls-position="right" /></el-form-item>
               <el-form-item label="超时后重试次数" for="task-retries"><el-input-number id="task-retries" v-model="retries" :min="0" :max="5" :step="1" :precision="0" :disabled="busy" controls-position="right" /></el-form-item>
-              <el-form-item label="总预算 / 秒" for="task-budget"><el-input-number id="task-budget" v-model="itemTimeout" :min="timeout" :max="600" :step="5" :precision="0" :disabled="busy" controls-position="right" /></el-form-item>
             </div>
-            <p class="config-hint">总预算包含单账号的所有重试与等待，耗尽后不再请求。</p>
-            <details class="request-help"><summary>超时与重试说明</summary><p>单次超时为一次网络请求的最长等待时间。0 次表示不重试；超时、TLS、5xx 及 Apple 返回“Try again later”会重试，密码错误、锁定等明确结论不重试。</p></details>
+            <details class="request-help"><summary>超时与重试说明</summary><p>单次超时独立应用于每次请求；超时后断开当前出口并换 IP 重试。0 次表示只请求一次；2 次表示首次请求后最多再重试 2 次。TLS、5xx 及 Apple 返回“Try again later”同样会重试，密码错误、锁定等明确结论不重试。</p></details>
             <div class="request-log-option">
               <div><strong>详细错误日志</strong><p>仅本任务生效。保存 Apple 真实原因（最多 240 字符）和紧凑原因码，之后可按账号查询；不会增加认证请求。</p></div>
               <el-switch v-model="detailedErrorLog" :disabled="busy" aria-label="详细错误日志" />

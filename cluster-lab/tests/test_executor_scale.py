@@ -852,7 +852,7 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(shared.discards, [
                 'socks5h://first-exit', 'socks5h://second-exit', 'socks5h://third-exit'])
 
-    def test_account_budget_stops_retry_and_caps_request_timeout(self):
+    def test_each_late_attempt_consumes_one_configured_retry(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'input.part').write_text('account----password\n', encoding='utf-8')
@@ -862,7 +862,7 @@ class ExecutorScaleTests(unittest.TestCase):
                           'item_timeout': .2, 'retries': 2, '_retry_delay': 0}
             shared = ScriptedProxyPool([
                 'socks5h://bootstrap', 'socks5h://first-exit',
-                'socks5h://second-exit'])
+                'socks5h://second-exit', 'socks5h://third-exit'])
             request_timeouts = []
 
             def check(_account, _password, _proxy, **kwargs):
@@ -878,22 +878,27 @@ class ExecutorScaleTests(unittest.TestCase):
                 _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
 
             record = json.loads((root / 'results.jsonl').read_text())
-            self.assertEqual(len(request_timeouts), 1)
-            self.assertLessEqual(request_timeouts[0], .1)
-            self.assertEqual((record['status'], record['attempts']), ('timeout', 0))
+            self.assertEqual(len(request_timeouts), 3)
+            self.assertTrue(all(value <= .1 for value in request_timeouts))
+            self.assertEqual((record['status'], record['attempts']), ('timeout', 2))
 
-    def test_account_timeout_is_hard_deadline_even_with_legacy_larger_budget(self):
+    def test_late_attempt_retries_on_fresh_exit_without_total_budget(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'input.part').write_text('account----password\n', encoding='utf-8')
             descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                           'device_capacity': 1, 'device_root': str(root / 'devices'),
                           'origin': 'http://127.0.0.1:1', 'timeout': .05,
-                          'item_timeout': 60, 'retries': 3, '_retry_delay': 0}
-            shared = ScriptedProxyPool(['socks5h://bootstrap', 'socks5h://account'])
+                          'item_timeout': .01, 'retries': 1, '_retry_delay': 0}
+            shared = ScriptedProxyPool([
+                'socks5h://bootstrap', 'socks5h://late-exit',
+                'socks5h://fresh-exit'])
+            checked = []
 
-            def check(*_args, **_kwargs):
-                time.sleep(.07)
+            def check(_account, _password, proxy, **_kwargs):
+                checked.append(proxy)
+                if len(checked) == 1:
+                    time.sleep(.07)
                 return {'status': 'valid', 'kind': 'valid', 'http': 200}
 
             with patch('clusterlab.executor._load_fastcheck', return_value=(
@@ -904,10 +909,14 @@ class ExecutorScaleTests(unittest.TestCase):
                 _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
 
             record = json.loads((root / 'results.jsonl').read_text())
-            self.assertEqual(record['status'], 'timeout')
-            self.assertEqual(record['stage'], 'account_deadline')
-            self.assertEqual(record['attempts'], 0)
-            self.assertEqual(shared.discards, ['socks5h://account'])
+            self.assertEqual(checked, [
+                'socks5h://late-exit', 'socks5h://fresh-exit'])
+            self.assertEqual((record['status'], record['attempts']), ('valid', 1))
+            self.assertEqual(shared.discards, ['socks5h://late-exit'])
+            self.assertEqual(shared.releases, [
+                ('socks5h://bootstrap', True),
+                ('socks5h://fresh-exit', True),
+            ])
 
     def test_auth_unit_retries_transient_apple_codes_with_new_ip_and_identity(self):
         class RefreshingPool(FakePool):

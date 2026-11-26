@@ -39,7 +39,7 @@ function setupFixture() {
     },
   }
   const script = task.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
-  const executable = ts.transpileModule(`${script}\nglobalThis.__ui = { submit, timeout, retries, itemTimeout, publicHeaderUseLimit, deviceUseLimit, webSecondaryAuth, mode, chosen, file, error, unitRows };`, {
+  const executable = ts.transpileModule(`${script}\nglobalThis.__ui = { submit, timeout, retries, publicHeaderUseLimit, deviceUseLimit, webSecondaryAuth, mode, chosen, file, error, unitRows };`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
   }).outputText
   vm.createContext(context)
@@ -118,7 +118,7 @@ test('Out-of-range, fractional, and missing device policy values prevent submiss
 })
 
 test('Invalid request policy and duplicate submission do not send requests', async () => {
-  for (const [field, value] of [['timeout', 4], ['timeout', 121], ['retries', -1], ['retries', 6], ['itemTimeout', 24], ['itemTimeout', 601]]) {
+  for (const [field, value] of [['timeout', 4], ['timeout', 121], ['retries', -1], ['retries', 6]]) {
     const fixture = setupFixture()
     fixture.ui.file.value = { name: 'fixture.txt' }
     fixture.ui[field].value = value
@@ -134,7 +134,7 @@ test('Invalid request policy and duplicate submission do not send requests', asy
   assert.equal(fixture.busy.value, true, 'Existing submission retains ownership of busy state')
 })
 
-test('Opening creation keeps the device default at 30 and total budget follows timeout', () => {
+test('Opening creation keeps the device default at 30 without a total budget', () => {
   const fixture = setupFixture()
   const onOpen = fixture.watches.find(watch => watch.source === fixture.createTaskOpen)
   onOpen.callback(true)
@@ -142,9 +142,7 @@ test('Opening creation keeps the device default at 30 and total budget follows t
   assert.equal(fixture.ui.deviceUseLimit.value, 30)
   assert.equal(fixture.ui.webSecondaryAuth.value, false)
   assert.equal(fixture.ui.unitRows.value, 10000)
-  const onTimeout = fixture.watches.find(watch => watch.source === fixture.ui.timeout)
-  onTimeout.callback(80)
-  assert.equal(fixture.ui.itemTimeout.value, 80)
+  assert.doesNotMatch(task, /itemTimeout|item_timeout|总预算/)
 })
 
 test('Detailed error logging is visible in request policy before the device card', () => {
