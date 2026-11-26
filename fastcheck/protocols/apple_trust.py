@@ -3,14 +3,18 @@
 The public Apple chain is valid in the operating-system trust store, but the
 Python.org macOS runtime uses a separate OpenSSL/Certifi store.  Using only the
 bundled legacy Apple root made that runtime reject the current GSA chain while
-the system ``curl`` accepted it.  ``truststore`` keeps certificate validation
-and hostname checks enabled while delegating platform verification to the same
-native store used by the host.  The bundled, fingerprint-checked Apple root is
-also loaded so minimal Linux images do not depend on an incidental CA package.
+the system ``curl`` accepted it.  On macOS, ``truststore`` keeps certificate
+validation and hostname checks enabled while delegating platform verification
+to the same native store used by the host.  Linux nodes deliberately use the
+stdlib SSLContext even when the optional package is installed: the native-store
+bridge is unnecessary there and caused severe high-concurrency proxy/TLS stalls
+in the legacy node image.  The bundled, fingerprint-checked Apple root is also
+loaded so minimal Linux images do not depend on an incidental CA package.
 """
 import hashlib
 from pathlib import Path
 import ssl
+import sys
 import threading
 
 from requests.adapters import HTTPAdapter
@@ -32,6 +36,17 @@ _GSA_CONTEXT = None
 _GSA_CONTEXT_LOCK = threading.Lock()
 
 
+def _new_gsa_context():
+    """Build the platform context without activating truststore on Linux."""
+    if sys.platform != "darwin":
+        return ssl.create_default_context()
+    try:
+        import truststore
+    except ImportError:  # dependency installation errors remain diagnosable
+        return ssl.create_default_context()
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
 def gsa_context():
     """返回进程级单例 SSLContext。
 
@@ -49,12 +64,7 @@ def gsa_context():
     with _GSA_CONTEXT_LOCK:
         if _GSA_CONTEXT is not None:                 # double-check
             return _GSA_CONTEXT
-        try:
-            import truststore
-        except ImportError:  # dependency installation errors remain diagnosable
-            context = ssl.create_default_context()
-        else:
-            context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context = _new_gsa_context()
         context.load_verify_locations(cafile=gsa_ca_file())
         context.check_hostname = True
         context.verify_mode = ssl.CERT_REQUIRED
