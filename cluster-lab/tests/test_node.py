@@ -560,6 +560,31 @@ class NodeRecoveryTests(unittest.TestCase):
             self.node._heartbeat()
         start.assert_not_called()
 
+    def test_manual_device_request_forwards_exit_ip_switch(self):
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': [],
+                 'device_request': 2, 'device_verify_exit_ip': True}
+        incomplete = {'running': False, 'capacity': 0, 'ready': 0, 'built': 0,
+                      'failed': 0, 'current': 0, 'attempted': 0, 'slots': []}
+        with patch.object(self.node, '_request', return_value=Response(value)), \
+             patch.object(self.node.builder, 'snapshot', return_value=incomplete), \
+             patch.object(self.node.builder, 'start') as start:
+            self.node._heartbeat()
+        start.assert_called_once_with(2, verify_exit_ip=True)
+
+    def test_manual_registration_skips_exit_ip_probe_by_default(self):
+        with patch('clusterlab.device_build._probe_proxy_exit_ip') as probe:
+            self.assertEqual(
+                self.node.builder._registration_origin('socks5h://proxy'), '未回查')
+        probe.assert_not_called()
+
+    def test_manual_registration_can_explicitly_probe_exit_ip(self):
+        with patch('clusterlab.device_build._probe_proxy_exit_ip',
+                   return_value='203.0.113.8') as probe:
+            self.assertEqual(self.node.builder._registration_origin(
+                'socks5h://proxy', True), '203.0.113.8')
+        probe.assert_called_once_with('socks5h://proxy')
+
     def test_auto_rotation_registers_one_replacement_before_removing_any_device(self):
         value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
                  'enabled': True, 'rejected': [], 'confirmed': [], 'device_request': 0,

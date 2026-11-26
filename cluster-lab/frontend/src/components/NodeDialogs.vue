@@ -24,7 +24,7 @@ async function save() {
   try { await mutate(`/api/nodes/${node.value.id}/config`, config, '配置已保存，将在后续领取工作包时生效'); configOpen.value = false }
   catch (e) { configError.value = (e as Error).message }
 }
-const deviceOpen = ref(false), deviceNodeId = ref('')
+const deviceOpen = ref(false), deviceNodeId = ref(''), verifyExitIp = ref(false)
 const deviceNode = computed(() => (state.value?.nodes || []).find((item: any) => item.id === deviceNodeId.value))
 const devicePool = computed(() => deviceNode.value?.telemetry?.device_pool || {})
 const deviceSlots = computed(() => devicePool.value?.slots || [])
@@ -32,7 +32,7 @@ const refreshCapacity = computed(() => Math.max(1,
   Number(deviceNode.value?.effective_processes || deviceNode.value?.desired_processes || 1) *
   Number(deviceNode.value?.effective_threads || deviceNode.value?.desired_threads || 1)))
 const stateNames: Record<string, string> = { ready: '已注册', registering: '注册中', failed: '失败', pending: '待完成', invalid: '已损坏', missing: '缺失' }
-function devices(value: any) { deviceNodeId.value = value.id; deviceOpen.value = true }
+function devices(value: any) { deviceNodeId.value = value.id; verifyExitIp.value = false; deviceOpen.value = true }
 async function clearDevices() {
   if (!deviceNode.value) return
   try {
@@ -51,14 +51,15 @@ async function refreshDevices() {
       `将清空旧设备，然后按节点当前 ${refreshCapacity.value} 线程目标重建。`,
       '一键刷新设备？', { type: 'warning', confirmButtonText: '开始刷新', cancelButtonText: '取消' })
     await mutate(`/api/nodes/${deviceNode.value.id}/devices/refresh`,
-      { capacity: refreshCapacity.value }, `已按 ${refreshCapacity.value} 设备目标下发刷新`)
+      { capacity: refreshCapacity.value, verify_exit_ip: verifyExitIp.value },
+      `已按 ${refreshCapacity.value} 设备目标下发刷新`)
   } catch (e) { if (e instanceof Error) ElMessage.error(e.message) }
 }
 async function fillDevices() {
   if (!deviceNode.value) return
   try {
     await mutate(`/api/nodes/${deviceNode.value.id}/devices`,
-      { capacity: refreshCapacity.value },
+      { capacity: refreshCapacity.value, verify_exit_ip: verifyExitIp.value },
       `已按 ${refreshCapacity.value} 台目标补齐；现有设备不会删除`)
   } catch (e) { if (e instanceof Error) ElMessage.error(e.message) }
 }
@@ -87,6 +88,7 @@ defineExpose({ configure, devices })
       <span>总设备 <b>{{ devicePool.ready || 0 }}</b></span><span>使用中 <b>{{ devicePool.in_use || 0 }}</b></span><span>注册中 <b>{{ devicePool.registering || 0 }}</b></span>
       <div class="device-actions"><el-button type="danger" plain :loading="busy" @click="clearDevices">一键删除</el-button><el-button plain :loading="busy" @click="refreshDevices">清空并重建</el-button><el-button type="primary" :loading="busy" @click="fillDevices">补齐到 {{ refreshCapacity }} 台</el-button></div>
     </div>
+    <div class="device-probe-option"><div><strong>注册后回查出口 IP</strong><p>关闭时不发起额外回查请求，注册速度更快；任务启动时线程自动注册固定跳过回查。</p></div><el-switch v-model="verifyExitIp" /></div>
     <el-table :data="deviceSlots" max-height="520" empty-text="暂无设备，可点击一键刷新">
       <el-table-column prop="slot" label="#" width="58" />
       <el-table-column label="状态" width="88"><template #default="scope">{{ stateNames[scope.row.state] || scope.row.state }}</template></el-table-column>
@@ -101,6 +103,7 @@ defineExpose({ configure, devices })
 </template>
 <style scoped>
 .device-summary{display:flex;align-items:center;gap:20px;margin-bottom:16px}.device-summary>span{color:var(--el-text-color-secondary)}.device-summary b{color:var(--el-text-color-primary);font-size:18px}.device-actions{margin-left:auto;display:flex;gap:8px}
+.device-probe-option{display:flex;align-items:center;justify-content:space-between;gap:24px;margin:-2px 0 16px;padding:12px 14px;border:1px solid var(--el-border-color-lighter);border-radius:10px;background:var(--el-fill-color-light)}.device-probe-option strong{color:var(--el-text-color-primary)}.device-probe-option p{margin:4px 0 0;color:var(--el-text-color-secondary);font-size:13px}
 .node-config-title{margin:0;color:#303b45;font-size:28px;font-weight:750;line-height:1.3;letter-spacing:-.02em}
 .node-config-form{min-height:300px;padding:22px 18px 8px}
 .node-config-form :deep(.el-form-item__label){padding-bottom:14px;color:#485661;font-size:18px;font-weight:650;line-height:1.4}

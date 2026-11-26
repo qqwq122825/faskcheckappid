@@ -144,7 +144,9 @@ def create_app(role, service, password=None):
         @app.post('/api/nodes/<node_id>/devices')
         def request_devices(node_id):
             data = request.get_json() or {}
-            return jsonify(service.request_devices(node_id, data.get('capacity') or 0))
+            return jsonify(service.request_devices(
+                node_id, data.get('capacity') or 0,
+                data.get('verify_exit_ip', False)))
 
         @app.delete('/api/nodes/<node_id>/devices')
         def clear_devices(node_id):
@@ -153,7 +155,9 @@ def create_app(role, service, password=None):
         @app.post('/api/nodes/<node_id>/devices/refresh')
         def refresh_devices(node_id):
             data = request.get_json() or {}
-            return jsonify(service.refresh_devices(node_id, data.get('capacity')))
+            return jsonify(service.refresh_devices(
+                node_id, data.get('capacity'),
+                data.get('verify_exit_ip', False)))
 
         @app.post('/api/nodes/<node_id>/config')
         def configure_node(node_id):
@@ -315,7 +319,8 @@ def create_app(role, service, password=None):
         @app.post('/api/devices/build')
         def devices_build():
             data = request.get_json() or {}
-            service.builder.start(int(data.get('capacity') or 0))
+            service.builder.start(int(data.get('capacity') or 0),
+                                  verify_exit_ip=bool(data.get('verify_exit_ip', False)))
             return jsonify(service.builder.snapshot()), 202
 
         @app.get('/api/devices/build')

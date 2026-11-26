@@ -589,7 +589,9 @@ class Node:
                     and not self.builder.state['running']):
                 snapshot = self.builder.snapshot()
                 if int(snapshot.get('ready') or 0) < requested:
-                    self.builder.start(requested)
+                    self.builder.start(
+                        requested,
+                        verify_exit_ip=bool(value.get('device_verify_exit_ip', False)))
             for unit_id in value['rejected']:
                 if unit_id in self.active:
                     self.active[unit_id][1].set()

@@ -167,10 +167,11 @@ class ControllerTests(unittest.TestCase):
                          (7, 321))
 
     def test_refresh_devices_rebuilds_to_requested_total_concurrency(self):
-        result = self.service.refresh_devices(self.node['id'])
+        result = self.service.refresh_devices(self.node['id'], verify_exit_ip=True)
         self.assertEqual(result['requested'], 4)
         response = self.heartbeat(ack_device_clear_version=0)
         self.assertEqual(response['device_request'], 4)
+        self.assertTrue(response['device_verify_exit_ip'])
         self.assertEqual(response['device_clear_version'], result['version'])
 
     def test_web_secondary_auth_defaults_on_persists_and_rejects_non_boolean(self):

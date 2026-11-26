@@ -337,6 +337,7 @@ class Controller:
                     db.execute(f'ALTER TABLE jobs ADD COLUMN {name} INTEGER')
             for name, definition in {'telemetry_json': "TEXT NOT NULL DEFAULT '{}'",
                                      'device_request': 'INTEGER NOT NULL DEFAULT 0',
+                                     'device_verify_exit_ip': 'INTEGER NOT NULL DEFAULT 0',
                                      'stop_version': 'INTEGER NOT NULL DEFAULT 0',
                                      'ack_stop_version': 'INTEGER NOT NULL DEFAULT 0',
                                      'device_clear_version': 'INTEGER NOT NULL DEFAULT 0',
@@ -830,16 +831,19 @@ class Controller:
                   if parts else '代理 API 配置已清空')
         return self.settings()
 
-    def request_devices(self, node_id, capacity):
+    def request_devices(self, node_id, capacity, verify_exit_ip=False):
         """把非破坏性补齐意图挂到节点上，节点只注册缺失槽位。"""
         capacity = integer(int(capacity), '设备数量', 1)
+        if type(verify_exit_ip) is not bool:
+            raise ValueError('出口 IP 回查开关应为布尔值')
         with self.db.transaction() as db:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:
                 raise ValueError('节点不存在')
             if not node['last_seen'] or time.time() - node['last_seen'] > self.offline_seconds:
                 raise Conflict('节点离线，无法初始化设备')
-            db.execute('UPDATE nodes SET device_request=? WHERE id=?', (capacity, node_id))
+            db.execute('UPDATE nodes SET device_request=?,device_verify_exit_ip=? WHERE id=?',
+                       (capacity, int(verify_exit_ip), node_id))
             event(db, 'device_build_requested', f'已请求节点初始化 {capacity} 台设备', node_id=node_id)
         return {'requested': capacity}
 
@@ -854,14 +858,16 @@ class Controller:
             if active:
                 raise Conflict(f'节点仍有 {active} 个工作包在执行，请先停止任务')
             version = int(node['device_clear_version'] or 0) + 1
-            db.execute('UPDATE nodes SET device_request=0,device_clear_version=? WHERE id=?',
+            db.execute('UPDATE nodes SET device_request=0,device_verify_exit_ip=0,device_clear_version=? WHERE id=?',
                        (version, node_id))
             event(db, 'device_pool_clear_requested', '已请求节点清空全部设备',
                   node_id=node_id)
         return {'requested': True, 'version': version}
 
-    def refresh_devices(self, node_id, capacity=None):
+    def refresh_devices(self, node_id, capacity=None, verify_exit_ip=False):
         """清空后按节点当前生效并发重建。"""
+        if type(verify_exit_ip) is not bool:
+            raise ValueError('出口 IP 回查开关应为布尔值')
         with self.db.transaction() as db:
             node = db.execute('SELECT * FROM nodes WHERE id=?', (node_id,)).fetchone()
             if not node:
@@ -876,8 +882,8 @@ class Controller:
                             * int(node['desired_threads'] or 1))
             target = integer(int(capacity or effective), '设备数量', 1)
             version = int(node['device_clear_version'] or 0) + 1
-            db.execute('UPDATE nodes SET device_request=?,device_clear_version=? WHERE id=?',
-                       (target, version, node_id))
+            db.execute('UPDATE nodes SET device_request=?,device_verify_exit_ip=?,device_clear_version=? WHERE id=?',
+                       (target, int(verify_exit_ip), version, node_id))
             event(db, 'device_pool_refresh_requested',
                   f'已请求节点清空并按 {target} 并发重建设备', node_id=node_id)
         return {'requested': target, 'version': version}
@@ -1507,7 +1513,8 @@ class Controller:
                     and isinstance(device_pool, dict)
                     and int(device_pool.get('ready') or 0) >= requested_devices
                     and not bool(device_pool.get('running'))):
-                db.execute('UPDATE nodes SET device_request=0 WHERE id=?', (node_id,))
+                db.execute('UPDATE nodes SET device_request=0,device_verify_exit_ip=0 WHERE id=?',
+                           (node_id,))
                 event(db, 'device_build_complete',
                       f'节点已完成 {requested_devices} 台设备注册', node_id=node_id)
             if (status_generation == node['update_generation'] and update_state
@@ -1551,6 +1558,7 @@ class Controller:
                                'origin': self.settings().get('origin') or 'https://new.ani.sidestore.io'}}
             if int(node['device_request'] or 0) > 0:
                 response['device_request'] = int(node['device_request'])
+                response['device_verify_exit_ip'] = bool(node['device_verify_exit_ip'])
             return response
 
     def _rate_allows(self):

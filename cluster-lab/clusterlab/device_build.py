@@ -14,7 +14,8 @@ import threading
 import time
 
 from .common import atomic_json, read_json
-from .executor import _load_fastcheck, record_device_registration
+from .executor import (_load_fastcheck, _probe_proxy_exit_ip,
+                       record_device_registration)
 
 REGISTRATION_TIMEOUT = 90
 DEVICE_REGISTRATION_WORKERS = 100
@@ -123,7 +124,7 @@ class DeviceBuilder:
             at = ''
         return {'model': model, 'at': at}
 
-    def start(self, capacity):
+    def start(self, capacity, verify_exit_ip=False):
         with self.lock:
             if self.state['running']:
                 raise RuntimeError('正在初始化设备，请等待本轮结束')
@@ -139,7 +140,8 @@ class DeviceBuilder:
                               proxy_status='checking', proxy_ip='',
                               slot_errors={}, active_slots=[],
                               started_at=time.strftime('%H:%M:%S'))
-            self.thread = threading.Thread(target=self._run, args=(int(capacity),),
+            self.thread = threading.Thread(target=self._run,
+                                           args=(int(capacity), bool(verify_exit_ip)),
                                            name='device-builder', daemon=True)
             self.thread.start()
 
@@ -254,7 +256,7 @@ class DeviceBuilder:
                 process.close()
         return result
 
-    def _run_slot(self, root, capacity, slot):
+    def _run_slot(self, root, capacity, slot, verify_exit_ip=False):
         """Build one missing slot; callers may run independent slots in parallel."""
         if self.stop.is_set() or self._reserved(slot):
             return
@@ -282,7 +284,8 @@ class DeviceBuilder:
             pool = DevicePool(str(root), self.node.origin, max_devices=capacity)
             ok = bool(result and result.get('ok')) and pool.inspect(slot)['state'] == 'ready'
             if ok:
-                self._record(slot, proxy, (result or {}).get('model'))
+                registration_origin = self._registration_origin(proxy, verify_exit_ip)
+                self._record(slot, registration_origin, (result or {}).get('model'))
                 self._clear_slot_error(slot)
                 self._change_counts(built=1, ready=1)
                 self._update(message=f'第 {slot} 台已就绪')
@@ -299,7 +302,7 @@ class DeviceBuilder:
         finally:
             self._mark_active(slot, False)
 
-    def _run(self, capacity):
+    def _run(self, capacity, verify_exit_ip=False):
         root = self.node.root / 'device-pool'
         root.mkdir(parents=True, exist_ok=True)
         try:
@@ -321,7 +324,8 @@ class DeviceBuilder:
                 self._update(message=f'并发注册 {len(missing)} 台设备（{workers} 个工作线程）')
                 with ThreadPoolExecutor(max_workers=workers,
                                         thread_name_prefix='device-register') as executor:
-                    futures = [executor.submit(self._run_slot, root, capacity, slot)
+                    futures = [executor.submit(self._run_slot, root, capacity, slot,
+                                               verify_exit_ip)
                                for slot in missing]
                     for future in as_completed(futures):
                         future.result()
@@ -459,6 +463,16 @@ class DeviceBuilder:
     def _record(self, slot, proxy, model=''):
         """记下每台设备注册时用的出口，供界面核对设备"出生地"。"""
         return record_device_registration(self.node.root / 'device-pool', slot, proxy, model)
+
+    @staticmethod
+    def _registration_origin(proxy, verify_exit_ip=False):
+        """Only manual device management may spend one request on exit-IP lookup."""
+        if not verify_exit_ip:
+            return '未回查'
+        try:
+            return _probe_proxy_exit_ip(proxy)
+        except Exception:                                         # noqa: BLE001
+            return '回查失败'
 
     def registry(self):
         data = {}

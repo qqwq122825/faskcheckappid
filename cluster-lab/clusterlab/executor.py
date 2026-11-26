@@ -40,6 +40,7 @@ PROXY_DEBUG_ENV = 'CLUSTER_PROXY_DEBUG'
 PROXY_EXIT_IP_URL = 'https://api.ipify.org?format=json'
 PROXY_EXIT_IP_TIMEOUT = 4.0
 PROXY_EXIT_IP_MAX = 2048
+REGISTRATION_EXIT_IP_SKIPPED = '未回查'
 
 
 class _WatermarkProxyPool:
@@ -1556,7 +1557,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                                      identity_uses=0, device_label=label)
                     if not ready and refreshed['state'] == 'ready':
                         record_device_registration(
-                            device_root, slot_id, warm_proxy,
+                            device_root, slot_id, REGISTRATION_EXIT_IP_SKIPPED,
                             profile.get('model', ''))
                     if proxy_pool is not None:
                         proxy_pool.release(lease, healthy=True)
@@ -1845,7 +1846,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                                 device_labels[slot_id] = worker_state['device_label']
                             if not ready and pool.inspect(slot_id)['state'] == 'ready':
                                 record_device_registration(
-                                    device_root, slot_id, account_proxy,
+                                    device_root, slot_id, REGISTRATION_EXIT_IP_SKIPPED,
                                     profile.get('model', ''))
                 # 与并发3一致：设备/公共头准备不消耗账号时限。
                 # 只有真正要发 GSA 请求时才开始 25 秒计时。
@@ -2132,7 +2133,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             device_labels[slot_id] = label
             if not ready and refreshed['state'] == 'ready':
                 record_device_registration(
-                    device_root, slot_id, account_proxy,
+                    device_root, slot_id, REGISTRATION_EXIT_IP_SKIPPED,
                     profile.get('model', ''))
             # ``proxy_for`` reserves the route for the thread.  Header setup is
             # not an account, so the first real task must still be use #1.
