@@ -10,6 +10,7 @@ const rows = ref<any[]>([])
 const total = ref(0)
 const loading = ref(false)
 const error = ref('')
+const accountQuery = ref('')
 let generation = 0
 let foregroundRequests = 0
 let backgroundPending = false
@@ -45,7 +46,9 @@ async function load(reset = false, showLoading = true) {
     error.value = ''
   }
   try {
-    const result = await api(`/api/jobs/${props.job.id}/rows?category=${category.value}&offset=${offset.value}&limit=${pageSize}`)
+    const params = new URLSearchParams({ category: category.value, offset: String(offset.value), limit: String(pageSize) })
+    if (accountQuery.value.trim()) params.set('account', accountQuery.value.trim())
+    const result = await api(`/api/jobs/${props.job.id}/rows?${params}`)
     if (current !== generation) return
     rows.value = Array.isArray(result.rows) ? result.rows : []
     total.value = Math.max(0, Number(result.total) || 0)
@@ -73,6 +76,7 @@ async function refreshInBackground() {
   }
 }
 function changeCategory() { load(true) }
+function searchAccount() { load(true) }
 function previous() { offset.value = Math.max(0, offset.value - pageSize); load() }
 function next() { offset.value += pageSize; load() }
 const elapsed = (value: any) => value == null ? '—' : `${Number(value).toFixed(2)}s`
@@ -97,9 +101,7 @@ watch(
     <template #header>
       <div class="section-heading result-list-heading">
         <div><h2>账号结果</h2><p>密码正确结果可逐页查看全部；其他分类各显示前 100 条。</p></div>
-        <el-select v-model="category" class="result-filter" @change="changeCategory">
-          <el-option v-for="item in options" :key="item.value" :label="item.label" :value="item.value" />
-        </el-select>
+        <div class="result-query"><el-input v-model="accountQuery" clearable placeholder="输入完整账号查询真实记录" @keyup.enter="searchAccount" /><el-button @click="searchAccount">查询账号</el-button><el-select v-model="category" class="result-filter" @change="changeCategory"><el-option v-for="item in options" :key="item.value" :label="item.label" :value="item.value" /></el-select></div>
       </div>
     </template>
     <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />

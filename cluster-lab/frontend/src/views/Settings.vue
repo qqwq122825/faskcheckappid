@@ -5,16 +5,12 @@ import { ElMessage } from 'element-plus'
 import { session, isNode, state, busy, mutate } from '../composables/useCluster'
 const maxUnitRows = ref(10000), error = ref('')
 const proxyApi = ref(''), proxyScheme = ref('socks5h'), proxyError = ref(''), proxyBusy = ref(false)
-const proxyDebug = ref(false), proxyDebugBusy = ref(false)
 const webSecondaryAuth = ref(true), webSecondaryAuthBusy = ref(false)
 watch(() => state.value?.settings?.max_unit_rows, value => {
   if (value != null) maxUnitRows.value = value
 }, { immediate: true })
 watch(() => state.value?.settings?.proxy_scheme, value => {
   if (value) proxyScheme.value = value
-}, { immediate: true })
-watch(() => state.value?.settings?.proxy_debug, value => {
-  if (value != null) proxyDebug.value = Boolean(value)
 }, { immediate: true })
 watch(() => state.value?.settings?.web_secondary_auth, value => {
   if (value != null) webSecondaryAuth.value = Boolean(value)
@@ -44,17 +40,6 @@ async function removeProxy(index: number) {
   try { await mutate('/api/settings/proxy', { action: 'delete', index }, '代理配置已删除') }
   catch (e) { proxyError.value = (e as Error).message; ElMessage.error(proxyError.value) }
   finally { proxyBusy.value = false }
-}
-async function saveProxyDebug(value: string | number | boolean) {
-  const enabled = Boolean(value)
-  proxyDebugBusy.value = true
-  try {
-    await mutate('/api/settings/debug', { proxy_debug: enabled },
-                 enabled ? '代理调试日志已开启，将对新工作包生效' : '代理调试日志已关闭，新工作包不再记录')
-  } catch (e) {
-    proxyDebug.value = !enabled
-    ElMessage.error((e as Error).message)
-  } finally { proxyDebugBusy.value = false }
 }
 async function saveWebSecondaryAuth(value: string | number | boolean) {
   const enabled = Boolean(value)
@@ -112,10 +97,6 @@ async function saveWebSecondaryAuth(value: string | number | boolean) {
           <section class="advanced-row">
             <div><h3>Web 二次验证</h3><p>仅对 GSA 返回 au=repair 的新工作包做细分。</p><small>authType=sa/non-sa 归入密码正确；hsa/hsa2 保留为双重验证。Web HTTP 0 或 503 按任务设置的重试次数重试。</small></div>
             <el-switch v-model="webSecondaryAuth" aria-label="Web 二次验证" :loading="webSecondaryAuthBusy" :disabled="webSecondaryAuthBusy" @change="saveWebSecondaryAuth" />
-          </section>
-          <section class="advanced-row">
-            <div><h3>代理调试日志</h3><p>仅在排查代理问题时开启，避免产生大量日志。</p><small>开启后节点直接回传 Apple 原始英文原因并写入 proxy-debug.jsonl；关闭后节点只回传快捷分类，总控显示中文原因。</small></div>
-            <el-switch v-model="proxyDebug" aria-label="代理调试日志" :loading="proxyDebugBusy" :disabled="proxyDebugBusy" @change="saveProxyDebug" />
           </section>
           <div class="deployment-values"><span>当前版本 <strong>v{{ session?.version }}</strong></span><span>部署角色 <strong>集群总控</strong></span><span>{{ session?.password_required ? '密码登录已启用' : '未启用密码登录' }}</span></div>
         </el-collapse-item>

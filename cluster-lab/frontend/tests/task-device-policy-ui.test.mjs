@@ -9,6 +9,7 @@ import ts from 'typescript'
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const task = readFileSync(resolve(root, 'src/components/CreateTaskDialog.vue'), 'utf8')
 const settings = readFileSync(resolve(root, 'src/views/Settings.vue'), 'utf8')
+const jobTable = readFileSync(resolve(root, 'src/components/JobTable.vue'), 'utf8')
 
 // Execute the real setup script with in-memory transport and ref fixtures.
 // No browser, filesystem upload, backend, or production request is involved.
@@ -16,7 +17,8 @@ function setupFixture() {
   const calls = [], watches = []
   const ref = value => ({ value })
   const busy = ref(false), createTaskOpen = ref(true)
-  const state = ref({ settings: { max_unit_rows: 45000, public_header_use_limit: 21, device_use_limit: 1800 } })
+  const state = ref({ settings: { max_unit_rows: 45000, public_header_use_limit: 21,
+    device_use_limit: 1800, web_secondary_auth: false } })
   const context = {
     ref, computed: get => ({ get value() { return get() } }),
     watch: (source, callback) => watches.push({ source, callback }),
@@ -37,7 +39,7 @@ function setupFixture() {
     },
   }
   const script = task.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
-  const executable = ts.transpileModule(`${script}\nglobalThis.__ui = { submit, timeout, retries, itemTimeout, publicHeaderUseLimit, deviceUseLimit, mode, chosen, file, error, unitRows };`, {
+  const executable = ts.transpileModule(`${script}\nglobalThis.__ui = { submit, timeout, retries, itemTimeout, publicHeaderUseLimit, deviceUseLimit, webSecondaryAuth, mode, chosen, file, error, unitRows };`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
   }).outputText
   vm.createContext(context)
@@ -54,6 +56,8 @@ test('Device limits are task fields, not global settings controls', () => {
   assert.match(settings, /公共头刷新、设备淘汰已移至/)
   assert.match(task, /v-model="publicHeaderUseLimit"[^>]*:min="1"[^>]*:max="10000"/)
   assert.match(task, /v-model="deviceUseLimit"[^>]*:min="1"[^>]*:max="1000000"/)
+  assert.match(task, /v-model="webSecondaryAuth"/)
+  assert.match(task, /GSA 返回 <code>au=repair<\/code>/)
   assert.match(task, /随任务保存/)
 })
 
@@ -62,6 +66,7 @@ test('Raw stream task creation transmits both chosen policy values', async () =>
   fixture.ui.file.value = { name: 'fixture.txt' }
   fixture.ui.publicHeaderUseLimit.value = 23
   fixture.ui.deviceUseLimit.value = 2300
+  fixture.ui.webSecondaryAuth.value = true
   await fixture.ui.submit()
   const request = fixture.calls.find(call => call.kind === 'stream')
   assert.ok(request)
@@ -69,7 +74,7 @@ test('Raw stream task creation transmits both chosen policy values', async () =>
   assert.equal(url.pathname, '/api/jobs/stream')
   assert.equal(url.searchParams.get('public_header_use_limit'), '23')
   assert.equal(url.searchParams.get('device_use_limit'), '2300')
-  assert.equal(url.searchParams.get('item_timeout'), '40')
+  assert.equal(url.searchParams.get('web_secondary_auth'), 'true')
   assert.equal(url.searchParams.get('enqueue'), 'true')
   assert.equal(fixture.busy.value, false)
   assert.equal(fixture.createTaskOpen.value, false)
@@ -82,6 +87,7 @@ test('Reused-file task creation transmits both chosen policy values', async () =
   fixture.ui.chosen.value = 'fixture-source'
   fixture.ui.publicHeaderUseLimit.value = 31
   fixture.ui.deviceUseLimit.value = 3100
+  fixture.ui.webSecondaryAuth.value = false
   await fixture.ui.submit()
   const request = fixture.calls.find(call => call.kind === 'api')
   assert.equal(request.url, '/api/jobs/from-file')
@@ -89,7 +95,7 @@ test('Reused-file task creation transmits both chosen policy values', async () =
   assert.equal(request.payload.source, 'fixture-source')
   assert.equal(request.payload.public_header_use_limit, 31)
   assert.equal(request.payload.device_use_limit, 3100)
-  assert.equal(request.payload.item_timeout, 40)
+  assert.equal(request.payload.web_secondary_auth, false)
   assert.equal(fixture.calls.some(call => call.kind === 'stream'), false)
   assert.equal(fixture.busy.value, false)
 })
@@ -128,17 +134,17 @@ test('Invalid request policy and duplicate submission do not send requests', asy
   assert.equal(fixture.busy.value, true, 'Existing submission retains ownership of busy state')
 })
 
-test('Opening creation resets defaults and exposes concurrency3 request budget', () => {
+test('Opening creation resets defaults from settings and total budget follows timeout', () => {
   const fixture = setupFixture()
   const onOpen = fixture.watches.find(watch => watch.source === fixture.createTaskOpen)
   onOpen.callback(true)
   assert.equal(fixture.ui.publicHeaderUseLimit.value, 21)
   assert.equal(fixture.ui.deviceUseLimit.value, 1800)
+  assert.equal(fixture.ui.webSecondaryAuth.value, false)
   assert.equal(fixture.ui.unitRows.value, 10000)
-  assert.equal(fixture.ui.itemTimeout.value, 40)
-  assert.match(task, /总预算 \/ 秒/)
-  assert.match(task, /单次超时 \/ 秒/)
-  assert.match(task, /可复用 IP 按使用次数最少轮转/)
+  const onTimeout = fixture.watches.find(watch => watch.source === fixture.ui.timeout)
+  onTimeout.callback(80)
+  assert.equal(fixture.ui.itemTimeout.value, 80)
 })
 
 test('Dialog has task, request, and device sections with scrollable body and stable footer', () => {
@@ -158,4 +164,13 @@ test('Dialog has task, request, and device sections with scrollable body and sta
 test('Native step alignment does not block custom-validated default values', () => {
   assert.match(task, /<el-form[^>]*novalidate/)
   assert.match(task, /Number\.isInteger\(deviceUseLimit\.value\)/)
+})
+
+test('Task table exposes selection, select-all, and guarded batch deletion', () => {
+  assert.match(jobTable, />全选当前列表</)
+  assert.match(jobTable, />批量删除</)
+  assert.match(jobTable, /selectedIds/)
+  assert.match(jobTable, /job\.status !== 'preparing'/)
+  assert.match(jobTable, /for \(const job of jobs\)/)
+  assert.match(jobTable, /api\(`\/api\/jobs\/\$\{job\.id\}`,[^\n]*'DELETE'\)/)
 })

@@ -42,6 +42,22 @@ PROXY_EXIT_IP_TIMEOUT = 4.0
 PROXY_EXIT_IP_MAX = 2048
 REGISTRATION_EXIT_IP_SKIPPED = '未回查'
 
+_APPLE_REASON_KEYS = (
+    ('unable to sign you in to your apple account. try again later', 'apple_signin_later'),
+    ('this request could not be completed because of a server error', 'apple_server_error'),
+    ('this action cannot be completed', 'apple_action_unavailable'),
+    ('this action could not be completed. try again', 'apple_action_unavailable'),
+    ('the request cannot be processed at this time. please try again later',
+     'apple_processing_later'),
+    ('we cannot process your request, please try again later', 'apple_processing_later'),
+    ('this apple account has been locked for security reasons', 'account_locked_security'),
+    ('this apple account has been locked', 'account_locked'),
+    ('enter the correct password for this apple account', 'wrong_password'),
+    ('this apple account is not active', 'account_not_active'),
+    ('your account information was entered incorrectly', 'account_info_incorrect'),
+    ('the account does not exist', 'account_not_found'),
+)
+
 
 class _WatermarkProxyPool:
     """Small task-local pool with fair reuse and one low-water refill path."""
@@ -495,17 +511,39 @@ def _proxy_debug_detail(value):
     return text[:240]
 
 
+def _apple_reason_key(result, status=''):
+    """Reduce a verbose Apple/transport reason to one bounded wire identifier."""
+    text = ' '.join(str(result.get(key) or '').strip()
+                    for key in ('apple_message', 'reason', 'detail')).casefold()
+    for phrase, key in _APPLE_REASON_KEYS:
+        if phrase in text:
+            return key
+    try:
+        http = int(result.get('http'))
+    except (TypeError, ValueError):
+        http = None
+    try:
+        apple_ec = int(result.get('apple_ec'))
+    except (TypeError, ValueError):
+        apple_ec = None
+    if http == 0:
+        return 'transport_timeout'
+    if http == 503:
+        return 'service_unavailable'
+    if apple_ec == -20970 and not str(result.get('apple_message') or result.get('reason') or '').strip():
+        return 'gsa_20970_unlabelled'
+    if apple_ec in (-22421, -22410, -332000, -33200, -3000303):
+        return 'apple_transient_code'
+    return '' if status in ('valid', 'wrong_password', 'need_2fa', 'locked', 'not_found') else 'unknown'
+
+
 def _apple_reason_for_record(result, status, debug=False):
-    """Return Apple's raw message only for an explicitly debug-enabled job."""
+    """Return one bounded raw Apple reason for an opted-in detailed task."""
     if not debug:
         return ''
     message = result.get('apple_message')
     if isinstance(message, str) and message.strip():
-        return message.strip()[:2048]
-    if status == 'need_2fa':
-        auth_type = str(result.get('auth_type') or '').strip()
-        if auth_type and auth_type != 'none':
-            return f'au={auth_type[:80]}'
+        return message.strip()[:240]
     return ''
 
 
@@ -1347,7 +1385,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
     # item_timeout values remain readable but no longer extend one account.
     item_timeout = timeout
     public_header_use_limit = max(1, int(descriptor.get('public_header_use_limit') or 15))
-    device_use_limit = max(1, int(descriptor.get('device_use_limit') or 1000))
+    device_use_limit = max(1, int(descriptor.get('device_use_limit') or 30))
     retry_delay = max(0.0, float(descriptor.get('_retry_delay',
                                                 PROXY_RETRY_DELAY_SECONDS)))
     configured_workers = max(1, int(descriptor.get('threads') or 1))
@@ -1361,6 +1399,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         proxy_pool = _ReferenceIpPoolAdapter(fetch_proxy_batch, workers)
         proxy_pool.bootstrap()
     debug_enabled = _proxy_debug_enabled(descriptor)
+    detailed_error_enabled = bool(descriptor.get('_detailed_error_log'))
     debug_path = (descriptor.get('_proxy_debug_path') or
                   str(directory / 'proxy-debug.jsonl')) if debug_enabled else None
     exit_ip_debug = _ProxyExitIpDebug(debug_path) if debug_enabled else None
@@ -1471,6 +1510,30 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         )
         return any(phrase in apple_text for phrase in phrases)
 
+    def retryable_20970(result):
+        """Retry every -20970 except explicit inactive/locked account verdicts."""
+        try:
+            http = int(result.get('http'))
+            apple_ec = int(result.get('apple_ec'))
+        except (TypeError, ValueError):
+            return False
+        text = ' '.join(str(result.get(key) or '').strip()
+                        for key in ('apple_message', 'reason', 'detail')).casefold()
+        final_phrases = ('this apple account is not active',
+                         'this apple account has been locked for security reasons',
+                         'this apple account has been locked')
+        return (http == 200 and apple_ec == -20970
+                and not any(phrase in text for phrase in final_phrases))
+
+    def unlabelled_20970(result):
+        try:
+            http = int(result.get('http'))
+            apple_ec = int(result.get('apple_ec'))
+        except (TypeError, ValueError):
+            return False
+        message = str(result.get('apple_message') or result.get('reason') or '').strip()
+        return http == 200 and apple_ec == -20970 and not message
+
     def retryable_transport(result):
         try:
             http = int(result.get('http'))
@@ -1484,6 +1547,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         # Anisette/设备环境失效时重试。重试次数仍严格受用户设置控制。
         return (http in (0, 503)
                 or apple_ec in (-22421, -22410, -332000, -33200, -3000303)
+                or retryable_20970(result)
                 or apple_retry_later(result))
 
     def auth_result_bucket(result):
@@ -1493,7 +1557,11 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             http = None
         if http in (0, 503):
             return 'timeout'
+        if unlabelled_20970(result):
+            return 'timeout'
         bucket = result_bucket(result)
+        if retryable_20970(result) and bucket in ('invalid', 'undetermined', 'unknown'):
+            return 'undetermined'
         # 没有命中内置英文原因的结果保留为“其他错误”，
         # 不再因某个 Apple ec 错误码而猜测账号已失效。
         return 'undetermined' if bucket in ('undetermined', 'unknown') else bucket
@@ -1925,6 +1993,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             # 另一条 IP；否则刚释放的健康租约可能被同一账号再次拿到。
             immediate_discard = (result_http in (0, 503) or web_failed
                                  or apple_ec in (-22410, -332000, -33200, -3000303)
+                                 or retryable_20970(result)
                                  or apple_retry_later(result))
             healthy_exit = result_http not in (None, 0, 407) and not web_failed
             if proxy_pool is not None and lease is not None:
@@ -2010,6 +2079,14 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
         result['slot'] = slot_id
         result['device_key'] = account_prefix
         mark_device_used(slot_id)
+        reason_key = _apple_reason_key(result, auth_result_bucket(result))
+        if debug_enabled:
+            _write_proxy_debug(
+                debug_path, 'final_result', row=row, slot=slot_id,
+                status=auth_result_bucket(result), http=result.get('http'),
+                code=result.get('apple_ec'), reason_key=reason_key,
+                apple_message=_proxy_debug_detail(result.get('apple_message')),
+                detail=_proxy_debug_detail(result.get('detail')))
         if debug_enabled and (auth_result_bucket(result) == 'timeout'
                               or (str(result.get('web_status') or '').casefold() == 'error'
                                   and result.get('web_http') in (0, 500, 502, 503, 504))):
@@ -2188,7 +2265,7 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             business_code = result.get('apple_ec')
             if business_code is None:
                 business_code = (result.get('detail') or result.get('kind') or '')[:180]
-            reason = _apple_reason_for_record(result, status, debug_enabled)
+            reason = _apple_reason_for_record(result, status, detailed_error_enabled)
             record = {'row': row, 'account': account, 'password': password, 'status': status,
                       'sha256': hashlib.sha256(raw_line).hexdigest(), 'bytes': len(raw_line),
                       'stage': result.get('stage') or '', 'http': result.get('http'),
@@ -2200,6 +2277,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
                       'attempts': max(
                           int(result.get('_proxy_retries') or 0),
                           max(0, int(result.get('web_attempts') or 0) - 1))}
+            if detailed_error_enabled:
+                record['reason_key'] = _apple_reason_key(result, status)
             for key in ('two_factor_method', 'web_auth_type', 'web_http',
                         'web_status', 'web_stage', 'web_kind', 'web_detail',
                         'web_attempts', 'web_server', 'web_via',

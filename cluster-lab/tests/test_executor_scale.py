@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import clusterlab.executor as executor_module
 from clusterlab.executor import (_ProcessDeviceAllocator, _ProcessOwnedDevicePool, _ReferenceIpPoolAdapter, _WatermarkProxyPool, _device_id_label, _execute_auth_unit, _gsa_per_hop_timeout, _proxy_watermarks,
-                                 _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
+                                 _apple_reason_for_record, _apple_reason_key,
+                                 _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_auth_unit, execute_unit_group,
                                  _partition_device_slots, record_device_registration, stall_timeout_seconds)
 
@@ -303,6 +304,10 @@ class ExecutorScaleTests(unittest.TestCase):
         self.assertEqual(_apple_reason_for_record(result, 'wrong_password'), '')
         self.assertEqual(_apple_reason_for_record(result, 'wrong_password', True),
                          'Your account information was entered incorrectly.')
+        self.assertEqual(_apple_reason_key(result, 'wrong_password'), 'account_info_incorrect')
+        unknown = {'apple_message': 'New Apple reason ' + 'x' * 400}
+        self.assertEqual(_apple_reason_key(unknown, 'undetermined'), 'unknown')
+        self.assertEqual(len(_apple_reason_for_record(unknown, 'undetermined', True)), 240)
 
     def test_stall_budget_covers_all_retry_windows(self):
         self.assertEqual(stall_timeout_seconds({'timeout': 20, 'retries': 4}), 180)
@@ -970,7 +975,8 @@ class ExecutorScaleTests(unittest.TestCase):
                 descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
                               'device_capacity': 1, 'device_root': str(root / 'devices'),
                               'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 1,
-                              '_retry_delay': 0, '_proxy_debug': True}
+                              '_retry_delay': 0, '_proxy_debug': True,
+                              '_detailed_error_log': True}
                 shared = ScriptedProxyPool([
                     'socks5h://bootstrap', 'socks5h://first-exit', 'socks5h://second-exit'])
                 stop = RecordingStop()
@@ -993,6 +999,7 @@ class ExecutorScaleTests(unittest.TestCase):
                 self.assertEqual(checked, ['socks5h://first-exit', 'socks5h://second-exit'])
                 self.assertEqual((record['status'], record['attempts']), ('timeout', 1))
                 self.assertEqual(record['reason'], reason)
+                self.assertNotEqual(record['reason_key'], 'unknown')
                 self.assertEqual(stop.waits, [])
                 self.assertEqual(shared.discards,
                                  ['socks5h://first-exit', 'socks5h://second-exit'])
@@ -1044,7 +1051,10 @@ class ExecutorScaleTests(unittest.TestCase):
 
             descriptor = {'rows': len(lines), 'first_row': 1, 'threads': 4,
                           'device_capacity': 2, 'device_root': str(root / 'devices'),
-                          'origin': 'http://127.0.0.1:1', 'timeout': 5}
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5,
+                          # This test exercises bounded futures and batched usage writes,
+                          # not device retirement. Keep the threshold above the fixture size.
+                          'device_use_limit': len(lines) + 1}
             with patch('clusterlab.executor._load_fastcheck',
                        return_value=(FakePool, check, lambda result: result['status'])), \
                  patch('fastcheck.workers.device_profile',
@@ -1149,7 +1159,7 @@ class ExecutorScaleTests(unittest.TestCase):
             self.assertEqual(len(preparing), 3)
             self.assertEqual(preparing[-1]['prepared_devices'], 50)
 
-    def test_auth_unit_classifies_gsa_20970_as_invalid_without_web_recheck(self):
+    def test_auth_unit_keeps_unrecognized_gsa_20970_as_undetermined(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'input.part').write_text('account----password\n', encoding='utf-8')
@@ -1171,14 +1181,68 @@ class ExecutorScaleTests(unittest.TestCase):
                 _execute_auth_unit(root, descriptor, threading.Event())
 
             record = json.loads((root / 'results.jsonl').read_text())
-            self.assertEqual(record['status'], 'invalid')
+            self.assertEqual(record['status'], 'undetermined')
             self.assertEqual(record['protocol'], 'GSA')
             self.assertEqual((record['http'], record['code']), (200, '-20970'))
             self.assertEqual(record['reason'], '')
             self.assertNotIn('gsa_code', record)
             self.assertNotIn('web_code', record)
             done = json.loads((root / 'done.json').read_text())
-            self.assertEqual(done['counts'], {'invalid': 1})
+            self.assertEqual(done['counts'], {'undetermined': 1})
+
+    def test_unlabelled_gsa_20970_consumes_retries_then_finishes_timeout(self):
+        cases = {
+            'http_zero_then_20970': [
+                {'status': 'error', 'kind': 'network', 'stage': 'init', 'http': 0},
+                {'status': 'error', 'kind': 'network', 'stage': 'init', 'http': 0},
+                {'status': 'error', 'kind': 'protocol', 'stage': 'init',
+                 'http': 200, 'apple_ec': -20970, 'detail': 'ec=-20970'},
+            ],
+            '20970_from_first_attempt': [
+                {'status': 'error', 'kind': 'protocol', 'stage': 'init',
+                 'http': 200, 'apple_ec': -20970, 'detail': 'ec=-20970'},
+            ] * 3,
+            '20970_with_unrecognized_reason': [
+                {'status': 'error', 'kind': 'protocol', 'stage': 'init',
+                 'http': 200, 'apple_ec': -20970,
+                 'apple_message': 'A new Apple reason not yet classified.'},
+            ] * 3,
+        }
+        for name, responses in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / 'input.part').write_text('account----password\n', encoding='utf-8')
+                descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
+                              'device_capacity': 1, 'device_root': str(root / 'devices'),
+                              'origin': 'http://127.0.0.1:1', 'timeout': 5,
+                              'retries': 2, '_retry_delay': 0}
+                shared = ScriptedProxyPool([
+                    'socks5h://bootstrap', 'socks5h://first-exit',
+                    'socks5h://second-exit', 'socks5h://third-exit'])
+                checked = []
+
+                def check(*_args, **_kwargs):
+                    checked.append(1)
+                    return dict(responses[len(checked) - 1])
+
+                def bucket(result):
+                    if int(result.get('http') or 0) == 0:
+                        return 'timeout'
+                    return 'invalid' if result.get('apple_ec') == -20970 else 'undetermined'
+
+                with patch('clusterlab.executor._load_fastcheck', return_value=(
+                        FakePool, check, bucket)), \
+                     patch('fastcheck.workers.device_profile',
+                           return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                     patch('clusterlab.executor._bump_usage'):
+                    _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+
+                record = json.loads((root / 'results.jsonl').read_text())
+                self.assertEqual(len(checked), 3)
+                expected = ('undetermined' if name == '20970_with_unrecognized_reason'
+                            else 'timeout')
+                self.assertEqual((record['status'], record['attempts'], record['code']),
+                                 (expected, 2, '-20970'))
 
 
 if __name__ == '__main__':

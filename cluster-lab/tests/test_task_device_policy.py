@@ -112,7 +112,7 @@ class TaskDevicePolicyTests(unittest.TestCase):
     def test_partial_policy_defaults_other_field_and_accepts_boundaries(self):
         first = self.job(public_header_use_limit=1)
         last = self.job(public_header_use_limit=10000, device_use_limit=1000000)
-        self.assertEqual(self.policy(first), (1, 1000))
+        self.assertEqual(self.policy(first), (1, 30))
         self.assertEqual(self.policy(last), (10000, 1000000))
 
     def test_invalid_policies_are_rejected_before_upload_is_saved(self):

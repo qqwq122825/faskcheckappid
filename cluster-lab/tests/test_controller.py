@@ -155,7 +155,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_device_policy_persists_and_is_attached_to_auth_leases(self):
         self.assertEqual(self.service.settings()['public_header_use_limit'], 15)
-        self.assertEqual(self.service.settings()['device_use_limit'], 100)
+        self.assertEqual(self.service.settings()['device_use_limit'], 30)
         saved = self.service.configure_device_policy({
             'public_header_use_limit': 7, 'device_use_limit': 321})
         self.assertEqual((saved['public_header_use_limit'], saved['device_use_limit']),
@@ -186,12 +186,36 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(self.service.configure_web_secondary_auth(
             {'web_secondary_auth': True})['web_secondary_auth'])
 
+    def test_web_secondary_auth_is_saved_per_task_and_attached_to_lease(self):
+        job = self.job(50, web_secondary_auth=False)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertFalse(unit['_web_secondary_auth'])
+        with self.service.db.connect() as db:
+            saved = db.execute('SELECT web_secondary_auth FROM jobs WHERE id=?',
+                               (job,)).fetchone()[0]
+        self.assertEqual(saved, 0)
+
+    def test_detailed_error_log_is_saved_per_task_and_attached_to_lease(self):
+        job = self.job(50, detailed_error_log=True)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        self.assertTrue(unit['_detailed_error_log'])
+        with self.service.db.connect() as db:
+            saved = db.execute('SELECT detailed_error_log FROM jobs WHERE id=?',
+                               (job,)).fetchone()[0]
+        self.assertEqual(saved, 1)
+        with self.assertRaisesRegex(ValueError, '详细错误日志'):
+            self.service.create_job('bad-detail', io.BytesIO(b'x\n' * 50), 50,
+                                    detailed_error_log='true')
+
     def heartbeat(self, **extra):
         return self.service.heartbeat(self.node['id'], dict(session='test-session', max_processes=1,
                                       max_threads=2, active=[], **extra))
 
-    def job(self, count=101):
-        job = self.service.create_job('test', io.BytesIO(b'hello\n' * count), 50)
+    def job(self, count=101, **kwargs):
+        job = self.service.create_job('test', io.BytesIO(b'hello\n' * count), 50,
+                                      **kwargs)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             state = next(j for j in self.service.snapshot()['jobs'] if j['id'] == job)
@@ -339,6 +363,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(unit['proxy_api'], first)
         self.assertNotIn('proxy_pool_size', unit)
         self.assertIs(unit['_proxy_debug'], False)
+        self.assertIs(unit['_detailed_error_log'], False)
         self.assertIs(unit['_web_secondary_auth'], True)
         self.assertNotIn(second, unit['proxy_api'])
 
@@ -658,6 +683,26 @@ class ControllerTests(unittest.TestCase):
                          (2, 'locked', -20970))
         self.assertEqual(b''.join(self.service.export_results(job, 'locked')), b'hello\n' * 2)
 
+    def test_detailed_task_supports_exact_account_lookup_with_raw_reason(self):
+        job = self.job(50, detailed_error_log=True)
+        self.service.job_action(job, 'start')
+        unit = self.service.lease(self.node['id'], 'test-session')
+        raw_reason = 'Unmapped Apple diagnostic for this exact account.'
+        payload = b''.join((json.dumps({
+            'row': unit['first_row'] + offset,
+            'account': 'Target@Example.com' if offset == 0 else f'other-{offset}@example.com',
+            'status': 'undetermined', 'protocol': 'GSA', 'http': 200, 'code': -1,
+            'reason': raw_reason if offset == 0 else '',
+            'reason_key': 'unknown' if offset == 0 else '',
+            'sha256': hashlib.sha256(b'hello').hexdigest(), 'bytes': 5},
+            separators=(',', ':')) + '\n').encode() for offset in range(unit['rows']))
+        self.service.accept_result(self.node['id'], unit['id'], unit['token'],
+                                   io.BytesIO(payload), hashlib.sha256(payload).hexdigest())
+        found = self.service.search_account(job, 'target@example.com')
+        self.assertEqual(found['total'], 1)
+        self.assertEqual(found['rows'][0]['reason'], raw_reason)
+        self.assertEqual(found['rows'][0]['reason_cn'], raw_reason)
+
     def test_http_zero_is_timeout_and_legacy_counts_are_reconciled(self):
         self.assertEqual(result_record_bucket({'status': 'undetermined', 'http': 0}), 'timeout')
         self.assertEqual(result_record_bucket({'status': 'undetermined'}), 'undetermined')
@@ -670,7 +715,18 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(result_record_bucket(record), status)
                 self.assertEqual(result_reason_cn(record, status), reason)
         self.assertEqual(result_record_bucket(
-            {'status': 'invalid', 'http': 200, 'code': '-20970'}), 'unknown')
+            {'status': 'invalid', 'http': 200, 'code': '-20970'}), 'timeout')
+        self.assertEqual(result_record_bucket(
+            {'status': 'timeout', 'http': 200, 'code': '-20970'}), 'timeout')
+        self.assertEqual(result_record_bucket(
+            {'status': 'timeout', 'http': 200, 'code': '-20970',
+             'reason_key': 'gsa_20970_unlabelled'}), 'timeout')
+        self.assertEqual(result_reason_cn(
+            {'status': 'timeout', 'reason_key': 'gsa_20970_unlabelled'}),
+            'GSA 返回 -20970 且无消息，已按任务设置重试并归为超时')
+        self.assertEqual(result_reason_cn(
+            {'status': 'timeout', 'reason_key': 'transport_timeout'}),
+            '网络请求未取得 HTTP 响应，已按任务设置重试')
         self.assertEqual(result_record_bucket(
             {'status': 'invalid', 'http': 200, 'code': '-22421'}), 'timeout')
         self.assertEqual(result_record_bucket(

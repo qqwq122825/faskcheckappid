@@ -23,6 +23,15 @@ def task_device_policy(data, *, text=False):
     for key in ('public_header_use_limit', 'device_use_limit'):
         value = data.get(key)
         values[key] = int(value) if text and value is not None else value
+    for key, label in (('web_secondary_auth', 'Web 二次验证'),
+                       ('detailed_error_log', '详细错误日志')):
+        value = data.get(key)
+        if text and value is not None:
+            normalized = str(value).strip().lower()
+            if normalized not in ('true', 'false'):
+                raise ValueError(f'{label}开关必须是 true 或 false')
+            value = normalized == 'true'
+        values[key] = value if value is not None else (False if key == 'detailed_error_log' else None)
     return values
 
 
@@ -270,6 +279,9 @@ def create_app(role, service, password=None):
             offset = int(request.args.get('offset', 0))
             limit = int(request.args.get('limit', 100))
             category = request.args.get('category', 'all')
+            account = str(request.args.get('account') or '').strip()
+            if account:
+                return jsonify(service.search_account(job_id, account, limit))
             return jsonify(service.read_rows(job_id, offset, limit, category))
 
         @app.get('/api/jobs/<job_id>/results')

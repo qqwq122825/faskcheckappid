@@ -70,6 +70,8 @@ test('Results use short device labels without exposing reusable slot numbers', (
   assert.match(results, /prop="device_display" label="设备"/)
   assert.doesNotMatch(results, /label="二次验证方式"/)
   assert.doesNotMatch(results, /prop="device" label="设备"/)
+  assert.match(results, /输入完整账号查询真实记录/)
+  assert.match(results, /params\.set\('account'/)
 })
 
 test('Running elapsed time and speed use live processed rows', () => {
@@ -104,15 +106,15 @@ test('Proxy settings add, list, delete, and explain node distribution', () => {
   assert.doesNotMatch(settings, /离线行摘要、合成模拟任务/)
 })
 
-test('Proxy debug setting is explicit, persistent, and warns about log volume', () => {
+test('Detailed error logging is an opt-in task setting with bounded payloads', () => {
+  const task = source('src/components/CreateTaskDialog.vue')
   const settings = source('src/views/Settings.vue')
-  assert.match(settings, /\/api\/settings\/debug/)
-  assert.match(settings, /proxy_debug: enabled/)
-  assert.match(settings, /代理调试日志/)
-  assert.match(settings, /proxy-debug\.jsonl/)
-  assert.match(settings, /节点直接回传 Apple 原始英文原因/)
-  assert.match(settings, /节点只回传快捷分类，总控显示中文原因/)
-  assert.match(settings, /避免产生大量日志/)
+  assert.match(task, /详细错误日志/)
+  assert.match(task, /v-model="detailedErrorLog"/)
+  assert.match(task, /detailed_error_log/)
+  assert.match(task, /最多 240 字符/)
+  assert.match(task, /不会增加认证请求/)
+  assert.doesNotMatch(settings, /错误原因与代理调试|详细错误日志/)
 })
 
 test('Web secondary auth setting only refines repair continuations', () => {
@@ -167,7 +169,7 @@ test('Task detail lists all valid rows by page and caps each other category at 1
   assert.match(results, /const pageSize = 100/)
   assert.match(results, /密码正确结果可逐页查看全部/)
   assert.match(results, /其他分类各显示前 100 条/)
-  assert.match(results, /category=\$\{category\.value\}/)
+  assert.match(results, /new URLSearchParams\(\{ category: category\.value/)
   assert.match(results, /props\.job\?\.confirmed/)
 })
 
@@ -203,7 +205,8 @@ test('Deleting a running task explicitly stops its node work', () => {
   const table = source('src/components/JobTable.vue')
   assert.doesNotMatch(table, /const removable/)
   assert.match(table, /如果节点正在执行，将在下一次心跳立即停止/)
-  assert.match(table, /confirmButtonText: '删除并停止任务'/)
+  assert.match(table, /删除并停止任务/)
+  assert.match(table, /批量删除任务/)
   assert.match(table, /:disabled="row\.status === 'preparing'"/)
   assert.match(table, /已通知节点停止/)
 })
