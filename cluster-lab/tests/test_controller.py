@@ -134,7 +134,7 @@ class ControllerTests(unittest.TestCase):
 
     def test_device_policy_persists_and_is_attached_to_auth_leases(self):
         self.assertEqual(self.service.settings()['public_header_use_limit'], 15)
-        self.assertEqual(self.service.settings()['device_use_limit'], 1000)
+        self.assertEqual(self.service.settings()['device_use_limit'], 100)
         saved = self.service.configure_device_policy({
             'public_header_use_limit': 7, 'device_use_limit': 321})
         self.assertEqual((saved['public_header_use_limit'], saved['device_use_limit']),
@@ -1260,6 +1260,8 @@ class ControllerTests(unittest.TestCase):
         value = self.service.clean_telemetry({'cpu_percent':25.2,'memory_percent':float('nan'),
                                              'upload_bps':1024,'download_bps':-1,'network_bytes':123456,
                                              'worker_processes':2,'secret':'private',
+                                             'python_version':'3.15.1','gmpy2_version':'2.3.2',
+                                             'srp_math_backend':'gmpy2',
                                              'device_pool': {'proxy_status': 'failed',
                                                              'in_use': 18,
                                                              'registering': 3,
@@ -1275,6 +1277,9 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(value['network_bytes'], 123456)
         self.assertIsNone(self.service.clean_telemetry({'network_bytes': -1})['network_bytes'])
         self.assertEqual(value['worker_processes'], 2)
+        self.assertEqual(value['python_version'], '3.15.1')
+        self.assertEqual(value['gmpy2_version'], '2.3.2')
+        self.assertEqual(value['srp_math_backend'], 'gmpy2')
         self.assertNotIn('secret', value)
         self.assertEqual(value['device_pool']['slots'][0]['used'], 987)
         self.assertEqual(value['device_pool']['slots'][0]['label'], 'B64:AbCdEf12')

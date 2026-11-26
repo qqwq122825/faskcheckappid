@@ -13,7 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import clusterlab.executor as executor_module
-from clusterlab.executor import (_ProcessDeviceAllocator, _ProcessOwnedDevicePool, _WatermarkProxyPool, _device_id_label, _execute_auth_unit, _gsa_per_hop_timeout, _proxy_watermarks,
+from clusterlab.executor import (_ProcessDeviceAllocator, _ProcessOwnedDevicePool, _ReferenceIpPoolAdapter, _WatermarkProxyPool, _device_id_label, _execute_auth_unit, _gsa_per_hop_timeout, _proxy_watermarks,
                                  _apple_reason_for_record, _proxy_debug_enabled, _slot_for_account, atomic_json,
                                  execute_auth_unit, execute_unit_group,
                                  _partition_device_slots, record_device_registration, stall_timeout_seconds)
@@ -151,6 +151,38 @@ class ExecutorScaleTests(unittest.TestCase):
         self.assertEqual(set(loaded), {251, 252, 253})
         with self.assertRaisesRegex(ValueError, 'not owned'):
             pool.inspect(250)
+
+    def test_process_owned_pool_reset_falls_back_to_retiring_real_device_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / '1'
+            directory.mkdir()
+            (directory / 'device.json').write_text('{}', encoding='utf-8')
+
+            class RealLikePool:
+                def __init__(inner):
+                    inner._memory_states = {1: {'cached': True}}
+                    inner._memory_states_lock = threading.Lock()
+                def slot_directory(inner, slot):
+                    self.assertEqual(slot, 1)
+                    return directory
+
+            delegate = RealLikePool()
+            pool = _ProcessOwnedDevicePool(delegate, [1])
+            self.assertTrue(pool.reset(1))
+            self.assertFalse(directory.exists())
+            self.assertNotIn(1, delegate._memory_states)
+
+    def test_reference_ip_pool_adapter_treats_supplier_timeout_as_empty_refill(self):
+        pool = _ReferenceIpPoolAdapter(
+            lambda _count: (_ for _ in ()).throw(TimeoutError('supplier timeout')),
+            workers=2, ttl=5)
+        try:
+            snapshot = pool.bootstrap()
+            self.assertEqual(snapshot['available'], 0)
+            self.assertIsNone(pool.acquire(wait=0.01))
+        finally:
+            pool.stop()
 
     def test_watermark_pool_bootstraps_exact_thread_count(self):
         calls = []

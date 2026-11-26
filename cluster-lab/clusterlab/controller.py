@@ -90,7 +90,7 @@ INSERT OR IGNORE INTO controller_settings(key,value) VALUES('proxy_debug','0');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('web_secondary_auth','1');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('update_parallel','2');
 INSERT OR IGNORE INTO controller_settings(key,value) VALUES('public_header_use_limit','15');
-INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_use_limit','1000');
+INSERT OR IGNORE INTO controller_settings(key,value) VALUES('device_use_limit','100');
 '''
 
 
@@ -629,7 +629,7 @@ class Controller:
         settings = self.settings()
         header = (settings.get('public_header_use_limit', 15) if public_header_use_limit is None
                   else public_header_use_limit)
-        device = (settings.get('device_use_limit', 1000) if device_use_limit is None
+        device = (settings.get('device_use_limit', 100) if device_use_limit is None
                   else device_use_limit)
         return (integer(header, '公共头使用次数', 1, 10000),
                 integer(device, '设备使用次数', 1, 1000000))
@@ -683,7 +683,7 @@ class Controller:
                 'proxy_scheme': values.get('proxy_scheme', 'socks5h'),
                 'proxy_debug': str(values.get('proxy_debug', '0')) in ('1', 'True', 'true'),
                 'public_header_use_limit': int(values.get('public_header_use_limit', 15)),
-                'device_use_limit': int(values.get('device_use_limit', 1000)),
+                'device_use_limit': int(values.get('device_use_limit', 100)),
                 'web_secondary_auth': str(values.get('web_secondary_auth', '1')) in
                                       ('1', 'True', 'true')}
 
@@ -902,6 +902,9 @@ class Controller:
         result.update(received_at=time.time(), scope='host_non_loopback')
         processes = value.get('worker_processes')
         result['worker_processes'] = processes if type(processes) is int and 0 <= processes <= 200 else None
+        for key, limit in (('python_version', 32), ('gmpy2_version', 32),
+                           ('srp_math_backend', 24)):
+            result[key] = str(value.get(key) or '')[:limit]
         pool = value.get('device_pool')
         if isinstance(pool, dict):
             result['device_pool'] = {key: pool.get(key) for key in
@@ -1577,7 +1580,7 @@ class Controller:
                                    settings.get('public_header_use_limit', 15)),
                                device_use_limit=(unit['device_use_limit']
                                    if unit['device_use_limit'] is not None else
-                                   settings.get('device_use_limit', 1000)))
+                                   settings.get('device_use_limit', 100)))
             return payload
 
     def unit_for_node(self, node_id, unit_id, token):

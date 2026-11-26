@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import threading
 import time
 from urllib.parse import urlsplit
@@ -231,7 +232,12 @@ class _ReferenceIpPoolAdapter:
             refill_interval=1.0, lease_margin=lease_margin, rotate=False)
         # Keep the exact reference queue/supplier implementation while using
         # cluster-lab's already validated API parser and scheme normalization.
-        self._pool._fetch = lambda count: list(fetch(int(count)) or ())
+        def safe_fetch(count):
+            try:
+                return list(fetch(int(count)) or ())
+            except Exception:                                      # noqa: BLE001
+                return []
+        self._pool._fetch = safe_fetch
         self._tid_lock = threading.Lock()
         self._thread_ids = {}
         self._next_tid = 0
@@ -358,7 +364,21 @@ class _ProcessOwnedDevicePool:
         return self.delegate.inspect(self._check(slot))
 
     def reset(self, slot):
-        return self.delegate.reset(self._check(slot))
+        """Retire one owned identity even when fastcheck lacks legacy reset()."""
+        value = self._check(slot)
+        legacy = getattr(self.delegate, 'reset', None)
+        if callable(legacy):
+            return legacy(value)
+        states = getattr(self.delegate, '_memory_states', None)
+        lock = getattr(self.delegate, '_memory_states_lock', None)
+        if isinstance(states, dict):
+            if lock is not None:
+                with lock:
+                    states.pop(value, None)
+            else:
+                states.pop(value, None)
+        shutil.rmtree(self.delegate.slot_directory(value), ignore_errors=True)
+        return True
 
     def fetch_headers(self, slot, *args, **kwargs):
         return self.delegate.fetch_headers(self._check(slot), *args, **kwargs)

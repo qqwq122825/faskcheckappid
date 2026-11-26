@@ -37,7 +37,7 @@ function setupFixture() {
     },
   }
   const script = task.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
-  const executable = ts.transpileModule(`${script}\nglobalThis.__ui = { submit, timeout, retries, publicHeaderUseLimit, deviceUseLimit, mode, chosen, file, error, unitRows };`, {
+  const executable = ts.transpileModule(`${script}\nglobalThis.__ui = { submit, timeout, retries, itemTimeout, publicHeaderUseLimit, deviceUseLimit, mode, chosen, file, error, unitRows };`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
   }).outputText
   vm.createContext(context)
@@ -69,7 +69,7 @@ test('Raw stream task creation transmits both chosen policy values', async () =>
   assert.equal(url.pathname, '/api/jobs/stream')
   assert.equal(url.searchParams.get('public_header_use_limit'), '23')
   assert.equal(url.searchParams.get('device_use_limit'), '2300')
-  assert.equal(url.searchParams.get('item_timeout'), '25')
+  assert.equal(url.searchParams.get('item_timeout'), '40')
   assert.equal(url.searchParams.get('enqueue'), 'true')
   assert.equal(fixture.busy.value, false)
   assert.equal(fixture.createTaskOpen.value, false)
@@ -89,6 +89,7 @@ test('Reused-file task creation transmits both chosen policy values', async () =
   assert.equal(request.payload.source, 'fixture-source')
   assert.equal(request.payload.public_header_use_limit, 31)
   assert.equal(request.payload.device_use_limit, 3100)
+  assert.equal(request.payload.item_timeout, 40)
   assert.equal(fixture.calls.some(call => call.kind === 'stream'), false)
   assert.equal(fixture.busy.value, false)
 })
@@ -111,7 +112,7 @@ test('Out-of-range, fractional, and missing device policy values prevent submiss
 })
 
 test('Invalid request policy and duplicate submission do not send requests', async () => {
-  for (const [field, value] of [['timeout', 4], ['timeout', 121], ['retries', -1], ['retries', 6]]) {
+  for (const [field, value] of [['timeout', 4], ['timeout', 121], ['retries', -1], ['retries', 6], ['itemTimeout', 24], ['itemTimeout', 601]]) {
     const fixture = setupFixture()
     fixture.ui.file.value = { name: 'fixture.txt' }
     fixture.ui[field].value = value
@@ -127,15 +128,16 @@ test('Invalid request policy and duplicate submission do not send requests', asy
   assert.equal(fixture.busy.value, true, 'Existing submission retains ownership of busy state')
 })
 
-test('Opening creation resets defaults and exposes one hard account deadline', () => {
+test('Opening creation resets defaults and exposes concurrency3 request budget', () => {
   const fixture = setupFixture()
   const onOpen = fixture.watches.find(watch => watch.source === fixture.createTaskOpen)
   onOpen.callback(true)
   assert.equal(fixture.ui.publicHeaderUseLimit.value, 21)
   assert.equal(fixture.ui.deviceUseLimit.value, 1800)
   assert.equal(fixture.ui.unitRows.value, 10000)
-  assert.doesNotMatch(task, /总预算|task-budget|itemTimeout/)
-  assert.match(task, /账号最长验证/)
+  assert.equal(fixture.ui.itemTimeout.value, 40)
+  assert.match(task, /总预算 \/ 秒/)
+  assert.match(task, /单次超时 \/ 秒/)
   assert.match(task, /可复用 IP 按使用次数最少轮转/)
 })
 

@@ -1,5 +1,6 @@
 import atexit
 import hashlib
+import importlib.metadata
 import json
 import multiprocessing as mp
 from pathlib import Path
@@ -20,6 +21,11 @@ from . import VERSION
 from .common import Database, atomic_json, file_digest, integer, private_dir, read_json
 from .executor import execute_unit_group, stall_timeout_seconds
 from .telemetry import HostTelemetry
+
+try:
+    from fastcheck.protocols.srp_auth import SRP_MATH_BACKEND
+except ImportError:
+    SRP_MATH_BACKEND = 'unavailable'
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS tasks (
@@ -89,6 +95,15 @@ class Node:
         self.update_generation = control.get('update_generation', 0)
         self.update_status_path = self.root / 'update-status.json'
         self.telemetry = HostTelemetry()
+        try:
+            gmpy2_version = importlib.metadata.version('gmpy2')
+        except importlib.metadata.PackageNotFoundError:
+            gmpy2_version = '未安装'
+        self.runtime_info = {
+            'python_version': '.'.join(map(str, sys.version_info[:3])),
+            'gmpy2_version': gmpy2_version,
+            'srp_math_backend': SRP_MATH_BACKEND,
+        }
         self.proxy_api, self.proxy_scheme = '', 'socks5h'
         self.origin = 'https://new.ani.sidestore.io'
         from .device_build import DeviceBuilder
@@ -455,7 +470,7 @@ class Node:
                            'ack_device_clear_version': self.device_clear_version,
                            'ack_update_generation': self.update_generation,
                            'update_status': self._update_status(),
-                           'telemetry': dict(self.telemetry.latest,
+                           'telemetry': dict(self.telemetry.latest, **self.runtime_info,
                                              worker_processes=self._active_worker_count()),
                            'devices': self._device_status(),
                            'error': '; '.join(report_errors)[:200]}) as response:

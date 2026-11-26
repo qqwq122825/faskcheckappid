@@ -216,6 +216,22 @@ class NodeRecoveryTests(unittest.TestCase):
         self.assertEqual(captured['active'][0]['processed'], 1)
         self.assertEqual(captured['active'][0]['counts'], {'wrong_password': 1})
 
+    def test_heartbeat_includes_runtime_backend(self):
+        captured = {}
+        value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
+                 'enabled': True, 'rejected': [], 'confirmed': []}
+
+        def request(*_args, **kwargs):
+            captured.update(kwargs['json'])
+            return Response(value)
+
+        with patch.object(self.node, '_request', side_effect=request):
+            self.node._heartbeat()
+        telemetry = captured['telemetry']
+        self.assertRegex(telemetry['python_version'], r'^\d+\.\d+\.\d+$')
+        self.assertTrue(telemetry['gmpy2_version'])
+        self.assertIn(telemetry['srp_math_backend'], ('gmpy2', 'python', 'unavailable'))
+
     def test_heartbeat_includes_device_proxy_health(self):
         captured = {}
         value = {'node_id': 'node', 'name': 'node', 'processes': 1, 'threads': 1,
