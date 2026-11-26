@@ -38,18 +38,18 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 
 def git_aligned_version(source_root=None):
-    """Return the deployed Git description, falling back to the release version."""
+    """Return the release version paired with the exact deployed Git commit."""
     root = Path(source_root) if source_root else Path(__file__).resolve().parents[1]
     try:
         value = subprocess.run(
-            ['git', '-C', str(root), 'describe', '--tags', '--always', '--dirty'],
+            ['git', '-C', str(root), 'rev-parse', '--short=7', 'HEAD'],
             check=True, capture_output=True, text=True, timeout=2,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return VERSION
-    if value.startswith('v'):
-        value = value[1:]
-    return value[:80] or VERSION
+    if not re.fullmatch(r'[0-9a-fA-F]{7}', value):
+        return VERSION
+    return f'{VERSION}+g{value.lower()}'
 
 
 class Node:

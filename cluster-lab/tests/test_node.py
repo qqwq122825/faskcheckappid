@@ -33,18 +33,18 @@ def _construct_node_in_spawned_child(root):
 
 class NodeRecoveryTests(unittest.TestCase):
     def test_git_aligned_version_reports_deployed_revision(self):
-        completed = type('Completed', (), {'stdout': 'v1.1.1-1-gabc1234\n'})()
+        completed = type('Completed', (), {'stdout': 'AbC1234\n'})()
         with patch('clusterlab.node.subprocess.run', return_value=completed) as run:
             self.assertEqual(git_aligned_version('/srv/cluster-lab'),
-                             '1.1.1-1-gabc1234')
+                             '1.1.2+gabc1234')
         run.assert_called_once_with(
-            ['git', '-C', '/srv/cluster-lab', 'describe', '--tags', '--always', '--dirty'],
+            ['git', '-C', '/srv/cluster-lab', 'rev-parse', '--short=7', 'HEAD'],
             check=True, capture_output=True, text=True, timeout=2,
         )
 
     def test_git_aligned_version_falls_back_without_repository(self):
         with patch('clusterlab.node.subprocess.run', side_effect=OSError('git unavailable')):
-            self.assertEqual(git_aligned_version('/srv/cluster-lab'), '1.1.1')
+            self.assertEqual(git_aligned_version('/srv/cluster-lab'), '1.1.2')
 
     def test_device_registration_allows_realistic_provisioning_time(self):
         self.assertGreaterEqual(REGISTRATION_TIMEOUT, 90)
@@ -299,8 +299,7 @@ class NodeRecoveryTests(unittest.TestCase):
         with patch.object(self.node, '_request', side_effect=request):
             self.node._heartbeat()
         self.assertEqual(captured['version'], self.node.version)
-        self.assertRegex(captured['version'],
-                         r'^\d+\.\d+\.\d+(?:-\d+-g[0-9a-f]+)?(?:-dirty)?$')
+        self.assertRegex(captured['version'], r'^1\.1\.2(?:\+g[0-9a-f]{7})?$')
         telemetry = captured['telemetry']
         self.assertRegex(telemetry['python_version'], r'^\d+\.\d+\.\d+$')
         self.assertTrue(telemetry['gmpy2_version'])
