@@ -1013,6 +1013,41 @@ class ExecutorScaleTests(unittest.TestCase):
                 self.assertEqual(shared.discards,
                                  ['socks5h://first-exit', 'socks5h://second-exit'])
 
+    def test_20970_account_information_incorrect_becomes_wrong_password_after_retries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'input.part').write_text('account----password\n', encoding='utf-8')
+            descriptor = {'rows': 1, 'first_row': 1, 'threads': 1,
+                          'device_capacity': 1, 'device_root': str(root / 'devices'),
+                          'origin': 'http://127.0.0.1:1', 'timeout': 5, 'retries': 3,
+                          '_retry_delay': 0, '_detailed_error_log': True}
+            shared = ScriptedProxyPool([
+                'socks5h://bootstrap', 'socks5h://first-exit',
+                'socks5h://second-exit', 'socks5h://third-exit',
+                'socks5h://fourth-exit'])
+            checked = []
+            reason = 'Your account information was entered incorrectly.'
+
+            def check(_account, _password, proxy, **_kwargs):
+                checked.append(proxy)
+                return {'status': 'error', 'kind': 'protocol', 'stage': 'init',
+                        'http': 200, 'apple_ec': -20970,
+                        'detail': reason, 'apple_message': reason}
+
+            with patch('clusterlab.executor._load_fastcheck', return_value=(
+                    FakePool, check, lambda _result: 'timeout')), \
+                 patch('fastcheck.workers.device_profile',
+                       return_value={'client_info': 'test', 'user_agent': 'test'}), \
+                 patch('clusterlab.executor._bump_usage'):
+                _execute_auth_unit(root, descriptor, threading.Event(), proxy_pool=shared)
+
+            record = json.loads((root / 'results.jsonl').read_text())
+            self.assertEqual(len(checked), 4)
+            self.assertEqual((record['status'], record['attempts'], record['code']),
+                             ('wrong_password', 3, '-20970'))
+            self.assertEqual(record['reason_key'], 'account_info_incorrect')
+            self.assertEqual(record['reason'], reason)
+
     def test_registration_history_keeps_the_first_time_and_proxy_per_slot(self):
         with tempfile.TemporaryDirectory() as temporary:
             self.assertTrue(record_device_registration(temporary, 3, 'socks5h://first:9000',

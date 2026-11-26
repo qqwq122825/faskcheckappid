@@ -1551,6 +1551,8 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             http = int(result.get('http'))
         except (TypeError, ValueError):
             http = None
+        if result.get('retry_exhausted') == 'account_information_incorrect':
+            return 'wrong_password'
         if http in (0, 503):
             return 'timeout'
         if unlabelled_20970(result):
@@ -2050,6 +2052,14 @@ def _execute_auth_unit(directory, descriptor, stop, proxy_pool=None):
             previous_proxy = current_proxy
             if not transport_failed or attempt + 1 >= attempt_limit:
                 result['_proxy_retries'] = attempt
+                # Apple sometimes returns HTTP 200/-20970 with this explicit
+                # password verdict.  It remains retryable, but after the
+                # configured attempts are exhausted it is a password error,
+                # not a transport timeout.
+                if (transport_failed and attempt + 1 >= attempt_limit
+                        and apple_ec == -20970
+                        and _apple_reason_key(result) == 'account_info_incorrect'):
+                    result['retry_exhausted'] = 'account_information_incorrect'
                 break
             # Return this account to the coordinator's delayed retry heap.
             # No worker thread sleeps during the five-second backoff.

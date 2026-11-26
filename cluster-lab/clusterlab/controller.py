@@ -133,7 +133,7 @@ _APPLE_REASON_BUCKETS = (
     ('this apple account has been locked', 'locked'),
     ('enter the correct password for this apple account', 'wrong_password'),
     ('this apple account is not active', 'locked'),
-    ('your account information was entered incorrectly', 'timeout'),
+    ('your account information was entered incorrectly', 'wrong_password'),
     ('the account does not exist', 'not_found'),
 )
 
@@ -146,7 +146,7 @@ _ERROR_REASON_CN = {
     'account_locked': '账号已被锁定',
     'wrong_password': '密码错误',
     'account_not_active': '账号已被锁定',
-    'account_info_incorrect': 'Apple 返回账号信息不正确，已按任务设置重试',
+    'account_info_incorrect': '密码错误（Apple 返回账号信息不正确）',
     'account_not_found': '账号不存在',
     'transport_timeout': '网络请求未取得 HTTP 响应，已按任务设置重试',
     'service_unavailable': '服务暂时不可用，已按任务设置重试',
@@ -160,7 +160,7 @@ _ERROR_REASON_BUCKETS = {
     'apple_action_unavailable': 'timeout', 'apple_processing_later': 'timeout',
     'account_locked_security': 'locked', 'account_locked': 'locked',
     'wrong_password': 'wrong_password', 'account_not_active': 'locked',
-    'account_info_incorrect': 'timeout', 'account_not_found': 'not_found',
+    'account_info_incorrect': 'wrong_password', 'account_not_found': 'not_found',
     'transport_timeout': 'timeout', 'service_unavailable': 'timeout',
     'gsa_20970_unlabelled': 'timeout', 'apple_transient_code': 'timeout',
     'blank_record': 'undetermined',
@@ -287,7 +287,7 @@ def result_reason_cn(value, bucket=None):
         ('enter the correct password for this apple account', '密码错误'),
         ('this apple account is not active', '账号已被锁定'),
         ('your account information was entered incorrectly',
-         'Apple 返回账号信息不正确，已按任务设置重试'),
+         '密码错误（Apple 返回账号信息不正确）'),
         ('the account does not exist', '账号不存在'),
     )
     for phrase, translated in translations:
@@ -347,7 +347,7 @@ class Controller:
     RESULT_RECORD_BYTE_LIMIT = 64 * 1024
     RESULT_BUCKETS = ('valid', 'wrong_password', 'need_2fa', 'locked', 'not_found',
                       'timeout', 'undetermined', 'unknown')
-    RESULT_CLASSIFICATION_VERSION = 15
+    RESULT_CLASSIFICATION_VERSION = 16
     DEFAULT_DEVICE_REQUEST = 30
     UPDATE_ACTIVE_STATES = ('dispatched', 'scheduled', 'fetching', 'installing', 'restarting', 'verifying')
     UPDATE_FINAL_STATES = ('success', 'failed', 'rolled_back')
