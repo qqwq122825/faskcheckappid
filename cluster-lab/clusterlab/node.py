@@ -37,6 +37,21 @@ CREATE TABLE IF NOT EXISTS tasks (
 '''
 
 
+def git_aligned_version(source_root=None):
+    """Return the deployed Git description, falling back to the release version."""
+    root = Path(source_root) if source_root else Path(__file__).resolve().parents[1]
+    try:
+        value = subprocess.run(
+            ['git', '-C', str(root), 'describe', '--tags', '--always', '--dirty'],
+            check=True, capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return VERSION
+    if value.startswith('v'):
+        value = value[1:]
+    return value[:80] or VERSION
+
+
 class Node:
     # 必须 >= 总控的 unit_byte_limit（controller.settings 里是 32 MiB）。
     # 两处不一致时总控切得出、节点收不下，大包会一直重试到租约过期。
@@ -76,6 +91,7 @@ class Node:
         self.max_threads = requested_threads
         self.allow_http, self.interval = allow_http, interval
         self.instance = uuid.uuid4().hex
+        self.version = git_aligned_version()
         self.context = mp.get_context('spawn')
         self.stop = threading.Event()
         self.lock = threading.RLock()
@@ -539,7 +555,7 @@ class Node:
                     report_states[task['id']] = next_state
                 collection.append(item)
         with self._request('POST', '/agent/heartbeat', json={'session': self.instance, 'hostname': socket.gethostname(),
-                           'version': VERSION, 'max_processes': self.max_processes, 'max_threads': self.max_threads,
+                           'version': self.version, 'max_processes': self.max_processes, 'max_threads': self.max_threads,
                            'active': values, 'interrupted': interrupted,
                            'ack_stop_version': self.stop_version,
                            'ack_device_clear_version': self.device_clear_version,
