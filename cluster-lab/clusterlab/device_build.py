@@ -16,7 +16,7 @@ from .executor import (_load_fastcheck, _probe_proxy_exit_ip,
                        record_device_registration)
 
 REGISTRATION_TIMEOUT = 90
-DEVICE_REGISTRATION_WORKERS = 100
+DEVICE_REGISTRATION_WORKERS = 500
 
 
 def device_label(device_id):
